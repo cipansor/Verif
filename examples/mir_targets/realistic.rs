@@ -9007,3 +9007,126 @@ pub fn clamp_builtin_is_a_value_cannot_prove_this(x: u32, lo: u32, hi: u32) -> u
 pub fn clamp_builtin_signed_reads(x: i8, lo: i8, hi: i8) -> i8 {
     x.clamp(lo, hi)
 }
+
+/// The ASCII class tests, which are `bool`-valued predicates on `u8` and take
+/// `&self`. `digit` returns the value's digit, so the postcondition pins both the
+/// predicate's boundary and the arithmetic after it: a model that read
+/// `is_ascii_digit` as `false` everywhere would prove `ret == 0`, and one that read
+/// it as `true` everywhere would leave the `b - b'0'` subtraction unguarded.
+/// requires: true
+/// ensures: ret <= 9
+pub fn ascii_digit_value(b: u8) -> u8 {
+    if b.is_ascii_digit() { b - b'0' } else { 0 }
+}
+
+/// A tripwire for the digit test: `b'9' + 1` is not a digit, so the body returns
+/// `0`, and claiming the *subtraction* ran (`ret >= 1`) is false at that input. A
+/// model that made every byte a digit would prove it.
+/// requires: true
+/// ensures: ret >= 1
+pub fn ascii_digit_is_not_every_byte_cannot_prove_this(b: u8) -> u8 {
+    if b.is_ascii_digit() { b - b'0' } else { 0 }
+}
+
+/// `is_ascii_hexdigit` and `is_ascii_alphabetic` are different classes, and the
+/// body returns a different constant for each. The postcondition pins the
+/// discrimination: a model that collapsed the two classes would return one
+/// constant for the other's inputs.
+/// requires: true
+/// ensures: ret <= 2
+pub fn ascii_class_discriminates(b: u8) -> u8 {
+    if b.is_ascii_hexdigit() {
+        1
+    } else if b.is_ascii_alphabetic() {
+        2
+    } else {
+        0
+    }
+}
+
+/// A tripwire for the class discrimination: `b'g'` is alphabetic but not a hex
+/// digit, so the body returns `2`, and claiming the hex arm ran for every byte is
+/// false there. A model that answered `1` for a letter would prove it.
+/// requires: true
+/// ensures: ret != 2
+pub fn ascii_class_hex_arm_is_not_every_byte_cannot_prove_this(b: u8) -> u8 {
+    if b.is_ascii_hexdigit() {
+        1
+    } else if b.is_ascii_alphabetic() {
+        2
+    } else {
+        0
+    }
+}
+
+/// `is_ascii` is the single comparison `b < 128`, so a byte above `0x7f` takes
+/// the else arm. The postcondition pins the boundary: a model that read `is_ascii`
+/// as always true would return `1` for every byte.
+/// requires: true
+/// ensures: ret <= 1
+pub fn ascii_is_ascii_boundary(b: u8) -> u8 {
+    if b.is_ascii() { 1 } else { 0 }
+}
+
+/// A tripwire for `is_ascii`'s boundary: `0xff` is not ASCII, so the body returns
+/// `0`, and claiming `ret == 1` is false there. A model that answered `true` for
+/// every byte would prove it.
+/// requires: true
+/// ensures: ret == 1
+pub fn ascii_is_ascii_is_not_every_byte_cannot_prove_this(b: u8) -> u8 {
+    if b.is_ascii() { 1 } else { 0 }
+}
+
+/// `abs_diff` returns the *unsigned* magnitude of the difference. `b >= a` makes
+/// the body take the `b - a` arm, so the result is `b - a`; the postcondition pins
+/// that the arms are not swapped. A model that returned the signed difference
+/// would give a negative value read as a huge unsigned one.
+/// requires: a <= b
+/// ensures: ret == b - a
+pub fn abs_diff_ordered(a: u32, b: u32) -> u32 {
+    a.abs_diff(b)
+}
+
+/// A tripwire for `abs_diff`: the difference is symmetric in the operands, so
+/// `a.abs_diff(b)` is not `b - a` when `a > b`. A model that ignored the ordering
+/// would prove it.
+/// requires: a > b
+/// ensures: ret == b - a
+pub fn abs_diff_is_symmetric_cannot_prove_this(a: u32, b: u32) -> u32 {
+    a.abs_diff(b)
+}
+
+/// A rotation by a nonzero constant moves bits and wraps the top to the bottom.
+/// `0b1000_0001` rotated left by one is `0b0000_0011`; the postcondition pins the
+/// wrap, which a plain shift (dropping the top bit) would get wrong.
+/// requires: true
+/// ensures: ret == 3
+pub fn rotate_left_wraps_the_top_bit() -> u8 {
+    0x81u8.rotate_left(1)
+}
+
+/// A tripwire for the rotation: a rotation is not a shift, so the body is not
+/// `0x81 << 1` (which wraps to `2` in eight bits). A model that used a shift would
+/// prove it.
+/// requires: true
+/// ensures: ret == 2
+pub fn rotate_is_not_a_shift_cannot_prove_this() -> u8 {
+    0x81u8.rotate_left(1)
+}
+
+/// A rotation by the full width is the identity, which is what the amount being
+/// reduced modulo the width means. A model that saturated the amount (as a shift
+/// does) would give `0` instead.
+/// requires: true
+/// ensures: ret == 0x81
+pub fn rotate_by_the_width_is_the_identity() -> u8 {
+    0x81u8.rotate_right(8)
+}
+
+/// A rotation by more than the width wraps, so `w + 1` is a rotation by `1`. A
+/// model that read the amount as a shift would return `0` past the width.
+/// requires: true
+/// ensures: ret == 3
+pub fn rotate_by_more_than_the_width_wraps() -> u8 {
+    0x81u8.rotate_left(9)
+}

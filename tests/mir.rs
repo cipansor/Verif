@@ -1085,8 +1085,8 @@ fn the_independent_corpus_does_not_regress() {
         .filter(|(_, o)| matches!(o, FnOutcome::Verified { .. }))
         .count();
     assert!(
-        verified >= 11,
-        "everyday.rs verified {verified} of {} functions, down from 11 (52%); a regression \
+        verified >= 13,
+        "everyday.rs verified {verified} of {} functions, down from 13 (62%); a regression \
          dropped coverage of ordinary Rust. Run: cargo run --features std --example \
          mir_coverage -- {EVERYDAY}",
         report.outcomes.len()
@@ -9328,6 +9328,104 @@ fn abs_and_clamp_are_modelled_with_their_panics() {
                 assert!(kind.starts_with("panic"), "`{name}` must fail on the panic, got `{kind}`")
             }
             other => panic!("`{name}` must be a failing panic, got: {other}"),
+        }
+    }
+}
+
+/// The ASCII class tests on `u8` are modelled, and each one is a *predicate*
+/// rather than an uninterpreted value.
+///
+/// The shape is the one `is_power_of_two` already had -- a `bool`-valued method
+/// whose destination is a `bool`, not a one-bit word -- with one difference: the
+/// receiver is `&self`, so the operand is the *referent* of a reference the body
+/// materialises (`_3 = &_1`). The three tripwires are the evidence the predicates
+/// are read at all: a model that returned a constant would prove them.
+#[test]
+fn the_ascii_classes_are_modelled_with_their_boundaries() {
+    let names = [
+        "ascii_digit_value",
+        "ascii_digit_is_not_every_byte_cannot_prove_this",
+        "ascii_class_discriminates",
+        "ascii_class_hex_arm_is_not_every_byte_cannot_prove_this",
+        "ascii_is_ascii_boundary",
+        "ascii_is_ascii_is_not_every_byte_cannot_prove_this",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+
+    for name in ["ascii_digit_value", "ascii_class_discriminates", "ascii_is_ascii_boundary"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    // Each tripwire must be refuted on the *postcondition*, with a witness at a
+    // byte that really takes the other arm -- so an unrelated refusal cannot
+    // satisfy it, and the model cannot be passing by answering a constant.
+    for (name, byte) in [
+        ("ascii_digit_is_not_every_byte_cannot_prove_this", 48u64),
+        ("ascii_class_hex_arm_is_not_every_byte_cannot_prove_this", 80),
+        ("ascii_is_ascii_is_not_every_byte_cannot_prove_this", 128),
+    ] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.starts_with("postcondition"),
+                "`{name}` must be refuted on the postcondition, got `{kind}`"
+            ),
+            other => panic!("`{name}` claims a false value and must be refuted, got: {other}"),
+        }
+        // The witness names the byte that takes the else arm: `b'0'` for the digit
+        // test, `b'P'` (80) for the hex arm, and `0x80` for `is_ascii`.
+        let detail = format!("{o}");
+        assert!(
+            detail.contains(&byte.to_string()),
+            "`{name}`'s witness should name the byte {byte}, got: {detail}"
+        );
+    }
+}
+
+/// `abs_diff` and the rotations are modelled, and each has a tripwire that a
+/// wrong model would *prove*.
+///
+/// `abs_diff`'s result is the *unsigned* magnitude, so the model computes the
+/// difference at one bit of headroom and takes the absolute value there; a model
+/// that returned the signed difference would read a negative result as a huge
+/// unsigned one. The rotations reduce the amount modulo the width (`rotate by the
+/// width` is the identity, `by w + 1` is `by 1`), which is the property a shift
+/// model gets wrong. Both tripwires claim the shape a *shift or signed-difference*
+/// model would produce, so they must be refuted.
+#[test]
+fn abs_diff_and_rotations_are_modelled_with_their_boundaries() {
+    let names = [
+        "abs_diff_ordered",
+        "abs_diff_is_symmetric_cannot_prove_this",
+        "rotate_left_wraps_the_top_bit",
+        "rotate_is_not_a_shift_cannot_prove_this",
+        "rotate_by_the_width_is_the_identity",
+        "rotate_by_more_than_the_width_wraps",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+
+    for name in [
+        "abs_diff_ordered",
+        "rotate_left_wraps_the_top_bit",
+        "rotate_by_the_width_is_the_identity",
+        "rotate_by_more_than_the_width_wraps",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    // The tripwires must be refuted on the *postcondition*, not by an unrelated
+    // refusal, so the model cannot pass by answering a constant.
+    for name in ["abs_diff_is_symmetric_cannot_prove_this", "rotate_is_not_a_shift_cannot_prove_this"]
+    {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.starts_with("postcondition"),
+                "`{name}` must be refuted on the postcondition, got `{kind}`"
+            ),
+            other => panic!("`{name}` claims a false value and must be refuted, got: {other}"),
         }
     }
 }

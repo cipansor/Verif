@@ -1964,11 +1964,29 @@ refused. `src/mir/intrinsics.rs` holds the model:
   `count_zeros` is `count_ones(!x)` and a fix to one half cannot leave the other
   behind. `!x` is spelled the way the executor spells it, so the model's `!x` and
   the body's `!x` are the same term.
-- `is_power_of_two` is the one modelled shape whose *return type* is `bool`, so it
-  is the one that produces a predicate rather than a bit-vector. The executor
-  writes it as a `bool`, which is what the `if` that consumes it branches on; a
-  one-bit word there would leave the local readable only as a word. It is
-  unsigned-only, matching `core`.
+- `is_power_of_two` is a modelled shape whose *return type* is `bool`, so it
+  produces a predicate rather than a bit-vector. The executor writes it as a
+  `bool`, which is what the `if` that consumes it branches on; a one-bit word
+  there would leave the local readable only as a word. It is unsigned-only,
+  matching `core`.
+- The ten `is_ascii_*` class tests (`is_ascii_digit`, `is_ascii_alphabetic`,
+  `is_ascii_alphanumeric`, `is_ascii_uppercase`, `is_ascii_lowercase`,
+  `is_ascii_hexdigit`, `is_ascii_whitespace`, `is_ascii_punctuation`,
+  `is_ascii_control`, `is_ascii`) are `bool` predicates too, and each is `core`'s
+  own range test on the byte (`is_ascii_digit` is `b'0'..=b'9'`, `is_ascii` is
+  `b < 128`, whitespace is the five `core` names — vertical tab excluded). They
+  are the first modelled methods whose receiver is `&self`, so the operand is the
+  *referent* of a reference the body materialises (`_3 = &_1`): the executor
+  follows the reference for these shapes and only these. Each is checked
+  exhaustively against Rust's own `u8` method, so the boundaries cannot drift from
+  the standard library's.
+- `slice::len` and `slice::is_empty` are modelled from the slice's length
+  variable — the same symbolic input the frontend already binds for the bounds
+  checks — so a contract's `s.len()` and the body's `PtrMetadata(_1)` are one
+  number. They are matched on the *path* (`core::slice::<impl [T]>::len`), so a
+  `Vec::len` or `str::len` is not mistaken for a slice length; and the receiver's
+  length has to be one the frontend holds, so a receiver it did not bind is
+  refused rather than given an invented number.
 - `Ord::min` and `Ord::max` are the two modelled *trait* methods, so a dump spells
   a call `<u8 as Ord>::min` (or `<i8 as std::cmp::Ord>::max` with `std` in scope)
   rather than a `core::num::<impl …>` inherent path. The model is one `ite` over
@@ -2007,6 +2025,17 @@ refused. `src/mir/intrinsics.rs` holds the model:
   clamp reads `i8::MIN` as below `0`. Both are refused on a non-primitive self
   type, and `clamp` is admitted only under the standard library's `Ord` path, the
   same rule `min`/`max` follow.
+- `iN::abs_diff` and `iN::rotate_left`/`rotate_right` are total, so they are plain
+  values rather than a value-and-panic pair. `abs_diff`'s result is the *unsigned*
+  magnitude even on a signed type — `i8::abs_diff(-128, 127)` is `255u8` — so the
+  model widens both operands by their *own* sign to `w + 1` bits, subtracts there,
+  and takes the absolute value with a *signed* sign test: the `w + 1`-bit range is
+  exactly a signed one, so an unsigned difference `0 - 1` is read as `-1`, not as
+  `255`. The rotations reduce the amount modulo the width the way `core` does — a
+  rotation by the width is the identity and by `w + 1` is by `1` — and because a
+  modelled width is a power of two the reduction is one `and` and no divider. Both
+  are checked exhaustively over `u8`/`i8` against Rust's own methods, so the
+  rotation's wrap cannot drift from the standard library's.
 - A *local* method that shares an intrinsic's name is answered by its own body,
   never by the model. rustc prints a trait impl's call as `<u8 as Trait>::m` but
   its definition as `<impl at …>::m`, so the names never match; the model is only
@@ -2115,8 +2144,11 @@ The frontend refuses far more than it accepts, and every refusal is reported:
   bitwise ops are computed from their operands (see below), as are the unary
   `neg`/`abs` in all four families, the six bit counts (`count_ones`,
   `count_zeros`, `leading_zeros`, `leading_ones`, `trailing_zeros`,
-  `trailing_ones`), the `bool` predicate `is_power_of_two`, the `Ord::min`/`Ord::max`
-  trait methods, the widening `From::from`/`Into::into` conversions, the
+  `trailing_ones`), the `bool` predicates `is_power_of_two` and the ten
+  `is_ascii_*` class tests, the `slice::len`/`is_empty` length queries, the
+  `Ord::min`/`Ord::max`
+  trait methods, the `abs_diff` and `rotate_left`/`rotate_right` methods, the
+  widening `From::from`/`Into::into` conversions, the
   mixed-signedness
   additions (`wrapping_add_signed`, `saturating_add_signed`, `checked_add_signed`,
   `overflowing_add_signed` and their `_unsigned` counterparts) and the `pow`

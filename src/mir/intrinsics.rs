@@ -205,6 +205,33 @@ pub enum Intrinsic {
     /// it produces a [`Pred`] rather than a [`Var`]. It is one bit by
     /// construction, so `result_w` is not read for it.
     Bool(BoolKind),
+    /// `slice::len`: the number of elements, as a `usize`.
+    ///
+    /// A slice's length is a *symbolic input* the frontend already binds for the
+    /// bounds checks (`PtrMetadata`), so the model is that same variable, not a
+    /// fresh one -- otherwise `s.len()` in a contract and the body's `s.len()`
+    /// would be two numbers. The executor reads it through `length_of`.
+    SliceLen,
+    /// `slice::is_empty`: `len == 0`, the same length variable compared to zero.
+    ///
+    /// The length is the one the *executor* holds, so the two shapes read the
+    /// same number and `is_empty()` cannot disagree with `len() == 0`.
+    SliceIsEmpty,
+    /// `iN::abs_diff`: the absolute difference of two operands, as the type.
+    ///
+    /// Its result is *unsigned* even on a signed type -- `i8::abs_diff(-128, 127)`
+    /// is `255`, which is why the result is a `u8` and not an `i8` -- so the model
+    /// widens the operands to the sign, subtracts the smaller from the larger, and
+    /// narrows back. It exists on both signednesses; on an unsigned type it is a
+    /// plain `|x - y|`, which is the same expression.
+    AbsDiff,
+    /// `iN::rotate_left`/`rotate_right`: a rotation by a `u32` amount.
+    ///
+    /// The amount is a `u32` beside a value of the method's own width, and `core`
+    /// reduces it modulo the width (`u8::rotate_left(x, 8)` is `x`), so the model
+    /// is a barrel shifter in each direction OR-ed together, with the amount read
+    /// modulo the width. It exists on both signednesses and is total.
+    Rotate(RotateKind),
     /// `Ord::min` or `Ord::max`: the smaller or larger of two operands of one
     /// type.
     ///
@@ -288,6 +315,47 @@ pub enum BoolKind {
     /// not one), and the type's width is the highest exponent it can hold, so a
     /// signed reading would be wrong in both directions -- see [`is_modelled`].
     PowerOfTwo,
+    /// The ASCII class tests on `u8`: `is_ascii_digit`, `is_ascii_alphabetic`,
+    /// `is_ascii_alphanumeric`, `is_ascii_uppercase`, `is_ascii_lowercase`,
+    /// `is_ascii_hexdigit`, `is_ascii_whitespace`, `is_ascii_punctuation`,
+    /// `is_ascii_control` and `is_ascii`.
+    ///
+    /// `core` defines every one of these as a range test on the byte, so the model
+    /// is one or more comparisons rather than a table: `is_ascii_digit` is
+    /// `b >= b'0' && b <= b'9'`, `is_ascii` is `b < 128`, and so on. They are
+    /// unsigned-only and exist only on `u8` -- `core` has no `is_ascii_digit` on
+    /// `u32` -- so a signed or wider receiver is not this method.
+    Ascii(AsciiKind),
+}
+
+/// The ASCII class a `u8` byte belongs to, for [`BoolKind::Ascii`].
+///
+/// Each variant is one `core` method, and the model is the method's own range
+/// test, so the two cannot disagree about the boundaries. A byte is a `u8`, so
+/// every comparison here is unsigned and the constants are the ASCII code points
+/// spelled as their character literals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AsciiKind {
+    /// `is_ascii_digit`: `b'0'..=b'9'`.
+    Digit,
+    /// `is_ascii_alphabetic`: `b'a'..=b'z'` or `b'A'..=b'Z'`.
+    Alphabetic,
+    /// `is_ascii_alphanumeric`: digit or alphabetic.
+    Alphanumeric,
+    /// `is_ascii_uppercase`: `b'A'..=b'Z'`.
+    Uppercase,
+    /// `is_ascii_lowercase`: `b'a'..=b'z'`.
+    Lowercase,
+    /// `is_ascii_hexdigit`: digit, `b'A'..=b'F'` or `b'a'..=b'f'`.
+    HexDigit,
+    /// `is_ascii_whitespace`: space, tab, newline, form feed or carriage return.
+    Whitespace,
+    /// `is_ascii_punctuation`: the printable non-alphanumeric, non-space ASCII.
+    Punctuation,
+    /// `is_ascii_control`: the C0 controls and DEL, `0..=0x1f` or `0x7f`.
+    Control,
+    /// `is_ascii`: `b < 128`.
+    Ascii,
 }
 
 /// `Ord::min` and `Ord::max`: the smaller or larger of two values of one type.
@@ -432,6 +500,15 @@ pub enum BitKind {
     TrailingOnes,
 }
 
+/// Which way a rotation turns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RotateKind {
+    /// Bits move toward the high end; the top bits wrap to the bottom.
+    Left,
+    /// Bits move toward the low end; the bottom bits wrap to the top.
+    Right,
+}
+
 impl Intrinsic {
     /// True for the shapes that take one operand and no operator.
     ///
@@ -521,6 +598,27 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if short == "is_power_of_two" {
         return Some(Intrinsic::Bool(BoolKind::PowerOfTwo));
     }
+    // The ASCII class tests on `u8`. Their receiver is `&u8`, not `u8` -- the dump
+    // prints `_3 = &_1; is_ascii_digit(move _3)` -- but that is the *executor's*
+    // concern, not the model's: the model sees the byte. Each is matched by its
+    // exact name so no prefix split can mistake it for an operator.
+    if let Some(kind) = ascii_kind(short) {
+        return Some(Intrinsic::Bool(BoolKind::Ascii(kind)));
+    }
+    // `slice::len`/`is_empty`. `Vec`, `String` and `str` also spell `len`, and
+    // their length is not the slice-length variable this model reads, so the
+    // *path* is checked rather than the tail alone: only an inherent `[T]` slice
+    // method is read as a slice length. Anything else falls through and stays
+    // unmodelled, which is the honest answer for a length the frontend does not
+    // hold.
+    if names_slice_impl(name) {
+        if short == "is_empty" {
+            return Some(Intrinsic::SliceIsEmpty);
+        }
+        if short == "len" {
+            return Some(Intrinsic::SliceLen);
+        }
+    }
     // `Ord::min`/`Ord::max`. These are *trait* methods, so the name is matched on
     // the trait path rather than a `core::num::<impl …>` path: the dump spells the
     // call `<u8 as Ord>::min`, naming the trait itself. `min`/`max` are matched
@@ -571,6 +669,20 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     // families' `wrapping_abs`/`checked_abs`/… are matched by the split below.
     if short == "abs" {
         return Some(Intrinsic::Abs);
+    }
+    // The inherent `abs_diff`, `rotate_left` and `rotate_right`. Like `abs` they
+    // are not family-prefixed, so they are matched before the split; unlike it
+    // they are total (no panic), so they are plain values rather than a
+    // `ValueOrPanic`. `abs_diff` exists on both signednesses; the rotations exist
+    // on both too and reduce the amount modulo the width.
+    if short == "abs_diff" {
+        return Some(Intrinsic::AbsDiff);
+    }
+    if short == "rotate_left" {
+        return Some(Intrinsic::Rotate(RotateKind::Left));
+    }
+    if short == "rotate_right" {
+        return Some(Intrinsic::Rotate(RotateKind::Right));
     }
     let (family, op) = if let Some(rest) = short.strip_prefix("wrapping_") {
         (Family::Wrapping, rest)
@@ -637,6 +749,19 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
 /// collide (a crate-root `Ord`, which the prelude also names `Ord`).
 pub fn names_ord_trait(name: &str) -> bool {
     matches!(trait_path(name), Some("Ord" | "core::cmp::Ord" | "std::cmp::Ord"))
+}
+
+/// True when a call names an inherent method on a *slice* `[T]`.
+///
+/// `len` and `is_empty` are spelled the same on `Vec`, `String`, `str` and many
+/// user types, and the model only knows the length of a `&[T]` the frontend
+/// bound. The path is the only thing that separates them, so it is checked: the
+/// dump prints a slice method as `core::slice::<impl [T]>::len`. A `Vec::len`
+/// (`alloc::vec::Vec<T>::len` or `Vec::<u8>::len`) has no `slice::<impl [`, so it
+/// is refused and stays unmodelled rather than answered with a slice length it
+/// does not have.
+pub fn names_slice_impl(name: &str) -> bool {
+    name.contains("slice::<impl [")
 }
 
 /// Whether a `from`/`into` name is `core`'s own `From`/`Into`, and theirs alone.
@@ -707,7 +832,27 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // is negative) and the model has no way to tell the two apart once it
         // has only the sign flag. It is total, so the only question is the width,
         // which is already bounded above.
-        Intrinsic::Bool(_) => !signed,
+        //
+        // The ASCII classes are stricter still: they exist only on `u8`, so the
+        // operand must be eight bits *and* unsigned. A wider or signed operand is
+        // a different method (or not a method), and modelling it as the byte test
+        // would answer a call `core` has no definition for.
+        Intrinsic::Bool(BoolKind::Ascii(_)) => !signed && w == 8,
+        Intrinsic::Bool(BoolKind::PowerOfTwo) => !signed,
+        // The slice length and emptiness. Both are the `usize` length the executor
+        // holds, so neither reads the operand width or sign -- they are answered by
+        // `eval_slice` from the length variable, and `eval` never sees them. They
+        // are total here so that a `is_modelled` probe does not report them
+        // unmodelled; the executor is what refuses a receiver whose length it does
+        // not have.
+        Intrinsic::SliceLen | Intrinsic::SliceIsEmpty => true,
+        // `abs_diff` computes at one bit of headroom, so it needs a width below the
+        // engine's 64. It exists on both signednesses -- on an unsigned type it is
+        // a plain magnitude -- so there is no membership fact to check.
+        Intrinsic::AbsDiff => (1..64).contains(&w),
+        // The rotations exist on both signednesses and are total; the only width
+        // constraint is the engine's own.
+        Intrinsic::Rotate(_) => (1..=64).contains(&w),
         // The unary operators. Two membership facts decide whether a call can be
         // modelled at all, and both are about the *type*, not the width:
         //
@@ -810,7 +955,19 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
     if !is_modelled(op, w, signed) {
         return None;
     }
+    // The slice shapes are answered from the length variable the *executor*
+    // holds, not from an operand term, so `eval` has nothing to compute for them.
+    // Routing them here rather than at a match arm keeps the two-operand `eval`
+    // from ever being asked about a shape with no operands.
+    if matches!(op, Intrinsic::SliceLen | Intrinsic::SliceIsEmpty) {
+        return None;
+    }
     Some(match op {
+        // Answered by `eval_slice` from the executor's length variable; the early
+        // return above keeps them from reaching here.
+        Intrinsic::SliceLen | Intrinsic::SliceIsEmpty => {
+            unreachable!("slice shapes are answered from the length variable")
+        }
         // The bit counts, each built at the operand's width and widened to the
         // result type. A count cannot exceed the operand width, so `w` bits hold
         // it; zero-extending to `result_w` is the promotion Rust performs (`u8`
@@ -1013,11 +1170,88 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             let fails = unary_failure(UnOp::Abs, x, w, signed)?;
             Outcome::ValueOrPanic { value: smt::truncate(unary_result(UnOp::Abs, x, w), result_w), fails }
         }
+        // `abs_diff`: `|x - y|`, computed at one bit of headroom so the
+        // subtraction cannot wrap, then narrowed back. The result is the *unsigned*
+        // magnitude -- `i8::abs_diff(-128, 127)` is `255` -- so it is written as an
+        // unsigned value whatever the operands' sign.
+        Intrinsic::AbsDiff => {
+            if w == 0 || w > 63 {
+                return None;
+            }
+            // Both operands widen by their *own* sign to `w + 1` bits, which holds
+            // the true difference: an unsigned `[0, 2^w)` and a signed
+            // `[-2^(w-1), 2^(w-1))` both have a difference in `(-2^w, 2^w)`, and
+            // that range is exactly a *signed* `w + 1`-bit value. So the sign test
+            // is `slt` in both cases -- reading an unsigned difference as unsigned
+            // would take the wrapped value for a negative one (`0 - 1` at eight
+            // bits is `255`, not `-1`), which is the bug this comment prevents.
+            let wide = w + 1;
+            let diff = smt::sub(
+                if signed { smt::sign_extend(x, wide) } else { smt::truncate(x, wide) },
+                if signed { smt::sign_extend(y, wide) } else { smt::truncate(y, wide) },
+            );
+            let mag = smt::ite(
+                smt::slt(diff, smt::word(0, wide)),
+                smt::sub(smt::word(0, wide), diff),
+                diff,
+            );
+            Outcome::Value(smt::truncate(mag, w))
+        }
+        // A rotation by a `u32` amount. `core` reduces the amount modulo the width,
+        // so the model does the same: the two directions are each a shift by the
+        // amount OR its complement shifted the other way, and the amount is masked
+        // to `log2(w)` bits so `rotate_left(x, w)` is `x` rather than a shift by the
+        // full width. The rotation is total, so there is no failure predicate.
+        Intrinsic::Rotate(kind) => {
+            if w == 0 || w > 64 {
+                return None;
+            }
+            Outcome::Value(rotate(x, y, w, kind))
+        }
         // `Ord::clamp` is three-operand and is evaluated by [`clamp`] rather than
         // here, because `eval` reads exactly two operands. Reaching this arm means
         // a caller used `eval` for a shape it does not serve.
         Intrinsic::Clamp => return None,
     })
+}
+
+/// `x.rotate_left(n)` / `x.rotate_right(n)` at width `w`.
+///
+/// `n` is the amount as a term (a `u32` in the dump), read modulo `w` the way
+/// `core` does: a rotation by the full width is the identity, and a rotation by
+/// more than the width wraps. The amount is a symbolic barrel shift, so the two
+/// half-shifts are `shift_var` calls rather than a loop over `w` cases; the
+/// `and`/`or` combine them, and an amount of `0` leaves `x` unchanged.
+pub fn rotate(x: Var, n: Var, w: u8, kind: RotateKind) -> Var {
+    // `n` is a `u32` and `core` reduces it modulo `w`; `shift_var` saturates an
+    // out-of-range amount to the defined out-of-range value (zero, or the sign
+    // fill) rather than reducing it, so the *amount* is reduced here. A rotation
+    // by the full width is the identity, and one by `w + k` is a rotation by `k`,
+    // which is what a modulo does.
+    //
+    // `n % w` is the exact reduction, but `smt::urem` on a symbolic amount is a
+    // divider -- the expensive circuit the engine already declines past a budget.
+    // A modelled integer width is a power of two (`8/16/32/64`), so `n mod w` is
+    // exactly the low `log2(w)` bits of `n`, which is one `and` and no divider.
+    // That is the amount the two half-shifts use.
+    let bits = (w as u32).trailing_zeros();
+    let low_mask = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+    let low = smt::band(n, smt::word(low_mask as u64, smt::bits(n)));
+    match kind {
+        // `(x << n) | (x >> (w - n))`, with the right shift logical so the bits
+        // that wrap in are zeros, not the sign.
+        RotateKind::Left => {
+            let hi = smt::shift_var(smt::Shift::Left, x, low);
+            let lo = smt::shift_var(smt::Shift::LogicalRight, x, smt::sub(smt::word(w as u64, smt::bits(n)), low));
+            smt::bor(hi, lo)
+        }
+        // The mirror image: `(x >> n) | (x << (w - n))`.
+        RotateKind::Right => {
+            let lo = smt::shift_var(smt::Shift::LogicalRight, x, low);
+            let hi = smt::shift_var(smt::Shift::Left, x, smt::sub(smt::word(w as u64, smt::bits(n)), low));
+            smt::bor(lo, hi)
+        }
+    }
 }
 
 /// The value and panic condition of `Ord::clamp`: `x.clamp(lo, hi)`.
@@ -1195,6 +1429,27 @@ fn not_bits(x: Var) -> Var {
     smt::bxor(x, smt::all_ones(w))
 }
 
+/// The ASCII class a method name denotes, for [`BoolKind::Ascii`].
+///
+/// The names are matched exactly -- not by prefix -- so `is_ascii_digit` cannot be
+/// confused with `is_ascii_alphanumeric`, and a name this model does not know
+/// returns `None` rather than the nearest class.
+fn ascii_kind(short: &str) -> Option<AsciiKind> {
+    Some(match short {
+        "is_ascii_digit" => AsciiKind::Digit,
+        "is_ascii_alphabetic" => AsciiKind::Alphabetic,
+        "is_ascii_alphanumeric" => AsciiKind::Alphanumeric,
+        "is_ascii_uppercase" => AsciiKind::Uppercase,
+        "is_ascii_lowercase" => AsciiKind::Lowercase,
+        "is_ascii_hexdigit" => AsciiKind::HexDigit,
+        "is_ascii_whitespace" => AsciiKind::Whitespace,
+        "is_ascii_punctuation" => AsciiKind::Punctuation,
+        "is_ascii_control" => AsciiKind::Control,
+        "is_ascii" => AsciiKind::Ascii,
+        _ => return None,
+    })
+}
+
 /// The truth value of a `bool`-valued predicate.
 ///
 /// `is_power_of_two` is `x != 0 && x & (x - 1) == 0`, which is the standard
@@ -1204,12 +1459,69 @@ fn not_bits(x: Var) -> Var {
 /// call zero a power of two. The mask test is spelled with the engine's own
 /// `and`/`sub`/`eq_const`, so it is the same term a hand-written
 /// `x & (x - 1) == 0` produces.
+///
+/// The ASCII classes are each `core`'s own range test, built from `ule`/`ult` on
+/// the byte. `is_ascii` is the one that is a single comparison (`x < 128`); the
+/// others are a disjunction of ranges, which is exactly how `core` writes them,
+/// so the boundaries cannot drift from the standard library's.
 fn bool_pred(kind: BoolKind, x: Var) -> Pred {
     match kind {
         BoolKind::PowerOfTwo => {
             let w = smt::bits(x);
             let cleared = smt::band(x, smt::sub(x, smt::word(1, w)));
             smt::and(smt::not(smt::eq_const(x, 0)), smt::eq_const(cleared, 0))
+        }
+        BoolKind::Ascii(kind) => ascii_pred(kind, x),
+    }
+}
+
+/// `core`'s range test for one ASCII class, on a `u8` operand.
+///
+/// Every comparison is unsigned -- a byte is a `u8` -- and the bounds are the
+/// ASCII code points written as character literals, so the model is readable
+/// against the standard library's definition. A range `lo..=hi` is
+/// `ule(lo, x) && ule(x, hi)`; the multi-range classes are the disjunction of
+/// their ranges, which is how `core` states them.
+fn ascii_pred(kind: AsciiKind, x: Var) -> Pred {
+    let in_range = |lo: u8, hi: u8| -> Pred {
+        let w = smt::bits(x);
+        let lo = smt::word(lo as u64, w);
+        let hi = smt::word(hi as u64, w);
+        smt::and(smt::ule(lo, x), smt::ule(x, hi))
+    };
+    match kind {
+        AsciiKind::Digit => in_range(b'0', b'9'),
+        AsciiKind::Uppercase => in_range(b'A', b'Z'),
+        AsciiKind::Lowercase => in_range(b'a', b'z'),
+        AsciiKind::Alphabetic => smt::or(in_range(b'A', b'Z'), in_range(b'a', b'z')),
+        AsciiKind::Alphanumeric => smt::or(
+            in_range(b'0', b'9'),
+            smt::or(in_range(b'A', b'Z'), in_range(b'a', b'z')),
+        ),
+        AsciiKind::HexDigit => smt::or(
+            in_range(b'0', b'9'),
+            smt::or(in_range(b'A', b'F'), in_range(b'a', b'f')),
+        ),
+        // `core`'s list is space, tab, newline, form feed and carriage return --
+        // not vertical tab (`0x0b`), which is why it is a disjunction of five
+        // equalities rather than one range.
+        AsciiKind::Whitespace => [0x20u64, 0x09, 0x0a, 0x0c, 0x0d]
+            .into_iter()
+            .map(|c| smt::eq_const(x, c))
+            .reduce(smt::or)
+            .unwrap_or_else(|| smt::truth(false)),
+        // The printable non-alphanumeric, non-space ASCII: the four runs
+        // `!` through `/`, `:` through `@`, `[` through backtick, and `{`
+        // through `~`, which is how `core` states it.
+        AsciiKind::Punctuation => smt::or(
+            in_range(b'!', b'/'),
+            smt::or(in_range(b':', b'@'), smt::or(in_range(b'[', b'`'), in_range(b'{', b'~'))),
+        ),
+        // The C0 controls and DEL: `0..=0x1f` or `0x7f`.
+        AsciiKind::Control => smt::or(in_range(0, 0x1f), smt::eq_const(x, 0x7f)),
+        AsciiKind::Ascii => {
+            let w = smt::bits(x);
+            smt::ult(x, smt::word(128, w))
         }
     }
 }
@@ -2982,6 +3294,84 @@ mod tests {
         }
     }
 
+    /// Every ASCII class agrees with Rust's own `u8` method over the whole byte
+    /// range.
+    ///
+    /// The oracle is `core` itself, walked exhaustively over `0..=255`, so the
+    /// model's range boundaries are checked against the standard library's rather
+    /// than against the same constants written twice. Each class has its own
+    /// method, and the two that are easy to get wrong are named in the list: the
+    /// whitespace set excludes vertical tab, and punctuation excludes the space.
+    #[test]
+    fn the_ascii_classes_agree_with_rust() {
+        type Case = (AsciiKind, fn(u8) -> bool, &'static str);
+        let classes: [Case; 10] = [
+            (AsciiKind::Digit, |b| b.is_ascii_digit(), "is_ascii_digit"),
+            (AsciiKind::Alphabetic, |b| b.is_ascii_alphabetic(), "is_ascii_alphabetic"),
+            (AsciiKind::Alphanumeric, |b| b.is_ascii_alphanumeric(), "is_ascii_alphanumeric"),
+            (AsciiKind::Uppercase, |b| b.is_ascii_uppercase(), "is_ascii_uppercase"),
+            (AsciiKind::Lowercase, |b| b.is_ascii_lowercase(), "is_ascii_lowercase"),
+            (AsciiKind::HexDigit, |b| b.is_ascii_hexdigit(), "is_ascii_hexdigit"),
+            (AsciiKind::Whitespace, |b| b.is_ascii_whitespace(), "is_ascii_whitespace"),
+            (AsciiKind::Punctuation, |b| b.is_ascii_punctuation(), "is_ascii_punctuation"),
+            (AsciiKind::Control, |b| b.is_ascii_control(), "is_ascii_control"),
+            (AsciiKind::Ascii, |b| b.is_ascii(), "is_ascii"),
+        ];
+        for (kind, oracle, label) in classes {
+            check_bool(
+                Intrinsic::Bool(BoolKind::Ascii(kind)),
+                8,
+                false,
+                |b: u64| oracle(b as u8),
+                label,
+            );
+        }
+        // The two boundaries a copied constant list gets wrong, pinned by value so
+        // a failure names the byte rather than only the class.
+        let p = |kind: AsciiKind, b: u64| {
+            smt::with_fresh(|| {
+                let a = smt::var(8);
+                let Outcome::Bool(p) = eval(Intrinsic::Bool(BoolKind::Ascii(kind)), a, a, 8, false, 8)
+                    .expect("an ASCII class at 8 bits must be modelled")
+                else {
+                    panic!("an ASCII class must produce a `bool`");
+                };
+                let ai = smt::index(a);
+                smt::evaluate_pred(p, |i| if i == ai { Some(b) } else { None })
+            })
+        };
+        for (kind, b, want, why) in [
+            (AsciiKind::Whitespace, 0x0b, false, "vertical tab is not ASCII whitespace"),
+            (AsciiKind::Whitespace, b' ' as u64, true, "space is whitespace"),
+            (AsciiKind::Punctuation, b' ' as u64, false, "space is not punctuation"),
+            (AsciiKind::Punctuation, b'!' as u64, true, "`!` is punctuation"),
+            (AsciiKind::Control, 0x1f, true, "the last C0 control"),
+            (AsciiKind::Control, 0x20, false, "space is the first printable"),
+            (AsciiKind::Control, 0x7f, true, "DEL is a control"),
+            (AsciiKind::Control, 0x80, false, "0x80 is not a control"),
+            (AsciiKind::Ascii, 0x7f, true, "DEL is ASCII"),
+            (AsciiKind::Ascii, 0x80, false, "0x80 is not ASCII"),
+        ] {
+            assert_eq!(p(kind, b), Some(want), "{why} (0x{b:02x})");
+        }
+    }
+
+    /// The ASCII classes are refused on a signed or wider operand, where `core`
+    /// has no such method.
+    ///
+    /// They exist only on `u8`, so an `i8` or `u16` receiver is a different method
+    /// (or not a method), and modelling it as the byte test would answer a call
+    /// `core` does not define.
+    #[test]
+    fn the_ascii_classes_are_refused_off_u8() {
+        let digit = Intrinsic::Bool(BoolKind::Ascii(AsciiKind::Digit));
+        assert!(is_modelled(digit, 8, false));
+        assert!(!is_modelled(digit, 8, true));
+        assert!(!is_modelled(digit, 16, false));
+        assert!(eval(digit, smt::var(8), smt::var(8), 8, true, 8).is_none());
+        assert!(eval(digit, smt::var(16), smt::var(16), 16, false, 16).is_none());
+    }
+
     /// `is_power_of_two` is refused on a signed operand, where `core` has no such
     /// method.
     ///
@@ -3198,11 +3588,49 @@ mod tests {
         // Distinct from the numeric shapes: a `bool` read as a value would write
         // a one-bit word into a `bool` local, which no `if` could read.
         assert_ne!(classify("is_power_of_two"), Some(Intrinsic::Bits(BitKind::Ones)));
+        // The ASCII classes are `Bool` too, and each maps to its own variant --
+        // a name matched by prefix would confuse `is_ascii` with `is_ascii_digit`.
+        assert_eq!(
+            classify("core::num::<impl u8>::is_ascii_digit"),
+            Some(Intrinsic::Bool(BoolKind::Ascii(AsciiKind::Digit)))
+        );
+        assert_eq!(
+            classify("core::num::<impl u8>::is_ascii_alphanumeric"),
+            Some(Intrinsic::Bool(BoolKind::Ascii(AsciiKind::Alphanumeric)))
+        );
+        assert_eq!(
+            classify("core::num::<impl u8>::is_ascii"),
+            Some(Intrinsic::Bool(BoolKind::Ascii(AsciiKind::Ascii)))
+        );
+        assert_ne!(
+            classify("is_ascii"),
+            Some(Intrinsic::Bool(BoolKind::Ascii(AsciiKind::Digit)))
+        );
         // Near misses that stay refused. `is_power_of_two` on the signed types is
-        // not a `core` method; the other `is_*` predicates are not modelled yet.
+        // not a `core` method; the other `is_*` predicates are not modelled.
         assert!(classify("is_power_of_two_signed").is_none());
-        assert!(classify("is_ascii").is_none());
         assert!(classify("is_negative").is_none());
+        // The slice shapes are matched on the *path*, so a `Vec`'s `len` is not
+        // read as a slice length.
+        assert_eq!(classify("core::slice::<impl [u8]>::len"), Some(Intrinsic::SliceLen));
+        assert_eq!(classify("core::slice::<impl [u8]>::is_empty"), Some(Intrinsic::SliceIsEmpty));
+        assert!(classify("alloc::vec::Vec<u8>::len").is_none());
+        assert!(classify("Vec::<u8>::len").is_none());
+        assert!(classify("str::len").is_none());
+        // `abs_diff` and the rotations are matched by their exact tail, so a
+        // longer name that merely starts the same way is refused rather than read
+        // as the shorter one.
+        assert_eq!(classify("core::num::<impl u8>::abs_diff"), Some(Intrinsic::AbsDiff));
+        assert_eq!(
+            classify("core::num::<impl u8>::rotate_left"),
+            Some(Intrinsic::Rotate(RotateKind::Left))
+        );
+        assert_eq!(
+            classify("core::num::<impl i32>::rotate_right"),
+            Some(Intrinsic::Rotate(RotateKind::Right))
+        );
+        assert!(classify("rotate_left_signed").is_none());
+        assert!(classify("abs_diff_thing").is_none());
     }
 
     /// The unary shapes are `is_unary`; the two-operand families are not.
@@ -3527,6 +3955,105 @@ mod tests {
             (MinMaxKind::Max, true, 0xff, 0xfe, 0xff, "0xff is -1, above -2"),
         ] {
             assert_eq!(ord(kind, signed, xb, yb), Some(want), "{why} ({xb:#x}, {yb:#x})");
+        }
+    }
+
+    /// `abs_diff` and the rotations agree with Rust over every `u8`/`i8` pair.
+    ///
+    /// The oracle is Rust's own method, so the model cannot drift from the
+    /// definition. `abs_diff`'s result is the *unsigned* magnitude even on a
+    /// signed type, so it is checked against `i8::abs_diff` (which returns a `u8`)
+    /// and the sign of the model's value is asserted to be unsigned; the
+    /// rotations are checked against `u8::rotate_left`/`rotate_right` and their
+    /// `i8` counterparts, whose amount is a `u32` reduced modulo the width.
+    #[test]
+    fn abs_diff_and_rotations_agree_with_rust() {
+        // `abs_diff` on both signednesses. The oracle reads the operands as their
+        // own type and returns the `uN` magnitude.
+        check(
+            Intrinsic::AbsDiff,
+            8,
+            false,
+            unident,
+            ident,
+            |x, y| Some(i64::from((x as u8).abs_diff(y as u8))),
+            "u8::abs_diff",
+        );
+        check(
+            Intrinsic::AbsDiff,
+            8,
+            true,
+            |b| i8::from_ne_bytes([b as u8]) as i64,
+            |v| v as u8 as u64,
+            |x, y| Some(i64::from((x as i8).abs_diff(y as i8))),
+            "i8::abs_diff",
+        );
+        // The rotations, at the width the amount reduces modulo. `i8`'s rotation
+        // operates on the bits, so the oracle reinterprets through `u8`.
+        for (kind, label_l, label_r) in [
+            (RotateKind::Left, "u8::rotate_left", "i8::rotate_left"),
+            (RotateKind::Right, "u8::rotate_right", "i8::rotate_right"),
+        ] {
+            // The amount is a `u32` in the dump; `check` passes a second operand of
+            // the *value's* width, so the oracle is given the same bits. The
+            // reduction modulo the width means the low `log2(w)` bits are all that
+            // matter, which is exactly what a value at the value's own width gives.
+            let (left, _right) = match kind {
+                RotateKind::Left => (true, false),
+                RotateKind::Right => (false, true),
+            };
+            check(
+                Intrinsic::Rotate(kind),
+                8,
+                false,
+                unident,
+                ident,
+                move |x, y| {
+                    let (x, n) = (x as u8, y as u32);
+                    Some(i64::from(if left { x.rotate_left(n) } else { x.rotate_right(n) }))
+                },
+                label_l,
+            );
+            check(
+                Intrinsic::Rotate(kind),
+                8,
+                true,
+                |b| i8::from_ne_bytes([b as u8]) as i64,
+                |v| v as u8 as u64,
+                move |x, y| {
+                    let (x, n) = (x as i8, y as u32);
+                    Some(i64::from(if left { x.rotate_left(n) } else { x.rotate_right(n) } as u8))
+                },
+                label_r,
+            );
+        }
+        // The named boundaries, so a failure names the input that broke. A rotation
+        // by the full width is the identity; a rotation by `w + k` is one by `k`.
+        for (kind, x, n, want, why) in [
+            (RotateKind::Left, 0x81u8, 8u32, 0x81u8, "rotate_left by the width is the identity"),
+            (RotateKind::Left, 0x81, 9, 0x03, "rotate_left by w+1 is by 1"),
+            (RotateKind::Right, 0x81, 0, 0x81, "rotate_right by 0 is the identity"),
+            (RotateKind::Right, 0x81, 7, 0x03, "rotate_right by w-1"),
+        ] {
+            let got = smt::with_fresh(|| {
+                let (a, b) = (smt::var(8), smt::var(32));
+                let Outcome::Value(v) = eval(Intrinsic::Rotate(kind), a, b, 8, false, 8)
+                    .expect("a rotation is modelled")
+                else {
+                    panic!("a rotation must produce a plain value");
+                };
+                let (ai, bi) = (smt::index(a), smt::index(b));
+                smt::evaluate(v, |i| {
+                    if i == ai {
+                        Some(x as u64)
+                    } else if i == bi {
+                        Some(n as u64)
+                    } else {
+                        None
+                    }
+                })
+            });
+            assert_eq!(got, Some(want as u64), "{why} ({x:#x}, {n})");
         }
     }
 

@@ -4324,19 +4324,75 @@ fn try_intrinsic(
     // destination's: `checked_add` on a `u8` writes an `Option<u8>`, and taking
     // the width from there would ask the engine for a 64-bit overflow test.
     let first = args.first()?;
-    let w = operand_width(cur, first)?;
+    // `slice::len`/`is_empty`. The receiver is a `&[T]`, whose *length* is the one
+    // symbolic input the frontend already binds for the bounds checks, so the
+    // model is that variable and not a fresh one. The length is a `usize`, which
+    // is why the width is not read from the receiver -- a reference has no
+    // bit-vector width -- and why this is handled before the generic operand read.
+    if matches!(op, intrinsics::Intrinsic::SliceLen | intrinsics::Intrinsic::SliceIsEmpty) {
+        let p = match first {
+            Operand::Copy(p) | Operand::Move(p) => p,
+            Operand::Const(_) => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        };
+        // `length_of` follows the reference to the slice local the frontend bound a
+        // length for. A receiver whose length is not modelled (a `Vec`, or a slice
+        // the contract never bound) is refused here rather than given an invented
+        // number.
+        let Val::Sym(len, _) = length_of(env, cur, p) else {
+            return Some(Err(format!("`{name}` on a receiver whose length is not modelled")));
+        };
+        return Some(match op {
+            intrinsics::Intrinsic::SliceLen => {
+                env.set(dest, Val::Sym(len, Sign::Unsigned));
+                Ok(Vec::new())
+            }
+            // `is_empty` is `len == 0`, on the *same* variable `len` reads, so the
+            // two cannot disagree. The destination is a `bool`, so it is a
+            // predicate and not a one-bit word.
+            _ => {
+                env.set(dest, Val::Bool(smt::eq_const(len, 0)));
+                Ok(Vec::new())
+            }
+        });
+    }
+    // The ASCII class tests take `&self`, so the operand is a reference whose
+    // *referent* is the byte. rustc prints `_3 = &_1; is_ascii_digit(move _3)`,
+    // and the width and the value both have to come from `_1`, not from the `&u8`
+    // local (which is a pointer with no bit-vector meaning). Only this shape needs
+    // the step: every other modelled method takes `self` by value.
+    let ascii_ref = matches!(op, intrinsics::Intrinsic::Bool(intrinsics::BoolKind::Ascii(_)))
+        .then(|| match first {
+            Operand::Copy(p) | Operand::Move(p) => Some(env.pointee(p)),
+            Operand::Const(_) => None,
+        })
+        .flatten();
+    let w = match &ascii_ref {
+        Some(p) => width_of(cur, p),
+        None => operand_width(cur, first),
+    }?;
     // The operand's signedness comes *from the value*. An operand whose type
     // could not be read was already refused when the value was built (it is
     // `Val::Unknown`, not a `Sym`), so there is no sign to guess here: guessing
     // would give `sdiv`/`srem` the unsigned meaning, which is a wrong value for
     // every negative operand rather than a weaker proof.
-    let (x, sign) = match operand(env, first) {
-        // The sign comes out of the value with the word, so the two cannot be
-        // read from different places and disagree.
-        Val::Sym(v, sign) => (v, sign),
-        // A `bool` operand has no bit-vector to hand the model, and an unknown
-        // one has no value at all. Either way there is nothing to compute with.
-        _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+    //
+    // The ASCII receiver is read through its reference: `operand` on the `&u8`
+    // local gives `Unknown` (a pointer has no bit-vector meaning), so the byte is
+    // read from the place `pointee` names instead. This is the same value the
+    // body's own `*_3` would read.
+    let (x, sign) = match &ascii_ref {
+        Some(p) => match env.get(p) {
+            Val::Sym(v, sign) => (v, sign),
+            _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        },
+        None => match operand(env, first) {
+            // The sign comes out of the value with the word, so the two cannot be
+            // read from different places and disagree.
+            Val::Sym(v, sign) => (v, sign),
+            // A `bool` operand has no bit-vector to hand the model, and an unknown
+            // one has no value at all. Either way there is nothing to compute with.
+            _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        },
     };
     // The unary shapes take one operand and no operator. They are handled here
     // rather than through a `BinOp`, because there is no second operand to read.
@@ -4515,8 +4571,14 @@ fn try_intrinsic(
     };
     // The result of an arithmetic intrinsic has the operand's type, so it has
     // the operand's sign -- `wrapping_sub(0, 1)` on a `u8` is `255` and on an
-    // `i8` is `-1`, the same bits read two ways.
-    let sign = Sign::of_bool(signed);
+    // `i8` is `-1`, the same bits read two ways. `abs_diff` is the exception: its
+    // result is the *unsigned* magnitude even on a signed operand
+    // (`i8::abs_diff(-128, 127)` is `255u8`), so it is written unsigned; labelling
+    // it with the operand's sign would read `255` as `-1`.
+    let sign = match op {
+        intrinsics::Intrinsic::AbsDiff => Sign::Unsigned,
+        _ => Sign::of_bool(signed),
+    };
     match outcome {
         Outcome::Value(v) => env.set(dest, Val::Sym(v, sign)),
         Outcome::Option { tag, payload } => {

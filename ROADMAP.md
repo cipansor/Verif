@@ -150,7 +150,32 @@ with no new false proof while the independent corpus keeps growing.
     not an error — the probe corpus caught the first version that got this wrong).
     `everyday.rs` moved 10/21 -> 12/21 (`abs_small`, `clamp_builtin` verified);
     `realistic.rs` 399/739 -> 402/746 with the true/tripwire/panic fixtures.
-    Remaining: `abs_diff`, `rotate_*`, `is_ascii_*`, `<[T]>::len/is_empty/first/get`.
+  - Progress (cont.): `is_ascii_*` are modelled. They are the first modelled
+    methods whose receiver is `&self`, so the operand is the *referent* of a
+    reference the body materialises (`_3 = &_1`); the executor follows the
+    reference for them and only them. All ten classes are `core`'s own range
+    tests (`is_ascii_digit` is `b'0'..=b'9'`, `is_ascii` is `b < 128`), checked
+    exhaustively against Rust's own `u8` methods. `digit` in `everyday.rs` moved
+    to verified (10/21 -> **13/21**), and six fixtures with their tripwires are in
+    `realistic.rs` (**405 of 752**).
+  - Progress (cont.): `abs_diff` and `rotate_left`/`rotate_right` are modelled.
+    `abs_diff`'s result is the *unsigned* magnitude even on a signed type
+    (`i8::abs_diff(-128, 127)` is `255u8`), so the model widens both operands by
+    their own sign to `w + 1` bits, subtracts there, and takes the absolute value
+    with a *signed* sign test (the `w + 1`-bit range is exactly a signed one). The
+    rotations reduce the amount modulo the width the way `core` does — a rotation
+    by the width is the identity and by `w + 1` is by `1` — and since a modelled
+    width is a power of two the reduction is one `and`, not a divider. Both are
+    total (no panic), so they are plain values. Checked exhaustively over `u8`/`i8`
+    against Rust's own methods (`abs_diff_and_rotations_agree_with_rust`), with
+    three verified fixtures and two tripwires in `realistic.rs` (**409 of 758**).
+  - Remaining: `<[T]>::first/get` (and the generic `<[T]>::len/is_empty`) are
+    blocked on *monomorphisation*: `first_or<T>` is generic, so its element type
+    has no width and the slice length is never seeded (the frontend refuses a
+    receiver whose length it does not hold, which is the honest answer, not a
+    bug). `slice::len`/`is_empty` *are* classified now (by path, so a `Vec::len`
+    is not mistaken for a slice length), so they decide the moment a contract
+    binds the slice.
 - **C7. Arithmetic scale and speed.** · P0 · in progress · Kani, Boolector,
   Bitwuzla
   - Gap: `u32::wrapping_mul` is past the 32-bit model; `clamp_std` takes 9.9 s.
