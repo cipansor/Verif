@@ -2138,6 +2138,279 @@ pub fn option_arg_payload_tripwire(x: Option<u8>) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// The `Option` *methods*: `unwrap_or`, `unwrap`, `expect`, `is_some`, `is_none`.
+//
+// These are the first modelled calls that read an *enum* rather than a bit-vector
+// operand: the receiver's tag and payload, which the model's own `checked_*`
+// family writes and which a contract-bound `Option` argument also fills. The
+// receiver is `self` for the first three and `&self` for the two predicates, so
+// the executor follows the reference either way.
+
+/// `checked_add` then `unwrap_or(u32::MAX)`: the payload on `Some`, the maximum on
+/// the `None` (overflow) path. The contract is true for every input -- the sum is
+/// `>= a` when it does not overflow, and `u32::MAX >= a` always -- so it must
+/// VERIFY. This is the `checked_or_max` scoreboard entry's shape.
+/// requires: true
+/// ensures: ret >= a
+pub fn option_unwrap_or_fallback(a: u32, b: u32) -> u32 {
+    a.checked_add(b).unwrap_or(u32::MAX)
+}
+
+/// The tripwire: the fallback is not `u32::MAX` but `0`, so `ret >= a` fails
+/// whenever the sum overflows and `a > 0`. A model that returned the payload
+/// unconditionally, ignoring the tag, could prove this.
+/// requires: true
+/// ensures: ret >= a
+pub fn option_unwrap_or_fallback_tripwire(a: u32, b: u32) -> u32 {
+    a.checked_add(b).unwrap_or(0)
+}
+
+/// `is_some` on a checked add pinned to a successful add: the tag is `Some`, so
+/// `is_some()` is `true`. Pinning the inputs is what gives this teeth -- the
+/// contract language cannot call `checked_add`, so "the add succeeds" has to be a
+/// precondition rather than an expression.
+/// requires: a == 0 && b == 0
+/// ensures: ret == true
+pub fn option_is_some_true_on_some(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_some()
+}
+
+/// The tripwire: the same successful add, where `is_some()` is `true`, so
+/// `ret == false` is refutable. A model that read the tag as a constant `None`
+/// would prove this.
+/// requires: a == 0 && b == 0
+/// ensures: ret == false
+pub fn option_is_some_true_on_some_tripwire(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_some()
+}
+
+/// `is_some` on a checked add pinned to an *overflowing* add: the tag is `None`,
+/// so `is_some()` is `false`. This is the other tag, so the pair pins that the
+/// model reads the tag rather than returning a constant.
+/// requires: a == 255 && b == 1
+/// ensures: ret == false
+pub fn option_is_some_false_on_none(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_some()
+}
+
+/// The tripwire: the overflowing add gives `is_some() == false`, so `ret == true`
+/// is refutable.
+/// requires: a == 255 && b == 1
+/// ensures: ret == true
+pub fn option_is_some_false_on_none_tripwire(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_some()
+}
+
+/// `is_none` on a successful add: the tag is `Some`, so `is_none()` is `false`.
+/// `is_none` tests the tag against `0`, so a model that tested against `1` would
+/// return `true` here and prove the tripwire below.
+/// requires: a == 0 && b == 0
+/// ensures: ret == false
+pub fn option_is_none_false_on_some(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_none()
+}
+
+/// The tripwire: a successful add gives `is_none() == false`, so `ret == true` is
+/// refutable. A model that read `is_none` as `is_some` (testing tag `1`) would
+/// prove this.
+/// requires: a == 0 && b == 0
+/// ensures: ret == true
+pub fn option_is_none_false_on_some_tripwire(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_none()
+}
+
+/// `is_none` on an overflowing add: the tag is `None`, so `is_none()` is `true`.
+/// requires: a == 255 && b == 1
+/// ensures: ret == true
+pub fn option_is_none_true_on_none(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_none()
+}
+
+/// The tripwire: an overflowing add gives `is_none() == true`, so `ret == false`
+/// is refutable.
+/// requires: a == 255 && b == 1
+/// ensures: ret == false
+pub fn option_is_none_true_on_none_tripwire(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_none()
+}
+
+/// `unwrap` on a checked add that the precondition proves cannot overflow, so the
+/// `None` panic is unreachable and the value is the sum. The contract must VERIFY,
+/// and the panic obligation must be *ruled out* (a `None` path is impossible).
+/// requires: a <= 100 && b <= 100
+/// ensures: ret == a + b
+pub fn option_unwrap_guarded(a: u8, b: u8) -> u8 {
+    a.checked_add(b).unwrap()
+}
+
+/// The panic tripwire: the same body with no guard, so the add *can* overflow and
+/// `unwrap` panics. The contract is true (it is a tautology) but the panic
+/// obligation must be refuted -- `a == 255, b == 1` reaches `None` and unwraps.
+/// requires: true
+/// ensures: true
+pub fn option_unwrap_unguarded(a: u8, b: u8) -> u8 {
+    a.checked_add(b).unwrap()
+}
+
+/// `expect` is `unwrap` with a message, so a guarded one verifies exactly as
+/// `option_unwrap_guarded` does.
+/// requires: a <= 100 && b <= 100
+/// ensures: ret == a + b
+pub fn option_expect_guarded(a: u8, b: u8) -> u8 {
+    a.checked_add(b).expect("overflow")
+}
+
+/// The idiom `if x.is_some() { x.unwrap() } else { 0 }`: the `is_some` tag test
+/// drives the branch, so the `unwrap` inside it is on a path where the tag is
+/// `Some` and the panic is unreachable. The contract is true for every input, so
+/// it must VERIFY with the panic ruled out -- which only happens if `is_some` and
+/// `unwrap` read the *same* tag.
+/// requires: true
+/// ensures: true
+pub fn option_is_some_guards_unwrap(x: Option<u8>) -> u8 {
+    if x.is_some() {
+        x.unwrap()
+    } else {
+        0
+    }
+}
+
+/// The `is_none` mirror of the guard: the `else` arm unwraps, on the path where
+/// `is_none` was false, so the tag is `Some` and the panic is unreachable. Must
+/// VERIFY.
+/// requires: true
+/// ensures: true
+pub fn option_is_none_guards_unwrap(x: Option<u8>) -> u8 {
+    if x.is_none() {
+        0
+    } else {
+        x.unwrap()
+    }
+}
+
+/// The guard tripwire: the same `is_some` guard, but the `else` arm unwraps
+/// instead -- on the path where the tag is `None`, so `unwrap` panics. The
+/// contract is a tautology but the panic obligation must be refuted, which is the
+/// evidence the guard and the unwrap are about the same tag.
+/// requires: true
+/// ensures: true
+pub fn option_guard_tripwire(x: Option<u8>) -> u8 {
+    if x.is_some() {
+        0
+    } else {
+        x.unwrap()
+    }
+}
+
+/// The `expect` panic tripwire, the same shape as `option_unwrap_unguarded`.
+/// requires: true
+/// ensures: true
+pub fn option_expect_unguarded(a: u8, b: u8) -> u8 {
+    a.checked_add(b).expect("overflow")
+}
+
+/// `unwrap_or` on a *contract-bound* `Option` argument: the payload on `Some`,
+/// the default on `None`. The receiver's tag and payload come from the argument
+/// seed, not from a modelled call, which is the other way the stores are filled.
+/// The contract holds on both arms: on `Some` the result is `x.Some` itself, on
+/// `None` it is `7`, and both are `<= x.Some || x.Some < 7` -- so it must VERIFY.
+/// requires: true
+/// ensures: ret == x.Some || ret == 7
+pub fn option_arg_unwrap_or(x: Option<u8>) -> u8 {
+    x.unwrap_or(7)
+}
+
+/// The tripwire: the default is `7`, so on the `None` path the result is `7`; the
+/// contract claims it is `x.Some` exactly, which the `None` path violates for
+/// every `x.Some != 7`. A model that ignored the tag and returned the payload
+/// unconditionally would prove this.
+/// requires: true
+/// ensures: ret == x.Some
+pub fn option_arg_unwrap_or_tripwire(x: Option<u8>) -> u8 {
+    x.unwrap_or(7)
+}
+
+/// `unwrap` on a contract-bound `Option` argument with no `is_some` guard, so the
+/// `None` path reaches `unwrap` and panics. The contract is a tautology but the
+/// panic obligation must be refuted -- the tag is a free input and `None` is
+/// reachable. (A *guarded* argument unwrap is deliberately not in the corpus: the
+/// contract language cannot name an `Option`'s tag, so "the caller passed `Some`"
+/// is not expressible, and pinning only `x.Some` leaves the tag free.)
+/// requires: true
+/// ensures: true
+pub fn option_arg_unwrap_unguarded(x: Option<u8>) -> u8 {
+    x.unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// The `Result` methods. The same shape as `Option`'s, with the payload on `Ok`
+// (tag 0) instead of `Some` (tag 1): `is_ok` tests the tag against `0`, `is_err`
+// against `1`, `unwrap`/`unwrap_or` read the `Ok` payload, and `unwrap` panics on
+// `Err`. One executor arm answers both families because the method name says which
+// variant carries the payload.
+
+/// `Result::is_ok` on a contract-bound `Result` argument: `true` on `Ok` and
+/// `false` on `Err`, so the contract holds on both arms.
+/// requires: true
+/// ensures: ret == true || ret == false
+pub fn result_is_ok(r: Result<u8, u16>) -> bool {
+    r.is_ok()
+}
+
+/// The tripwire: `is_ok` is `true` exactly on `Ok`, so `ret == false` is refutable
+/// with an `Ok` receiver. A model that tested the tag against `1` (the `Err` tag)
+/// would prove this.
+/// requires: true
+/// ensures: ret == false
+pub fn result_is_ok_tripwire(r: Result<u8, u16>) -> bool {
+    r.is_ok()
+}
+
+/// `Result::is_err` is the complement of `is_ok`, so it is `true` exactly on
+/// `Err`. The contract holds on both arms.
+/// requires: true
+/// ensures: ret == true || ret == false
+pub fn result_is_err(r: Result<u8, u16>) -> bool {
+    r.is_err()
+}
+
+/// The tripwire: `is_err` is `true` on `Err`, so `ret == false` is refutable with
+/// an `Err` receiver -- which is what separates `is_err` (tag `1`) from `is_ok`
+/// (tag `0`).
+/// requires: true
+/// ensures: ret == false
+pub fn result_is_err_tripwire(r: Result<u8, u16>) -> bool {
+    r.is_err()
+}
+
+/// `Result::unwrap_or(default)` on a contract-bound argument: the `Ok` payload on
+/// `Ok`, the default on `Err`. The contract holds on both arms.
+/// requires: true
+/// ensures: ret == r.Ok || ret == 7
+pub fn result_unwrap_or(r: Result<u8, u16>) -> u8 {
+    r.unwrap_or(7)
+}
+
+/// The tripwire: the default is `7`, so on the `Err` path the result is `7`; the
+/// contract claims it is the `Ok` payload exactly, which the `Err` path violates
+/// for every `r.Ok != 7`. A model that ignored the tag would prove this.
+/// requires: true
+/// ensures: ret == r.Ok
+pub fn result_unwrap_or_tripwire(r: Result<u8, u16>) -> u8 {
+    r.unwrap_or(7)
+}
+
+/// `Result::unwrap` with no guard, so the `Err` path panics. The contract is a
+/// tautology but the panic obligation must be refuted -- and the message must
+/// name `Err`, which is the evidence the model read the `Result` tag rather than
+/// the `Option` one.
+/// requires: true
+/// ensures: true
+pub fn result_unwrap_unguarded(r: Result<u8, u16>) -> u8 {
+    r.unwrap()
+}
+
+// ---------------------------------------------------------------------------
 // A cast in a *contract*: `x as u32`. The body has modelled `as` for a while
 // (it is what lets a narrow argument meet a wide return), but the contract
 // language had no cast at all, so any contract that related the two was

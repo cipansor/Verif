@@ -19,8 +19,8 @@ baseline every item is scored against:
 | Corpus | Command | Verified / decided |
 |---|---|---|
 | `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 18 / 33 |
-| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 402 / 746 |
-| `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **12 / 21 (57%)** |
+| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 424 / 789 |
+| `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **15 / 21 (71%)** |
 
 `everyday.rs` is the honest one: ordinary Rust written by an external reviewer,
 not shaped for the tool. `realistic.rs` is a regression corpus (about a third of
@@ -92,7 +92,7 @@ with no new false proof while the independent corpus keeps growing.
     drop(_2)`), which loses a proof but never invents one.
   - Exit: `guard_guarded` verified (today: incomplete on the unmodelled `drop`).
   - Move: **build**.
-- **C2. `Option`/`Result` and `?`.** · P0 · todo · Kani, Verus, Prusti, Creusot
+- **C2. `Option`/`Result` and `?`.** · P0 · in progress · Kani, Verus, Prusti, Creusot
   - Gap: `unwrap`, `unwrap_or`, `expect`, `ok_or`, `map`, `is_some` and `?` are
     unmodelled. Evidence: `checked_or_max`, `div_unwrap` incomplete.
   - Approach: the enum payload/discriminant model exists; add a **contract library
@@ -101,6 +101,26 @@ with no new false proof while the independent corpus keeps growing.
   - Exit: `checked_or_max` and `div_unwrap` verified; a misused `unwrap` refuted
     with a counterexample.
   - Move: **build**.
+  - Progress: the `Option` and `Result` *methods* are modelled. `unwrap`,
+    `unwrap_or`, `expect`, `is_some`/`is_none` and `is_ok`/`is_err` read the
+    receiver's tag and payload from the executor's discriminant/payload stores —
+    the first modelled calls whose input is an *enum* rather than a bit-vector
+    operand. `unwrap`/`expect` report a **panic** on the failure variant (the same
+    reachable-failure obligation `abs`/`clamp` carry), so
+    `if x.is_some() { x.unwrap() }` verifies with the panic ruled out;
+    `unwrap_or(default)` is total. `Option` and `Result` are one shape with the
+    payload on the other discriminant (`Some` = tag 1, `Ok` = tag 0), so one
+    executor arm answers both with the payload variant read off the method name.
+    `checked_or_max` (`checked_add(..).unwrap_or(u32::MAX)`) now **verifies** —
+    `everyday.rs` 14/21 -> **15/21**. `div_unwrap` is still incomplete, but the gap
+    is the *divider* wall (`n / d <= n` at `u32`), not the `Option`; the same body
+    decides at `u8`. Sixteen fixtures (true/tripwire/panic pairs, both families) in
+    `realistic.rs` (**424 of 789**).
+  - Remaining: `?` (the `Try` desugaring needs `From` on the error type), `ok_or`,
+    `map`/`map_err`/`and_then` (closures), and the `Option`/`Result` *result* of a
+    function whose contract names the payload (the `qmark_probe` gap: a contract
+    reading `ret <= n` on an `Option<u32>` return is refused because the return has
+    no single word).
 - **C3. Ranges and `for` loops.** · P0 · todo · Kani, Verus, Prusti
   - Gap: `RangeInclusive::new`, `Range`, `Iterator::next` unmodelled, so the
     commonest loop in Rust is out of reach. Evidence: `tri` incomplete.

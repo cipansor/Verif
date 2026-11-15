@@ -5041,6 +5041,122 @@ fn a_qualified_standard_construction_resolves() {
     assert!(!t.is_verified(), "the qualified-construction tripwire must be refuted, got: {t}");
 }
 
+/// The `Option` *methods* read the receiver's tag and payload, not a bit-vector
+/// operand.
+///
+/// `unwrap_or`, `unwrap`, `expect`, `is_some` and `is_none` are the first modelled
+/// calls whose input is an enum's state rather than a word. Each true direction
+/// must verify and each tripwire must be *refuted* (not merely undecided): the
+/// tripwires are the evidence the tag and payload are read, because a model that
+/// returned a constant -- a fixed tag, or the payload unconditionally -- would
+/// prove the false contract instead.
+///
+/// The two panic tripwires (`option_unwrap_unguarded`, `option_expect_unguarded`)
+/// are the sharpest: they must fail with a *panic* obligation, because an
+/// unguarded `unwrap` on a value that can be `None` really does panic. A model
+/// that reported the method total would report them verified.
+#[test]
+fn the_option_methods_read_the_receivers_tag_and_payload() {
+    let names = [
+        "option_unwrap_or_fallback",
+        "option_unwrap_or_fallback_tripwire",
+        "option_is_some_true_on_some",
+        "option_is_some_true_on_some_tripwire",
+        "option_is_some_false_on_none",
+        "option_is_some_false_on_none_tripwire",
+        "option_is_none_false_on_some",
+        "option_is_none_false_on_some_tripwire",
+        "option_is_none_true_on_none",
+        "option_is_none_true_on_none_tripwire",
+        "option_unwrap_guarded",
+        "option_unwrap_unguarded",
+        "option_expect_guarded",
+        "option_expect_unguarded",
+        "option_is_some_guards_unwrap",
+        "option_is_none_guards_unwrap",
+        "option_guard_tripwire",
+        "option_arg_unwrap_or",
+        "option_arg_unwrap_or_tripwire",
+        "option_arg_unwrap_unguarded",
+        "result_is_ok",
+        "result_is_ok_tripwire",
+        "result_is_err",
+        "result_is_err_tripwire",
+        "result_unwrap_or",
+        "result_unwrap_or_tripwire",
+        "result_unwrap_unguarded",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    // The true directions.
+    for name in [
+        "option_unwrap_or_fallback",
+        "option_is_some_true_on_some",
+        "option_is_some_false_on_none",
+        "option_is_none_false_on_some",
+        "option_is_none_true_on_none",
+        "option_unwrap_guarded",
+        "option_expect_guarded",
+        "option_is_some_guards_unwrap",
+        "option_is_none_guards_unwrap",
+        "option_arg_unwrap_or",
+        "result_is_ok",
+        "result_is_err",
+        "result_unwrap_or",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    // The postcondition tripwires: refuted, so the tag and payload are read.
+    for name in [
+        "option_unwrap_or_fallback_tripwire",
+        "option_is_some_true_on_some_tripwire",
+        "option_is_some_false_on_none_tripwire",
+        "option_is_none_false_on_some_tripwire",
+        "option_is_none_true_on_none_tripwire",
+        "option_arg_unwrap_or_tripwire",
+        "result_is_ok_tripwire",
+        "result_is_err_tripwire",
+        "result_unwrap_or_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        assert!(!o.is_verified(), "`{name}` must be refuted, got: {o}");
+    }
+    // The panic tripwires: an unguarded `unwrap`/`expect`/argument `unwrap` panics
+    // on the failure value, and the *wrong-arm* guard unwraps on that path, so each
+    // must fail with a *panic* obligation, not merely be undecided.
+    for name in [
+        "option_unwrap_unguarded",
+        "option_expect_unguarded",
+        "option_guard_tripwire",
+        "option_arg_unwrap_unguarded",
+        "result_unwrap_unguarded",
+    ] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => {
+                assert!(
+                    kind.contains("panic"),
+                    "`{name}` must fail on a panic obligation, got kind: {kind}"
+                );
+            }
+            other => panic!("`{name}` must fail with a panic, got: {other}"),
+        }
+    }
+    // The `Result` panic message names `Err`, not `None`: the evidence the model
+    // read the `Result` tag (payload on `Ok`) rather than the `Option` one. A model
+    // that assumed `Some` would report the panic at the wrong variant, or (worse)
+    // read the `Err` payload as the value.
+    let FnOutcome::Failed { kind, .. } = outcome(&report, "result_unwrap_unguarded") else {
+        panic!("`result_unwrap_unguarded` must fail on the `Err` panic");
+    };
+    assert!(
+        kind.contains("Err") && !kind.contains("None"),
+        "the `Result::unwrap` panic must name `Err`, got kind: {kind}"
+    );
+}
+
 /// A trailing line comment on a variant line does not erase the enum layout.
 ///
 /// `B = 3, // special` keeps the comma *before* the comment, so the reader that

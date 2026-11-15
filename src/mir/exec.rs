@@ -4227,6 +4227,146 @@ fn try_fmt_call(
     None
 }
 
+/// Answer a modelled `Option`/`Result` method from the receiver's tag and payload.
+///
+/// These are the first modelled calls that read an *enum* rather than a bit-vector
+/// operand. `unwrap`/`unwrap_or` return the payload (or a default), the two
+/// predicates return a `bool` about the tag. The receiver is `self` for the value
+/// methods and `&self` for the predicates, so it is followed through a reference
+/// exactly as the ASCII tests are -- `_2 = &_1; is_some(move _2)` must read `_1`'s
+/// tag, and the `&Option` local has no bit-vector meaning of its own.
+///
+/// # The two families are one shape
+///
+/// `Option` and `Result` differ only in *which* variant carries the payload and in
+/// the tag the predicates test: `Option` puts the payload on `Some` (tag
+/// [`intrinsics::SOME_TAG`]) and `is_some` tests that tag, `Result` puts it on `Ok`
+/// (tag [`intrinsics::OK_TAG`]) and `is_ok` tests *that* tag. The method name says
+/// which, so one arm answers both: the payload variant is `Some` for an `Option`
+/// method and `Ok` for a `Result` one, read off `name`.
+///
+/// # What is read, and what is refused
+///
+/// The tag and payload come from the environment's `discriminants`/`payloads`
+/// stores, which the model's own `checked_*` family writes (`checked_add` on a
+/// `u8` writes the tag and payload of an `Option<u8>`) and which a `Option`/
+/// `Result` argument a contract bound also fills. A receiver whose enum state is
+/// *not* in those stores -- a `Vec::pop` result, an enum a body built by hand -- is
+/// refused rather than guessed: reading a fresh variable would be a wrong value,
+/// not a weaker proof.
+///
+/// # The tag's width
+///
+/// A `checked_*` tag is a term at the *operand's* width (`ite(fails, 0, 1)` at
+/// `w`), and a contract-bound enum argument's tag is seeded at its discriminants'
+/// width. Both are recorded, so the comparison against the variant constants is
+/// made at the width the tag was actually built at; reading it at the dump's
+/// `isize` would widen a two-bit tag to 64 and the `switchInt` would compare the
+/// wrong word. This is the same width rule `Rvalue::Discriminant` uses, and it is
+/// deliberately read the same way so the two cannot disagree.
+fn enum_method(
+    name: &str,
+    kind: intrinsics::OptionMethod,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+    path: Pred,
+    pins: &[(u32, u64)],
+) -> Result<Vec<Obligation>, String> {
+    use intrinsics::OptionMethod;
+    let receiver = args
+        .first()
+        .ok_or_else(|| format!("`{name}` has no receiver"))?;
+    let p = match receiver {
+        Operand::Copy(p) | Operand::Move(p) => p,
+        Operand::Const(_) => return Err(format!("unmodelled argument to `{name}`")),
+    };
+    // `&self` for the predicates, `self` for the rest; `pointee` follows the
+    // reference either way and is a no-op for a by-value receiver.
+    let opt = env.pointee(p);
+    let Some(tag) = env.discriminants.get(&opt.local).copied() else {
+        return Err(format!("`{name}` on a receiver whose enum state is not modelled"));
+    };
+    let Val::Sym(tag, _) = tag else {
+        return Err(format!("`{name}` on a receiver whose tag is not a value"));
+    };
+    // `Result`'s payload is on `Ok` (tag 0), `Option`'s on `Some` (tag 1).
+    let payload_variant = if intrinsics::names_result_impl(name) {
+        intrinsics::OK_TAG
+    } else {
+        intrinsics::SOME_TAG
+    };
+    // The tag's width: the seeded/enum width where there is one, else the
+    // payload's, exactly as `Rvalue::Discriminant` reads it.
+    let tag_w = env.tag_width(opt.local).or_else(|| env.option_width(opt.local)).unwrap_or(64);
+    let tag = smt::truncate(tag, tag_w);
+    Ok(match kind {
+        // `is_some`/`is_ok` is `tag == success`, `is_none`/`is_err` is
+        // `tag == failure`. The destination is a `bool`, so the result is a
+        // predicate and not a one-bit word -- the `if` that consumes it reads a
+        // predicate.
+        OptionMethod::IsSuccess => {
+            env.set(dest, Val::Bool(smt::eq_const(tag, payload_variant)));
+            Vec::new()
+        }
+        OptionMethod::IsFailure => {
+            env.set(dest, Val::Bool(smt::eq_const(tag, 1 - payload_variant)));
+            Vec::new()
+        }
+        // `unwrap`/`unwrap_or` read the payload, which `checked_*` recorded
+        // *unconditionally* -- it is only ever read on a path whose tag is the
+        // success variant, which rustc guarantees by emitting the downcast
+        // projection only inside that arm. So the payload is written without a
+        // guard here; the tag's `switchInt` is what keeps a failure path from
+        // reaching this read.
+        OptionMethod::Unwrap | OptionMethod::Expect | OptionMethod::UnwrapOr => {
+            let Some((Val::Sym(payload, sign), _)) =
+                env.payloads.get(&(opt.local, payload_variant)).copied()
+            else {
+                return Err(format!("`{name}` on a receiver whose payload is not modelled"));
+            };
+            let value = if let OptionMethod::UnwrapOr = kind {
+                // `unwrap_or(default)`: the payload on the success variant, the
+                // default on the failure one. The default is the second argument
+                // (`Option::unwrap_or(self, default)`), so a failure receiver
+                // yields it and the method is *total* -- no panic obligation.
+                let default = match args.get(1) {
+                    Some(d) => match operand(env, d) {
+                        Val::Sym(v, _) => v,
+                        _ => return Err(format!("unmodelled default argument to `{name}`")),
+                    },
+                    None => return Err(format!("`{name}` has no default argument")),
+                };
+                smt::ite(smt::eq_const(tag, payload_variant), payload, default)
+            } else {
+                payload
+            };
+            env.set(dest, Val::Sym(value, sign));
+            if matches!(kind, OptionMethod::Unwrap | OptionMethod::Expect) {
+                // `unwrap`/`expect` **panic** on the failure variant. The failure
+                // is `tag == failure`, a reachable-failure obligation of the same
+                // polarity as a rustc-inserted `assert`: the call is safe exactly
+                // where `path ∧ tag == failure` is unsatisfiable. `unwrap_or` has
+                // no such obligation -- it is total.
+                return Ok(vec![Obligation {
+                    kind: ObligationKind::Panic {
+                        message: if payload_variant == intrinsics::OK_TAG {
+                            format!("`{name}` on an `Err` value")
+                        } else {
+                            format!("`{name}` on a `None` value")
+                        },
+                    },
+                    verdict: find_obligation(
+                        smt::and(path, smt::eq_const(tag, 1 - payload_variant)),
+                        pins,
+                    ),
+                }]);
+            }
+            Vec::new()
+        }
+    })
+}
+
 /// Answer a modelled `core::num` call, if the callee is one.
 ///
 /// `None` means the callee is not a modelled intrinsic, and the caller falls
@@ -4279,8 +4419,18 @@ fn try_intrinsic(
     // widening between modelled integers (see the branch below). The crate-root
     // collision -- a user `From` that prints as the bare `From` -- is again closed
     // by the same-dump lookup, not by the name.
-    let trait_method =
-        is_ord_callee(name) || matches!(op, intrinsics::Intrinsic::Conversion(_));
+    //
+    // The `Option` methods are the same shape once more: rustc prints
+    // `Option::<u32>::unwrap`, an inherent method on the `Option` type rather than
+    // a `core::num::<impl u32>` path, so there is no `<impl` to match. `classify`
+    // accepts them only for the standard library's `Option` (see
+    // `names_option_impl`), and the same-dump lookup answers a real `Option` body
+    // first, which is what keeps a local type spelled `Option` out.
+    let trait_method = is_ord_callee(name)
+        || matches!(
+            op,
+            intrinsics::Intrinsic::Conversion(_) | intrinsics::Intrinsic::OptionMethod(_)
+        );
     if !name.contains("<impl") && !trait_method {
         return None;
     }
@@ -4354,6 +4504,16 @@ fn try_intrinsic(
                 Ok(Vec::new())
             }
         });
+    }
+    // The standard library's `Option`/`Result` methods. The receiver is an
+    // `Option<T>`/`Result<T, E>` whose tag and payload the model's own
+    // `checked_*` family (or an argument the contract bound) recorded in the
+    // environment's discriminant and payload stores. The receiver is `self` for
+    // `unwrap`/`unwrap_or` and `&self` for the predicates, so it is followed
+    // through a reference the same way the ASCII tests are -- `_2 = &_1;
+    // is_some(move _2)` reads `_1`.
+    if let intrinsics::Intrinsic::OptionMethod(kind) = op {
+        return Some(enum_method(name, kind, args, dest, env, path, pins));
     }
     // The ASCII class tests take `&self`, so the operand is a reference whose
     // *referent* is the byte. rustc prints `_3 = &_1; is_ascii_digit(move _3)`,

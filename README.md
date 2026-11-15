@@ -2039,6 +2039,28 @@ refused. `src/mir/intrinsics.rs` holds the model:
   modelled width is a power of two the reduction is one `and` and no divider. Both
   are checked exhaustively over `u8`/`i8` against Rust's own methods, so the
   rotation's wrap cannot drift from the standard library's.
+- `Option`'s `unwrap`, `unwrap_or`, `expect`, `is_some` and `is_none`, and
+  `Result`'s `is_ok`, `is_err`, `unwrap` and `unwrap_or`, are the first modelled
+  calls that read an *enum* rather than a bit-vector operand: the receiver's tag
+  and payload, which the model's own `checked_*` family writes (`checked_add` on a
+  `u8` writes the tag and payload of an `Option<u8>`) and which a contract-bound
+  `Option`/`Result` argument also fills. `unwrap`/`expect` return the payload and
+  report a **panic** on the failure variant, the same reachable-failure obligation
+  `abs` and `clamp` carry, so the idiom `if x.is_some() { x.unwrap() }` verifies
+  with the panic ruled out; `unwrap_or(default)` is *total* — the payload on the
+  success variant, the default on the failure one — and the predicates are the tag
+  tested against the success/failure discriminant. The receiver is `self` for the
+  value methods and `&self` for the predicates, so the executor follows the
+  reference either way. The two families are one shape: `Option` puts the payload
+  on `Some` (tag `1`) and `is_some` tests that tag, `Result` puts it on `Ok` (tag
+  `0`) and `is_ok` tests *that* tag, so a single executor arm answers both with the
+  payload variant read off the method name. They are matched on the
+  `option::Option`/`result::Result` path rustc prints, so a user type spelled
+  `Option`/`Result` is refused, and a same-dump body wins the lookup first. This
+  closes the `checked_add(..).unwrap_or(u32::MAX)` and `checked_div(..).unwrap()`
+  idioms, whose `Option` handling was the gap — the remaining `div_unwrap`
+  incompleteness is the *divider* wall (`n / d <= n` at `u32`), not the `Option`,
+  and the same body decides at `u8`.
 - A *local* method that shares an intrinsic's name is answered by its own body,
   never by the model. rustc prints a trait impl's call as `<u8 as Trait>::m` but
   its definition as `<impl at …>::m`, so the names never match; the model is only

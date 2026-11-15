@@ -164,6 +164,12 @@ pub const POW_MAX_WIDTH: u8 = 8;
 /// lives. rustc numbers `None` 0 and `Some` 1.
 pub const SOME_TAG: u64 = 1;
 
+/// The discriminant of the `Ok` variant, where a modelled `Result` payload lives.
+/// rustc numbers `Ok` 0 and `Err` 1 -- the opposite of `Option`'s numbering, which
+/// is why the executor reads the payload variant off the method rather than
+/// assuming [`SOME_TAG`].
+pub const OK_TAG: u64 = 0;
+
 /// What a modelled intrinsic computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intrinsic {
@@ -296,6 +302,16 @@ pub enum Intrinsic {
     /// [`Intrinsic::MinMax`] and the same-dump lookup still answers a local trait
     /// first.
     Clamp,
+    /// A standard-library enum method: `Option`'s `unwrap`, `unwrap_or`,
+    /// `expect`, `is_some`, `is_none`, and `Result`'s `is_ok`, `is_err`,
+    /// `unwrap`, `unwrap_or`.
+    ///
+    /// These read the receiver's *enum* state rather than a bit-vector operand, so
+    /// they are answered by the executor from its discriminant/payload stores and
+    /// `eval` returns `None` for them. They are modelled only on the standard
+    /// library's `Option`/`Result` (see [`names_option_impl`] and
+    /// [`names_result_impl`]); a same-dump body always wins the lookup first.
+    OptionMethod(OptionMethod),
 }
 
 /// Which family of a `core::num` method name a call belongs to.
@@ -398,6 +414,51 @@ pub enum MinMaxKind {
     Min,
     /// The larger of the two operands: `a >= b ? a : b`.
     Max,
+}
+
+/// A standard-library enum method the model knows: `Option`'s `unwrap`,
+/// `unwrap_or`, `expect`, `is_some`, `is_none`, and `Result`'s `is_ok`, `is_err`,
+/// `unwrap`, `unwrap_or`.
+///
+/// Unlike every other modelled shape these read the receiver's *enum* state -- the
+/// tag and the payload -- rather than a bit-vector operand, so the model is not a
+/// function of a value but a reader of the environment's discriminant/payload
+/// stores. The executor is where they are answered (see `enum_method`), because
+/// only it holds those stores; `eval` has no operand to compute them from and
+/// returns `None` for them the way it does for `slice::len`.
+///
+/// The receiver is `self` for `unwrap`/`unwrap_or` and `&self` for the predicates,
+/// so the dump prints `_0 = Option::<u32>::unwrap(move _3)` for the first group
+/// and `_2 = &_1; _0 = Option::<u8>::is_some(move _2)` for the second. The
+/// executor follows the reference, so both spellings reach the same enum local.
+///
+/// The variant a method reads is carried *in the method* rather than looked up per
+/// enum: for `Option` the payload is on `Some` (tag [`SOME_TAG`]) and `is_some` is
+/// that tag; for `Result` the payload is on `Ok` (tag 0) and `is_ok` is that tag.
+/// One executor arm answers both families, because the two are the same shape with
+/// the payload on the other discriminant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptionMethod {
+    /// `unwrap_or(default)`: the payload on the success variant, the default on
+    /// the other. Total.
+    UnwrapOr,
+    /// `unwrap()`: the payload, and a **panic** on the failure variant. The one
+    /// shape here whose failure is a panic, so it yields a reachable-panic
+    /// obligation rather than a plain value.
+    Unwrap,
+    /// `expect(msg)`: the payload, and a **panic** on the failure variant with the
+    /// given message. Identical to [`OptionMethod::Unwrap`] except that the message
+    /// is carried rather than fixed, so the two share one model and differ only in
+    /// the panic text.
+    Expect,
+    /// `is_some()` / `is_ok()`: the tag equals the *success* discriminant
+    /// ([`SOME_TAG`] for `Option`, `0` for `Result`).
+    IsSuccess,
+    /// `is_none()` / `is_err()`: the tag equals the *failure* discriminant
+    /// (`0` for `Option`, `1` for `Result`). `core` defines it as `!is_success()`,
+    /// and the model tests the tag against the failure constant so the two cannot
+    /// disagree.
+    IsFailure,
 }
 
 /// A widening integer conversion: `u16::from(x)` where `x: u8`, `x.into()`.
@@ -539,7 +600,16 @@ impl Intrinsic {
     pub fn is_unary(self) -> bool {
         matches!(
             self,
-            Intrinsic::Unary(..) | Intrinsic::Bits(_) | Intrinsic::Bool(_) | Intrinsic::Abs
+            Intrinsic::Unary(..)
+                | Intrinsic::Bits(_)
+                | Intrinsic::Bool(_)
+                | Intrinsic::Abs
+                | Intrinsic::OptionMethod(
+                    OptionMethod::Unwrap
+                        | OptionMethod::Expect
+                        | OptionMethod::IsSuccess
+                        | OptionMethod::IsFailure
+                )
         )
     }
 }
@@ -639,6 +709,33 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
         }
         if short == "len" {
             return Some(Intrinsic::SliceLen);
+        }
+    }
+    // The standard library's `Option`/`Result` methods. Like the slice shapes
+    // these read the receiver's own state rather than a bit-vector operand -- the
+    // tag and the payload -- so the executor answers them from its
+    // discriminant/payload stores and `eval` returns `None` for them. The *path*
+    // is checked (see `names_option_impl`/`names_result_impl`) so a user type
+    // spelled `Option`/`Result` is refused, and the same-dump lookup still answers
+    // a real body before the model.
+    if names_option_impl(name) {
+        match short {
+            "unwrap_or" => return Some(Intrinsic::OptionMethod(OptionMethod::UnwrapOr)),
+            "unwrap" => return Some(Intrinsic::OptionMethod(OptionMethod::Unwrap)),
+            "expect" => return Some(Intrinsic::OptionMethod(OptionMethod::Expect)),
+            "is_some" => return Some(Intrinsic::OptionMethod(OptionMethod::IsSuccess)),
+            "is_none" => return Some(Intrinsic::OptionMethod(OptionMethod::IsFailure)),
+            _ => {}
+        }
+    }
+    if names_result_impl(name) {
+        match short {
+            "unwrap_or" => return Some(Intrinsic::OptionMethod(OptionMethod::UnwrapOr)),
+            "unwrap" => return Some(Intrinsic::OptionMethod(OptionMethod::Unwrap)),
+            "expect" => return Some(Intrinsic::OptionMethod(OptionMethod::Expect)),
+            "is_ok" => return Some(Intrinsic::OptionMethod(OptionMethod::IsSuccess)),
+            "is_err" => return Some(Intrinsic::OptionMethod(OptionMethod::IsFailure)),
+            _ => {}
         }
     }
     // `Ord::min`/`Ord::max`. These are *trait* methods, so the name is matched on
@@ -786,6 +883,33 @@ pub fn names_slice_impl(name: &str) -> bool {
     name.contains("slice::<impl [")
 }
 
+/// True when a call names an inherent method on the standard library's `Option`.
+///
+/// `unwrap`, `unwrap_or`, `is_some` and `is_none` are spelled the same on a user
+/// type that happens to be called `Option`, so the *path* is checked: rustc prints
+/// an `Option` method as `core::option::Option::<u32>::unwrap` (or the
+/// `std::option::…` spelling), naming the `option` module. A same-dump body is
+/// always consulted first (the executor resolves it before the model), so this
+/// predicate only has to keep the model from answering a *different* type's
+/// method: a user `enum Option` in a local module is `m::Option::<u32>::unwrap`,
+/// which has no `option::` segment, and is refused. The standard library's
+/// `Option` is the only thing rustc prints with `option::Option`, because a user
+/// cannot define items inside `core`/`std`.
+pub fn names_option_impl(name: &str) -> bool {
+    name.contains("option::Option") || name.starts_with("Option::")
+}
+
+/// Whether a name is a `Result` method call, and the standard library's alone.
+///
+/// The `Result` twin of [`names_option_impl`]: rustc prints the call as
+/// `core::result::Result::<u8, u16>::is_ok` (or the `std::result::…` spelling),
+/// naming the `result` module. A user `enum Result` in a local module is
+/// `m::Result::<…>::is_ok`, which has no `result::` segment and is refused; a
+/// same-dump body is answered by the executor before the model either way.
+pub fn names_result_impl(name: &str) -> bool {
+    name.contains("result::Result") || name.starts_with("Result::")
+}
+
 /// Whether a `from`/`into` name is `core`'s own `From`/`Into`, and theirs alone.
 ///
 /// The dump spells the call `<u16 as From<u8>>::from` or `<u8 as Into<u16>>::into`,
@@ -868,6 +992,13 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // unmodelled; the executor is what refuses a receiver whose length it does
         // not have.
         Intrinsic::SliceLen | Intrinsic::SliceIsEmpty => true,
+        // The `Option` methods. They read the receiver's tag and payload, which
+        // live in the executor's stores rather than in an operand term, so there is
+        // no width or sign to check here -- `eval` never sees them and the
+        // executor answers them from the stores (or refuses a receiver whose
+        // `Option` state it does not hold). Total here so a probe does not report
+        // them unmodelled.
+        Intrinsic::OptionMethod(_) => true,
         // `abs_diff` computes at one bit of headroom, so it needs a width below the
         // engine's 64. It exists on both signednesses -- on an unsigned type it is
         // a plain magnitude -- so there is no membership fact to check.
@@ -984,11 +1115,22 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
     if matches!(op, Intrinsic::SliceLen | Intrinsic::SliceIsEmpty) {
         return None;
     }
+    // The `Option` methods read the receiver's tag and payload from the executor's
+    // stores, not from an operand term, so `eval` has nothing to compute for them
+    // either. The executor answers them (see `enum_method`).
+    if matches!(op, Intrinsic::OptionMethod(_)) {
+        return None;
+    }
     Some(match op {
         // Answered by `eval_slice` from the executor's length variable; the early
         // return above keeps them from reaching here.
         Intrinsic::SliceLen | Intrinsic::SliceIsEmpty => {
             unreachable!("slice shapes are answered from the length variable")
+        }
+        // Answered by the executor's `enum_method` from the discriminant/payload
+        // stores; the early return above keeps them from reaching here.
+        Intrinsic::OptionMethod(_) => {
+            unreachable!("Option methods are answered from the tag and payload stores")
         }
         // The bit counts, each built at the operand's width and widened to the
         // result type. A count cannot exceed the operand width, so `w` bits hold
@@ -2486,7 +2628,65 @@ mod tests {
         assert_eq!(classify("next_power_of_two"), None);
     }
 
-
+    /// The `Option`/`Result` method names classify, and a *user* type spelled
+    /// `Option`/`Result` does not.
+    ///
+    /// `names_option_impl`/`names_result_impl` key on the `option::Option` /
+    /// `result::Result` path rustc prints for the standard library's types, so the
+    /// interesting cases are the ones that must be refused: a local `Option` in a
+    /// module (`m::Option`) and a bare `Option::unwrap` that names neither. A
+    /// same-dump body is answered by the executor before the model, so these
+    /// predicates only have to keep the model from claiming a different type's
+    /// method. The success/failure variants are checked too, because `Result` puts
+    /// the payload on the *other* discriminant from `Option`.
+    #[test]
+    fn the_option_and_result_method_names_classify_and_a_local_type_does_not() {
+        assert_eq!(
+            classify("core::option::Option::<u32>::unwrap_or"),
+            Some(Intrinsic::OptionMethod(OptionMethod::UnwrapOr))
+        );
+        assert_eq!(
+            classify("std::option::Option::<u8>::unwrap"),
+            Some(Intrinsic::OptionMethod(OptionMethod::Unwrap))
+        );
+        assert_eq!(
+            classify("Option::<u32>::expect"),
+            Some(Intrinsic::OptionMethod(OptionMethod::Expect))
+        );
+        assert_eq!(
+            classify("core::option::Option::<u8>::is_some"),
+            Some(Intrinsic::OptionMethod(OptionMethod::IsSuccess))
+        );
+        assert_eq!(
+            classify("core::option::Option::<u8>::is_none"),
+            Some(Intrinsic::OptionMethod(OptionMethod::IsFailure))
+        );
+        // The `Result` family: `is_ok` is the success variant (`Ok`), `is_err` the
+        // failure one.
+        assert_eq!(
+            classify("core::result::Result::<u8, u16>::is_ok"),
+            Some(Intrinsic::OptionMethod(OptionMethod::IsSuccess))
+        );
+        assert_eq!(
+            classify("std::result::Result::<u8, u16>::is_err"),
+            Some(Intrinsic::OptionMethod(OptionMethod::IsFailure))
+        );
+        assert_eq!(
+            classify("Result::<u8, u16>::unwrap"),
+            Some(Intrinsic::OptionMethod(OptionMethod::Unwrap))
+        );
+        assert_eq!(
+            classify("core::result::Result::<u8, u16>::unwrap_or"),
+            Some(Intrinsic::OptionMethod(OptionMethod::UnwrapOr))
+        );
+        // A local type spelled `Option`/`Result` in a module is not the standard
+        // library's.
+        assert_eq!(classify("m::Option::<u8>::unwrap"), None);
+        assert_eq!(classify("m::Result::<u8, u16>::is_ok"), None);
+        // A different method the model does not know stays unmodelled.
+        assert_eq!(classify("core::option::Option::<u8>::map"), None);
+        assert_eq!(classify("core::result::Result::<u8, u16>::map"), None);
+    }
 
     /// The `overflowing_*` family, two-operand, against `core` over all of `u8`
     /// and `i8`.
