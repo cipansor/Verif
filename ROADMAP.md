@@ -186,13 +186,38 @@ with no new false proof while the independent corpus keeps growing.
     slow shape is reported rather than waited out.
   - Exit: `hash_step` decided; `clamp_std` under 0.5 s.
   - Move: **build**.
-  - Progress: the exit criterion is **not met**. Measured on the release build,
-    `clamp_std` (`x.max(lo).min(hi)`) verifies in **7.4 s** (the review measured
-    9.4 s; the two are the same order and the criterion is "under 0.5 s"), and the
-    new `clamp_builtin_reads` (C6) — the same 32-bit three-operand `clamp` query —
-    verifies in **0.7 s**. So C6 moved the *coverage* and left the *latency*: this
-    item is the one that closes it, and the `u32` three-operand shape is the
-    workload to profile.
+  - Progress: the exit criterion is **half met**, and the two halves are now
+    clearly separable.
+
+    *The coverage half is done.* `u32::wrapping_mul` was past the model because
+    `MUL_MAX_WIDTH` was 16, so `hash_step` — the flagship `u32` example — was
+    `incomplete`. Raised to 32, and the two costs were measured apart: the
+    *value* (`wrapping_*`, which builds no predicate) is a plain `w`-bit multiply
+    and settles in milliseconds, so `hash_step` now **verifies in 0.00 s** and
+    every `u32` value product (`x * y`, `(x*y)*z`, `x * x`) verifies in under
+    50 ms; the *widened* `2w == 64` failure predicate is built only where a family
+    needs it, where a constant multiplier folds it (`x.saturating_mul(3)` verifies
+    in 0.01 s) and a fully symbolic one answers `Unknown` after ~5 s rather than
+    hanging. The bound is 32 and not 64 because `2w == 128` cannot be held — a
+    `u64` product's predicate is refused, and a `u64` `wrapping_mul` is past the
+    BDD wall anyway. See [`MUL_MAX_WIDTH`] and the `u32` product fixtures in
+    `examples/mir_targets/realistic.rs`.
+
+    *The latency half is not.* Measured on the release build, `clamp_std`
+    (`x.max(lo).min(hi)`) still verifies in **9.8 s** (the criterion is "under
+    0.5 s") while `clamp_builtin_reads` — the same 32-bit three-operand `clamp`
+    query — verifies in **0.74 s**. So the `u32` three-operand shape remains the
+    workload to profile, and the item stays open on that half: the approach is the
+    word-level preprocessing and a per-function *time* budget named above.
+
+    The third exit criterion, **"`u32` multiply-overflow guards decided at full
+    width"**, is likewise open but *bounded*: the saturation idiom
+    (`if b != 0 && a > u32::MAX / b { u32::MAX } else { a * b }`) and a plain
+    `a * b` under a guard both report `incomplete` after ~4 s — the plain-`*`
+    path's exact-division form at `u32` is past the diagram budget — rather than
+    hanging. A per-function time budget is what would turn that ~4 s into a
+    reported `incomplete` the caller can act on.
+
 
 ### Trust tracking (A1, tracked from Phase 1)
 

@@ -9429,3 +9429,43 @@ fn abs_diff_and_rotations_are_modelled_with_their_boundaries() {
         }
     }
 }
+
+/// The `u32` product surface is modelled: `wrapping_mul` as a value, and a
+/// `saturating_mul` whose widened `2w == 64` failure predicate is built.
+///
+/// `MUL_MAX_WIDTH` was 16, so every `u32` product reported "past what the model
+/// covers" and `hash_step` — the flagship `u32` example — was `incomplete`. At 32
+/// the value half (`wrapping_mul`) is a plain `w`-bit multiply and settles at once,
+/// and the constant-multiplier `saturating_mul` folds rather than blasting the
+/// 64-bit multiplier. The tripwires pin that the value is the *product* rather
+/// than a constant: a model that answered `0` or the operand would prove them.
+///
+/// The pinned-argument equality is the discriminating half: `100000 * 31` is
+/// `3_100_000`, which does not fit a 16-bit result, so a model that wrapped
+/// narrower would refute the true fixture instead of proving it.
+#[test]
+fn the_u32_product_surface_is_modelled() {
+    let names = [
+        "u32_wrapping_product",
+        "u32_wrapping_product_tripwire",
+        "u32_saturating_product",
+        "u32_saturating_product_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+
+    for name in ["u32_wrapping_product", "u32_saturating_product"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    for name in ["u32_wrapping_product_tripwire", "u32_saturating_product_tripwire"] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.starts_with("postcondition"),
+                "`{name}` must be refuted on the postcondition, got `{kind}`"
+            ),
+            other => panic!("`{name}` claims a false value and must be refuted, got: {other}"),
+        }
+    }
+}

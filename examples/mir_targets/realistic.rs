@@ -532,6 +532,60 @@ pub fn u16_product_unguarded_tripwire(a: u16, b: u16) -> u16 {
     a.saturating_mul(b)
 }
 
+/// The `u32` `wrapping_mul` — the shape `hash_step` needs, and the value half of
+/// the widened-product story.
+///
+/// The `wrapping_*` family builds no overflow predicate at all: it is a plain
+/// `w`-bit multiply, which the BDD holds at `u32` in milliseconds. Raising
+/// `MUL_MAX_WIDTH` from 16 to 32 is what admits it; at 16 every `u32`
+/// `wrapping_mul` reported "past what the model covers" and `hash_step` — the
+/// flagship `u32` example — was `incomplete`.
+///
+/// The argument is *pinned* and the postcondition names the exact product, which
+/// makes the fixture discriminating: `100000 * 31` is `3_100_000`, which fits
+/// neither an 8- nor a 16-bit result, so a model that wrapped at a narrower width
+/// would refute this rather than prove it.
+/// requires: h == 100000
+/// ensures: ret == 3100000
+pub fn u32_wrapping_product(h: u32) -> u32 {
+    h.wrapping_mul(31)
+}
+
+/// The tripwire for the fixture above: the same pinned argument under a
+/// postcondition that is false of the real product, so the obligation must fail.
+///
+/// `100000 * 31` is `3_100_000`, not `100000`. `tests/mir.rs` requires the
+/// failure; a frontend that verified this would be proving the wrong thing.
+/// requires: h == 100000
+/// ensures: ret == 100000
+pub fn u32_wrapping_product_tripwire(h: u32) -> u32 {
+    h.wrapping_mul(31)
+}
+
+/// A `u32` `saturating_mul` by a *constant*, so the widened failure predicate is
+/// built at `2w == 64` and the obligation settles by cancellation rather than by
+/// blasting the 64-bit multiplier.
+///
+/// `h <= 1000000` and `h.saturating_mul(3)` is at most `3_000_000`, well below
+/// `u32::MAX`, so the saturating product is the exact product and the bound holds.
+/// requires: h <= 1000000
+/// ensures: ret <= 3000000
+pub fn u32_saturating_product(h: u32) -> u32 {
+    h.saturating_mul(3)
+}
+
+/// The tripwire for the `u32` `saturating_mul`: the guard does not rule out the
+/// product reaching the bound, so the tighter postcondition must fail.
+///
+/// At `h == 1000000` the product is `3_000_000`, which is above `1_000_000`, so
+/// `ret <= 1000000` is false. `tests/mir.rs` requires the failure; a frontend that
+/// verified this would be proving the wrong thing about a saturating product.
+/// requires: h <= 1000000
+/// ensures: ret <= 1000000
+pub fn u32_saturating_product_tripwire(h: u32) -> u32 {
+    h.saturating_mul(3)
+}
+
 /// A comparison through `core::cmp::Ord` rather than the builtin operator.
 /// requires: true
 /// ensures: ret <= a

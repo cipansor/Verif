@@ -108,15 +108,37 @@ pub const DIV_MAX_WIDTH: u8 = 32;
 /// widened product, and `DIV_MAX_WIDTH` is its limit -- so this bound is the
 /// intrinsics' own, stated here so the two cannot be confused.
 ///
-/// Sixteen is measured rather than guessed. The widened product is what makes a
+/// The bound is measured rather than guessed. The widened product is what makes a
 /// `u16` product decidable at all: with this bound at 8, every `u16`
 /// `saturating_mul`/`checked_mul` reported "past what the model covers" and no
 /// contract over one could be settled. At 16 a guarded `u16` product is
 /// *verified* and a mis-guarded one is correctly *refuted*, both in under 200ms,
 /// because the obligation's guard and the model's predicate are the same term and
-/// the boolean fold settles them without blasting the multiplier. The `2w == 32`
-/// multiplier is built only when the fold cannot cancel it, and even a fully
-/// unconstrained `u16` product answers inside the budget.
+/// the boolean fold settles them without blasting the multiplier.
+///
+/// **Raised to 32, and the two costs were measured apart.** What the wider bound
+/// admits is the whole `u32` surface, and it pays off because the two shapes at
+/// `u32` cost very different things:
+///
+/// * the *value* -- the `wrapping_*` family, which builds no predicate -- is a
+///   plain `w`-bit multiply and settles in milliseconds: `x.wrapping_mul(31)`,
+///   `x.wrapping_mul(y)`, `(x * y) * z` and `x * x` all verify in under 50ms, and
+///   `hash_step` (`h.wrapping_mul(31).wrapping_add(b as u32)`) went from
+///   `incomplete` to `verified` in 0.00s;
+/// * the *widened* `2w`-bit product is built only when a family actually needs the
+///   failure predicate. It is a 64-bit multiply, so it is not free: a constant
+///   multiplier usually folds the obligation without blasting it
+///   (`x.saturating_mul(2)` verifies in 0.00s), while a fully symbolic one can
+///   answer `Unknown` after ~5s -- `x.saturating_mul(y)` at `u32` is undecided,
+///   which is the honest answer, not a wrong one, and it is bounded by the
+///   engine's own apply budget rather than hanging.
+///
+/// The bound is `32` and not `64` because `2w == 128` cannot be widened at all:
+/// `mul_failure` clamps the widened width at 64, so a `u64` product's predicate is
+/// refused (`wide == w`) and reported "past what the model covers". Raising this
+/// constant to 64 would not help even for the *value*: a `u64` `wrapping_mul` is
+/// already past the BDD wall and comes back `incomplete` in 0.01s. So 32 is where
+/// the cheap shape reaches and the expensive one is merely declined.
 ///
 /// It is *not* the division form the plain-`*` path uses. That form was measured
 /// here and is strictly worse: a `u16` idiom that the widened test settles in
@@ -124,7 +146,7 @@ pub const DIV_MAX_WIDTH: u8 = 32;
 /// *value* of a `core` call and carry no hand-written guard for a division to
 /// cancel against. The two paths therefore share the overflow *rule* but not its
 /// cheapest spelling.
-pub const MUL_MAX_WIDTH: u8 = 16;
+pub const MUL_MAX_WIDTH: u8 = 32;
 
 /// The widest base `pow` is modelled at.
 ///
@@ -1612,15 +1634,15 @@ fn failure(op: BinOp, x: Var, y: Var, w: u8, signed: bool) -> Option<Pred> {
 ///
 /// The exact result is built by widening: `truncate` zero-extends when the target
 /// is wider, so the operands are widened to `2w` and multiplied exactly there.
-/// Past `2w == 32` the widened multiply is the scaling wall this crate documents,
-/// so the model declines and the caller reports the path unknown. That is the same
-/// width [`MUL_MAX_WIDTH`] admits, so the two agree today; the guard stays here as
-/// well because it is the *correctness* condition on the term this function builds,
-/// and a caller that changed the policy bound should get a refusal rather than a
-/// term the blaster cannot hold.
+/// Past `2w == 64` the widened multiply is the scaling wall this crate documents,
+/// so the model declines and the caller reports the path unknown. The guard is the
+/// *correctness* condition on the term this function builds -- a `2w`-bit product
+/// the blaster cannot hold -- so it tracks [`MUL_MAX_WIDTH`]: every width that
+/// bound admits (`w <= 32`, so `2w <= 64`) builds a predicate, and a `u64` product
+/// (`2w == 128`, clamped to 64 and equal to `w`) is refused here.
 fn mul_failure(x: Var, y: Var, w: u8, signed: bool) -> Option<Pred> {
     let wide = w.saturating_mul(2).min(64);
-    if wide <= w || wide > 32 {
+    if wide <= w || wide > 64 {
         return None;
     }
     Some(if signed {
@@ -2941,6 +2963,68 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// A `u32` product is modelled and exact, and a `u64` one is still refused.
+    ///
+    /// The bound is 32, so the widened test builds a 64-bit multiply here. The
+    /// chosen values straddle the `u32` `MAX` boundary -- `65536` squares to
+    /// exactly `2^32`, one past `MAX`, and `65535 * 65537` is one below it -- so a
+    /// predicate that is off by one at the fencepost fails.
+    #[test]
+    fn a_u32_product_is_modelled_and_exact() {
+        let vals: [u32; 14] = [
+            0,
+            1,
+            2,
+            255,
+            65535,
+            65536,
+            65537,
+            46341,
+            0x8000_0000,
+            0xffff_fffe,
+            0xffff_ffff,
+            12345,
+            1_000_000,
+            65_537,
+        ];
+        smt::with_fresh(|| {
+            let a = smt::var(32);
+            let b = smt::var(32);
+            let (ai, bi) = (smt::index(a), smt::index(b));
+            let checked = eval(Intrinsic::Checked(BinOp::Mul), a, b, 32, false, 32)
+                .expect("checked_mul u32 must be modelled");
+            let sat = eval(Intrinsic::Saturating(BinOp::Mul), a, b, 32, false, 32)
+                .expect("saturating_mul u32 must be modelled");
+            for &x in &vals {
+                for &y in &vals {
+                    let (got_some, got_val) = read(checked, ai, bi, x as u64, y as u64);
+                    assert_eq!(
+                        got_some,
+                        Some(u32::checked_mul(x, y).is_some()),
+                        "checked_mul u32 at ({x}, {y}): the tag must match `core`"
+                    );
+                    if let Some(want) = u32::checked_mul(x, y) {
+                        assert_eq!(
+                            got_val,
+                            Some(want as u64),
+                            "checked_mul u32 at ({x}, {y}): the payload must match `core`"
+                        );
+                    }
+                    let (_, sat_val) = read(sat, ai, bi, x as u64, y as u64);
+                    assert_eq!(
+                        sat_val,
+                        Some(u32::saturating_mul(x, y) as u64),
+                        "saturating_mul u32 at ({x}, {y})"
+                    );
+                }
+            }
+        });
+        // A `u64` product is past the widened test (`2w == 128` cannot be held), so
+        // the model declines rather than building a term the blaster cannot take.
+        assert!(eval(Intrinsic::Saturating(BinOp::Mul), smt::var(64), smt::var(64), 64, false, 64).is_none());
+        assert!(!is_modelled(Intrinsic::Saturating(BinOp::Mul), 64, false));
     }
 
     /// Above the documented width limits the model declines rather than guessing.

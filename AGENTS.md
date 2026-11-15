@@ -3098,13 +3098,26 @@ themselves in the `detail` column — an unreadable `requires` (`c.lo <= c.hi`, 
 and a tuple-returning `ensures` (`ret.0 <= a`). Those are the next gaps, and they are parser
 gaps rather than engine ones, which the scoreboard says without being asked.
 
-## A product is widened to `2w == 32`, and `pow`'s fold keeps its own tighter bound
+## A product is widened to `2w == 64`, and `pow`'s fold keeps its own tighter bound
 
 The `Mul` arm of `intrinsics::failure` widens the operands to `2w` and multiplies there, because
-overflow needs the *exact* product and `2w` bits hold it. That widening was capped at
-`2w == 16`, so a `u16` `saturating_mul`/`checked_mul` was refused outright — every contract over
-one reported "past what the model covers" and none could be settled. The cap is `2w == 32` now
-(`MUL_MAX_WIDTH = 16`), and the width that was refused is decided.
+overflow needs the *exact* product and `2w` bits hold it. The cap was `2w == 16` first, so a
+`u16` `saturating_mul`/`checked_mul` was refused outright — every contract over one reported
+"past what the model covers" and none could be settled. Raising `MUL_MAX_WIDTH` to `16` made the
+`2w == 32` cap, and that width decided. The bound is `32` now (`2w == 64`), which decides the
+whole `u32` product surface; `64` is where it stops, because `2w == 128` cannot be held at all.
+
+**The two halves of a product cost very different things, and the bound is set where the cheap
+half reaches.** The *value* families (`wrapping_*`) build no predicate — a `wrapping_mul` is a
+plain `w`-bit multiply, which the BDD holds at `u32` in milliseconds — so raising the bound from
+16 to 32 admitted `u32::wrapping_mul` and `hash_step` (the flagship `u32` example,
+`h.wrapping_mul(31).wrapping_add(b as u32)`) went from `incomplete` to `verified` in 0.00s. The
+*widened* `2w == 64` product is built only where a family needs the failure predicate: a constant
+multiplier folds the obligation without blasting the multiply (`x.saturating_mul(3)` verifies in
+0.01s), and a fully symbolic one answers `Unknown` after ~5s rather than hanging. The bound is
+`32` and not `64` because a `u64` product's predicate is refused (`wide == w`, since `2w == 128`
+clamps to 64) and a `u64` `wrapping_mul` is past the BDD wall regardless — measured `incomplete`
+in 0.01s.
 
 **The division form was tried here first and is worse.** The plain-`*` path uses
 `y != 0 && x > MAX / y` (see the section above), and it is the *right* predicate there because
@@ -3125,13 +3138,24 @@ refusal at 8 bits is immediate. An answer that cannot be reached is not worth pa
 test `pow_is_modelled_only_where_a_product_is` pins the separation so a later change cannot
 collapse the two constants quietly.
 
-The teeth are a unit test and a corpus pair. `a_u16_product_is_modelled_and_exact` sweeps the
-boundary neighbourhood of a `u16` product against `core`'s own `checked_mul`/`saturating_mul`,
-so the widened test is pinned as *exact* at the new width and not merely reachable. In the
-corpus, `u16_product_guarded` must verify and `u16_product_unguarded_tripwire` — the same body
-under a guard that does not rule out overflow — must still be refuted; a bound raised without
-the refutation would be a model that proves the wrong thing, which is worse than one that
-declines.
+The teeth are unit tests and corpus pairs. `a_u16_product_is_modelled_and_exact` and
+`a_u32_product_is_modelled_and_exact` sweep the boundary neighbourhood of a product against
+`core`'s own `checked_mul`/`saturating_mul`, so the widened test is pinned as *exact* at each
+width and not merely reachable; the `u32` sweep includes `65536 * 65536` (exactly `2^32`, one
+past `MAX`) so an off-by-one fencepost fails. In the corpus, `u16_product_guarded` and
+`u32_wrapping_product`/`u32_saturating_product` must verify while their `*_tripwire` twins — the
+same body under a guard that does not rule out the claim — must be refuted; a bound raised
+without the refutation would be a model that proves the wrong thing, which is worse than one
+that declines.
+
+**What is still open, and it is the *speed* half rather than the coverage half.** A `u32`
+multiply-overflow guard at full width — the saturation idiom
+`if b != 0 && a > u32::MAX / b { u32::MAX } else { a * b }`, and a plain `a * b` under a guard —
+reports `incomplete` after ~4s. The plain-`*` path's exact-division form at `u32` is past the
+diagram budget, so the query is *bounded* rather than decided; a per-function time budget would
+report it promptly instead of waiting the ~4s out. `clamp_std` (`x.max(lo).min(hi)`) verifies in
+9.8s, likewise the latency half of C7 rather than a coverage gap.
+
 
 ## An inlined call must restore the caller's loop cut, or the caller unwinds a loop it had cut
 

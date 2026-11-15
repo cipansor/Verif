@@ -1946,7 +1946,10 @@ refused. `src/mir/intrinsics.rs` holds the model:
 
 - `wrapping_*` is the plain operator, because the plain operator already takes the
   result modulo `2^w`. The term is the *same term* `a + b` produces, not a second
-  definition that could drift from it.
+  definition that could drift from it. A `wrapping_mul` needs no overflow test, so
+  it is admitted up to `MUL_MAX_WIDTH` (`32`) rather than stopping where the widened
+  product does; a `u32` `wrapping_mul` is a plain 32-bit multiply and settles in
+  milliseconds.
 - `saturating_*` is `ite(fails, bound, plain)`, where `fails` is the very predicate
   rustc's own `assert` reads and `bound` is the sign of the overflow. A function
   written with `saturating_add` and one written with a hand-rolled guard are decided
@@ -2139,6 +2142,16 @@ The frontend refuses far more than it accepts, and every refusal is reported:
   form: a guard written as this predicate cancels against the obligation's assert at
   every width, while a bare multiply the engine has to reason about from scratch can
   run out of budget and report `incomplete`.
+- **A `core::num` product whose overflow test needs a widened `2w`-bit multiply past
+  `u32`.** The `checked_*`/`saturating_*`/`overflowing_*` families need the exact
+  product to test overflow, which is built by widening the operands to `2w` — the
+  BDD scaling wall. `MUL_MAX_WIDTH` is `32`, so a `u32` product's predicate is built
+  (a 64-bit multiply) while a `u64` one is refused (`2w == 128` cannot be held) and
+  reported "past what the model covers". The *value* families (`wrapping_*`) need no
+  widened product at all — they are a plain `w`-bit multiply — so they are admitted
+  up to the same bound and a `u32` `wrapping_mul` (the shape `hash_step` uses) now
+  decides, while a `u64` one is past the wall regardless. The refusal is the honest
+  answer: the path stays unknown rather than being proved from a truncated product.
 - **`core::num` operations other than the modelled families.** `checked_*`,
   `saturating_*` and `wrapping_*` for `add`/`sub`/`mul`/`div`/`rem` and the
   bitwise ops are computed from their operands (see below), as are the unary
