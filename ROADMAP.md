@@ -67,7 +67,7 @@ with no new false proof while the independent corpus keeps growing.
 
 ### Coverage (C items)
 
-- **C1. `Drop` and cleanup edges.** · P0 · in progress · Kani, Prusti, Creusot,
+- **C1. `Drop` and cleanup edges.** · P0 · done · Kani, Prusti, Creusot,
   Verus, SPARK
   - Gap: `drop(_x) -> [return: bbN, unwind …]` is unmodelled, so any function with
     an RAII local (`Vec`, `String`, `Box`, a lock guard, a user `Drop`) is
