@@ -9585,3 +9585,180 @@ fn the_u32_product_surface_is_modelled() {
         }
     }
 }
+
+/// C1: a `drop` terminator is modelled, not dropped.
+///
+/// The review's exit criterion for C1 was a `guarded`/`misguarded` pair on a
+/// function holding a live `Drop` local: the first verifies, the second is
+/// refuted. It runs here on inline source so the shape is pinned even if the
+/// corpus is edited, and it asserts the *verdict*, not merely "not incomplete" --
+/// a fix that refused every `drop` would pass the second and fail the first.
+#[test]
+fn a_drop_terminator_is_modelled_and_its_destructor_runs() {
+    let src = r#"
+pub struct Guard(pub u8);
+impl Drop for Guard {
+    fn drop(&mut self) {}
+}
+
+/// requires: x < 200
+/// ensures: ret == 1
+pub fn guarded(x: u8) -> u8 {
+    let _g = Guard(0);
+    assert!(x < 200);
+    1
+}
+
+/// requires: true
+/// ensures: ret == 1
+pub fn misguarded(x: u8) -> u8 {
+    let _g = Guard(0);
+    assert!(x < 200);
+    1
+}
+"#;
+    let Some(g) = verify_src("guarded", src) else { return };
+    assert!(
+        g.is_verified(),
+        "a function holding a live `Drop` local with a satisfied assert must verify, got: {g}"
+    );
+    let Some(m) = verify_src("misguarded", src) else { return };
+    match m {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.starts_with("panic"),
+            "the misguarded assert must be refuted as a panic, got `{kind}`"
+        ),
+        other => panic!("the misguarded assert is reachable and must be refuted, got: {other}"),
+    }
+}
+
+/// C1 soundness: a destructor's *body* is executed, so its panic is an obligation.
+///
+/// This is the direction that makes the model safe. Treating every `drop` as a
+/// no-op -- the tempting way to make RAII locals decide -- would report the
+/// unguarded function `verified`, but the destructor panics for `x >= 10`. The
+/// guarded companion is the positive control: refusing every `drop` would leave
+/// it undecided, so the pair pins both that the destructor runs and that the tool
+/// is not merely refusing the shape.
+#[test]
+fn a_destructor_body_is_executed_and_its_panic_is_an_obligation() {
+    let src = r#"
+pub struct PanicGuard { pub v: u8 }
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        assert!(self.v < 10);
+    }
+}
+
+/// requires: true
+/// ensures: ret == 1
+pub fn unguarded(x: u8) -> u8 {
+    let _p = PanicGuard { v: x };
+    1
+}
+
+/// requires: x < 10
+/// ensures: ret == 1
+pub fn guarded(x: u8) -> u8 {
+    let _p = PanicGuard { v: x };
+    1
+}
+"#;
+    let Some(u) = verify_src("unguarded", src) else { return };
+    match u {
+        FnOutcome::Failed { kind, detail } => {
+            assert!(
+                kind.starts_with("panic"),
+                "the destructor's assert must be a refuted panic, got `{kind}`"
+            );
+            assert!(
+                kind.contains("v < 10"),
+                "the refuted obligation must be the destructor's own assert, got: `{kind}` \
+                 with witness {detail}"
+            );
+        }
+        other => panic!(
+            "a destructor that panics for `x >= 10` must be refuted, got: {other} -- \
+             treating the drop as a no-op would have proved it"
+        ),
+    }
+    let Some(g) = verify_src("guarded", src) else { return };
+    assert!(g.is_verified(), "the guarded destructor cannot panic, got: {g}");
+}
+
+/// C1: a container whose destructor the tool cannot represent is *refused*.
+///
+/// A `String` local frees the heap, which is not a bit-vector fact. Assuming the
+/// `drop` were a no-op would be a false proof whenever the destructor's effect is
+/// observable, so the honest answer is a refusal -- not a verdict. This is the
+/// case the dump cannot tell apart from a struct holding a user-`Drop` field (both
+/// print `drop(_x) -> [return: …]`), which is why the no-op is not taken here.
+#[test]
+fn an_unmodelled_drop_is_refused_not_assumed_away() {
+    let src = r#"
+/// requires: true
+/// ensures: ret == 1
+pub fn owns_string(s: String) -> u8 {
+    let _owned = s;
+    1
+}
+"#;
+    let Some(o) = verify_src("owns_string", src) else { return };
+    match o {
+        FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. } => {}
+        other => panic!(
+            "a `String` drop is not representable and must be refused, got: {other} -- \
+             a verdict here would be a false proof"
+        ),
+    }
+}
+
+/// C1, on the corpus: the `Drop` fixtures decide, and the false ones are refuted.
+///
+/// The review's exit criterion is stated on `guard_guarded` (verifies) and
+/// `guard_misguarded` (refuted). This asserts the corpus copies of those, plus the
+/// destructor-panic pair, so a regression in the corpus cannot pass unnoticed --
+/// `realistic.rs` is scored by a floor, and a fixture that flipped to `incomplete`
+/// would lower the score without failing the floor test.
+#[test]
+fn the_drop_fixtures_decide_and_the_false_ones_are_refuted() {
+    let names = [
+        "guard_is_dropped_cleanly",
+        "guard_guarded",
+        "destructor_panic_guarded",
+        "guard_misguarded_cannot_prove_this",
+        "destructor_panic_cannot_prove_this",
+        "string_drop_is_refused",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+
+    for name in [
+        "guard_is_dropped_cleanly",
+        "guard_guarded",
+        "destructor_panic_guarded",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "guard_misguarded_cannot_prove_this",
+        "destructor_panic_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.starts_with("panic"),
+                "`{name}` must be refuted as a reachable panic, got `{kind}`"
+            ),
+            other => panic!(
+                "`{name}` has a reachable panic and must be refuted, got: {other} -- \
+                 treating the `drop` as a no-op, or dropping the path at it, would hide it"
+            ),
+        }
+    }
+    // A container drop is a refusal, not a verdict.
+    match outcome(&report, "string_drop_is_refused") {
+        FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. } => {}
+        other => panic!("a `String` drop must be refused, got: {other}"),
+    }
+}

@@ -9016,3 +9016,66 @@ edition comes from its manifest -- and the README's "what is read from where" ta
 did not mention it. The table gained an `edition` row and a paragraph on the
 precedence and the loose-file override, which is what `CONTRIBUTING.md` asks for
 when behaviour changes.
+
+## A `drop` is a terminator, and the dump does not say which kind it is
+
+C1 modelled `drop(_x)`, the terminator rustc emits for a local whose type has drop
+glue. Three findings, and the middle one is the soundness boundary.
+
+**It is a terminator the parser was reading as a call.** `drop(_2) -> [return: bb1,
+unwind continue]` prints with the same `-> [return:` shape as a call, so the call
+arm claimed it: the line has no ` = ` destination, so `parse_call_head` returned
+`None`, and the arm's fallback turned the whole line into `Unknown` -- reported as
+"unmodelled terminator", dropping the path. Every RAII local lowers to a `drop`, so
+any function holding a `Vec`, a `String`, a lock guard or a user `Drop` was
+`incomplete` for a reason that had nothing to do with its contract. (A `drop(` branch
+existed before but was dead: the call arm above it matched first, because the line
+contains ` -> [return:`.) The arm has to come *before* the call arm, and
+`successors` has to know the terminator has a normal successor (`vec![*target]`), or
+the path dies at the `drop` instead of continuing. It is a **refusal** at HEAD, not
+a false proof -- confirmed by running the unmodified tree on a `Drop` whose
+destructor panics (`incomplete`, "unmodelled terminator") -- so C1 closes a lost
+proof, not a soundness hole.
+
+**A glue-free `drop` is a no-op, but rustc never emits one -- so the no-op arm is
+defensive, not the common case.** The tempting framing (and the ROADMAP's first
+draft) was "a scalar no-op subset, the common case". Measured over `realistic.rs`,
+**0 of 6** `drop` terms are glue-free: rustc emits no `drop` at all for an integer,
+an array of integers, or a plain struct with no destructor. So the no-op branch
+cannot be exercised through the frontend, and a test that claims to exercise it is
+vacuous -- the check lives in a unit test on `drop_is_noop` instead. The arm is
+kept because the alternative to a no-op is a refusal, and refusing `drop(_2)` for a
+glue-free type would lose a proof; it is correctness insurance, not coverage.
+
+**A container and a struct holding a user destructor are the same line.** The
+review's suggestion was "a std container is a no-op that changes no scalar state".
+That is **unsound**. The MIR probe: `fn g(w: Wrapper)` with `struct Wrapper { v:
+Vec<u8> }` and `fn f()` with `struct Outer { i: Inner }` where `Inner: Drop` both
+lower to the *same* `drop(_2) -> [return: bb1, unwind continue]`. The dump carries
+the dropped local's type, not its drop glue, so it cannot tell a `Vec` from a struct
+wrapping a `Vec<PanicOnDrop>`. Treating the container as a no-op would prove a
+function panic-free whose destructor panics. So a container is **refused**
+(`drop of `std::string::String` is not modelled`), which is a lost proof, never a
+false one.
+
+The three cases the executor takes, then: **no drop glue** -> no-op (defensive);
+**a user `impl Drop`** -> execute its body through the inliner the method path uses
+(`self` is `&mut T`, so the dropped place is the argument and the `by_ref` copy-back
+carries the destructor's writes); **anything else** -> refuse. The user-`Drop` path
+is what makes the review's exit criterion pass: `destructor_panic_cannot_prove_this`
+is refuted with witness `v = 16` (the destructor's own assert fires), and its
+guarded twin verifies.
+
+Two smaller traps. The inliner's env-seeding was extracted into `seed_callee_env`
+so the `drop` path and the call path share it -- a second copy would be a second
+chance to forget one of the seven stores a reference argument carries in. And
+`drop_destructor` resolves the impl by its *owner* (the `impl at FILE:L:C` location,
+like a method contract), matching the type's bare name: two same-named types in
+different modules that both `Drop` are an ambiguity, and the resolver refuses rather
+than guessing one (probed: `m::Guard` and `n::Guard` both `Drop` -> `incomplete`).
+
+The parser side is pinned by `parses_a_drop_terminator`; the executor's three cases
+by the `tests/mir.rs` Drop tests and the `realistic.rs` fixtures; the no-op table by
+`a_glue_free_type_has_a_noop_drop` (which can run without a compiler). The
+`rustc_public` oracle agrees (862 of 881 on `realistic.rs`, 0 differ), which is what
+confirms the parser reads the terminator's real shape.

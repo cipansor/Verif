@@ -394,6 +394,22 @@ pub enum Term {
         msg_args: Vec<Operand>,
         target: usize,
     },
+    /// `drop(place)` — run `place`'s destructor, then continue at `target`.
+    ///
+    /// A type with no drop glue (an integer, `bool`, a plain struct or tuple of
+    /// such) has nothing to run, so the executor treats it as a no-op. A user
+    /// `impl Drop` has a body in the dump and the executor runs it; a container
+    /// whose destructor this tool cannot represent (`Vec`, `String`, `Box`) is
+    /// refused, because assuming such a `drop` changes nothing is a false proof
+    /// whenever the destructor is observable.
+    ///
+    /// Every RAII local lowers to this, so before it was modelled any function
+    /// with a `Drop` local — a `Vec`, a guard, a lock — reported `incomplete` on
+    /// an unmodelled `drop`, even when the destructor had no scalar effect.
+    Drop {
+        place: Place,
+        target: usize,
+    },
     /// `unreachable`
     Unreachable,
     Unknown(String),
@@ -2672,6 +2688,24 @@ fn parse_stmt_or_term(line: &str, enums: &BTreeMap<String, EnumLayout>) -> Resul
             None => Term::Unknown(t.to_string()),
         });
     }
+    // A `drop(place) -> [return: bbN, …]` terminator. It prints with the same
+    // `-> [return:` shape as a call, so without this arm the call arm below claims
+    // it: `parse_call_head` finds no ` = ` and returns `None`, and the arm's
+    // fallback turns the whole line into `Unknown`, reported as "unmodelled
+    // terminator" and dropping the path. Every RAII local lowers to a `drop`, so
+    // any function with a `Vec`, a guard or a lock was `incomplete` on this -- a
+    // refusal, never a false proof. The arm has to come *before* the call arm,
+    // which would otherwise claim the line.
+    if let Some(r) = t.strip_prefix("drop(") {
+        if let Some((inner, after)) = take_until_close(r) {
+            let place = parse_place(inner, enums);
+            let target = parse_return_target(after).unwrap_or(usize::MAX);
+            if let Some(place) = place {
+                return Err(Term::Drop { place, target });
+            }
+        }
+        return Err(Term::Unknown(t.to_string()));
+    }
     // A call terminator: `dest = callee(args) -> [return: bbN, …]`
     if let Some(i) = t.find(" -> [return:") {
         let target = parse_return_target(&t[i..]).unwrap_or(usize::MAX);
@@ -2709,11 +2743,6 @@ fn parse_stmt_or_term(line: &str, enums: &BTreeMap<String, EnumLayout>) -> Resul
                 }
             }
         }
-    }
-    if let Some(r) = t.strip_prefix("drop(") {
-        let _ = r;
-        let target = parse_return_target(t).unwrap_or(usize::MAX);
-        return Err(Term::Goto(target));
     }
     // A plain assignment ----------------------------------------------------
     if let Some(eq) = find_assign_eq(t) {
@@ -3341,6 +3370,27 @@ fn add(_1: u32, _2: u32) -> u32 {
         // alone -- the marker is not applied to every `-> bbN`.
         assert!(prog.fns[0].blocks.iter().find(|b| b.id == 4).unwrap().cleanup);
         assert!(!prog.fns[0].blocks.iter().find(|b| b.id == 0).unwrap().cleanup);
+    }
+
+    /// A `drop(place)` terminator parses as a `Drop`, not as a call.
+    ///
+    /// It prints with the same `-> [return: bbN, …]` shape an ordinary call does,
+    /// so without its own arm the call arm below claims it and turns the whole line
+    /// into `Unknown` (reported as "unmodelled terminator"), dropping the path --
+    /// a refusal, not a false proof, but a lost proof all the same. Every RAII local
+    /// lowers to this, so the shape has to parse.
+    #[test]
+    fn parses_a_drop_terminator() {
+        let dump = "fn f(_1: u8) -> u8 {\n    debug x => _1;\n    let mut _0: u8;\n    let _2: [u8; 2];\n\n    bb0: {\n        _2 = [const 1_u8, const 2_u8];\n        _0 = copy _1;\n        drop(_2) -> [return: bb1, unwind continue];\n    }\n\n    bb1: {\n        return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        match &prog.fns[0].blocks[0].term {
+            Term::Drop { place, target } => {
+                assert_eq!(place.local, 2);
+                assert!(place.proj.is_empty());
+                assert_eq!(*target, 1);
+            }
+            other => panic!("expected a `drop`, got {other:?}"),
+        }
     }
 
     /// An ordinary returning call keeps its target, even into a block that happens

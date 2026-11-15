@@ -77,20 +77,41 @@ with no new false proof while the independent corpus keeps growing.
     so an `assert!` in any function with a live `Drop` local was a dropped path.
     Now read as a diverging call: `guard_misguarded` FAILED with a counterexample
     (`x = 224`). ✅
-  - Remaining: model `drop` itself. rustc emits `drop(_x)` **only** for a local
-    whose type has drop glue, so there is no "scalar no-op" subset to take: every
-    such line is a type with a destructor. Treating the line as a no-op would be
-    **unsound**, not merely incomplete — `impl Drop for G { fn drop(&mut self) {
-    assert!(self.0 < 10) } }` panics inside the destructor, and a no-op would
-    report the function panic-free. (The `-> [return: bbN, unwind continue]` edge
-    is exactly the destructor's unwind path.) So the sound model is to execute the
-    destructor: a `drop` of a type with **no** drop glue is a no-op, a user
-    `impl Drop` is a call through the existing inlining machinery, and a std
-    container (`Vec`, `String`, `Box`) is a no-op that changes no scalar state —
-    each reached by resolving the dropped local's type to its `Drop::drop` body.
-    Until that lands, `drop` stays a **refusal** (`unmodelled terminator:
-    drop(_2)`), which loses a proof but never invents one.
-  - Exit: `guard_guarded` verified (today: incomplete on the unmodelled `drop`).
+  - **`drop` (done):** `Term::Drop { place, target }` is parsed (its `drop(_2) ->
+    [return: …]` line prints like a call, and since it has no ` = ` destination the
+    call arm's fallback turned the whole line into `Unknown` — reported "unmodelled
+    terminator" — so without its own arm the path was dropped) and executed. Three
+    cases, and the middle one is the soundness boundary:
+    - **No drop glue** — an integer, `bool`, `()`, a reference, or an aggregate of
+      such (`[u8; N]`, a plain struct, a tuple). The terminator changes nothing, so
+      it is a no-op and the path continues. This arm is *defensive*: rustc emits no
+      `drop` at all for such a type (measured over `realistic.rs`: 0 of 6 `drop`
+      terms are glue-free — the other six are a user `Drop` or a container), so the
+      arm cannot be exercised through the frontend and its check lives in a unit
+      test on `drop_is_noop`. It is kept because the alternative to a no-op is a
+      refusal, and refusing a glue-free `drop` would lose a proof.
+    - **A user `impl Drop`** — its body is in the dump, so it is executed through
+      the same inliner a method call uses (`self` is `&mut T`, so the dropped place
+      is the argument and the write-back carries the destructor's effects).
+      `destructor_panic_cannot_prove_this` is refuted with a witness (`v = 16`) and
+      its guarded twin verifies.
+    - **An unmodellable container** — a `Vec`, `String`, `Box`, or a struct whose
+      field has a user destructor. **Refused, not no-oped.** The MIR probe that
+      decided this: `fn g(w: Wrapper)` with `struct Wrapper { v: Vec<u8> }` and
+      `fn f()` with `struct Outer { i: Inner }` where `Inner: Drop` both lower to
+      the *same* `drop(_2) -> [return: bb1, unwind continue]` line — the dump does
+      not distinguish a container from a struct holding a user destructor. So the
+      review's suggested "std container is a no-op that changes no scalar state" is
+      unsound for the aggregate case (a `Vec<PanicOnDrop>`, or any struct wrapping
+      one, panics in its destructor). The honest answer is a refusal: a lost proof,
+      never a false one.
+    - A *projected* place (`drop(_2.0)`) is refused for the same reason: the
+      reference write-back is keyed on a whole local, so a projection would land
+      the post-state on the wrong storage. rustc does not emit that shape for a
+      glue-bearing place.
+  - Exit (done): `guard_guarded` / `guard_is_dropped_cleanly` verified,
+    `guard_misguarded` FAILED with a counterexample. ✅
+  - Who has it: Kani, Prusti, Creusot, Verus, SPARK (finalization).
   - Move: **build**.
 - **C2. `Option`/`Result` and `?`.** · P0 · in progress · Kani, Verus, Prusti, Creusot
   - Gap: `unwrap`, `unwrap_or`, `expect`, `ok_or`, `map`, `is_some` and `?` are

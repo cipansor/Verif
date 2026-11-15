@@ -2815,6 +2815,7 @@ fn successors(t: &Term) -> Vec<usize> {
         Term::Call { diverges: true, .. } => Vec::new(),
         Term::Call { target, .. } => vec![*target],
         Term::Assert { target, .. } => vec![*target],
+        Term::Drop { target, .. } => vec![*target],
         Term::Return | Term::Unreachable | Term::Unknown(_) => Vec::new(),
     }
 }
@@ -4777,6 +4778,229 @@ fn operand_width(f: &MirFn, o: &Operand) -> Option<u8> {
     }
 }
 
+/// Seed a callee's environment from a call's arguments.
+///
+/// Shared by the inliner and by a `drop` of a user `impl Drop` -- both hand a
+/// place over to a callee's frame and need the same carried-in state, so a
+/// second copy would be a second chance to forget one of the stores.
+fn seed_callee_env(
+    prog: &MirProgram,
+    caller_env: &mut Env,
+    callee_fn: &MirFn,
+    args: &[Operand],
+) -> (Env, Vec<(Place, u32)>) {
+    let mut env = Env::with_prog(prog);
+    // Which caller locals were handed over through a reference, so the
+    // return path knows whose store the callee's post-state belongs to.
+    let mut by_ref: Vec<(Place, u32)> = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        let v = operand(caller_env, a);
+        let Some(&l) = callee_fn.arg_locals.get(i) else { continue };
+        env.locals.insert(l, v);
+        // A reference argument may be dereferenced inside the callee
+        // (`*_1 = 5`), and `Ty::Ref` is modelled as its referent, so `_1`
+        // *is* the value `*_1` names. `verify_fn` marks the root's
+        // reference arguments this way; the inliner builds the callee's
+        // env itself, so it has to mark them too, or the callee's
+        // `(*_1) = v` is treated as a deref with no recorded referent and
+        // the write is dropped -- which is how a `&mut u8` helper's write
+        // was lost and a false `ret == 0` contract was proved.
+        if matches!(callee_fn.ty_of(l), Some(Ty::Ref(_))) {
+            env.deref_ok.insert(l, ());
+        }
+        let Place { local: cl, proj } = match a {
+            Operand::Copy(p) | Operand::Move(p) => p,
+            Operand::Const(_) => continue,
+        };
+        if !proj.is_empty() {
+            continue;
+        }
+        // The *storage* the argument denotes, which is the caller's local
+        // itself for a by-value argument and the pointee for a reference.
+        //
+        // `pointee`, not `resolve`: `resolve` only follows an explicit
+        // `*_p` projection, and `set5(&mut x)` hands the callee a *temp*
+        // (`_5 = &mut _2; set5(_5)`) whose place has no projection at all.
+        // `pointee` follows the recorded address of an empty-projection
+        // local, which is what turns `_5` into the `_2` the caller reads.
+        //
+        // The whole argument's state -- its element store *and* its parts
+        // -- is carried in, keyed on the callee's local. A reference shares
+        // the caller's storage, so the callee's `a[0]`, `c.lo` and `o.i.v`
+        // must read the caller's values; without them a helper that indexes
+        // or reads a field has an unmodelled operand and the caller's
+        // contract stays unproved, while a read-modify-write helper
+        // (`c.lo = c.lo + d`) cannot be modelled at all.
+        //
+        // The state is *cloned*, never shared: the callee must not be able
+        // to write the caller's copy directly, or a by-value argument would
+        // behave like a reference. Only a reference argument's post-state
+        // is copied back (see the return path).
+        let is_ref = arg_is_ref(callee_fn, i);
+        let source = if is_ref {
+            caller_env.pointee(&Place { local: *cl, proj: Vec::new() })
+        } else {
+            Place { local: *cl, proj: Vec::new() }
+        };
+        let sl = source.local;
+        // The value *at the target*, and the target's parts. The value is
+        // read through `get`, not out of `locals`, because a sub-place
+        // target has no whole-local entry: `&mut c.lo` targets `c.0`, whose
+        // value lives in `fields`. Reading `locals[source.local]` there
+        // returned the *struct's* absent value, so the callee's `*v` was
+        // `Unknown` and a helper that *reads* through its argument (`*v`,
+        // `*v = *v + 1`, a two-reference `swap`) had an unmodelled operand --
+        // while a helper that only *wrote* (`*v = 5`) worked, because the
+        // write creates the value the copy-back then reads. `Ty::Ref` is
+        // modelled as its referent, so the callee's local *is* the target's
+        // value and this is a copy of what the caller holds, not an
+        // assumption about it.
+        //
+        // The part stores are copied only for a *whole-local* target, and
+        // they are keyed by `source.local` because that is the local that
+        // owns them. For a sub-place target the parts belong to the target's
+        // own type, which the value copy above already covers for a scalar;
+        // copying the enclosing local's parts instead would hand the callee
+        // a sibling field it does not own.
+        if is_ref {
+            let v = caller_env.get(&source);
+            env.locals.insert(l, v);
+        }
+        if source.proj.is_empty() {
+            if let Some(store) = caller_env.indexed.get(&sl).cloned() {
+                env.indexed.insert(l, store);
+            }
+            for ((l0, f), v) in caller_env.fields.iter() {
+                if *l0 == sl {
+                    env.fields.insert((l, *f), *v);
+                }
+            }
+            for ((l0, chain), v) in caller_env.nested.iter() {
+                if *l0 == sl {
+                    env.nested.insert((l, chain.clone()), *v);
+                }
+            }
+            for ((l0, k), v) in caller_env.elems.iter() {
+                if *l0 == sl {
+                    env.elems.insert((l, *k), *v);
+                }
+            }
+            // Elements of field-path arrays (`o.a[0]`) are carried in for the
+            // same reason the plain elements are: the callee's `(_1.0)[k]` is
+            // the caller's `o.a[k]`, so a helper that *reads* one has to see
+            // the caller's seed. Without this the callee read `Unknown`, and a
+            // helper that wrote the element had its write die with the frame --
+            // the caller read its own seed, so `requires: x.a[0] == 5;
+            // ensures: ret == 5` on `set_first(x); x.a[0]` was **proved**
+            // against a body that returns 9.
+            for ((l0, chain, k), v) in caller_env.elems_path.iter() {
+                if *l0 == sl {
+                    env.elems_path.insert((l, chain.clone(), *k), *v);
+                }
+            }
+            // The leaves *inside* those elements (`o.a[0].v`), keyed
+            // index-first. A helper that reads a leaf through its argument
+            // (`a[0].v`) otherwise saw `Unknown`; and one that wrote it had
+            // the write die with the frame, so the caller read the leaf its
+            // literal had before the call.
+            for ((l0, k, chain), v) in caller_env.elem_parts.iter() {
+                if *l0 == sl {
+                    env.elem_parts.insert((l, *k, chain.clone()), *v);
+                }
+            }
+            // An already-poisoned array stays poisoned in the callee: its
+            // elements are unknown, so carrying them in would hand over
+            // values the caller's own write already invalidated.
+            if caller_env.poisoned_elems.contains(&sl) {
+                env.poisoned_elems.insert(l);
+            }
+        } else if is_ref {
+            // A sub-place target whose own type is an aggregate: `&mut
+            // o.i`. The callee's `i.v` is the caller's `o.i.v`, so the
+            // target's parts are carried in *re-based* -- the target's
+            // chain is dropped from the front of each key and the callee's
+            // local takes its place. This is the exact inverse of the
+            // re-based copy-back, and it is what lets a helper *read* a
+            // nested aggregate it was handed (`read_inner(&o.i)`), which is
+            // otherwise an unmodelled operand.
+            let mut rc = Vec::with_capacity(source.proj.len());
+            let ok = source.proj.iter().all(|p| match p {
+                Proj::Field(i) => {
+                    rc.push(*i);
+                    true
+                }
+                _ => false,
+            });
+            if ok {
+                // A remainder of one step is a *field* in this store's
+                // spelling (`fields` is keyed by a single index, `nested` by
+                // a chain of two or more), so the two lengths have to be
+                // routed apart or the callee's `_1.0` -- a lone field read --
+                // would consult `fields` and miss.
+                for ((l0, chain), v) in caller_env.nested.iter() {
+                    if *l0 != sl || !chain.starts_with(&rc) {
+                        continue;
+                    }
+                    let rem = &chain[rc.len()..];
+                    match rem {
+                        [f] => {
+                            env.fields.insert((l, *f), *v);
+                        }
+                        [] => {}
+                        _ => {
+                            env.nested.insert((l, rem.to_vec()), *v);
+                        }
+                    }
+                }
+                // Elements of field-path arrays under a sub-place target, the
+                // same re-basing as the nested parts above: `&mut o.i` makes the
+                // caller's `o.i.a[0]` the callee's `_1.a[0]`, so the chain has
+                // the target's prefix dropped. Without this a helper that only
+                // *reads* the element through its argument (`read_inner(&o.i)` ->
+                // `i.a[0]`) saw `Unknown` and its contract was unreadable -- an
+                // incompleteness where the true contract should decide.
+                for ((l0, chain, k), v) in caller_env.elems_path.iter() {
+                    if *l0 != sl || !chain.starts_with(&rc) {
+                        continue;
+                    }
+                    let rem = &chain[rc.len()..];
+                    if rem.is_empty() {
+                        // The target *is* the array (`peek_of(&x.a)`): in the
+                        // callee's terms its argument is a whole local, so the
+                        // callee's `_1[k]` read consults the *plain* element store,
+                        // not the field-path one. Without this the callee read
+                        // `Unknown` and a read-only helper's contract was
+                        // unreadable -- an incompleteness where the true contract
+                        // should decide. This is the exact inverse of the write-back
+                        // arm that re-bases a whole-array target's element.
+                        env.elems.insert((l, *k), *v);
+                    } else {
+                        env.elems_path.insert((l, rem.to_vec(), *k), *v);
+                    }
+                }
+            }
+        }
+        if is_ref {
+            by_ref.push((source.clone(), l));
+        }
+        // The origin local of a reference argument, in the *caller's*
+        // frame, so a reference the callee returns can be resolved once it
+        // is back in the caller. A `&mut x` argument is passed through a
+        // temp (`_5 = &mut _2; set5(_5)`), so the origin is `_5`'s origin --
+        // `_2` -- not `_5` itself.
+        if matches!(callee_fn.ty_of(l), Some(Ty::Ref(_))) {
+            // The argument denotes `source` in the caller's frame, and
+            // inside the callee it is the local `l` itself. Recording both
+            // is what lets a reference the callee returns be translated
+            // back: the callee's `_0` names `l` (or a projection of it),
+            // and `arg_source` turns that into the caller's place.
+            env.arg_source.insert(l, source.clone());
+            env.ref_origin.insert(l, Place { local: l, proj: Vec::new() });
+        }
+    }
+    (env, by_ref)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_state<F>(
     prog: &MirProgram,
@@ -5464,6 +5688,94 @@ where
                 }
             }
         }
+        Term::Drop { place, target } => {
+            // `drop(place)` runs `place`'s destructor, then continues. Three
+            // cases, and the middle one is the soundness boundary:
+            //
+            // * A type with no drop glue -- an integer, `bool`, `()`, a reference,
+            //   or a plain aggregate of such -- runs nothing, so the terminator is
+            //   a no-op. rustc does not emit a `drop` for such a type, so this arm
+            //   is *defensive*: it is kept so that a malformed or future dump shape
+            //   is answered correctly rather than refused, not because it is the
+            //   common case. Measured over `realistic.rs`: 0 of 6 `drop` terms are
+            //   glue-free; the other six are a user `Drop` or a container.
+            // * A *user* `impl Drop` has a body in the dump, so it is executed in
+            //   the place's own frame -- the same inliner a method call uses, so a
+            //   destructor that reads or writes its `self` fields is modelled.
+            // * A container whose destructor this tool cannot represent (`Vec`,
+            //   `String`, `Box`, a `MutexGuard`) has no `Drop` body in the dump, so
+            //   it is refused. Assuming such a `drop` changes nothing is a *false
+            //   proof* whenever the destructor is observable, which is the one
+            //   outcome this crate must never produce -- and the dump cannot tell a
+            //   container apart from a struct that holds a user-`Drop` field, since
+            //   both print `drop(_x) -> [return: …]`.
+            //
+            // A projected place (`drop(_2.0)`) is refused for the same reason: the
+            // write-back a reference argument performs is keyed on a whole local, so
+            // a projection would land the destructor's post-state on the wrong
+            // storage. rustc does not emit that shape for a glue-bearing place, so
+            // the refusal loses no proof.
+            let f = &prog.fns[st.frame.func];
+            let Some(ty) = type_of_place(f, place) else {
+                report.unknown_paths.push("drop of a place with no modelled type".into());
+                return;
+            };
+            if drop_is_noop(&ty) {
+                let next = State { block: *target, ..st };
+                advance(prog, next, *target, report, work, pins);
+                return;
+            }
+            let Some(idx) = (if place.proj.is_empty() { drop_destructor(prog, &ty) } else { None })
+            else {
+                report
+                    .unknown_paths
+                    .push(format!("drop of `{}` is not modelled", ty_label(&ty)));
+                return;
+            };
+            let callee_fn = &prog.fns[idx];
+            let Some(b0) = callee_fn.blocks.first() else {
+                report.unknown_paths.push("destructor has no body".into());
+                return;
+            };
+            // The destructor's `self` is `&mut T`, and the place being dropped is
+            // the storage it borrows, so the argument is that place itself.
+            let arg = Operand::Copy(place.clone());
+            let (env, by_ref) =
+                seed_callee_env(prog, &mut st.env, callee_fn, std::slice::from_ref(&arg));
+            let caller = Frame {
+                func: st.frame.func,
+                ret_target: *target,
+                // A destructor returns `()`: there is no value to hand back, only
+                // the writes through `self`, which the `by_ref` copy-back carries.
+                ret_dest: None,
+                saved_env: Some(st.env.clone()),
+                saved_cut: st.cut.clone(),
+                saved_variant: st.variant_entry,
+                by_ref,
+                caller: st.frame.caller.clone(),
+            };
+            let mut visits = st.visits;
+            visits.insert((idx, b0.id), 0);
+            work.push(State {
+                frame: Frame {
+                    func: idx,
+                    ret_target: usize::MAX,
+                    ret_dest: None,
+                    saved_env: None,
+                    saved_cut: None,
+                    saved_variant: None,
+                    by_ref: Vec::new(),
+                    caller: Some(Box::new(caller)),
+                },
+                block: b0.id,
+                path: st.path,
+                env,
+                visits,
+                depth: st.depth + 1,
+                cut: None,
+                variant_entry: None,
+            });
+        }
         Term::Unreachable => {
             report.obligations.push(Obligation {
                 kind: ObligationKind::Unreachable,
@@ -5746,215 +6058,7 @@ where
                 report.unknown_paths.push(format!("callee `{name}` has no body"));
                 return;
             };
-            let mut env = Env::with_prog(prog);
-            // Which caller locals were handed over through a reference, so the
-            // return path knows whose store the callee's post-state belongs to.
-            let mut by_ref: Vec<(Place, u32)> = Vec::new();
-            for (i, a) in args.iter().enumerate() {
-                let v = operand(&mut st.env, a);
-                let Some(&l) = callee_fn.arg_locals.get(i) else { continue };
-                env.locals.insert(l, v);
-                // A reference argument may be dereferenced inside the callee
-                // (`*_1 = 5`), and `Ty::Ref` is modelled as its referent, so `_1`
-                // *is* the value `*_1` names. `verify_fn` marks the root's
-                // reference arguments this way; the inliner builds the callee's
-                // env itself, so it has to mark them too, or the callee's
-                // `(*_1) = v` is treated as a deref with no recorded referent and
-                // the write is dropped -- which is how a `&mut u8` helper's write
-                // was lost and a false `ret == 0` contract was proved.
-                if matches!(callee_fn.ty_of(l), Some(Ty::Ref(_))) {
-                    env.deref_ok.insert(l, ());
-                }
-                let Place { local: cl, proj } = match a {
-                    Operand::Copy(p) | Operand::Move(p) => p,
-                    Operand::Const(_) => continue,
-                };
-                if !proj.is_empty() {
-                    continue;
-                }
-                // The *storage* the argument denotes, which is the caller's local
-                // itself for a by-value argument and the pointee for a reference.
-                //
-                // `pointee`, not `resolve`: `resolve` only follows an explicit
-                // `*_p` projection, and `set5(&mut x)` hands the callee a *temp*
-                // (`_5 = &mut _2; set5(_5)`) whose place has no projection at all.
-                // `pointee` follows the recorded address of an empty-projection
-                // local, which is what turns `_5` into the `_2` the caller reads.
-                //
-                // The whole argument's state -- its element store *and* its parts
-                // -- is carried in, keyed on the callee's local. A reference shares
-                // the caller's storage, so the callee's `a[0]`, `c.lo` and `o.i.v`
-                // must read the caller's values; without them a helper that indexes
-                // or reads a field has an unmodelled operand and the caller's
-                // contract stays unproved, while a read-modify-write helper
-                // (`c.lo = c.lo + d`) cannot be modelled at all.
-                //
-                // The state is *cloned*, never shared: the callee must not be able
-                // to write the caller's copy directly, or a by-value argument would
-                // behave like a reference. Only a reference argument's post-state
-                // is copied back (see the return path).
-                let is_ref = arg_is_ref(callee_fn, i);
-                let source = if is_ref {
-                    st.env.pointee(&Place { local: *cl, proj: Vec::new() })
-                } else {
-                    Place { local: *cl, proj: Vec::new() }
-                };
-                let sl = source.local;
-                // The value *at the target*, and the target's parts. The value is
-                // read through `get`, not out of `locals`, because a sub-place
-                // target has no whole-local entry: `&mut c.lo` targets `c.0`, whose
-                // value lives in `fields`. Reading `locals[source.local]` there
-                // returned the *struct's* absent value, so the callee's `*v` was
-                // `Unknown` and a helper that *reads* through its argument (`*v`,
-                // `*v = *v + 1`, a two-reference `swap`) had an unmodelled operand --
-                // while a helper that only *wrote* (`*v = 5`) worked, because the
-                // write creates the value the copy-back then reads. `Ty::Ref` is
-                // modelled as its referent, so the callee's local *is* the target's
-                // value and this is a copy of what the caller holds, not an
-                // assumption about it.
-                //
-                // The part stores are copied only for a *whole-local* target, and
-                // they are keyed by `source.local` because that is the local that
-                // owns them. For a sub-place target the parts belong to the target's
-                // own type, which the value copy above already covers for a scalar;
-                // copying the enclosing local's parts instead would hand the callee
-                // a sibling field it does not own.
-                if is_ref {
-                    let v = st.env.get(&source);
-                    env.locals.insert(l, v);
-                }
-                if source.proj.is_empty() {
-                    if let Some(store) = st.env.indexed.get(&sl).cloned() {
-                        env.indexed.insert(l, store);
-                    }
-                    for ((l0, f), v) in st.env.fields.iter() {
-                        if *l0 == sl {
-                            env.fields.insert((l, *f), *v);
-                        }
-                    }
-                    for ((l0, chain), v) in st.env.nested.iter() {
-                        if *l0 == sl {
-                            env.nested.insert((l, chain.clone()), *v);
-                        }
-                    }
-                    for ((l0, k), v) in st.env.elems.iter() {
-                        if *l0 == sl {
-                            env.elems.insert((l, *k), *v);
-                        }
-                    }
-                    // Elements of field-path arrays (`o.a[0]`) are carried in for the
-                    // same reason the plain elements are: the callee's `(_1.0)[k]` is
-                    // the caller's `o.a[k]`, so a helper that *reads* one has to see
-                    // the caller's seed. Without this the callee read `Unknown`, and a
-                    // helper that wrote the element had its write die with the frame --
-                    // the caller read its own seed, so `requires: x.a[0] == 5;
-                    // ensures: ret == 5` on `set_first(x); x.a[0]` was **proved**
-                    // against a body that returns 9.
-                    for ((l0, chain, k), v) in st.env.elems_path.iter() {
-                        if *l0 == sl {
-                            env.elems_path.insert((l, chain.clone(), *k), *v);
-                        }
-                    }
-                    // The leaves *inside* those elements (`o.a[0].v`), keyed
-                    // index-first. A helper that reads a leaf through its argument
-                    // (`a[0].v`) otherwise saw `Unknown`; and one that wrote it had
-                    // the write die with the frame, so the caller read the leaf its
-                    // literal had before the call.
-                    for ((l0, k, chain), v) in st.env.elem_parts.iter() {
-                        if *l0 == sl {
-                            env.elem_parts.insert((l, *k, chain.clone()), *v);
-                        }
-                    }
-                    // An already-poisoned array stays poisoned in the callee: its
-                    // elements are unknown, so carrying them in would hand over
-                    // values the caller's own write already invalidated.
-                    if st.env.poisoned_elems.contains(&sl) {
-                        env.poisoned_elems.insert(l);
-                    }
-                } else if is_ref {
-                    // A sub-place target whose own type is an aggregate: `&mut
-                    // o.i`. The callee's `i.v` is the caller's `o.i.v`, so the
-                    // target's parts are carried in *re-based* -- the target's
-                    // chain is dropped from the front of each key and the callee's
-                    // local takes its place. This is the exact inverse of the
-                    // re-based copy-back, and it is what lets a helper *read* a
-                    // nested aggregate it was handed (`read_inner(&o.i)`), which is
-                    // otherwise an unmodelled operand.
-                    let mut rc = Vec::with_capacity(source.proj.len());
-                    let ok = source.proj.iter().all(|p| match p {
-                        Proj::Field(i) => {
-                            rc.push(*i);
-                            true
-                        }
-                        _ => false,
-                    });
-                    if ok {
-                        // A remainder of one step is a *field* in this store's
-                        // spelling (`fields` is keyed by a single index, `nested` by
-                        // a chain of two or more), so the two lengths have to be
-                        // routed apart or the callee's `_1.0` -- a lone field read --
-                        // would consult `fields` and miss.
-                        for ((l0, chain), v) in st.env.nested.iter() {
-                            if *l0 != sl || !chain.starts_with(&rc) {
-                                continue;
-                            }
-                            let rem = &chain[rc.len()..];
-                            match rem {
-                                [f] => {
-                                    env.fields.insert((l, *f), *v);
-                                }
-                                [] => {}
-                                _ => {
-                                    env.nested.insert((l, rem.to_vec()), *v);
-                                }
-                            }
-                        }
-                        // Elements of field-path arrays under a sub-place target, the
-                        // same re-basing as the nested parts above: `&mut o.i` makes the
-                        // caller's `o.i.a[0]` the callee's `_1.a[0]`, so the chain has
-                        // the target's prefix dropped. Without this a helper that only
-                        // *reads* the element through its argument (`read_inner(&o.i)` ->
-                        // `i.a[0]`) saw `Unknown` and its contract was unreadable -- an
-                        // incompleteness where the true contract should decide.
-                        for ((l0, chain, k), v) in st.env.elems_path.iter() {
-                            if *l0 != sl || !chain.starts_with(&rc) {
-                                continue;
-                            }
-                            let rem = &chain[rc.len()..];
-                            if rem.is_empty() {
-                                // The target *is* the array (`peek_of(&x.a)`): in the
-                                // callee's terms its argument is a whole local, so the
-                                // callee's `_1[k]` read consults the *plain* element store,
-                                // not the field-path one. Without this the callee read
-                                // `Unknown` and a read-only helper's contract was
-                                // unreadable -- an incompleteness where the true contract
-                                // should decide. This is the exact inverse of the write-back
-                                // arm that re-bases a whole-array target's element.
-                                env.elems.insert((l, *k), *v);
-                            } else {
-                                env.elems_path.insert((l, rem.to_vec(), *k), *v);
-                            }
-                        }
-                    }
-                }
-                if is_ref {
-                    by_ref.push((source.clone(), l));
-                }
-                // The origin local of a reference argument, in the *caller's*
-                // frame, so a reference the callee returns can be resolved once it
-                // is back in the caller. A `&mut x` argument is passed through a
-                // temp (`_5 = &mut _2; set5(_5)`), so the origin is `_5`'s origin --
-                // `_2` -- not `_5` itself.
-                if matches!(callee_fn.ty_of(l), Some(Ty::Ref(_))) {
-                    // The argument denotes `source` in the caller's frame, and
-                    // inside the callee it is the local `l` itself. Recording both
-                    // is what lets a reference the callee returns be translated
-                    // back: the callee's `_0` names `l` (or a projection of it),
-                    // and `arg_source` turns that into the caller's place.
-                    env.arg_source.insert(l, source.clone());
-                    env.ref_origin.insert(l, Place { local: l, proj: Vec::new() });
-                }
-            }
+            let (env, by_ref) = seed_callee_env(prog, &mut st.env, callee_fn, args);
             let caller = Frame {
                 func: st.frame.func,
                 ret_target: *target,
@@ -5998,6 +6102,110 @@ where
             report.unknown_paths.push(format!("unmodelled terminator: {text}"));
         }
     }
+}
+
+/// True when a `drop` of this type runs nothing.
+///
+/// A type with no drop glue -- an integer, `bool`, `()`, a reference, a function
+/// pointer, or an aggregate of such -- has no destructor, so its `drop`
+/// terminator changes no state and the executor skips it. This is the common
+/// case: `let v = [1u8, 2];` lowers to a `drop(_2)` on the array, and before this
+/// was recognised every function holding such a local was `incomplete`.
+///
+/// An `Other` type is the unknown case, and it is *not* a no-op: it may name a
+/// `Vec`, a `String`, a `Box`, a guard, or a user struct with a `Drop` field, any
+/// of which has a destructor. Treating it as nothing to run would be a false
+/// proof whenever that destructor is observable, so it is refused instead. A
+/// user `impl Drop` for it is found by [`drop_destructor`] and executed; a
+/// container is refused. See the `Term::Drop` executor arm.
+fn drop_is_noop(ty: &Ty) -> bool {
+    match ty {
+        Ty::Bool
+        | Ty::U8
+        | Ty::U16
+        | Ty::U32
+        | Ty::U64
+        | Ty::U128
+        | Ty::Usize
+        | Ty::I8
+        | Ty::I16
+        | Ty::I32
+        | Ty::I64
+        | Ty::I128
+        | Ty::Isize
+        | Ty::Unit
+        | Ty::Ref(_) => true,
+        Ty::Tuple(ts) => ts.iter().all(drop_is_noop),
+        Ty::Array(inner, _) => drop_is_noop(inner),
+        Ty::Slice(inner) => drop_is_noop(inner),
+        Ty::Other(_) => false,
+    }
+}
+
+/// A short, printable name for a type, for a refusal message.
+fn ty_label(ty: &Ty) -> String {
+    match ty {
+        Ty::Bool => "bool".into(),
+        Ty::U8 => "u8".into(),
+        Ty::U16 => "u16".into(),
+        Ty::U32 => "u32".into(),
+        Ty::U64 => "u64".into(),
+        Ty::U128 => "u128".into(),
+        Ty::Usize => "usize".into(),
+        Ty::I8 => "i8".into(),
+        Ty::I16 => "i16".into(),
+        Ty::I32 => "i32".into(),
+        Ty::I64 => "i64".into(),
+        Ty::I128 => "i128".into(),
+        Ty::Isize => "isize".into(),
+        Ty::Unit => "()".into(),
+        Ty::Ref(inner) => format!("&{}", ty_label(inner)),
+        Ty::Tuple(ts) => {
+            let parts: Vec<String> = ts.iter().map(ty_label).collect();
+            format!("({})", parts.join(", "))
+        }
+        Ty::Array(inner, n) => format!("[{}; {}]", ty_label(inner), n),
+        Ty::Slice(inner) => format!("[{}]", ty_label(inner)),
+        Ty::Other(s) => s.clone(),
+    }
+}
+
+/// The index of the `impl Drop` body for a type, if the dump has one.
+///
+/// A user `impl Drop for T` prints its definition as `<impl at FILE:L:C: L:C>::drop`,
+/// so the *owner* of the impl block -- not the type's name spelling -- is what
+/// identifies it: `Ty::Other("Guard")` names the type, and the impl block whose
+/// owner is `Guard` holds the destructor. A type with no `impl Drop` in the dump
+/// -- a `Vec`, a `String`, a `Box`, or any struct with no explicit destructor --
+/// has no candidate here, which is what lets the caller refuse it rather than
+/// treat the drop as a no-op.
+///
+/// More than one candidate is refused (the caller gets `None`): two `impl Drop`
+/// blocks for one owner is not something a valid crate contains, and picking one
+/// would be a guess.
+fn drop_destructor(prog: &MirProgram, ty: &Ty) -> Option<usize> {
+    let Ty::Other(name) = ty else { return None };
+    // The impl's owner is stored bare (`Guard`); the type is too, but it may carry
+    // a path (`m::Guard`) or generics (`Wrapper<u8>`) the owner does not, so the
+    // last `::` segment of the type is what is compared.
+    let bare = name.rsplit("::").next().unwrap_or(name);
+    let bare = bare.split('<').next().unwrap_or(bare);
+    let mut hit = None;
+    for (i, f) in prog.fns.iter().enumerate() {
+        if f.name.rsplit("::").next() != Some("drop") {
+            continue;
+        }
+        let Some(loc) = f.impl_loc else { continue };
+        let Some(owner) = prog.impl_owners.get(&loc) else { continue };
+        let owner_bare = owner.split('<').next().unwrap_or(owner);
+        if owner_bare == bare {
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some(i);
+        }
+    }
+    hit
 }
 
 /// Resolve an operand to a symbolic value.
@@ -8342,5 +8550,33 @@ fn count_via_helper(_1: u8) -> u8 {
         assert_eq!(Divergence::of("my_crate::never_returns"), Divergence::Never);
         assert_eq!(Divergence::Never.label(), "diverges");
         assert_eq!(Divergence::Exit.label(), "exit");
+    }
+
+    /// Which types carry no drop glue, so a `drop` of one runs nothing.
+    ///
+    /// This is the *defensive* arm of the `Term::Drop` executor, not a live path:
+    /// rustc emits no `drop` for a type with no drop glue (measured -- 0 of 6
+    /// `drop` terms over `realistic.rs` are glue-free). So the arm cannot be
+    /// exercised through the frontend, and the check lives here where it can be
+    /// asserted directly. It matters because the alternative to a no-op is a
+    /// refusal, and a refusal of `drop(_2)` for an integer would lose a proof.
+    #[test]
+    fn a_glue_free_type_has_a_noop_drop() {
+        for ty in [
+            Ty::Bool, Ty::U8, Ty::U64, Ty::I8, Ty::I64, Ty::Usize, Ty::Unit,
+            Ty::Ref(Box::new(Ty::U8)),
+        ] {
+            assert!(drop_is_noop(&ty), "`{ty:?}` has no drop glue");
+        }
+        // An aggregate is glue-free exactly when every leaf is.
+        assert!(drop_is_noop(&Ty::Array(Box::new(Ty::U8), 4)));
+        assert!(drop_is_noop(&Ty::Tuple(vec![Ty::U8, Ty::Bool])));
+        // A nominal type is not known glue-free from the dump, so it is *not* a
+        // no-op -- it is resolved to a destructor or refused.
+        assert!(!drop_is_noop(&Ty::Other("Vec<u8>".into())));
+        assert!(!drop_is_noop(&Ty::Other("Guard".into())));
+        // A tuple/array with a nominal leaf inherits the nominal's glue.
+        assert!(!drop_is_noop(&Ty::Array(Box::new(Ty::Other("Guard".into())), 2)));
+        assert!(!drop_is_noop(&Ty::Tuple(vec![Ty::U8, Ty::Other("String".into())])));
     }
 }

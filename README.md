@@ -87,6 +87,7 @@ all obligations discharged
 - [A negative answer has to say what it swept](#a-negative-answer-has-to-say-what-it-swept)
 - [An unreachable precondition is not a proof](#an-unreachable-precondition-is-not-a-proof)
 - [A diverging call is a checked panic, not a dropped line](#a-diverging-call-is-a-checked-panic-not-a-dropped-line)
+- [A `drop` is a terminator with a real successor](#a-drop-is-a-terminator-with-a-real-successor)
 - [A bound must be wider than the address, or "all cells" is vacuous](#a-bound-must-be-wider-than-the-address-or-all-cells-is-vacuous)
 - [The memory family, positive side](#the-memory-family-positive-side)
 - [The differential harness now covers memory](#the-differential-harness-now-covers-memory)
@@ -1821,6 +1822,44 @@ which pass a literal, still name the text the programmer wrote. A name is never
 reported as its type arguments: `panic!("{}", x)` has no literal piece at all, so it
 falls back to the callee's name read through its generics (`panic_display`, not
 `<u8>`).
+
+### A `drop` is a terminator with a real successor
+
+`drop(_x)` is the terminator `rustc` emits for a local whose type has drop glue, and
+it prints with the same `-> [return: bbN, unwind continue]` shape as a call. So the
+call arm claimed it, and because a `drop` line has no ` = ` destination,
+`parse_call_head` returned `None` and the arm's fallback turned the whole line into
+`Unknown` — reported as "unmodelled terminator", dropping the path. Every RAII local
+lowers to a `drop`, so a function holding a `Vec`, a `String`, a lock guard or a user
+`Drop` was `incomplete` for a reason that had nothing to do with its contract. It has
+its own parser arm now, and `successors` knows the terminator has a normal successor,
+so the path continues past it. (The old code had a `drop(` branch too, but it was
+dead: the call arm above it matched first, because the line contains ` -> [return:`.)
+
+Three cases, and the middle one is the soundness boundary:
+
+* a type with **no drop glue** runs nothing, so the terminator is a no-op. rustc
+  emits no `drop` for such a type, so this arm is *defensive* — measured over
+  `realistic.rs`, 0 of 6 `drop` terms are glue-free — and its check lives in a unit
+  test rather than in a corpus fixture that could not exercise it;
+* a **user `impl Drop`** has a body in the dump, so it is executed through the same
+  inliner a method call uses. The destructor's `self` is `&mut T`, so the dropped
+  place is the argument and the `by_ref` copy-back carries the destructor's writes
+  back to the caller. A destructor that panics is therefore a real obligation:
+  `destructor_panic_cannot_prove_this` is refuted with the witness that fires the
+  destructor's own `assert`, and its guarded twin verifies;
+* **anything else** — a `Vec`, a `String`, a `Box`, a `MutexGuard`, or a generic `T`
+  whose glue the dump does not spell — is **refused**, never assumed to be a no-op.
+  This is the one place the review's first suggestion ("a std container is a no-op
+  that changes no scalar state") was unsound: the dump cannot tell a `Vec` from a
+  struct holding a user-`Drop` field, because both print the same `drop(_x)` line, so
+  treating the container as a no-op would prove a function panic-free whose destructor
+  panics. A refusal is a lost proof, never a false one.
+
+The parser side is pinned by `parses_a_drop_terminator`; the executor's three cases by
+the `tests/mir.rs` Drop tests and the `realistic.rs` fixtures; the no-op table by
+`a_glue_free_type_has_a_noop_drop`, which needs no compiler. The `rustc_public` oracle
+agrees on the parser's reading of the terminator's real shape.
 
 ### What is read from where, and why
 

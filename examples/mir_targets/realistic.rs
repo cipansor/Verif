@@ -9457,3 +9457,110 @@ pub fn rotate_by_the_width_is_the_identity() -> u8 {
 pub fn rotate_by_more_than_the_width_wraps() -> u8 {
     0x81u8.rotate_left(9)
 }
+
+/// A guard whose destructor is empty. Its `drop` has a body in the dump, so the
+/// executor runs it; because it touches nothing, the function decides instead of
+/// reporting an unmodelled `drop`.
+pub struct QuietGuard(pub u8);
+impl Drop for QuietGuard {
+    fn drop(&mut self) {}
+}
+
+/// The C1 gap the review named: a function holding an RAII local was `incomplete`
+/// on an unmodelled `drop`. With an empty destructor the value of `x` is what
+/// survives, so the contract is the body's own value.
+/// requires: true
+/// ensures: ret == x
+pub fn guard_is_dropped_cleanly(x: u8) -> u8 {
+    let _g = QuietGuard(x);
+    x
+}
+
+/// The `guard_guarded` half of the review's C1 exit criterion: an assert that
+/// holds is verified even with a live `Drop` local.
+/// requires: x < 200
+/// ensures: ret == 1
+pub fn guard_guarded(x: u8) -> u8 {
+    let _g = QuietGuard(0);
+    assert!(x < 200);
+    1
+}
+
+/// The `guard_misguarded` half: the same body with no precondition, so the assert
+/// is a reachable panic. A `drop` treated as a no-op would not change this, but
+/// dropping the *path* at the `drop` -- the pre-fix behaviour -- would leave it
+/// undecided rather than refuted.
+/// requires: true
+/// ensures: ret == 1
+pub fn guard_misguarded_cannot_prove_this(x: u8) -> u8 {
+    let _g = QuietGuard(0);
+    assert!(x < 200);
+    1
+}
+
+/// A destructor that *panics* on part of its domain. Treating the `drop` as a
+/// no-op -- the tempting way to make RAII locals decide -- would prove this
+/// function, which panics for `x >= 10`. The destructor's body is executed, so the
+/// panic is a real obligation.
+/// requires: true
+/// ensures: ret == 1
+pub fn destructor_panic_cannot_prove_this(x: u8) -> u8 {
+    let _p = PanicGuard { v: x };
+    1
+}
+
+/// The guarded companion: with `x < 10` the destructor cannot panic, so the same
+/// body verifies. A refusal of every `drop` would leave it undecided.
+/// requires: x < 10
+/// ensures: ret == 1
+pub fn destructor_panic_guarded(x: u8) -> u8 {
+    let _p = PanicGuard { v: x };
+    1
+}
+
+/// A guard whose destructor is empty.
+pub struct PanicGuard {
+    pub v: u8,
+}
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        assert!(self.v < 10);
+    }
+}
+
+/// A plain struct with no `impl Drop`. rustc emits no `drop` for it (a type with
+/// no drop glue is dropped nowhere), so this function never reaches the
+/// `Term::Drop` arm -- it pins that an aggregate local still decides, which is the
+/// shape the review's `everyday` corpus hits.
+/// requires: true
+/// ensures: ret == s.x
+pub fn plain_struct_local_decides(s: PlainStruct) -> u8 {
+    let _p = s;
+    s.x
+}
+
+/// A struct with no destructor.
+#[derive(Clone, Copy)]
+pub struct PlainStruct {
+    pub x: u8,
+}
+
+/// An array local. Like the struct above, an array of a glue-free type carries no
+/// drop glue, so rustc emits no `drop` and this pins that the local decides.
+/// requires: true
+/// ensures: ret == a[0]
+pub fn array_local_decides(a: [u8; 4]) -> u8 {
+    let _copy = a;
+    a[0]
+}
+
+/// A `String` local: its destructor frees the heap, which this tool cannot
+/// represent, so the `drop` is *refused* -- never assumed to be a no-op. Assuming
+/// it were a no-op would be a false proof whenever the destructor's effect is
+/// observable, which is the one outcome this crate must never produce.
+/// requires: true
+/// ensures: ret == 1
+pub fn string_drop_is_refused(s: String) -> u8 {
+    let _owned = s;
+    1
+}
