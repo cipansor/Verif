@@ -3783,6 +3783,124 @@ fn a_measure_without_an_invariant_is_refused() {
     assert!(matches!(o, FnOutcome::Skipped { .. }), "expected a refusal; got: {o}");
 }
 
+/// A loop with no invariant is unwound up to `unwind:`, and the clause raises the
+/// bound so a loop whose trip count exceeds the default still decides.
+///
+/// `count_twelve` runs twelve iterations, more than `DEFAULT_UNWIND` (9), so the
+/// default refuses it. With `unwind: 20` the walk reaches the exit edge and the
+/// postcondition is proved. This is the C4 exit criterion's bounded-unrolling
+/// half: the bound is *declared* and governs the loop.
+#[test]
+fn an_unwind_clause_raises_the_unwinding_bound() {
+    let default = verify_src(
+        "count_twelve_default",
+        "/// requires: true\n/// ensures: ret == 12\n\
+         pub fn count_twelve_default() -> u8 { let mut i = 0u8; while i < 12 { i += 1; } i }\n",
+    );
+    let Some(o) = default else { return };
+    assert!(
+        !o.is_verified(),
+        "twelve iterations exceed the default bound, so it must not verify; got: {o}"
+    );
+    match &o {
+        FnOutcome::Incomplete { reasons, .. } => assert!(
+            reasons.iter().any(|r| r.contains("unwound past")),
+            "the cutoff must name the unwinding bound; got: {reasons:?}"
+        ),
+        other => panic!("expected an unwinding cutoff, got: {other}"),
+    }
+
+    let raised = verify_src(
+        "count_twelve_unwind",
+        "/// requires: true\n/// unwind: 20\n/// ensures: ret == 12\n\
+         pub fn count_twelve_unwind() -> u8 { let mut i = 0u8; while i < 12 { i += 1; } i }\n",
+    );
+    let Some(o) = raised else { return };
+    assert!(o.is_verified(), "an explicit larger bound must decide the loop; got: {o}");
+}
+
+/// The bound is an *unwinding assertion*: too small a bound must not decide the
+/// function by accident. `unwind: 3` on a loop that runs five iterations cannot
+/// reach the exit edge, so the bound is *refuted* -- a failure, not an
+/// incompleteness.
+///
+/// This is the Kani-style discipline the review asked for (C4(b)): a bound can
+/// never cut off a path *silently*, and a too-small bound fails the unwinding
+/// check rather than being reported as "could not decide". A bound that were only
+/// an incompleteness could be read as "no counterexample found", which is exactly
+/// the weaker proof the clause exists to prevent.
+#[test]
+fn an_unwind_bound_too_small_for_the_loop_is_refuted() {
+    let small = verify_src(
+        "count_five_unwind3",
+        "/// requires: true\n/// unwind: 3\n/// ensures: ret == 5\n\
+         pub fn count_five_unwind3() -> u8 { let mut i = 0u8; while i < 5 { i += 1; } i }\n",
+    );
+    let Some(o) = small else { return };
+    assert!(!o.is_verified(), "a bound below the trip count must not verify; got: {o}");
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("unwind: 3"),
+            "the failure must name the declared bound; got: {kind}"
+        ),
+        other => panic!("expected an unwinding-assertion failure, got: {other}"),
+    }
+}
+
+/// A postcondition that is false is still refuted under a raised bound, so the
+/// clause widens *coverage* and not the proof.
+#[test]
+fn an_unwind_clause_does_not_turn_a_false_postcondition_true() {
+    let bad = verify_src(
+        "count_twelve_bad",
+        "/// requires: true\n/// unwind: 20\n/// ensures: ret == 11\n\
+         pub fn count_twelve_bad() -> u8 { let mut i = 0u8; while i < 12 { i += 1; } i }\n",
+    );
+    let Some(o) = bad else { return };
+    assert!(!o.is_verified(), "a false postcondition must not verify; got: {o}");
+    match &o {
+        FnOutcome::Failed { kind, .. } => {
+            assert!(kind.contains("postcondition"), "the failure is the postcondition; got: {kind}")
+        }
+        other => panic!("expected a postcondition failure, got: {other}"),
+    }
+}
+
+/// C4's exit criterion, exactly: `max_of` verified with `unwind: 5`, and refuted
+/// with `unwind: 3` by the unwinding check.
+///
+/// `max_of` is a four-iteration loop over a `[u8; 4]` with a branch inside, so it
+/// explores 199 paths -- above the default 64-path budget. `unwind: 5` both raises
+/// the loop bound and grows the path budget to match (see [`exec::path_budget`]),
+/// so the loop decides. `unwind: 3` cannot reach the exit edge, and because the
+/// bound is *declared* that is the unwinding assertion failing, not an
+/// incompleteness.
+#[test]
+fn max_of_verifies_with_a_sufficient_unwind_bound_and_fails_with_a_small_one() {
+    const BODY: &str = "pub fn max_of(a: [u8; 4]) -> u8 { let mut m = 0; let mut i = 0; \
+                        while i < 4 { if a[i] > m { m = a[i]; } i += 1; } m }\n";
+    const ENSURES: &str = "/// ensures: ret >= a[0] && ret >= a[1] && ret >= a[2] && ret >= a[3]\n";
+
+    let ok = verify_src("max_of", &format!("/// requires: true\n/// unwind: 5\n{ENSURES}{BODY}"));
+    let Some(o) = ok else { return };
+    assert!(o.is_verified(), "`max_of` under `unwind: 5` must verify; got: {o}");
+
+    let small = verify_src(
+        "max_of_small",
+        &format!("/// requires: true\n/// unwind: 3\n{ENSURES}{BODY}")
+            .replace("max_of", "max_of_small"),
+    );
+    let Some(o) = small else { return };
+    assert!(!o.is_verified(), "`max_of` under `unwind: 3` must not verify; got: {o}");
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("unwind: 3"),
+            "the small-bound failure is the unwinding check; got: {kind}"
+        ),
+        other => panic!("expected an unwinding-assertion failure, got: {other}"),
+    }
+}
+
 /// A clause-shaped doc comment that is not a clause is refused, not dropped.
 ///
 /// `/// ensuers: ret == 99` used to be discarded: the function then had no

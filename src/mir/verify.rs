@@ -552,6 +552,14 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         },
     };
 
+    // The loop-unwinding bound, if the contract carries one. It applies to a
+    // function's loops whether or not it also has an `invariant:`: an invariant
+    // decides a loop by induction (no unwinding), but a *second* loop with no
+    // invariant is still unwound, and the bound governs it. It is not tied to the
+    // invariant the way `variant:` is, so a lone `unwind:` is honoured rather than
+    // refused.
+    let unwind: Option<u32> = contract.and_then(|c| c.unwind);
+
     // Build the precondition. No contract means `true`, which is the right
     // default: a function with no `requires` is checked for panic freedom on
     // every input.
@@ -822,7 +830,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         f,
         pre,
         post,
-        exec::LoopSpec { invariant, variant },
+        exec::LoopSpec { invariant, variant, unwind },
         &callees,
         &exec::Seeds {
             fields: fields.seeds.clone(),

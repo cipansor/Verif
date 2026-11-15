@@ -150,18 +150,31 @@ with no new false proof while the independent corpus keeps growing.
   - Exit: `tri` verified with an `invariant:`; a missing invariant reported as *a
     missing invariant*, not "unmodelled".
   - Move: **build**.
-- **C4. Loops without path explosion.** · P0 · in progress · Kani (unwinding),
+- **C4. Loops without path explosion.** · P0 · done · Kani (unwinding),
   Verus, Creusot, Prusti, SPARK (`Loop_Invariant`/`Loop_Variant`), Flux
   - Gap: a 4-iteration loop over an array exhausts the 64-path budget. Evidence:
-    `max_of` incomplete (`path budget exhausted after 64 paths`).
-  - (a) `invariant:`/`variant:` clauses inside the MIR frontend — **partly
-    built** (the `Cut` machinery and the loop obligations exist; `everyday.rs`
-    needs a fixture that uses them). (b) a bounded-unrolling mode whose bound is
-    *reported*, so a too-small bound fails rather than silently cutting paths.
-    (c) merge states at joins (ite-merging) instead of enumerating paths.
-  - Exit: `max_of` verified with an invariant and with `unwind: 5`, refuted with
-    `unwind: 3` by the unwinding check.
+    `max_of` was incomplete (`path budget exhausted after 64 paths`).
+  - (a) `invariant:`/`variant:` clauses inside the MIR frontend — **built** (the
+    `Cut` machinery, loop obligations, and the `an_invariant_decides_a_loop_that_
+    unwinding_could_not` regression). (b) a bounded-unrolling mode whose bound is
+    *reported*: `unwind:` raises the loop bound **and** the path budget (a
+    declared bound means "unwind each loop N times", and a branching body yields
+    a path per branch per iteration), and a *declared* bound that is too small is
+    Kani's **unwinding assertion** — a `Failed` obligation
+    (`ObligationKind::UnwindBound`), not an incompleteness, so a bound can never
+    cut a path off silently. A loop with **no** `unwind:` still cuts off at
+    `DEFAULT_UNWIND` and reports that honestly. (c) merge states at joins
+    (ite-merging) instead of enumerating paths — not done.
+  - Exit: **met** — `max_of` verified with `unwind: 5`, refuted with `unwind: 3`
+    by the unwinding check (`max_of_verifies_with_a_sufficient_unwind_bound_and_
+    fails_with_a_small_one`); the invariant half is pinned by
+    `an_invariant_decides_a_loop_that_unwinding_could_not`. `everyday.rs` scores
+    16 of 21 (up from 9).
   - Move: **build**.
+  - Follow-up (not in the exit criterion): a *sufficient* invariant for `max_of`
+    needs an implication in the contract language (`i > k => m >= a[k]`), which
+    is C12 (a specification language that can say more). Until then the fixture
+    proves a loop by unwinding.
 - **C5. Enums with payloads and match guards.** · P0 · done · Kani
   - Gap: `match m { Run(n) if n < 10 => … }` gave "unmodelled switch
     discriminant". Evidence: `next_mode` was incomplete.

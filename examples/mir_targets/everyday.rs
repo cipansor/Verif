@@ -133,8 +133,13 @@ pub fn digit(b: u8) -> u8 {
 }
 
 /// Fixed array loop.
+///
+/// The loop body branches, so the search explores 199 paths -- more than the
+/// default budget. `unwind: 5` both bounds the loop (four iterations) and grows
+/// the path budget to match, which is what C4's exit criterion asks for.
 /// requires: true
-/// ensures: true
+/// unwind: 5
+/// ensures: ret >= a[0] && ret >= a[1] && ret >= a[2] && ret >= a[3]
 pub fn max_of(a: [u8; 4]) -> u8 {
     let mut m = 0;
     let mut i = 0;

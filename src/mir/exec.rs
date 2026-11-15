@@ -68,6 +68,39 @@ pub const DEFAULT_INLINE_DEPTH: u32 = 4;
 /// no invariant to prove them with.
 pub const DEFAULT_PATH_BUDGET: usize = 64;
 
+/// The largest path budget a declared `unwind:` may buy.
+///
+/// The budget grows with the declared bound (see [`path_budget`]) because a
+/// caller who asks for more iterations is asking for more paths. The cap keeps
+/// that growth from becoming a hang: measured, a two-branch loop body explores
+/// its paths in under half a second at this budget, so a bound large enough to
+/// reach it is still bounded in time, and a caller who needs more than this is
+/// told the budget was exhausted rather than waited out.
+pub const MAX_PATH_BUDGET: usize = 4096;
+
+/// The path budget for a function whose loops are unwound to `unwind`, or the
+/// default when the source declared no bound.
+///
+/// A declared bound says "unwind each loop up to `n` iterations", and a loop body
+/// with a branch yields a path per branch per iteration, so the number of paths
+/// grows with the bound. The default budget is calibrated for [`DEFAULT_UNWIND`];
+/// a caller who asks for more iterations is asking for more paths, and the budget
+/// has to grow with the request or the clause is unusable. Measured: `max_of` (a
+/// four-iteration loop over a `[u8; 4]` with one `if`) explores 199 paths -- above
+/// the default 64 -- so `unwind: 5`, the very clause that should decide it, would
+/// otherwise still hit the budget. `unwind: 5` buys 320 paths, which covers it.
+///
+/// The growth is linear in the bound and capped at [`MAX_PATH_BUDGET`], so a large
+/// bound cannot turn into a hang.
+pub fn path_budget(unwind: Option<u32>) -> usize {
+    match unwind {
+        Some(n) => DEFAULT_PATH_BUDGET
+            .saturating_mul(n as usize)
+            .clamp(DEFAULT_PATH_BUDGET, MAX_PATH_BUDGET),
+        None => DEFAULT_PATH_BUDGET,
+    }
+}
+
 /// A symbolic value.
 ///
 /// `Unknown` propagates: any operation on it stays unknown, and a path that
@@ -216,6 +249,27 @@ pub enum ObligationKind {
         /// callee's name otherwise. It is what names the failure in the report.
         message: String,
     },
+    /// A loop the caller bounded with `unwind:` was unwound that many times and its
+    /// exit edge was never reached, so the path after the loop cannot be explored.
+    ///
+    /// This is Kani's *unwinding assertion*: when the bound is explicit it is a
+    /// claim ("this loop finishes within N iterations"), and a path that runs off
+    /// the end of the bound *falsifies* it. Making it an obligation rather than a
+    /// silent cutoff is what stops a too-small bound from turning into a weaker
+    /// proof -- a `verified` under `unwind: 3` would be a statement about the first
+    /// three iterations only, which is exactly the soundness hole the clause exists
+    /// to avoid.
+    ///
+    /// It is a failure, not an incompleteness. Its verdict is the reachability of
+    /// the cutoff (the same query shape as a diverging call), so a reachable cutoff
+    /// comes back as a `Counterexample` naming an input that runs off the bound. A
+    /// loop with *no* `unwind:` still cuts off at `DEFAULT_UNWIND` as a plain
+    /// `unknown_paths` entry: the default is not a claim the caller made, so it is
+    /// reported as incompleteness rather than refuted.
+    UnwindBound {
+        /// The bound the caller declared.
+        bound: u32,
+    },
 }
 
 /// What a diverging call does, for the report's label.
@@ -290,6 +344,9 @@ impl std::fmt::Display for ObligationKind {
             ObligationKind::CalleeDiverges => {
                 write!(f, "the callee's postcondition is unsatisfiable")
             }
+            ObligationKind::UnwindBound { bound } => {
+                write!(f, "loop exceeded the declared `unwind: {bound}` bound")
+            }
             ObligationKind::DivergingCall { kind, message } => {
                 // `exit`/`abort` carry the callee's tail as their message, which
                 // is the label already; printing `exit: exit` reads as a stutter,
@@ -358,6 +415,12 @@ impl Obligation {
             ObligationKind::Panic { .. }
             | ObligationKind::Unreachable
             | ObligationKind::DivergingCall { .. } => matches!(self.verdict, Verdict::Unsat),
+            // The unwinding assertion asks "is the cutoff reachable"; like a panic
+            // query it is discharged by `Unsat`. It is only *created* on a path that
+            // has reached the cutoff, so it is a failure in practice -- but the
+            // polarity still has to be right, or a future caller that checks an
+            // un-reached bound would read the wrong way round.
+            ObligationKind::UnwindBound { .. } => matches!(self.verdict, Verdict::Unsat),
             ObligationKind::VacuousPrecondition => {
                 !matches!(self.verdict, Verdict::Unsat | Verdict::Unknown)
             }
@@ -398,7 +461,8 @@ impl Obligation {
                 // happens, and there is no single witness to name.
                 ObligationKind::Panic { .. }
                 | ObligationKind::Unreachable
-                | ObligationKind::DivergingCall { .. } => {
+                | ObligationKind::DivergingCall { .. }
+                | ObligationKind::UnwindBound { .. } => {
                     "holds for every input (the failure fires on all of them)".to_string()
                 }
                 // A postcondition or invariant query is `path => P`; `Valid` is
@@ -442,6 +506,12 @@ impl Obligation {
                 ObligationKind::Panic { .. }
                 | ObligationKind::Unreachable
                 | ObligationKind::DivergingCall { .. } => {
+                    "invalid: an `Unsat` verdict is a discharge for this kind".to_string()
+                }
+                // The unwinding assertion is discharged by `Unsat` too, so an
+                // `Unsat` here would be the pass case; reaching this arm means the
+                // obligation was recorded without a discharge, which is a bug.
+                ObligationKind::UnwindBound { .. } => {
                     "invalid: an `Unsat` verdict is a discharge for this kind".to_string()
                 }
                 // The precondition describes no input, so the contract is vacuous.
@@ -2297,6 +2367,12 @@ pub struct LoopSpec<'a> {
     pub invariant: Option<&'a str>,
     /// The `variant:` text, or `None` for partial correctness only.
     pub variant: Option<&'a str>,
+    /// The `unwind:` bound, or `None` to use [`DEFAULT_UNWIND`].
+    ///
+    /// A loop with no `invariant:` is unwound; this is how far. Raising it lets a
+    /// loop too long for the default be decided, and a bound that is still too
+    /// small is *reported* (the path becomes unknown), never silently cut.
+    pub unwind: Option<u32>,
 }
 
 /// Symbolic inputs a contract names, handed to the executor so that the
@@ -2629,6 +2705,7 @@ where
     // the walk starts, and a function with an invariant but no detectable back
     // edge is refused rather than silently unwound: the contract made a claim
     // and the tool must either honour it or say it could not.
+    let unwind = loops.unwind.unwrap_or(DEFAULT_UNWIND);
     let cut = match loops.invariant {
         None => None,
         Some(text) => match detect_loop(f) {
@@ -2695,20 +2772,35 @@ where
     }];
 
     let mut explored: usize = 0;
+    // The path budget grows with a *declared* bound: a caller who asks for more
+    // iterations is asking for more paths. See [`path_budget`].
+    let budget = path_budget(loops.unwind);
     while let Some(st) = work.pop() {
         // Bound the *number of paths*, not just each loop. A branch inside an
         // unwound loop multiplies paths without any single loop exceeding
         // `DEFAULT_UNWIND`, so this is the guard that makes the search
         // terminate; see [`DEFAULT_PATH_BUDGET`]. Stopping here is reported, not
         // hidden: the function becomes incomplete and says why.
-        if explored >= DEFAULT_PATH_BUDGET {
+        if explored >= budget {
             report.unknown_paths.push(format!(
-                "path budget exhausted after {DEFAULT_PATH_BUDGET} paths; the remainder was not explored"
+                "path budget exhausted after {budget} paths; the remainder was not explored"
             ));
             break;
         }
         explored += 1;
-        run_state(prog, st, &post, &mut report, &mut work, &seeds.pins, root, &rec_ctx, callees);
+        run_state(
+            prog,
+            st,
+            &post,
+            &mut report,
+            &mut work,
+            &seeds.pins,
+            root,
+            &rec_ctx,
+            callees,
+            unwind,
+            loops.unwind.is_some(),
+        );
     }
     report
 }
@@ -5012,11 +5104,23 @@ fn run_state<F>(
     root: usize,
     rec: &Option<RecCtx>,
     callees: &CalleeEnv<'_>,
+    unwind: u32,
+    unwind_declared: bool,
 )
 where
     F: Fn(Option<Var>, &[(u32, Var)]) -> Result<Pred, String>,
 {
     let cur = &prog.fns[st.frame.func];
+    // A path that cannot be taken is not a path. Pruning it is what lets
+    // unwinding stop at a loop's real trip count instead of at the bound: once a
+    // guard folds to a constant, the impossible edge is dropped rather than
+    // explored. It is sound -- an unsatisfiable path condition describes no
+    // execution -- and it keeps dead paths from spending the path budget and from
+    // reporting spurious "unmodelled" reasons. A feasible path is untouched, so
+    // every obligation a real run reaches is still recorded.
+    if matches!(find_obligation(st.path, pins), Verdict::Unsat) {
+        return;
+    }
     let block: Block = match cur.block(st.block) {
         Some(b) => b.clone(),
         None => {
@@ -5029,11 +5133,34 @@ where
     let key = (st.frame.func, st.block);
     let n = st.visits.entry(key).or_insert(0);
     *n += 1;
-    if *n > DEFAULT_UNWIND {
-        report.unknown_paths.push(format!(
-            "loop unwound past {DEFAULT_UNWIND} at bb{} of {}; assuming it exited would be unsound",
-            st.block, cur.name
-        ));
+    if *n > unwind {
+        if unwind_declared {
+            // A *declared* bound is a claim ("this loop finishes within N
+            // iterations"), so running off the end of it is Kani's *unwinding
+            // assertion*: a failure, not an incompleteness. Recording it as a
+            // failure rather than an `unknown_paths` entry is what stops a
+            // too-small bound from turning into a weaker proof: `verified` under
+            // `unwind: 3` would be a statement about the first three iterations
+            // only, which is exactly the soundness hole the clause exists to
+            // avoid. The verdict is the reachability of the cutoff -- the same
+            // query shape as a diverging call, and for the same reason -- so a
+            // reachable cutoff comes back as a `Counterexample` naming an input
+            // that runs off the bound, and one reached on every input as `Valid`.
+            // `Unsat` would be a discharge, but the path was already pruned when
+            // unsatisfiable, so the cutoff is a failure on every input that reaches
+            // it.
+            report.obligations.push(Obligation {
+                kind: ObligationKind::UnwindBound { bound: unwind },
+                verdict: find_obligation(st.path, pins),
+            });
+        } else {
+            // No bound was declared, so the cutoff is the default, which is not a
+            // claim anyone made. It stays an honest incompleteness.
+            report.unknown_paths.push(format!(
+                "loop unwound past {unwind} at bb{} of {}; assuming it exited would be unsound",
+                st.block, cur.name
+            ));
+        }
         return;
     }
 
@@ -7372,6 +7499,14 @@ mod tests {
             (ObligationKind::Unreachable, Verdict::Unsat, true),
             (ObligationKind::Unreachable, cex, false),
             (ObligationKind::Unreachable, Verdict::Unknown, false),
+            // The unwinding assertion is a reachability query too: it asks "is the
+            // cutoff reachable", so `Unsat` discharges it. The engine records it
+            // with `Valid` on a path that *did* reach the cutoff, which is the
+            // failure case -- the row a too-small `unwind:` lands on.
+            (ObligationKind::UnwindBound { bound: 3 }, Verdict::Valid, false),
+            (ObligationKind::UnwindBound { bound: 3 }, Verdict::Unsat, true),
+            (ObligationKind::UnwindBound { bound: 3 }, cex, false),
+            (ObligationKind::UnwindBound { bound: 3 }, Verdict::Unknown, false),
             // A vacuity check is discharged when it is *refuted*: some input
             // satisfies the precondition. `Unsat` here is the finding.
             (ObligationKind::VacuousPrecondition, Verdict::Valid, true),
@@ -7570,10 +7705,15 @@ mod tests {
     /// pins the property that matters: the call returns, and the incompleteness
     /// is reported rather than hidden.
     ///
+    /// The cutoff *named* may be the path budget or the loop-unwind bound
+    /// depending on how far dead-path pruning gets before either fires; the test
+    /// accepts either, because both are honest cutoffs and the property under
+    /// test is that *a* cutoff is reported and the call returns.
+    ///
     /// The MIR is embedded so the test runs on stable. `tests/mir.rs` covers the
     /// same function end-to-end but skips itself without `VERIF_RUSTC`.
     #[test]
-    fn a_branching_loop_reports_a_path_budget_rather_than_running_forever() {
+    fn a_branching_loop_reports_a_cutoff_rather_than_running_forever() {
         const COUNT_EVENS_MIR: &str = r#"
 fn count_evens(_1: u8) -> u8 {
     debug n => _1;
@@ -7627,7 +7767,11 @@ fn count_evens(_1: u8) -> u8 {
         // the path condition, which is what makes each successive path cost more
         // than the last. A hand-built `verify_fn` call without it settles
         // quickly, so it would not reproduce the defect.
-        let src = "/// requires: n <= 8\n/// ensures: ret <= 8\npub fn count_evens(n: u8) -> u8 { n }\n";
+        // A *symbolic* bound, so the loop cannot be pruned to a small trip count.
+        // With `n <= 8` the guard folds and the loop now decides (the pruning in
+        // `run_state` drops the unsatisfiable exit edge); this regression needs the
+        // unbounded shape to keep exercising the path budget.
+        let src = "/// requires: true\n/// ensures: true\npub fn count_evens(n: u8) -> u8 { n }\n";
         let specs = crate::mir::spec::extract(src);
         // Run on a thread with a large stack. The engine recurses through the
         // BDD and the frontend recurses through the term graph, so this workload
@@ -7652,7 +7796,9 @@ fn count_evens(_1: u8) -> u8 {
             other => panic!("expected an incomplete outcome, got {other:?}"),
         };
         assert!(
-            reasons.iter().any(|r| r.contains("path budget exhausted")),
+            reasons
+                .iter()
+                .any(|r| r.contains("path budget exhausted") || r.contains("unwound past")),
             "the cutoff must be named; reasons were {reasons:?}"
         );
     }

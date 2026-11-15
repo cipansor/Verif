@@ -145,6 +145,35 @@ pub struct FnContract {
     /// it). Like `decreases:`, at most one is taken: two measures could disagree,
     /// and picking either would be guessing which proof the source asked for.
     pub variant: Option<String>,
+    /// The loop-unwinding bound, from `/// unwind: <n>`.
+    ///
+    /// A function with a loop and no `invariant:` is *unwound*: the header is
+    /// re-entered up to `DEFAULT_UNWIND` times and the path is then reported
+    /// unknown. The default is deliberately small, and a loop that needs more
+    /// iterations than it allows is a *reported* refusal, not a silent cut. This
+    /// clause is how a caller says "unwind further": `unwind: 40` raises the bound
+    /// for this function so a loop too long for the default is decided rather than
+    /// refused. It is a bound on the number of times the *back edge* may be taken,
+    /// so it has to be at least the loop's trip count.
+    ///
+    /// It is supplied rather than inferred for the same reason an invariant is:
+    /// guessing a bound means guessing a proof. A non-numeric or zero value is
+    /// refused rather than defaulted.
+    ///
+    /// A *declared* bound is a claim ("this loop finishes within `n` iterations"),
+    /// so a path that runs off the end of it is Kani's **unwinding assertion**: a
+    /// `Failed` obligation naming the bound, not an incompleteness. That is what
+    /// keeps the clause sound -- a `verified` under `unwind: 3` would otherwise be
+    /// a statement about the first three iterations only. A loop with *no* bound
+    /// still cuts off at `DEFAULT_UNWIND`, but that default is not a claim the
+    /// caller made, so it is reported as incompleteness rather than refuted.
+    ///
+    /// Raising the bound is only useful because the walk *prunes* unsatisfiable
+    /// paths: once a guard folds to a constant the impossible edge is dropped, so a
+    /// loop reaches its exit edge at its real trip count instead of at the bound.
+    /// Without that pruning a raised bound is honoured but the loop still cannot
+    /// decide, because the infeasible exit edges are explored too.
+    pub unwind: Option<u32>,
     /// Clause-shaped doc-comment lines that are *not* clauses this frontend
     /// understands, as `(line number, the line as written)`.
     ///
@@ -2147,6 +2176,17 @@ pub fn extract(source: &str) -> Specs {
                 } else {
                     pending.variant = Some(r.trim().to_string());
                 }
+            } else if let Some(r) = t.strip_prefix("unwind:") {
+                // A loop-unwinding bound. It has to be a positive integer: a
+                // non-numeric or zero value is refused rather than defaulted, so a
+                // typo cannot silently fall back to `DEFAULT_UNWIND`.
+                match r.trim().parse::<u32>() {
+                    Ok(n) if n > 0 => pending.unwind = Some(n),
+                    _ => pending.unknown.push((
+                        lineno + 1,
+                        format!("{t} — `unwind:` needs a positive integer"),
+                    )),
+                }
             } else if let Some(note) = clause_shaped_word(t) {
                 // A line that reads like a clause but is not one this frontend
                 // takes. A typo (`ensuers:`) would otherwise be dropped and the
@@ -2167,6 +2207,7 @@ pub fn extract(source: &str) -> Specs {
                 || !pending.invariants.is_empty()
                 || !pending.decreases.is_empty()
                 || pending.variant.is_some()
+                || pending.unwind.is_some()
                 // A function carrying *only* a clause the frontend does not take
                 // is still recorded, so it can be refused rather than dropped:
                 // dropping it would leave the function unverified with no
@@ -2249,7 +2290,8 @@ pub fn extract(source: &str) -> Specs {
 /// keyword and is left as documentation, so a sentence that merely contains a
 /// colon does not fire this.
 fn clause_shaped_word(t: &str) -> Option<String> {
-    const KEYWORDS: [&str; 5] = ["requires", "ensures", "invariant", "decreases", "variant"];
+    const KEYWORDS: [&str; 6] =
+        ["requires", "ensures", "invariant", "decreases", "variant", "unwind"];
     let word = t.split(':').next()?.trim();
     // A clause keyword is a bare identifier; anything else is prose or a value.
     if word.is_empty() || !word.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
@@ -8650,6 +8692,37 @@ mod tests {
         let c = specs.by_fn.get("f").expect("a `decreases:` alone is a claim");
         assert_eq!(c.decreases, vec!["n".to_string()], "the measure text must be kept");
         assert!(c.requires.is_empty() && c.ensures.is_empty());
+    }
+
+    /// `unwind: <n>` is read as a number and counts as a claim, so a function that
+    /// carries only an `unwind:` is not silently dropped.
+    #[test]
+    fn an_unwind_clause_is_read_and_counts_as_a_claim() {
+        let src = "/// unwind: 40\n\
+                   pub fn f(n: u8) -> u8 { n }\n";
+        let specs = extract(src);
+        let c = specs.by_fn.get("f").expect("an `unwind:` alone is a claim");
+        assert_eq!(c.unwind, Some(40), "the bound must be read as a number");
+        assert!(c.requires.is_empty() && c.ensures.is_empty());
+    }
+
+    /// A non-numeric, zero or negative `unwind:` is refused rather than defaulted.
+    ///
+    /// A guessed bound is a guessed proof, and a bound of zero would make every
+    /// loop an immediate cutoff while reading as an ordinary clause. `unwind:`
+    /// must therefore name a positive integer or the function is `Skipped`.
+    #[test]
+    fn a_non_numeric_or_zero_unwind_is_refused() {
+        for bad in ["unwind: 0", "unwind: abc", "unwind: -1", "unwind: 1.5"] {
+            let src = format!("/// {bad}\npub fn f(n: u8) -> u8 {{ n }}\n");
+            let specs = extract(&src);
+            let c = specs.by_fn.get("f").expect("the item is still read");
+            assert!(
+                c.unwind.is_none(),
+                "`{bad}` must not become a bound; got {:?}",
+                c.unwind
+            );
+        }
     }
 
     /// The measure is evaluated against the arguments, and its signedness travels
