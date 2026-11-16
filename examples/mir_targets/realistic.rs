@@ -11331,6 +11331,60 @@ pub fn ilog10_is_bounded(a: u8) -> u32 {
     a.ilog10()
 }
 
+/// `checked_ilog2` is `Some(6)` for `100` (`2^6 = 64 <= 100 < 128`).
+/// requires: a == 100
+/// ensures: ret.is_some() && ret.Some == 6
+pub fn checked_ilog2_in_range(a: u8) -> Option<u32> {
+    a.checked_ilog2()
+}
+
+/// The false direction: the payload is `6`, so a model that read the tag or the
+/// payload the wrong way round would prove this.
+/// requires: a == 100
+/// ensures: ret.is_some() && ret.Some == 7
+pub fn checked_ilog2_overflow_is_some_cannot_prove_this(a: u8) -> Option<u32> {
+    a.checked_ilog2()
+}
+
+/// `checked_ilog2` is `None` on `0`, where the plain call would panic -- so no
+/// panic obligation is emitted here, and the value is the `None` tag.
+/// requires: a == 0
+/// ensures: ret.is_none()
+pub fn checked_ilog2_of_zero_is_none(a: u8) -> Option<u32> {
+    a.checked_ilog2()
+}
+
+/// `checked_ilog10` is `Some(2)` for `100`.
+/// requires: a == 100
+/// ensures: ret.is_some() && ret.Some == 2
+pub fn checked_ilog10_in_range(a: u8) -> Option<u32> {
+    a.checked_ilog10()
+}
+
+/// `checked_ilog10` is `None` on `0` (the plain `ilog10` would panic there).
+/// requires: a == 0
+/// ensures: ret.is_none()
+pub fn checked_ilog10_of_zero_is_none(a: u8) -> Option<u32> {
+    a.checked_ilog10()
+}
+
+/// `checked_ilog2` on a signed argument is signed too: `-1i8` is non-positive,
+/// so it is `None`.
+/// requires: a == -1
+/// ensures: ret.is_none()
+pub fn checked_ilog2_of_a_negative_is_none(a: i8) -> Option<u32> {
+    a.checked_ilog2()
+}
+
+/// `checked_ilog2` on a signed argument reads the signed order: `-1i8` is
+/// `0xff`, the *largest* unsigned byte, so an unsigned model would report
+/// `Some(7)` where Rust reports `None`.
+/// requires: a == -1
+/// ensures: ret.is_some() && ret.Some == 7
+pub fn checked_ilog2_of_a_negative_cannot_prove_this(a: i8) -> Option<u32> {
+    a.checked_ilog2()
+}
+
 /// `100u8.next_power_of_two()` is `128` (`2^7`, the smallest power of two that
 /// is `>= 100`), not `100` or `64`.
 /// requires: a == 100

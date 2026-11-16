@@ -5379,6 +5379,7 @@ fn try_intrinsic(
             | intrinsics::Intrinsic::UnsignedAbs
             | intrinsics::Intrinsic::Signum
             | intrinsics::Intrinsic::Ilog(_)
+            | intrinsics::Intrinsic::CheckedIlog(_)
             | intrinsics::Intrinsic::NextPowerOfTwo
             | intrinsics::Intrinsic::CheckedNextPowerOfTwo
             | intrinsics::Intrinsic::BitReverse
@@ -5416,13 +5417,24 @@ fn try_intrinsic(
                 Ok(Vec::new())
             }
             Outcome::Option { tag, payload } => {
-                // `checked_neg` and `checked_abs` return an `Option`.
+                // `checked_neg`, `checked_abs`, `checked_next_multiple_of` and the
+                // `checked_` logarithms return an `Option`. The payload's type is
+                // the operand's (`checked_next_multiple_of` returns `Option<T>`),
+                // so its sign and width follow the operand -- *except* for a
+                // `checked_ilog*`, whose payload is a `u32` whatever the operand's
+                // type (`i32::checked_ilog2` is `Option<u32>`), the same
+                // result-width rule the plain logarithm already follows.
+                let (payload_sign, payload_w) = if matches!(op, intrinsics::Intrinsic::CheckedIlog(_)) {
+                    (Sign::Unsigned, result_w)
+                } else {
+                    (Sign::of_bool(signed), w)
+                };
                 env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
                 env.set_payload(
                     dest.local,
                     intrinsics::SOME_TAG,
-                    Val::Sym(payload, Sign::of_bool(signed)),
-                    w,
+                    Val::Sym(payload, payload_sign),
+                    payload_w,
                 );
                 Ok(Vec::new())
             }

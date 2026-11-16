@@ -2143,7 +2143,9 @@ refused. `src/mir/intrinsics.rs` holds the model:
   `Option` (`None` exactly where the plain call would panic, so its tag is a term
   and no panic obligation is emitted). `ilog2`/`ilog10` exist on both signednesses,
   are value-and-panic (a
-  non-positive argument panics), and return a `u32` whatever the operand's type.
+  non-positive argument panics), and return a `u32` whatever the operand's type;
+  `checked_ilog2`/`checked_ilog10` are the same value as an `Option`, `None` exactly
+  where the plain form panics, with the same `u32` payload.
   `next_power_of_two` (unsigned-only) and its `checked_` counterpart are the
   rounding sibling of `is_power_of_two`: the classic smear-and-add (`p = x - 1`,
   forced to `0` for `x <= 1`; `p |= p >> 1; p |= p >> 2; …`; `p + 1`), which is

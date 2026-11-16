@@ -230,6 +230,15 @@ pub enum Intrinsic {
     /// the same polarity as `iN::abs`'s overflow. `ilog2` exists on both
     /// signednesses; `ilog10` on both too.
     Ilog(LogKind),
+    /// `iN::checked_ilog2`/`checked_ilog10`: the integer logarithm as an `Option`.
+    ///
+    /// The `Option` counterpart of [`Intrinsic::Ilog`]: `None` exactly where the
+    /// plain call would panic (a non-positive argument), so the tag is the
+    /// *negation* of the same failure predicate and no panic obligation is
+    /// emitted. Its result is a `u32` whatever the operand's type, exactly as the
+    /// plain form's is, so it is zero-extended to `result_w`. Exists on both
+    /// signednesses.
+    CheckedIlog(LogKind),
     /// `iN::next_multiple_of`: the smallest multiple of `b` that is `>= a`.
     ///
     /// A method that *panics*: on a zero divisor, and on an overflow (`u8::MAX`
@@ -888,6 +897,7 @@ impl Intrinsic {
             Intrinsic::Unary(..)
                 | Intrinsic::Bits(_)
                 | Intrinsic::Ilog(_)
+                | Intrinsic::CheckedIlog(_)
                 | Intrinsic::Bool(
                     BoolKind::PowerOfTwo
                         | BoolKind::Ascii(_)
@@ -1214,6 +1224,15 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     }
     if short == "ilog10" {
         return Some(Intrinsic::Ilog(LogKind::Ilog10));
+    }
+    // The `checked_` spellings of the logs: the same value as an `Option`, `None`
+    // exactly where the plain form panics. They are their own shape for the same
+    // reason `checked_next_multiple_of` is -- the plain form is a `ValueOrPanic`.
+    if short == "checked_ilog2" {
+        return Some(Intrinsic::CheckedIlog(LogKind::Ilog2));
+    }
+    if short == "checked_ilog10" {
+        return Some(Intrinsic::CheckedIlog(LogKind::Ilog10));
     }
     if short == "reverse_bits" {
         return Some(Intrinsic::BitReverse);
@@ -1594,6 +1613,8 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // the operand width and zero-extended, so any width the engine holds is
         // fine.
         Intrinsic::Ilog(_) => true,
+        // The `checked_` logarithms have the same domain as the plain ones.
+        Intrinsic::CheckedIlog(_) => true,
         // `next_power_of_two`/`checked_next_power_of_two` are unsigned-only (the
         // signed types have no such method) and build no divider, so any width the
         // engine holds is fine.
@@ -2113,6 +2134,22 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             }
             let fails = ilog_fails(x, signed);
             Outcome::ValueOrPanic { value: smt::truncate(ilog_value(kind, x, w), result_w), fails }
+        }
+        // `checked_ilog2`/`checked_ilog10`: the same value and the same failure
+        // condition as the plain logarithm, as an `Option`. The tag is a *term*
+        // -- `1` where the operand is positive, `0` where the plain call would
+        // panic -- built at the *operand* width, exactly as the other `checked_*`
+        // tags are. The payload is the `u32` index, zero-extended to `result_w`
+        // like the plain form's value.
+        Intrinsic::CheckedIlog(kind) => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            let fails = ilog_fails(x, signed);
+            Outcome::Option {
+                tag: smt::ite(fails, smt::word(0, w), smt::word(1, w)),
+                payload: smt::truncate(ilog_value(kind, x, w), result_w),
+            }
         }
         // `next_power_of_two`: the smallest power of two `>= x`. Unsigned-only. The
         // value is the smear-and-add, which is total at `w` bits; the failure is a
@@ -6093,6 +6130,87 @@ mod tests {
         });
     }
 
+    /// `checked_ilog2`/`checked_ilog10` agree with Rust over the whole `u8`/`i8`
+    /// domain, tag and payload together.
+    ///
+    /// The tag is the point: `Some` exactly where the plain logarithm is defined
+    /// (`x > 0`) and `None` where it would panic, so a model that wrote the tag
+    /// the wrong way round -- or built it at the wrong width -- is caught here
+    /// rather than only at a corpus fixture. The payload is a `u32`, so
+    /// `result_w` is `32` and the walk checks the widened term, which is what a
+    /// caller reads.
+    #[test]
+    fn the_checked_logs_agree_with_rust() {
+        for (kind, oracle_u, oracle_i, label) in [
+            (
+                LogKind::Ilog2,
+                (|x: u8| x.checked_ilog2().map(u64::from)) as fn(u8) -> Option<u64>,
+                (|x: i8| x.checked_ilog2().map(u64::from)) as fn(i8) -> Option<u64>,
+                "checked_ilog2",
+            ),
+            (
+                LogKind::Ilog10,
+                (|x: u8| x.checked_ilog10().map(u64::from)) as fn(u8) -> Option<u64>,
+                (|x: i8| x.checked_ilog10().map(u64::from)) as fn(i8) -> Option<u64>,
+                "checked_ilog10",
+            ),
+        ] {
+            for xb in 0..=u8::MAX {
+                let x = xb;
+                check_checked_log(
+                    Intrinsic::CheckedIlog(kind),
+                    false,
+                    xb as u64,
+                    oracle_u(x),
+                    &format!("u8::{label} at {x}"),
+                );
+            }
+            for xb in 0..=u8::MAX {
+                let x = i8::from_ne_bytes([xb]);
+                check_checked_log(
+                    Intrinsic::CheckedIlog(kind),
+                    true,
+                    xb as u64,
+                    oracle_i(x),
+                    &format!("i8::{label} at {x}"),
+                );
+            }
+        }
+    }
+
+    /// Evaluate a `checked_ilog*` model at one input and compare tag and payload.
+    ///
+    /// The payload is compared only where Rust returns `Some`; where it returns
+    /// `None` the model's payload is unconstrained (a path that takes the `None`
+    /// arm never reads it), so asserting it would be asserting something the
+    /// model does not claim.
+    fn check_checked_log(
+        op: Intrinsic,
+        signed: bool,
+        bits: u64,
+        want: Option<u64>,
+        label: &str,
+    ) {
+        smt::with_fresh(|| {
+            let a = smt::var(8);
+            let outcome = eval(op, a, a, 8, signed, 32)
+                .unwrap_or_else(|| panic!("{label} must be modelled"));
+            let Outcome::Option { tag, payload } = outcome else {
+                panic!("{label} must produce an `Option` outcome");
+            };
+            let ai = smt::index(a);
+            let env = |i: u32| if i == ai { Some(bits) } else { None };
+            assert_eq!(
+                smt::evaluate(tag, env),
+                Some(if want.is_some() { 1 } else { 0 }),
+                "{label}: tag"
+            );
+            if let Some(v) = want {
+                assert_eq!(smt::evaluate(payload, env), Some(v), "{label}: payload");
+            }
+        });
+    }
+
     /// The width-aware oracle for `next_power_of_two`: `Some(2^ceil(log2 x))`
     /// when that fits `w` bits, `None` when it does not.
     ///
@@ -6330,6 +6448,14 @@ mod tests {
         assert_eq!(classify("core::num::<impl u32>::ilog2"), Some(Intrinsic::Ilog(LogKind::Ilog2)));
         assert_eq!(classify("core::num::<impl i32>::ilog2"), Some(Intrinsic::Ilog(LogKind::Ilog2)));
         assert_eq!(classify("core::num::<impl u32>::ilog10"), Some(Intrinsic::Ilog(LogKind::Ilog10)));
+        assert_eq!(
+            classify("core::num::<impl u32>::checked_ilog2"),
+            Some(Intrinsic::CheckedIlog(LogKind::Ilog2))
+        );
+        assert_eq!(
+            classify("core::num::<impl i32>::checked_ilog10"),
+            Some(Intrinsic::CheckedIlog(LogKind::Ilog10))
+        );
         assert_eq!(classify("core::num::<impl i32>::ilog10"), Some(Intrinsic::Ilog(LogKind::Ilog10)));
         // The `_bytes` forms return an array, so they are left unclassified rather
         // than modelled as a word.

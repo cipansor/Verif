@@ -531,6 +531,16 @@ with no new false proof while the independent corpus keeps growing.
     by `the_new_num_methods_verify_and_their_tripwires_refute`; checked
     exhaustively against `core`'s own `checked_next_multiple_of` over the whole
     `u8` domain (`checked_next_multiple_of_agrees_with_rust`).
+  - Progress (cont.): `iN::checked_ilog2`/`checked_ilog10` are modelled — the
+    `Option` counterpart of the panicking logarithms, with `None` exactly where the
+    plain call would panic (a non-positive argument), and the same `u32` payload as
+    the plain form (so the payload is zero-extended to the destination's width, the
+    one `checked_*` shape whose result width differs from the operand's). Seven
+    fixtures (five true, two tripwires) in `realistic.rs` (**543 of 1001**), pinned
+    by `the_new_num_methods_verify_and_their_tripwires_refute`; checked
+    exhaustively against `core`'s own `checked_ilog2`/`checked_ilog10` over the
+    whole `u8`/`i8` domain, tag and payload together
+    (`the_checked_logs_agree_with_rust`).
   - Remaining: the *generic* `<[T]>::first/get/len/is_empty` (`first_or<T>`) need
     monomorphisation, which is C10: `first_or`'s element type has no width and its
     slice length is never seeded (the frontend refuses a receiver whose length it
