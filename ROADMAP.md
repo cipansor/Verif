@@ -387,16 +387,22 @@ Exit: one real `no_std` crate with a dependency verified end to end with
   - Exit: one function in a real `no_std` crate with at least one dependency
     (an `embedded-hal` driver, say) verified end to end with `cargo verif`.
   - Move: **build**.
-- **C9. References and aliasing.** · P1 · in progress · Prusti (ownership),
-    Creusot (prophecies)
+- **C9. References and aliasing.** · P1 · **done** (scalar referents) · Prusti
+    (ownership), Creusot (prophecies)
   - Gap: reference arguments are refused ("no aliasing model"), yet `&`/`&mut`
-    are the norm. **Partly built:** `&T`/`&mut T` arguments, writes through them,
+    are the norm. **Built:** `&T`/`&mut T` arguments, writes through them,
     returned references and two-reference targets are modelled (see the `AGENTS.md`
-    sections on the call boundary). What remains is the *general* case the
-    ownership model buys.
+    sections on the call boundary). A **scalar referent named in a contract** is
+    now modelled too: a `&mut u16` argument's name denotes the value it addresses,
+    the postcondition's name is the *final* value, and `old(name)` / `old(*name)`
+    reaches the entry value (`*c` and `c` are one binding). What remains is the
+    *general* case the ownership model buys (a reference to an aggregate named as a
+    whole, aliasing between two arguments that may point at one place).
   - Exit: `fn bump(c: &mut u16)` with `ensures: *c == old(*c) + 1` verified and
-    its caller verified modularly.
-  - Move: **build**.
+    its caller verified modularly. **Met** -- `bump_scalar_ref_star` and
+    `a_scalar_ref_caller` in `examples/mir_targets/realistic.rs`, pinned by
+    `a_scalar_reference_argument_is_named_in_a_contract`.
+  - Move: **done**.
 - **C10. Generics, traits, closures and `dyn`.** · P1 · in progress · Kani
   (monomorphised instances)
   - Gap: generics are partly supported; "indirect call not modelled" ends the
@@ -417,10 +423,13 @@ Exit: one real `no_std` crate with a dependency verified end to end with
   - `old(x)` in contracts; quantifiers; mathematical integers (a spec must not
     overflow itself); pure spec functions; ghost code and lemmas; `modifies`/frame
     clauses; type invariants. **Partly built:** `old` via a caller snapshot and a
-    `wp::unchanged` query, bounded quantifiers in `quant`, frames derived by
+    `wp::unchanged` query (the wp layer), and now in the **MIR frontend** too:
+    `old(name)` / `old(*name)` reads a reference argument's *entry* value while a
+    bare name reads its *final* value, so a two-state spec over a `&mut` argument
+    is expressible (see C9). Bounded quantifiers in `quant`, frames derived by
     `wp::writes`.
   - Exit: a contract with a `forall i < n: a[i] <= m` verified.
-  - Move: **build**.
+  - Move: **build** (the `old` sub-item is done).
 - **C13. Rust's own contract attributes as input.** · P1 · todo · the `contracts`
     crate
   - Approach: read `#[core::contracts::requires/ensures]`

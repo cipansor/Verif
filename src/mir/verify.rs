@@ -521,6 +521,23 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         return FnOutcome::Skipped { reason };
     }
     let arg_vars = spec::arg_vars_named(f, rename.as_ref());
+    // The *entry* value of each reference argument, keyed by the contract's name
+    // for it, for `old(c)` in a postcondition. A bare `c` in an `ensures` is the
+    // value at *return* (see the `post` closure), so this is the only route back to
+    // the input. Built once, from the same bindings `arg_vars` uses, so a name and
+    // its entry value cannot disagree.
+    let old_args_for_post: BTreeMap<String, smt::Var> = f
+        .arg_locals
+        .iter()
+        .filter_map(|&l| {
+            if !matches!(f.ty_of(l), Some(Ty::Ref(_))) {
+                return None;
+            }
+            let name = spec::arg_name_of(f, rename.as_ref(), l)?;
+            let v = *arg_vars.get(&name)?;
+            Some((name, v))
+        })
+        .collect();
     let signed = spec::signed_args_named(f, rename.as_ref());
     // Fields of struct-typed arguments, bound to their own symbolic inputs. The
     // same bindings are handed to the executor as seeds, so `c.lo` in a contract
@@ -749,6 +766,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
                 &signed,
                 ret_signed,
                 &probe_fields,
+                &old_args_for_post,
             )
             .err()
         }) {
@@ -757,6 +775,17 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     }
     let args_for_post = arg_vars.clone();
     let fields_for_post = fields.clone();
+    // The names bound to a reference-to-scalar argument. A bare one in an `ensures`
+    // means its value at *return*, so the `post` closure must rebind it to the final
+    // value -- and, when the final value is not known on this path, *remove* it, so
+    // the name is refused rather than silently read as the entry value. Falling back
+    // to the entry value is the false proof this shape closed.
+    let ref_arg_names: Vec<String> = f
+        .arg_locals
+        .iter()
+        .filter(|&&l| matches!(f.ty_of(l), Some(Ty::Ref(_))))
+        .filter_map(|&l| spec::arg_name_of(f, rename.as_ref(), l))
+        .collect();
     // The return type's components, for a postcondition that names `ret.N`. The
     // type comes from the MIR (`-> (u8, u8)`), so the binding is to the declared
     // shape rather than to whichever elements a particular path happened to
@@ -804,7 +833,30 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     let post = if ensures.is_empty() {
         None
     } else {
-        Some(move |ret: Option<smt::Var>, projs: &[(u32, smt::Var)]| {
+        Some(move |ret: Option<smt::Var>,
+                   projs: &[(u32, smt::Var)],
+                   ref_final: &[(u32, smt::Var)]| {
+            // A reference argument's name denotes the value the body left at the
+            // target, so a bare `c` in the postcondition is bound to the *final*
+            // value. Binding it to the entry value instead (which `arg_vars` holds)
+            // was a false proof: `ensures: c == 0` on `*c = 5` verified, because
+            // `c` still named the input. The entry value stays reachable through
+            // `old(c)`, which is why the two maps are handed over separately.
+            //
+            // A reference argument whose final value is not known on this path is
+            // *removed* from the map rather than left at its entry value: a bare
+            // name that could not be read at return must be refused, never quietly
+            // resolved to the input. `old(name)` still works -- the entry value is
+            // known regardless of what the body did.
+            let mut args = args_for_post.clone();
+            for name in &ref_arg_names {
+                args.remove(name);
+            }
+            for (l, v) in ref_final {
+                if let Some(name) = spec::arg_name_of(f, rename.as_ref(), *l) {
+                    args.insert(name, *v);
+                }
+            }
             // Bind each declared component that this path actually produced.
             let mut fields = fields_for_post.clone();
             for (i, ty) in ret_components.iter().enumerate() {
@@ -825,12 +877,13 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             for e in &ensures {
                 let p = spec::eval_ensures(
                     e,
-                    &args_for_post,
+                    &args,
                     ret,
                     ret_absent,
                     &signed,
                     ret_signed,
                     &fields,
+                    &old_args_for_post,
                 )
                 .map_err(|err| err.to_string())?;
                 acc = Some(match acc {

@@ -6676,6 +6676,44 @@ std --all-targets -- -D warnings` clean; `scripts/gate.sh` green (bare-metal bui
 zero-dependency and no_std gates included). Gate green; zero dependencies and `no_std`
 untouched.
 
+## A scalar reference argument's name is its *final* value; `old(name)` is its entry value
+
+`Ty::Ref` is modelled as its referent, so a `&mut u16` argument's name in a contract
+denotes the `u16` it addresses -- one word, the same one the body's `*c` reads and
+writes. The first cut of C9 bound that name to the argument's *entry* value (the same
+`arg_vars` map every by-value argument uses). That was a **false proof**: with
+`requires: c == 0` / `ensures: c == 0` on `*c = 5`, the postcondition's `c` still named
+the input, so the contract held and the function was reported `verified` for a body
+that leaves 5.
+
+The fix has two halves, and the second is the one that makes two-state specs possible:
+
+- **A bare name in an `ensures` is the value at *return*.** The executor collects the
+  final value of every reference-to-scalar argument at the root `return`
+  (`ref_final`) and the `post` closure rebinds that argument's name to it, so the
+  postcondition is checked against what the body left there. A by-value argument is
+  *not* rebound: the body cannot write it, so its final value *is* its entry value and
+  a second binding would be the same word.
+- **`old(name)` reaches the entry value.** The entry bindings are handed to the parser
+  as `old_args`, a map only `eval_ensures` fills. `old(c)` on a name with no entry
+  value is **refused**, not silently read as the name itself -- so `old` on a by-value
+  argument does not become a second spelling of the same thing. The lookup is gated on
+  a following `(`, so an argument literally *named* `old` still resolves.
+
+`*c` is accepted as the explicit spelling of the referent `c` already denotes: the two
+are one binding, because a contract is this crate's own language rather than a compiled
+program. So the roadmap's exit shape, `fn bump(c: &mut u16)` with
+`ensures: *c == old(*c) + 1`, now verifies, and its caller verifies through the inlined
+body (`bump_scalar_ref_star` and `a_scalar_ref_caller` in `realistic.rs`).
+
+The signed case is pinned by `signed_scalar_ref` (`&mut i16`, `ensures: c < 0`): an
+unsigned reading would call `-1` the largest value, so the postcondition would be
+refuted -- `verified` is the evidence the referent's sign was read. The false
+directions are the teeth: `a_stale_scalar_ref_cannot_prove_this` (`ensures: c == old(c)`)
+and `a_scalar_ref_write_cannot_prove_this` (`ensures: c == 0` on `*c = 5`) must both be
+**refuted**, and each *verifies* under the pre-fix binding, which is what makes them
+regression tests rather than happy-path assertions.
+
 ## A helper's write through a `&mut` argument died with the callee's frame
 
 The inliner copied a callee's post-state back to the caller for exactly one kind of

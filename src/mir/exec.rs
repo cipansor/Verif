@@ -2568,7 +2568,7 @@ pub fn verify_fn<F>(
     rec: Option<Recursion>,
 ) -> MirReport
 where
-    F: Fn(Option<Var>, &[(u32, Var)]) -> Result<Pred, String>,
+    F: Fn(Option<Var>, &[(u32, Var)], &[(u32, Var)]) -> Result<Pred, String>,
 {
     let mut report = MirReport { function: f.name.clone(), ..Default::default() };
 
@@ -2614,7 +2614,13 @@ where
         smt::word(k & mask, w)
     };
     for &l in &f.arg_locals {
-        let ty = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
+        let decl = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
+        // `Ty::Ref` is modelled as its referent, so a `&u16` argument is seeded at
+        // the *referent's* width and sign -- the same variable the contract's `c`
+        // binds to (see `arg_vars_named`). Seeding it `Unknown` instead made a
+        // contract that names a scalar reference argument unreadable, which is the
+        // C9 exit shape (`bump(c: &mut u16)` with `ensures: c == old(c) + 1`).
+        let ty = decl.referent().clone();
         let v = match ty.width() {
             Some(w) => {
                 let sym = smt::var_named(l, w);
@@ -2632,7 +2638,7 @@ where
         env.locals.insert(l, v);
         // A `&T` argument may be dereferenced: `Ty::Ref` is modelled as its
         // referent, so `*_1` names the same value `_1` does.
-        if matches!(ty, Ty::Ref(_)) {
+        if matches!(decl, Ty::Ref(_)) {
             env.deref_ok.insert(l, ());
         }
     }
@@ -3772,6 +3778,7 @@ fn try_callee_contract(
             &cc.signed,
             cc.ret_signed,
             &fields,
+            &BTreeMap::new(),
         ) {
             Ok(p) => post = Some(match post {
                 None => p,
@@ -4024,6 +4031,7 @@ fn try_recursive_call(
             &rc.rec.signed,
             ret_signed,
             &fields,
+            &BTreeMap::new(),
         ) {
             Ok(p) => post_assumed = Some(match post_assumed {
                 None => p,
@@ -5423,7 +5431,7 @@ fn run_state<F>(
     unwind_declared: bool,
 )
 where
-    F: Fn(Option<Var>, &[(u32, Var)]) -> Result<Pred, String>,
+    F: Fn(Option<Var>, &[(u32, Var)], &[(u32, Var)]) -> Result<Pred, String>,
 {
     let cur = &prog.fns[st.frame.func];
     // A path that cannot be taken is not a path. Pruning it is what lets
@@ -5691,7 +5699,27 @@ where
                             Val::Bool(rp) => Some(smt::ite(rp, smt::word(1, 1), smt::word(0, 1))),
                             _ => None,
                         };
-                        match post(rv, &projs) {
+                        // The *final* value of each reference argument, so an
+                        // `ensures` that names one means what the body left there
+                        // and `old(name)` reaches the entry value. A reference
+                        // shares the caller's storage, so the value at return is
+                        // the post-state one. Only reference-to-scalar arguments
+                        // are collected: a reference to an aggregate has no single
+                        // word, and a by-value argument cannot be written by the
+                        // body, so neither needs a second binding.
+                        let mut ref_final: Vec<(u32, Var)> = Vec::new();
+                        for &l in &cur.arg_locals {
+                            if !matches!(cur.ty_of(l), Some(Ty::Ref(_))) {
+                                continue;
+                            }
+                            if cur.ty_of(l).and_then(|t| t.referent().width()).is_none() {
+                                continue;
+                            }
+                            if let Val::Sym(v, _) = st.env.get(&Place::new(l)) {
+                                ref_final.push((l, v));
+                            }
+                        }
+                        match post(rv, &projs, &ref_final) {
                             Ok(p) => {
                                 report.obligations.push(Obligation {
                                     kind: ObligationKind::Postcondition,

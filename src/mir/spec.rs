@@ -4064,6 +4064,7 @@ pub const RET_IS_AGGREGATE: &str =
 pub const RET_IS_UNKNOWN: &str = "the return value is not known on this path";
 
 /// Turn an `ensures` contract into a predicate over the arguments and `ret`.
+#[allow(clippy::too_many_arguments)]
 pub fn eval_ensures(
     text: &str,
     args: &BTreeMap<String, Var>,
@@ -4072,6 +4073,7 @@ pub fn eval_ensures(
     signed: &BTreeSet<String>,
     ret_signed: bool,
     fields: &FieldEnv,
+    old_args: &BTreeMap<String, Var>,
 ) -> Result<Pred, SpecError> {
     let orig = text;
     let text = rewrite_fields(text, fields)?;
@@ -4084,6 +4086,7 @@ pub fn eval_ensures(
     p.variant_consts = fields.variant_consts.clone();
     p.enum_args = fields.enum_args.clone();
     p.consts = fields.consts.clone();
+    p.old_args = old_args.clone();
     let pred = p.parse_or().map_err(|e| e.about(orig))?;
     p.expect_end().map_err(|e| e.about(orig))?;
     Ok(pred)
@@ -4309,6 +4312,14 @@ struct Parser<'a> {
     /// `const` name is refused rather than guessed at -- the same answer the
     /// reader gave before this table existed. See [`FieldEnv::consts`].
     consts: BTreeMap<String, Const>,
+    /// The *entry* value of each name a contract may write `old(name)` for.
+    ///
+    /// A reference argument's name denotes the value it addresses, which the body
+    /// may write, so an `ensures` that names it means the value at *return*; the
+    /// entry value is reachable only through `old`. Empty outside an `ensures`,
+    /// where `old` is refused rather than guessed -- the same discipline as
+    /// `ret_absent`.
+    old_args: BTreeMap<String, Var>,
     /// The `(min, max)` envelope, as `i128`, of the *literals and folded
     /// intermediate values* in the term a `Var` holds. Rust range-checks every
     /// literal and every constant `+ - *` intermediate against the type the
@@ -4530,6 +4541,7 @@ impl<'a> Parser<'a> {
             variant_consts: BTreeMap::new(),
             enum_args: BTreeSet::new(),
             consts: BTreeMap::new(),
+            old_args: BTreeMap::new(),
             range: BTreeMap::new(),
             bare_literals: BTreeSet::new(),
             amount_floor: 0,
@@ -5953,6 +5965,22 @@ impl<'a> Parser<'a> {
     /// comparisons consult the flag, so the mistake is a *wrong value* rather than
     /// a refusal -- the one outcome a verifier must not produce silently.
     fn parse_neg(&mut self) -> Result<(Var, Sign), SpecError> {
+        // `*c` names the value a reference argument addresses, which is the same
+        // word the bare `c` names (the referent *is* the value), so the two are
+        // one binding. A contract is this crate's own language rather than a
+        // compiled program, so `*NAME` is read as `NAME` for any bound name; the
+        // value is the one the name already denotes, so no reading is invented.
+        if self.eat_op("*") {
+            let Some(Tok::Ident(inner)) = self.peek().cloned() else {
+                return Err(self.err("`*` must be applied to a name"));
+            };
+            self.pos += 1;
+            let v = *self
+                .args
+                .get(&inner)
+                .ok_or_else(|| self.err(format!("unknown name `{inner}`")))?;
+            return Ok((v, Sign::from_bool(self.is_signed_name(&inner))));
+        }
         if self.eat_op("-") {
             let (v, sgn) = self.parse_neg()?;
             // Rust rejects `-x` for an unsigned `x` (`E0600: cannot apply unary
@@ -6283,6 +6311,39 @@ impl<'a> Parser<'a> {
                     // width check then refuses a literal compared against a
                     // wider operand, which is the right refusal.
                     return Ok((smt::word(u64::from(name == "true"), 1), Sign::Literal));
+                }
+                // `old(name)` — the value a name held at *entry*. A reference
+                // argument's name denotes the value it addresses, which the body
+                // may write, so a bare `c` in an `ensures` is the value at
+                // *return*; the entry value is reachable only through `old`.
+                // Only a name the caller recorded an entry value for is admitted
+                // (a reference-to-scalar argument); anything else is refused, so
+                // `old` on a by-value argument -- whose entry value is just its
+                // value, and which the body cannot change -- is not silently
+                // accepted as a second spelling of the same thing.
+                //
+                // Gated on the `(` so an argument *named* `old` still resolves:
+                // `old == 5` is the argument, `old(c)` is the operator.
+                if name == "old" && matches!(self.peek(), Some(Tok::Op(o)) if o == "(") {
+                    self.pos += 1;
+                    // `old(*c)` and `old(c)` name the same entry value: the deref
+                    // is the explicit spelling of the referent the bare name
+                    // already denotes.
+                    self.eat_op("*");
+                    let Some(Tok::Ident(inner)) = self.peek().cloned() else {
+                        return Err(self.err("`old(...)` must name a variable"));
+                    };
+                    self.pos += 1;
+                    if !self.eat_op(")") {
+                        return Err(self.err("`old(...)` takes a single name"));
+                    }
+                    let Some(v) = self.old_args.get(&inner).copied() else {
+                        return Err(self.err(format!(
+                            "`old({inner})` is not a reference argument, so its entry value \
+                             is not tracked"
+                        )));
+                    };
+                    return Ok((v, Sign::from_bool(self.is_signed_name(&inner))));
                 }
                 // `i16::MIN` and friends: the named bound of an integer type,
                 // which is how a contract names the value it must exclude. The
@@ -7091,7 +7152,12 @@ pub fn signed_args_named(
 ) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for &l in &f.arg_locals {
-        if f.ty_of(l).map(|t| t.is_signed()).unwrap_or(false) {
+        // The *referent's* sign: a `&i16` argument is named in a contract as the
+        // `i16` it addresses, so `c < 0` on `c: &mut i16` is a signed comparison.
+        // Reading the reference's own sign (`Ty::Ref` is neither signed nor
+        // unsigned) would make it an unsigned one -- the exact class of bug the
+        // `Sign` type exists to prevent.
+        if f.ty_of(l).map(|t| t.referent().is_signed()).unwrap_or(false) {
             let name = rename
                 .and_then(|r| r.name_of(l))
                 .map(|s| s.to_string())
@@ -7200,17 +7266,8 @@ pub fn arg_vars_named(
     f: &crate::mir::parse::MirFn,
     rename: Option<&ArgRename>,
 ) -> BTreeMap<String, Var> {
-    let mut out = BTreeMap::new();
-    for &l in &f.arg_locals {
-        let ty = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
-        if let Some(w) = ty.width() {
-            let name = rename
-                .and_then(|r| r.name_of(l))
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| f.name_of(l));
-            out.insert(name, smt::var_named(l, w));
-        }
-    }
+    let mut out: BTreeMap<String, Var> =
+        arg_bindings(f, rename).into_iter().map(|(_, n, v)| (n, v)).collect();
     if rename.is_some() {
         return out;
     }
@@ -7221,6 +7278,49 @@ pub fn arg_vars_named(
         }
     }
     out
+}
+
+/// The argument bindings, as `(local, name, variable)`, in argument order.
+///
+/// The one place the contract's name for an argument is decided, so `arg_vars_named`
+/// and [`arg_name_of`] cannot disagree about it. `Ty::Ref` is modelled as its
+/// referent, so a `&u16` argument's value *is* the `u16` it addresses, at the
+/// referent's width: a contract names it by the argument's own name
+/// (`bump(c: &mut u16)` with `ensures: c == 0`), and the body's `*c` and the
+/// contract's `c` are the same word. A reference to an aggregate has no single
+/// word (`&Config` is bound field by field instead), so only a scalar referent is
+/// bound here.
+fn arg_bindings(
+    f: &crate::mir::parse::MirFn,
+    rename: Option<&ArgRename>,
+) -> Vec<(crate::mir::parse::LocalIdx, String, Var)> {
+    let mut out = Vec::new();
+    for &l in &f.arg_locals {
+        let ty = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
+        if let Some(w) = ty.referent().width() {
+            let name = rename
+                .and_then(|r| r.name_of(l))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| f.name_of(l));
+            out.push((l, name, smt::var_named(l, w)));
+        }
+    }
+    out
+}
+
+/// The contract name of one argument local, or `None` when it has no binding.
+///
+/// The inverse of the argument-binding list, used to key a reference argument's
+/// *final* value back onto the name the postcondition will use for it.
+pub fn arg_name_of(
+    f: &crate::mir::parse::MirFn,
+    rename: Option<&ArgRename>,
+    local: crate::mir::parse::LocalIdx,
+) -> Option<String> {
+    arg_bindings(f, rename)
+        .into_iter()
+        .find(|(l, _, _)| *l == local)
+        .map(|(_, name, _)| name)
 }
 
 #[cfg(test)]

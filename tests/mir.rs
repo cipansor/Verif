@@ -239,6 +239,7 @@ fn a_literal_is_sized_from_the_operand_it_meets() {
             &std::collections::BTreeSet::new(),
             false,
             &spec::FieldEnv::default(),
+            &std::collections::BTreeMap::new(),
         )
         .expect("a narrow literal against a wide name must still parse");
         assert!(
@@ -293,6 +294,7 @@ fn a_bare_ret_on_an_aggregate_names_the_aggregate_reason() {
             &std::collections::BTreeSet::new(),
             false,
             &spec::FieldEnv::default(),
+            &std::collections::BTreeMap::new(),
         )
         .expect_err("a bare `ret` on an aggregate must be refused");
         assert!(
@@ -321,6 +323,7 @@ fn a_bare_ret_with_an_unknown_value_names_the_unknown_reason() {
             &std::collections::BTreeSet::new(),
             false,
             &spec::FieldEnv::default(),
+            &std::collections::BTreeMap::new(),
         )
         .expect_err("a bare `ret` with no value must be refused");
         assert!(
@@ -3646,6 +3649,126 @@ fn a_scalar_field_crosses_a_reference_argument() {
     }
 }
 
+/// A scalar `&mut` argument named in a contract (C9).
+///
+/// `Ty::Ref` is modelled as its referent, so a `&mut u16` argument's name denotes
+/// the `u16` it addresses. The name is the *final* value -- what the body left
+/// there -- and `old(c)` reaches the entry value. Binding a bare `c` to the entry
+/// value (the first cut of this feature) was a **false proof**: `ensures: c == 0`
+/// on `*c = 5` verified, because `c` still named the input.
+#[test]
+fn a_scalar_reference_argument_is_named_in_a_contract() {
+    let Some(report) = verify_realistic(&[
+        "bump_scalar_ref",
+        "a_stale_scalar_ref_cannot_prove_this",
+        "set_scalar_ref",
+        "a_scalar_ref_write_cannot_prove_this",
+        "signed_scalar_ref",
+        "a_scalar_ref_caller",
+        "bump_scalar_ref_star",
+    ]) else {
+        return;
+    };
+    for name in [
+        "bump_scalar_ref",
+        "set_scalar_ref",
+        "signed_scalar_ref",
+        "a_scalar_ref_caller",
+        "bump_scalar_ref_star",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a scalar reference argument must be nameable; got: {o}");
+    }
+    // The false directions: each claims the *entry* value survived a write, which
+    // only a model that bound the postcondition's name to the input would prove.
+    for name in ["a_stale_scalar_ref_cannot_prove_this", "a_scalar_ref_write_cannot_prove_this"] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a scalar reference write must not prove the stale contract; got: {o}"
+        );
+    }
+}
+
+/// A scalar `&mut` argument's name and `old(name)`, checked directly so the guard
+/// runs even without a nightly `rustc`.
+#[test]
+fn a_scalar_reference_argument_reads_as_its_referent() {
+    use verif::smt;
+    smt::with_fresh(|| {
+        let mut args = std::collections::BTreeMap::new();
+        args.insert("c".to_string(), smt::var(16));
+        let mut old = std::collections::BTreeMap::new();
+        old.insert("c".to_string(), smt::var(16));
+        // `c` (final) and `old(c)` (entry) are distinct inputs, so their equality
+        // is not a tautology.
+        let p = spec::eval_ensures(
+            "c == old(c) + 1",
+            &args,
+            None,
+            spec::RET_IS_AGGREGATE,
+            &std::collections::BTreeSet::new(),
+            false,
+            &spec::FieldEnv::default(),
+            &old,
+        )
+        .expect("a scalar reference argument and `old` must parse");
+        assert!(!smt::is_ill_formed(), "the contract must be well-formed");
+        // The claim is a real predicate over two distinct variables, not a
+        // tautology: it is refutable at `c == old(c)`.
+        assert!(
+            matches!(smt::prove(p), smt::Verdict::Counterexample(_)),
+            "`c == old(c) + 1` must be refutable, not a tautology"
+        );
+        // `*c` and `old(*c)` are the explicit spellings of the same two bindings,
+        // so the roadmap's exit shape parses and means the same predicate.
+        let star = spec::eval_ensures(
+            "*c == old(*c) + 1",
+            &args,
+            None,
+            spec::RET_IS_AGGREGATE,
+            &std::collections::BTreeSet::new(),
+            false,
+            &spec::FieldEnv::default(),
+            &old,
+        )
+        .expect("`*c` and `old(*c)` must parse");
+        assert!(
+            matches!(smt::prove(smt::iff(star, p)), smt::Verdict::Valid),
+            "`*c == old(*c) + 1` must mean the same as `c == old(c) + 1`"
+        );
+        // `*NAME` on an unbound name is refused, not read as a fresh variable.
+        assert!(
+            spec::eval_ensures(
+                "*d == 0",
+                &args,
+                None,
+                spec::RET_IS_AGGREGATE,
+                &std::collections::BTreeSet::new(),
+                false,
+                &spec::FieldEnv::default(),
+                &old,
+            )
+            .is_err(),
+            "`*d` on an unbound name must be refused"
+        );
+        // `old` on a name with no entry value is refused, not silently treated as
+        // the name itself.
+        let err = spec::eval_ensures(
+            "c == old(d)",
+            &args,
+            None,
+            spec::RET_IS_AGGREGATE,
+            &std::collections::BTreeSet::new(),
+            false,
+            &spec::FieldEnv::default(),
+            &old,
+        )
+        .expect_err("`old(d)` has no entry value and must be refused");
+        assert!(err.to_string().contains("old"), "the refusal must name `old`, got: {err}");
+    });
+}
+
 /// A reference reached *through* another reference, and a reference to a local copy.
 ///
 /// `**rr = 5` lowers to `_4 = no_retag copy (*_3); (*_4) = 5` with `_4: &mut u8`. The
@@ -5221,6 +5344,7 @@ fn a_contract_error_quotes_the_source_text() {
         &std::collections::BTreeSet::new(),
         false,
         &fields,
+        &std::collections::BTreeMap::new(),
     )
     .expect_err("`a[j]` has no chain and must be refused");
     assert_eq!(

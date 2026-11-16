@@ -34,6 +34,7 @@ fn ensures(text: &str) -> Result<smt::Pred, spec::SpecError> {
         &signed,
         true, // `ret` is `i8`
         &spec::FieldEnv::default(),
+        &BTreeMap::new(),
     )
 }
 

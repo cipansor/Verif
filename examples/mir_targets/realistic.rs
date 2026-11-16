@@ -9726,3 +9726,69 @@ pub fn string_drop_is_refused(s: String) -> u8 {
     let _owned = s;
     1
 }
+
+// ---------------------------------------------------------------------------
+// A scalar reference argument named in a contract (C9)
+//
+// `Ty::Ref` is modelled as its referent, so a `&mut u16` argument's name in a
+// contract denotes the `u16` it addresses. The name is the *final* value (what
+// the body left there); the entry value is reachable through `old(...)`. This is
+// the C9 exit shape: `bump(c: &mut u16)` with `ensures: c == old(c) + 1`.
+// ---------------------------------------------------------------------------
+
+/// The C9 exit criterion: a scalar `&mut` argument named in the postcondition.
+/// requires: c < 65535
+/// ensures: c == old(c) + 1
+pub fn bump_scalar_ref(c: &mut u16) {
+    *c += 1;
+}
+
+/// The false direction of [`bump_scalar_ref`]: the postcondition's `c` is the
+/// *final* value, so claiming the entry value must be refuted. Binding `c` to the
+/// entry value instead (the bug this shape closed) would **prove** it.
+/// requires: c < 65535
+/// ensures: c == old(c)
+pub fn a_stale_scalar_ref_cannot_prove_this(c: &mut u16) {
+    *c += 1;
+}
+
+/// A scalar `&mut` argument written to a constant.
+/// requires: true
+/// ensures: c == 5
+pub fn set_scalar_ref(c: &mut u16) {
+    *c = 5;
+}
+
+/// The false direction of [`set_scalar_ref`].
+/// requires: true
+/// ensures: c == 0
+pub fn a_scalar_ref_write_cannot_prove_this(c: &mut u16) {
+    *c = 5;
+}
+
+/// A *signed* scalar `&mut` argument: `c < 0` is a signed comparison. An unsigned
+/// reading would make `-1` read as `65535`, so `c < 0` would be false and the
+/// function refuted rather than verified -- `verified` is the evidence the sign
+/// was read.
+/// requires: true
+/// ensures: c < 0
+pub fn signed_scalar_ref(c: &mut i16) {
+    *c = -1;
+}
+
+/// A caller of the scalar-`&mut` helper, verified through the inlined body.
+/// requires: x == 4
+/// ensures: ret == 5
+pub fn a_scalar_ref_caller(x: u16) -> u16 {
+    let mut y = x;
+    bump_scalar_ref(&mut y);
+    y
+}
+
+/// The roadmap's exact exit spelling: `*c` (the explicit deref) and `old(*c)`.
+/// requires: c < 65535
+/// ensures: *c == old(*c) + 1
+pub fn bump_scalar_ref_star(c: &mut u16) {
+    *c += 1;
+}
+

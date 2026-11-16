@@ -105,6 +105,21 @@ impl Ty {
         )
     }
 
+    /// The type a reference points at, or the type itself when it is not one.
+    ///
+    /// `Ty::Ref` is modelled as its referent throughout (a `&u16` argument's
+    /// value *is* the `u16` it addresses), so this is what a reader needs to size
+    /// a value reached through a reference. One level only: a `&mut &mut u8` is a
+    /// reference to a reference, which is a shape the frontend refuses rather than
+    /// models (see the `&mut &mut T` note in `exec.rs`), so collapsing both levels
+    /// here would claim a width the caller cannot reach.
+    pub fn referent(&self) -> &Ty {
+        match self {
+            Ty::Ref(inner) => inner,
+            other => other,
+        }
+    }
+
     /// Parse a printed type. `usize`/`isize` are modelled at 64 bits, which is
     /// what this tool's own host target uses.
     pub fn parse(s: &str) -> Ty {
