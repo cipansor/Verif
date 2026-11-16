@@ -42,6 +42,10 @@
 //!   produces a [`Pred`] and the executor writes a `Val::Bool`, which is what the
 //!   `if` that consumes it branches on. It is unsigned-only, because `core` has no
 //!   such method on the signed types.
+//! * `is_negative`/`is_positive` — also `bool`, and also `core`'s own definition:
+//!   `x < 0` and `x > 0` read *signed*. They exist only on the signed types, and
+//!   the signedness is the whole content -- `i8::MIN` (`0x80`) is the largest
+//!   unsigned byte, so an unsigned reading of the top bit would call it positive.
 //! * `Ord::min`/`Ord::max` — the two *trait* methods, so the dump spells a call
 //!   `<u8 as Ord>::min` rather than a `core::num::<impl …>` path. The model is one
 //!   `ite` whose ordering predicate the operand's sign selects (`sle`/`sge` for a
@@ -83,14 +87,13 @@
 //! * `pow` is modelled as a fold over the exponent's bits (see [`POW_MAX_WIDTH`]).
 //!   `next_multiple_of`/`div_ceil`/`div_floor`/`midpoint`/`rem_euclid` and the
 //!   float ops remain absent, and an unmodelled name is refused rather than
-//!   approximated. So do the sign predicates `is_negative`/`is_positive`: each
-//!   would need its own definition rather than a shared one.
+//!   approximated.
 //!
-//! `abs_diff`, `rotate_left`/`rotate_right` and the ten `is_ascii_*` classes are
-//! modelled, and this header said otherwise for a while -- the list of what is
-//! modelled has to move with the tables below it. The unit test
-//! `the_documented_modelled_set_matches_classify` pins the four spellings so a
-//! later removal cannot leave the prose behind again.
+//! `abs_diff`, `rotate_left`/`rotate_right`, the ten `is_ascii_*` classes and the
+//! sign predicates `is_negative`/`is_positive` are modelled, and this header said
+//! otherwise for a while -- the list of what is modelled has to move with the
+//! tables below it. The unit test `the_documented_modelled_set_matches_classify`
+//! pins the four spellings so a later removal cannot leave the prose behind again.
 
 use crate::mir::parse::{BinOp, Ty};
 use crate::smt::{self, Pred, Var};
@@ -404,6 +407,14 @@ pub enum BoolKind {
     /// unsigned-only and exist only on `u8` -- `core` has no `is_ascii_digit` on
     /// `u32` -- so a signed or wider receiver is not this method.
     Ascii(AsciiKind),
+    /// `is_negative`: the value is below zero, which is the top bit set on a
+    /// signed type. The model is `slt(x, 0)`, and it exists only on the signed
+    /// types, so an unsigned receiver is refused rather than read (the top bit of
+    /// a `u8` is not a sign).
+    Negative,
+    /// `is_positive`: the value is above zero. The model is `sgt(x, 0)`, on the
+    /// signed types only for the same reason as [`Self::Negative`].
+    Positive,
 }
 
 /// The ASCII class a `u8` byte belongs to, for [`BoolKind::Ascii`].
@@ -729,6 +740,15 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     // prefix, so they are matched before the split for the same reason.
     if short == "is_power_of_two" {
         return Some(Intrinsic::Bool(BoolKind::PowerOfTwo));
+    }
+    // The sign predicates on the signed types. Matched by their exact names, and
+    // only on a `core::num::<impl …>` path (see `is_modelled`), so a user method
+    // spelled the same way is not read as one.
+    if short == "is_negative" {
+        return Some(Intrinsic::Bool(BoolKind::Negative));
+    }
+    if short == "is_positive" {
+        return Some(Intrinsic::Bool(BoolKind::Positive));
     }
     // The ASCII class tests on `u8`. Their receiver is `&u8`, not `u8` -- the dump
     // prints `_3 = &_1; is_ascii_digit(move _3)` -- but that is the *executor's*
@@ -1066,6 +1086,10 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // would answer a call `core` has no definition for.
         Intrinsic::Bool(BoolKind::Ascii(_)) => !signed && w == 8,
         Intrinsic::Bool(BoolKind::PowerOfTwo) => !signed,
+        // `is_negative`/`is_positive` exist only on the *signed* types, so an
+        // unsigned receiver is a different method (or not one), and reading the
+        // top bit as a sign would answer a call `core` has no definition for.
+        Intrinsic::Bool(BoolKind::Negative | BoolKind::Positive) => signed,
         // The slice length and emptiness. Both are the `usize` length the executor
         // holds, so neither reads the operand width or sign -- they are answered by
         // `eval_slice` from the length variable, and `eval` never sees them. They
@@ -1740,6 +1764,13 @@ fn bool_pred(kind: BoolKind, x: Var) -> Pred {
             smt::and(smt::not(smt::eq_const(x, 0)), smt::eq_const(cleared, 0))
         }
         BoolKind::Ascii(kind) => ascii_pred(kind, x),
+        // `is_negative`/`is_positive` on a signed value: `x < 0` and `x > 0`. The
+        // comparisons are the engine's *signed* ones, so `i8::MIN` (whose bits are
+        // the largest unsigned byte) is below zero, which is what `core` means.
+        // They exist only on the signed types -- see `is_modelled` -- so there is
+        // no unsigned reading to fall back to.
+        BoolKind::Negative => smt::slt(x, smt::word(0, smt::bits(x))),
+        BoolKind::Positive => smt::sgt(x, smt::word(0, smt::bits(x))),
     }
 }
 
@@ -3682,6 +3713,62 @@ mod tests {
         }
     }
 
+    /// `is_negative`/`is_positive` agree with Rust over whole `i8`/`i16` domains.
+    ///
+    /// The oracle is `core`'s own method. The named points are the ones a wrong
+    /// reading gets wrong: `i8::MIN` (`0x80`) is *negative* though its bits are the
+    /// largest unsigned byte, so an unsigned model would call it positive; `0` is
+    /// neither; and `i8::MAX` is positive. A signedness check is what the sweep is
+    /// for -- an unsigned reading is caught at `0x80`.
+    #[test]
+    fn the_sign_predicates_agree_with_rust() {
+        for w in [8u8, 16] {
+            let neg = move |b: u64| match w {
+                8 => (b as u8 as i8).is_negative(),
+                16 => (b as u16 as i16).is_negative(),
+                _ => unreachable!("the test walks 8 and 16 bits"),
+            };
+            let pos = move |b: u64| match w {
+                8 => (b as u8 as i8).is_positive(),
+                16 => (b as u16 as i16).is_positive(),
+                _ => unreachable!("the test walks 8 and 16 bits"),
+            };
+            check_bool(Intrinsic::Bool(BoolKind::Negative), w, true, neg, "is_negative");
+            check_bool(Intrinsic::Bool(BoolKind::Positive), w, true, pos, "is_positive");
+        }
+        // The named points at 8 bits, so a failure names the value that broke.
+        let ev = |kind: BoolKind, b: u64| {
+            smt::with_fresh(|| {
+                let a = smt::var(8);
+                let Outcome::Bool(p) = eval(Intrinsic::Bool(kind), a, a, 8, true, 8)
+                    .expect("a sign predicate at 8 bits must be modelled")
+                else {
+                    panic!("a sign predicate must produce a `bool`");
+                };
+                let ai = smt::index(a);
+                smt::evaluate_pred(p, |i| if i == ai { Some(b) } else { None })
+            })
+        };
+        for (bits, neg, pos, why) in [
+            (0u64, false, false, "zero is neither negative nor positive"),
+            (1, false, true, "one is positive"),
+            (0x7f, false, true, "i8::MAX is positive"),
+            (0x80, true, false, "i8::MIN is negative -- an unsigned read would call it positive"),
+            (0xff, true, false, "-1 is negative"),
+        ] {
+            assert_eq!(
+                ev(BoolKind::Negative, bits),
+                Some(neg),
+                "is_negative {why} (at bits {bits:#x})"
+            );
+            assert_eq!(
+                ev(BoolKind::Positive, bits),
+                Some(pos),
+                "is_positive {why} (at bits {bits:#x})"
+            );
+        }
+    }
+
     /// Every ASCII class agrees with Rust's own `u8` method over the whole byte
     /// range.
     ///
@@ -3995,9 +4082,12 @@ mod tests {
             Some(Intrinsic::Bool(BoolKind::Ascii(AsciiKind::Digit)))
         );
         // Near misses that stay refused. `is_power_of_two` on the signed types is
-        // not a `core` method; the other `is_*` predicates are not modelled.
+        // not a `core` method; the other `is_*` predicates are not modelled. The
+        // sign predicates *are* modelled now (see `the_sign_predicates_agree_with_rust`),
+        // so they are checked as present rather than as near misses.
         assert!(classify("is_power_of_two_signed").is_none());
-        assert!(classify("is_negative").is_none());
+        assert_eq!(classify("is_negative"), Some(Intrinsic::Bool(BoolKind::Negative)));
+        assert_eq!(classify("is_positive"), Some(Intrinsic::Bool(BoolKind::Positive)));
         // The slice shapes are matched on the *path*, so a `Vec`'s `len` is not
         // read as a slice length.
         assert_eq!(classify("core::slice::<impl [u8]>::len"), Some(Intrinsic::SliceLen));
@@ -4056,6 +4146,15 @@ mod tests {
                 "the header says `{name}` is modelled, so it must classify"
             );
         }
+        // The sign predicates the header names alongside the ASCII classes.
+        assert_eq!(
+            classify("core::num::<impl i8>::is_negative"),
+            Some(Intrinsic::Bool(BoolKind::Negative))
+        );
+        assert_eq!(
+            classify("core::num::<impl i8>::is_positive"),
+            Some(Intrinsic::Bool(BoolKind::Positive))
+        );
     }
 
     /// The unary shapes are `is_unary`; the two-operand families are not.

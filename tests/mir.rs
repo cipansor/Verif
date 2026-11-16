@@ -1636,6 +1636,38 @@ fn is_power_of_two_branches_on_the_predicate() {
     }
 }
 
+/// `is_negative`/`is_positive` are modelled as signed comparisons, not bit tests.
+///
+/// The signedness is the whole point: `i8::MIN` is `0x80`, the *largest* unsigned
+/// byte, so a model that read the top bit as a plain bit (or compared unsigned)
+/// would call it positive and refute `is_negative_of_min`. The zero tripwire is
+/// the sharp one in the other direction: `0` is neither sign, so a model that
+/// answered `x != 0` for `is_positive`, or the bare top bit for `is_negative`,
+/// would *prove* a false contract. The `MAX`/`MIN`/`-1` pins name the boundary
+/// values, so a failure names the value that broke rather than only the function.
+#[test]
+fn the_sign_predicates_are_signed_comparisons() {
+    let verified = [
+        "is_negative_of_min",
+        "is_negative_of_max",
+        "is_positive_of_max",
+        "is_negative_branching_takes_the_true_arm",
+    ];
+    let refuted = ["is_negative_of_zero_tripwire", "is_positive_of_minus_one_tripwire"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+    }
+}
+
 /// The mixed-signedness additions, each pinned in both directions.
 ///
 /// Every shape gets a true contract *and* a false one with a concrete witness, so

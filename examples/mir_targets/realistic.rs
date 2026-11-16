@@ -3726,6 +3726,62 @@ pub fn is_power_of_two_branching_of_zero_tripwire(x: u8) -> u8 {
     }
 }
 
+/// `is_negative` is true for `i8::MIN`, whose bits (`0x80`) are the *largest*
+/// unsigned byte -- so an unsigned reading of the top bit would call it positive.
+/// This is the signedness pin: the model must compare signed, which is why the
+/// contract is satisfiable only under the signed reading.
+/// requires: x == i8::MIN
+/// ensures: ret == true
+pub fn is_negative_of_min(x: i8) -> bool {
+    x.is_negative()
+}
+
+/// The complement pin: `i8::MAX` is positive, so a model that read the top bit
+/// (clear here) as "not negative" and stopped would refute this. It is the pair
+/// to the `MIN` pin above, which alone could be passed by an unsigned `x != 0`.
+/// requires: x == i8::MAX
+/// ensures: ret == false
+pub fn is_negative_of_max(x: i8) -> bool {
+    x.is_negative()
+}
+
+/// The tripwire: zero is neither negative nor positive, so this false contract
+/// must be refuted. A model that used the *top bit* rather than a signed compare
+/// would prove it (bit 7 of `0` is clear).
+/// requires: x == 0
+/// ensures: ret == true
+pub fn is_negative_of_zero_tripwire(x: i8) -> bool {
+    x.is_negative()
+}
+
+/// `is_positive` is the strict `> 0`, so `i8::MAX` is positive.
+/// requires: x == i8::MAX
+/// ensures: ret == true
+pub fn is_positive_of_max(x: i8) -> bool {
+    x.is_positive()
+}
+
+/// The tripwire for `is_positive`: `-1` is negative, so this must be refuted. A
+/// model that answered `x != 0` would *prove* it.
+/// requires: x == -1
+/// ensures: ret == true
+pub fn is_positive_of_minus_one_tripwire(x: i8) -> bool {
+    x.is_positive()
+}
+
+/// The predicate is consumed by a branch, not only read in a postcondition, so a
+/// `Val::Bool` the `switchInt` could not read would leave the path unknown rather
+/// than take the right arm.
+/// requires: x == -1
+/// ensures: ret == 7
+pub fn is_negative_branching_takes_the_true_arm(x: i8) -> u8 {
+    if x.is_negative() {
+        7
+    } else {
+        9
+    }
+}
+
 /// `wrapping_add_signed` adds a signed addend to an unsigned self, and the result
 /// is the plain wrapped sum: `0u8 + (-1i8)` is `255`. This is the *value* pin --
 /// a model that refused the mixed shape, or read the addend as unsigned, would

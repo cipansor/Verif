@@ -2011,6 +2011,12 @@ refused. `src/mir/intrinsics.rs` holds the model:
   `bool`, which is what the `if` that consumes it branches on; a one-bit word
   there would leave the local readable only as a word. It is unsigned-only,
   matching `core`.
+- `is_negative`/`is_positive` are `bool` predicates too, and the model is
+  `core`'s own definition: `x < 0` and `x > 0` read *signed*. They exist only on
+  the signed types, and the signedness is the whole content — `i8::MIN` (`0x80`)
+  is the *largest* unsigned byte, so an unsigned reading of the top bit would call
+  it positive. Each is checked exhaustively against Rust's own method over `i8`
+  and `i16`, with `i8::MIN` named as the point an unsigned reading gets wrong.
 - The ten `is_ascii_*` class tests (`is_ascii_digit`, `is_ascii_alphabetic`,
   `is_ascii_alphanumeric`, `is_ascii_uppercase`, `is_ascii_lowercase`,
   `is_ascii_hexdigit`, `is_ascii_whitespace`, `is_ascii_punctuation`,
@@ -2218,7 +2224,8 @@ The frontend refuses far more than it accepts, and every refusal is reported:
   bitwise ops are computed from their operands (see below), as are the unary
   `neg`/`abs` in all four families, the six bit counts (`count_ones`,
   `count_zeros`, `leading_zeros`, `leading_ones`, `trailing_zeros`,
-  `trailing_ones`), the `bool` predicates `is_power_of_two` and the ten
+  `trailing_ones`), the `bool` predicates `is_power_of_two`,
+  `is_negative`/`is_positive` and the ten
   `is_ascii_*` class tests, the `slice::len`/`is_empty` length queries, the
   `Ord::min`/`Ord::max`
   trait methods, the `abs_diff` and `rotate_left`/`rotate_right` methods, the

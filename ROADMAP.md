@@ -253,9 +253,12 @@ with no new false proof while the independent corpus keeps growing.
   - Move: **built**.
 - **C6. The everyday `core` surface.** · P0 · in progress · Kani, Verus (`vstd`)
   - Gap: `Ord::min/max/clamp`, `iN::abs`, `abs_diff`, `rotate_*`, `is_ascii_*`,
-    `<[T]>::len/is_empty/first/get`. Evidence: `abs_small`, `clamp_builtin`,
-    `digit`, `first_or` incomplete. `min`/`max` and `From`/`Into` are already
-    modelled; the rest are not.
+    `is_negative`/`is_positive`, `<[T]>::len/is_empty/first/get`. Evidence:
+    `abs_small`, `clamp_builtin`, `digit`, `first_or` incomplete. All but
+    `<[T]>::first/get` are now modelled (`min`/`max`, `From`/`Into`, `clamp`,
+    `abs`, `abs_diff`, `rotate_*`, the `is_ascii_*` classes, the sign predicates,
+    and `slice::len`/`is_empty`); the remaining `first`/`get` are blocked on
+    monomorphisation.
   - Approach: the C2 contract library, plus a published list of the modelled
     `core` items with each item's oracle.
   - Exit: `abs_small`, `clamp_builtin`, `digit`, `first_or` verified; the list is
@@ -287,6 +290,15 @@ with no new false proof while the independent corpus keeps growing.
     total (no panic), so they are plain values. Checked exhaustively over `u8`/`i8`
     against Rust's own methods (`abs_diff_and_rotations_agree_with_rust`), with
     three verified fixtures and two tripwires in `realistic.rs` (**409 of 758**).
+  - Progress (cont.): `is_negative`/`is_positive` are modelled. Both are `bool`
+    predicates, and the model is `core`'s own definition — `x < 0` and `x > 0`
+    read *signed*. The signedness is the whole content: `i8::MIN` (`0x80`) is the
+    largest unsigned byte, so an unsigned reading of the top bit would call it
+    positive. They exist only on the signed types, so an unsigned receiver is
+    refused rather than read. Checked exhaustively over `i8`/`i16` against Rust's
+    own methods (`the_sign_predicates_agree_with_rust`), with `i8::MIN` named as
+    the point an unsigned reading gets wrong; six fixtures with their tripwires
+    are in `realistic.rs` (**433 of 803**).
   - Remaining: `<[T]>::first/get` (and the generic `<[T]>::len/is_empty`) are
     blocked on *monomorphisation*: `first_or<T>` is generic, so its element type
     has no width and the slice length is never seeded (the frontend refuses a
