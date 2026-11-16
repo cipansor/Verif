@@ -122,6 +122,54 @@ pub fn first_of(xs: &[u8]) -> u8 {
     xs[0]
 }
 
+/// The same element reached through `slice::first`, which returns `Option<&u8>`.
+/// The payload is the slice's own element variable -- the same one `xs[0]` names
+/// -- so this proves the method and the subscript agree.
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 5
+pub fn first_method(xs: &[u8]) -> u8 {
+    *xs.first().unwrap()
+}
+
+/// The false direction: the method's element is the slice's element, not a fresh
+/// value, so a claim about a *different* element fails.
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 6
+pub fn first_method_tripwire(xs: &[u8]) -> u8 {
+    *xs.first().unwrap()
+}
+
+/// `first` is `None` exactly when the slice is empty, so `is_none` is the same
+/// predicate `is_empty` is.
+/// requires: xs.len() == 0
+/// ensures: ret
+pub fn first_method_is_none_when_empty(xs: &[u8]) -> bool {
+    xs.first().is_none()
+}
+
+/// `slice::get(k)` with a constant index: `Some(xs[k])` when `k < len`, `None`
+/// otherwise, and the element is the slice's own `xs[k]`.
+/// requires: xs.len() > 1 && xs[1] == 7
+/// ensures: ret == 7
+pub fn get_method(xs: &[u8]) -> u8 {
+    *xs.get(1).unwrap()
+}
+
+/// The false direction for `get`: a claim about the wrong element fails.
+/// requires: xs.len() > 1 && xs[1] == 7
+/// ensures: ret == 8
+pub fn get_method_tripwire(xs: &[u8]) -> u8 {
+    *xs.get(1).unwrap()
+}
+
+/// `get` past the end is `None`, so `unwrap` panics -- and the panic is a real
+/// obligation, not a silent `Some`.
+/// requires: xs.len() > 0
+/// ensures: ret == 7
+pub fn get_method_out_of_range_panics(xs: &[u8]) -> u8 {
+    *xs.get(1).unwrap()
+}
+
 /// A fixed-size array argument. Unlike a slice the length is a *type*
 /// constant, so `a.len()` is not an input and the bounds check is against a
 /// literal: `_3 = Lt(_2, const 4_usize)`. That literal is what makes this shape

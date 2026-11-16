@@ -374,10 +374,12 @@ with no new false proof while the independent corpus keeps growing.
   - Gap: `Ord::min/max/clamp`, `iN::abs`, `abs_diff`, `rotate_*`, `is_ascii_*`,
     `is_negative`/`is_positive`, `<[T]>::len/is_empty/first/get`. Evidence:
     `abs_small`, `clamp_builtin`, `digit`, `first_or` incomplete. All but
-    `<[T]>::first/get` are now modelled (`min`/`max`, `From`/`Into`, `clamp`,
+    `first_or` are now modelled (`min`/`max`, `From`/`Into`, `clamp`,
     `abs`, `abs_diff`, `rotate_*`, the `is_ascii_*` classes, the sign predicates,
-    and `slice::len`/`is_empty`); the remaining `first`/`get` are blocked on
-    monomorphisation.
+    `slice::len`/`is_empty`, and `slice::first`/`get`). `first_or` stays
+    incomplete because it is *generic* (`<T: Copy>`), which is C10, not this item
+    — the earlier note that `first`/`get` were "blocked on monomorphisation" was
+    wrong for a concrete `&[u8]`, which is what `everyday.rs` uses.
   - Approach: the C2 contract library, plus a published list of the modelled
     `core` items with each item's oracle.
   - Exit: `abs_small`, `clamp_builtin`, `digit`, `first_or` verified; the list is
@@ -418,13 +420,25 @@ with no new false proof while the independent corpus keeps growing.
     own methods (`the_sign_predicates_agree_with_rust`), with `i8::MIN` named as
     the point an unsigned reading gets wrong; six fixtures with their tripwires
     are in `realistic.rs` (**433 of 803**).
-  - Remaining: `<[T]>::first/get` (and the generic `<[T]>::len/is_empty`) are
-    blocked on *monomorphisation*: `first_or<T>` is generic, so its element type
-    has no width and the slice length is never seeded (the frontend refuses a
-    receiver whose length it does not hold, which is the honest answer, not a
-    bug). `slice::len`/`is_empty` *are* classified now (by path, so a `Vec::len`
-    is not mistaken for a slice length), so they decide the moment a contract
-    binds the slice.
+  - Progress (cont.): `<[T]>::first` and `<[T]>::get` are modelled for a
+    *concrete* slice. They produce `Option<&T>`, so the payload is a reference,
+    not a value: the model writes the `Option`'s tag as a *predicate* (`len == 0`
+    for `first`, `k >= len` for `get(k)`, so `unwrap`'s panic obligation is real)
+    and records the payload as the slice's *own* element variable — the same one
+    `xs[k]` names — so `*xs.first().unwrap()` and `xs[0]` agree by construction.
+    The reference's deref (`*_2`) resolves through a new `Env::slice_elem_ref`
+    store, and `unwrap` carries the element to its destination. `get`'s index must
+    be a *constant* (a slice's length is symbolic, so a symbolic index has no
+    finite domain and reading "some element" would be a wrong proof). `first_or`
+    stays incomplete because it is *generic* (`<T: Copy>`) — that is C10, not this
+    item — and the earlier note that `first`/`get` were "blocked on
+    monomorphisation" was wrong for a concrete `&[u8]`. Seven fixtures (four true,
+    two tripwires, one panic) are in `realistic.rs` (**494 of 924**), pinned by
+    `slice_first_and_get_reach_the_slices_own_element` in `tests/mir.rs`.
+  - Remaining: the *generic* `<[T]>::first/get/len/is_empty` (`first_or<T>`) need
+    monomorphisation, which is C10: `first_or`'s element type has no width and its
+    slice length is never seeded (the frontend refuses a receiver whose length it
+    does not hold, which is the honest answer, not a bug).
 - **C7. Arithmetic scale and speed.** · P0 · in progress · Kani, Boolector,
   Bitwuzla
   - Gap: `u32::wrapping_mul` is past the 32-bit model; `clamp_std` takes 9.9 s.

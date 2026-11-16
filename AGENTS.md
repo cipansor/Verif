@@ -3589,6 +3589,49 @@ write poisons the field, so the postcondition is unreadable),
 `array_write_then_symbolic_read`, `mut_ref_array_write_then_symbolic_read`,
 `generated_name_shadows_argument` and `struct_reassign_then_field_read`.
 
+### `slice::first`/`get` return a *place*, so the payload is a reference, not a value
+
+Modelling `slice::first` and `slice::get` (C6) turned on one shape the earlier
+`core` models never met: their result is `Option<&T>`, so the payload is a
+*reference* to a slice element, and the code that consumes it dereferences —
+`*xs.first().unwrap()` lowers to `_3 = first(_1); _2 = unwrap(_3); _0 = copy (*_2)`.
+Two things follow, and both are the honest direction rather than a convenience:
+
+- **The payload is the slice's own element variable.** The model records
+  `(slice local, index)` in `Env::slice_elem_ref` and writes the `Option`'s payload
+  as the same `xs[k]` variable a subscript read names, so `*xs.first().unwrap()`
+  and `xs[0]` are *one* term by construction. Writing a fresh variable there would
+  make the two disagree, and `ensures: ret == xs[0]` would fail for a body that
+  clearly returns it.
+- **The deref reads through the store, before the `deref_ok` gate.** `Env::get`'s
+  `Proj::Deref` arm refuses a deref of a local that is not a recorded reference
+  argument, which is what keeps a field-that-is-a-reference from being read as its
+  owner's referent. A `first`/`get` reference is a local a *call* produced, not an
+  argument, so the store is consulted first and the `deref_ok` gate is left for the
+  argument case it was written for. `unwrap` carries the element to its
+  destination, so the read works whether the caller dereferences the `Option`'s
+  payload directly or through an intermediate `let`.
+
+**The tag is a predicate, and that is the point.** `first` is `Some` exactly when
+the slice is non-empty (`len != 0`), and `get(k)` exactly when `k < len`
+(`len > k`, not `len >= k` — the predicate is the other way round, and getting it
+backwards made every `get(0)` on a non-empty slice report a `None`-unwrap panic
+until the fixtures caught it). Because the tag is an `ite` over that predicate and
+not a constant, the `unwrap`'s panic obligation is real: `get(1)` past the end
+*is* refuted with a panic witness, which a model that wrote `Some` unconditionally
+would have missed. `get`'s index must be a *constant* — a slice's length is
+symbolic, so a symbolic index has no finite domain, and reading "some element"
+would make `xs[i]` a different value per read, which is a wrong proof rather than a
+missing one. The *generic* `first_or<T>` is not this shape at all: its element type
+has no width and its length is never seeded, so it stays refused until generics
+(C10) land — which is why the ROADMAP note that `first`/`get` were "blocked on
+monomorphisation" was wrong for a concrete `&[u8]`.
+
+Seven fixtures are in `realistic.rs` (four true, two tripwires, one panic) and
+`tests/mir.rs::slice_first_and_get_reach_the_slices_own_element` pins all six
+directions; the test was confirmed to have teeth by neutralising the
+`slice_elem_ref` lookup, which turns the true direction `incomplete`.
+
 ## A call boundary is a real boundary: what crosses it and what must not
 
 Four soundness holes and two completeness holes lived at the same place — the

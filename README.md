@@ -2035,6 +2035,18 @@ refused. `src/mir/intrinsics.rs` holds the model:
   `Vec::len` or `str::len` is not mistaken for a slice length; and the receiver's
   length has to be one the frontend holds, so a receiver it did not bind is
   refused rather than given an invented number.
+- `slice::first` and `slice::get` are modelled for a *concrete* slice. They return
+  `Option<&T>`, so the payload is a *place*, not a value, and the model writes the
+  `Option`'s tag as a *predicate* — `len == 0` for `first`, `k >= len` for `get(k)`
+  — which is what makes the `unwrap` that usually follows carry a real panic
+  obligation rather than an assumed `Some`. The payload is the slice's *own*
+  element variable, the same one `xs[k]` names, so `*xs.first().unwrap()` and
+  `xs[0]` agree by construction; the returned reference's deref (`*_2`) reads
+  through a dedicated `Env::slice_elem_ref` store, and `unwrap` carries the element
+  to its destination. `get`'s index must be a *constant*: a slice's length is
+  symbolic, so a symbolic index has no finite domain and reading "some element"
+  would be a wrong proof, not a missing one. The *generic* `first_or<T>` is not
+  this shape — it needs monomorphisation — so it stays refused.
 - `Ord::min` and `Ord::max` are the two modelled *trait* methods, so a dump spells
   a call `<u8 as Ord>::min` (or `<i8 as std::cmp::Ord>::max` with `std` in scope)
   rather than a `core::num::<impl …>` inherent path. The model is one `ite` over

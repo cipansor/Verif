@@ -721,6 +721,19 @@ struct Env {
     /// distinct inputs per index, so `xs[0]` and `xs[1]` are two values and
     /// `xs[0] == xs[1]` is not provable; see `Indexed::elems`.
     indexed: BTreeMap<u32, Indexed>,
+    /// A local that carries a reference to a slice *element* (`slice::first`/`get`
+    /// produce `Option<&T>`), mapped to the element it names: `(indexed local,
+    /// index)`.
+    ///
+    /// Two locals share one entry: the `Option` local the call wrote, and -- once
+    /// `unwrap` moves the payload out -- the reference local the payload moved to.
+    /// The payload is a *place*, not a value, and the shape the caller reads it
+    /// through is `*_2`, a dereference. Recording the element lets `Env::get`
+    /// answer `*_2` with the slice's own element variable (the same one a `s[0]`
+    /// read names), so the payload is not a fresh value the slice never holds. A
+    /// reference this store has no entry for is read as `Unknown` by the deref,
+    /// which is the honest answer rather than a wrong element.
+    slice_elem_ref: BTreeMap<u32, (u32, u64)>,
     /// The program's enum layouts, so a variant *construction* constant
     /// (`Mode::Idle`) resolves to its discriminant.
     ///
@@ -832,6 +845,7 @@ impl Env {
             ref_origin: BTreeMap::new(),
             arg_source: BTreeMap::new(),
             indexed: BTreeMap::new(),
+            slice_elem_ref: BTreeMap::new(),
             whole_writes: BTreeSet::new(),
             enums: BTreeMap::new(),
             consts: BTreeMap::new(),
@@ -1537,6 +1551,29 @@ impl Env {
                     // the field's). Letting that through would read the field as
                     // though it were the argument's referent, which is a wrong
                     // value rather than a missing one.
+                    // A reference to a slice *element* (`slice::first`/`get`):
+                    // `*_2` names the element the reference was built from, so it
+                    // reads the slice's own element variable rather than a fresh
+                    // one. This is checked *before* the `deref_ok` gate, because
+                    // the reference is a local the call produced, not an argument,
+                    // and the store is authoritative for it. `unwrap` moves the
+                    // payload out and records the element under the destination
+                    // local, so the lookup is by this local.
+                    if i == 0 {
+                        if let Some((sl, k)) = self.slice_elem_ref.get(&p.local).copied() {
+                            if let Some(s) = self.indexed.get(&sl) {
+                                if s.poisoned {
+                                    return Val::Unknown;
+                                }
+                                let sign = Sign::of_bool(s.elem_signed);
+                                return s
+                                    .elems
+                                    .get(&k)
+                                    .map(|v| Val::Sym(*v, sign))
+                                    .unwrap_or(Val::Unknown);
+                            }
+                        }
+                    }
                     if i != 0 || !self.deref_ok.contains_key(&p.local) {
                         return Val::Unknown;
                     }
@@ -4870,6 +4907,15 @@ fn enum_method(
             };
             env.set(dest, Val::Sym(value, sign));
             if matches!(kind, OptionMethod::Unwrap | OptionMethod::Expect) {
+                // If the payload was a reference to a slice element
+                // (`slice::first`/`get` produce `Option<&T>`), the element the
+                // reference names travels with the payload, so `*_2` on the
+                // destination reads the slice's own element. `unwrap`/`expect`
+                // panic on the failure variant, so the payload here is always the
+                // `Some` element -- no path reaches the deref without it.
+                if let Some(e) = env.slice_elem_ref.get(&opt.local).copied() {
+                    env.slice_elem_ref.insert(dest.local, e);
+                }
                 // `unwrap`/`expect` **panic** on the failure variant. The failure
                 // is `tag == failure`, a reachable-failure obligation of the same
                 // polarity as a rustc-inserted `assert`: the call is safe exactly
@@ -4893,6 +4939,81 @@ fn enum_method(
         }
     })
 }
+
+/// Answer `slice::first`/`slice::get`, which produce `Option<&T>`.
+///
+/// The element is the executor's own `s[0]`/`s[k]` variable -- the same one a
+/// `s[0]` read names -- so the `Option`'s payload *is* that element and not a
+/// fresh value the slice never holds. The `Option`'s tag is a *predicate*
+/// (`len == 0` for `first`, `k >= len` for `get`), so the arm is decided by the
+/// caller's `switchInt` on the discriminant, and the payload is recorded under the
+/// `Some` discriminant so a `(_2 as Some).0` downcast -- or the reference's deref
+/// -- reads it. The element is also recorded in `slice_elem_ref`, so `*_2` on the
+/// returned reference reads the slice's element rather than the reference local's
+/// absent value.
+fn slice_element(
+    name: &str,
+    op: intrinsics::Intrinsic,
+    receiver: &Place,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+    f: &MirFn,
+) -> Result<Vec<Obligation>, String> {
+    use intrinsics::Intrinsic;
+    let recv = env.pointee(receiver);
+    let Val::Sym(len, _) = length_of(env, f, receiver) else {
+        return Err(format!("`{name}` on a receiver whose length is not modelled"));
+    };
+    let Some(s) = env.indexed.get(&recv.local) else {
+        return Err(format!("`{name}` on a receiver whose elements are not modelled"));
+    };
+    let (sl, elem_w) = (recv.local, s.elem_w);
+    // `first` names element 0; `get(k)` names element `k`. The index must be a
+    // *constant*: a slice's length is symbolic, so a symbolic index has no finite
+    // domain and reading "some element" would make `s[i]` a different value per
+    // read -- a wrong proof, not a missing one. A literal index is exact.
+    let (index, failure) = match op {
+        Intrinsic::SliceFirst => (0u64, smt::eq_const(len, 0)),
+        _ => {
+            let k = match args.get(1) {
+                Some(Operand::Const(Const::UInt(v, _))) => u64::try_from(*v).ok(),
+                Some(Operand::Copy(p) | Operand::Move(p)) => match env.locals.get(&p.local) {
+                    Some(Val::Sym(v, _)) => smt::evaluate(*v, |_| None),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(k) = k else {
+                return Err(format!(
+                    "`{name}` with an index that is not a constant is not modelled"
+                ));
+            };
+            // `get(k)` is `None` exactly when `k >= len`, which is `len <= k`.
+            (k, smt::ule_const(len, k))
+        }
+    };
+    let (elem, elem_sign) = env
+        .index_elem(sl, index)
+        .ok_or_else(|| format!("`{name}` on a receiver whose elements are not modelled"))?;
+    // `Some` when the access is in range, `None` otherwise. The tag is one bit
+    // (the discriminants are `0`/`1`), and it is a predicate, not a constant.
+    let tag = smt::ite(
+        failure,
+        smt::word(0, 1),
+        smt::word(intrinsics::SOME_TAG, 1),
+    );
+    env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+    env.set_payload(
+        dest.local,
+        intrinsics::SOME_TAG,
+        Val::Sym(elem, elem_sign),
+        elem_w,
+    );
+    env.slice_elem_ref.insert(dest.local, (sl, index));
+    Ok(Vec::new())
+}
+
 
 /// Answer `Try::branch`, the first call of the `?` desugaring.
 ///
@@ -5153,6 +5274,20 @@ fn try_intrinsic(
                 Ok(Vec::new())
             }
         });
+    }
+    // `slice::first`/`get`: `Option<&T>`. The element is the executor's own
+    // `s[0]`/`s[k]` variable -- the same one a `s[0]` read names -- so the
+    // `Option`'s payload *is* that element rather than a fresh value the slice
+    // never holds. The `Option` tag is a predicate (`len == 0` for `first`,
+    // `k >= len` for `get`), so the arm is decided by the caller's `switchInt`,
+    // and the payload is recorded under the `Some` discriminant so a `(_2 as
+    // Some).0` downcast -- or the reference's deref -- reads it.
+    if matches!(op, intrinsics::Intrinsic::SliceFirst | intrinsics::Intrinsic::SliceGet) {
+        let p = match first {
+            Operand::Copy(p) | Operand::Move(p) => p,
+            Operand::Const(_) => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        };
+        return Some(slice_element(name, op, p, args, dest, env, cur));
     }
     // The standard library's `Option`/`Result` methods. The receiver is an
     // `Option<T>`/`Result<T, E>` whose tag and payload the model's own

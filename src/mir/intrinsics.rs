@@ -261,6 +261,23 @@ pub enum Intrinsic {
     /// The length is the one the *executor* holds, so the two shapes read the
     /// same number and `is_empty()` cannot disagree with `len() == 0`.
     SliceIsEmpty,
+    /// `slice::first`: `Option<&T>` -- `Some(&s[0])` when the slice is non-empty,
+    /// `None` otherwise.
+    ///
+    /// The element is the executor's own `s[0]` variable (the same one a
+    /// `s[0]` read names), so the `Option`'s payload *is* that element rather than
+    /// a fresh one. The length test is the executor's length variable compared to
+    /// zero, so `first()` cannot disagree with `is_empty()`.
+    SliceFirst,
+    /// `slice::get`: `Option<&T>` -- `Some(&s[k])` when `k < len`, `None`
+    /// otherwise.
+    ///
+    /// Unlike `first`, the index is an operand: `get(i)` is `Some(s[i])` under
+    /// `i < len`, and the element is looked up by the index's *value*. A symbolic
+    /// index on a slice has no finite domain, so the executor refuses it rather
+    /// than reading an arbitrary element -- the same rule a `s[i]` subscript
+    /// follows. A literal index (`get(0)`) is exact.
+    SliceGet,
     /// `iN::abs_diff`: the absolute difference of two operands, as the type.
     ///
     /// Its result is *unsigned* even on a signed type -- `i8::abs_diff(-128, 127)`
@@ -810,6 +827,14 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
         if short == "len" {
             return Some(Intrinsic::SliceLen);
         }
+        if short == "first" {
+            return Some(Intrinsic::SliceFirst);
+        }
+        // `get` is printed with its index type (`::<usize>`), so the tail is not
+        // the bare name; match the head before any generic arguments.
+        if short == "get" || short.starts_with("get::<") {
+            return Some(Intrinsic::SliceGet);
+        }
     }
     // The standard library's `Option`/`Result` methods. Like the slice shapes
     // these read the receiver's own state rather than a bit-vector operand -- the
@@ -1229,13 +1254,16 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // unsigned receiver is a different method (or not one), and reading the
         // top bit as a sign would answer a call `core` has no definition for.
         Intrinsic::Bool(BoolKind::Negative | BoolKind::Positive) => signed,
-        // The slice length and emptiness. Both are the `usize` length the executor
-        // holds, so neither reads the operand width or sign -- they are answered by
-        // `eval_slice` from the length variable, and `eval` never sees them. They
-        // are total here so that a `is_modelled` probe does not report them
-        // unmodelled; the executor is what refuses a receiver whose length it does
-        // not have.
-        Intrinsic::SliceLen | Intrinsic::SliceIsEmpty => true,
+        // The slice length, emptiness and element access. All read the executor's
+        // own stores (the length variable, the element variable), so none reads the
+        // operand width or sign -- they are answered from the executor's state, and
+        // `eval` never sees them. Total here so that an `is_modelled` probe does not
+        // report them unmodelled; the executor is what refuses a receiver whose
+        // length (or index) it does not hold.
+        Intrinsic::SliceLen
+        | Intrinsic::SliceIsEmpty
+        | Intrinsic::SliceFirst
+        | Intrinsic::SliceGet => true,
         // The `Option` methods. They read the receiver's tag and payload, which
         // live in the executor's stores rather than in an operand term, so there is
         // no width or sign to check here -- `eval` never sees them and the
@@ -1374,7 +1402,13 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
     // holds, not from an operand term, so `eval` has nothing to compute for them.
     // Routing them here rather than at a match arm keeps the two-operand `eval`
     // from ever being asked about a shape with no operands.
-    if matches!(op, Intrinsic::SliceLen | Intrinsic::SliceIsEmpty) {
+    if matches!(
+        op,
+        Intrinsic::SliceLen
+            | Intrinsic::SliceIsEmpty
+            | Intrinsic::SliceFirst
+            | Intrinsic::SliceGet
+    ) {
         return None;
     }
     // The `Option` methods read the receiver's tag and payload from the executor's
@@ -1399,8 +1433,11 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
     Some(match op {
         // Answered by `eval_slice` from the executor's length variable; the early
         // return above keeps them from reaching here.
-        Intrinsic::SliceLen | Intrinsic::SliceIsEmpty => {
-            unreachable!("slice shapes are answered from the length variable")
+        Intrinsic::SliceLen
+        | Intrinsic::SliceIsEmpty
+        | Intrinsic::SliceFirst
+        | Intrinsic::SliceGet => {
+            unreachable!("slice shapes are answered from the executor's stores")
         }
         // Answered by the executor's `enum_method` from the discriminant/payload
         // stores; the early return above keeps them from reaching here.

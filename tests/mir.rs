@@ -6417,6 +6417,89 @@ pub fn slice_written_then_symbolic(s: &mut [u8], i: usize) -> u8 {
     );
 }
 
+/// `slice::first`/`get` produce `Option<&T>`, and the payload is the slice's
+/// *own* element, so `*xs.first().unwrap()` and `xs[0]` agree -- and a claim
+/// about a different element is refuted rather than proved.
+///
+/// The tag is a predicate (`len == 0` for `first`, `len <= k` for `get`), so the
+/// `unwrap`'s panic obligation is real: `get(1)` past the end must fail, not be
+/// assumed `Some`. Both directions are pinned, because a model that answered
+/// every `first` with the element would prove the true contracts and the false
+/// ones alike.
+#[test]
+fn slice_first_and_get_reach_the_slices_own_element() {
+    let src = r#"
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 5
+pub fn first_reads_the_element(xs: &[u8]) -> u8 {
+    *xs.first().unwrap()
+}
+
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 6
+pub fn first_wrong_element_cannot_prove_this(xs: &[u8]) -> u8 {
+    *xs.first().unwrap()
+}
+
+/// requires: xs.len() == 0
+/// ensures: ret
+pub fn first_is_none_when_empty(xs: &[u8]) -> bool {
+    xs.first().is_none()
+}
+
+/// requires: xs.len() > 1 && xs[1] == 7
+/// ensures: ret == 7
+pub fn get_reads_the_indexed_element(xs: &[u8]) -> u8 {
+    *xs.get(1).unwrap()
+}
+
+/// requires: xs.len() > 1 && xs[1] == 7
+/// ensures: ret == 8
+pub fn get_wrong_element_cannot_prove_this(xs: &[u8]) -> u8 {
+    *xs.get(1).unwrap()
+}
+
+/// requires: xs.len() > 0
+/// ensures: ret == 7
+pub fn get_out_of_range_unwrap_panics(xs: &[u8]) -> u8 {
+    *xs.get(1).unwrap()
+}
+"#;
+    let Some(o) = verify_src("first_reads_the_element", src) else { return };
+    assert!(
+        o.is_verified(),
+        "`*xs.first().unwrap()` is `xs[0]`, so the true contract must verify; got: {o}"
+    );
+    let Some(o) = verify_src("first_wrong_element_cannot_prove_this", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "the payload is the slice's own element, so a claim about a different value \
+         must be refuted, not proved; got: {o}"
+    );
+    let Some(o) = verify_src("first_is_none_when_empty", src) else { return };
+    assert!(
+        o.is_verified(),
+        "`first` is `None` exactly when the slice is empty; got: {o}"
+    );
+    let Some(o) = verify_src("get_reads_the_indexed_element", src) else { return };
+    assert!(
+        o.is_verified(),
+        "`*xs.get(1).unwrap()` is `xs[1]`, so the true contract must verify; got: {o}"
+    );
+    let Some(o) = verify_src("get_wrong_element_cannot_prove_this", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`get`'s payload is the indexed element, so a claim about another value must \
+         be refuted; got: {o}"
+    );
+    let Some(o) = verify_src("get_out_of_range_unwrap_panics", src) else { return };
+    assert!(
+        matches!(&o, FnOutcome::Failed { kind, .. } if kind.starts_with("panic")),
+        "`get(1)` past the end is `None`, so `unwrap` panics -- a real obligation, not \
+         an assumed `Some`; got: {o}"
+    );
+}
+
 /// A whole-struct reassignment must invalidate the fields bound from it.
 ///
 /// `c = d; c.lo` returns `d.lo`, so `ret == c.lo` is false unless `c.lo == d.lo`.
