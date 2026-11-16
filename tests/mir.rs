@@ -1655,6 +1655,84 @@ fn is_power_of_two_branches_on_the_predicate() {
     }
 }
 
+/// `midpoint`, `next_multiple_of`, `ilog2` and `ilog10`, pinned in both
+/// directions.
+///
+/// Four `core::num` methods added as a group. The true halves pin the *value* --
+/// `midpoint` of an overflowing sum (`255.midpoint(255) == 255`, not the wrapped
+/// `254`), the truncating rounding (`(-5).midpoint(-2) == -3`, not the floor
+/// `-4`), `next_multiple_of` of an exact multiple (the identity, which a model
+/// that always added `b` gets wrong), and the logs at their boundary values
+/// (`ilog2(1) == 0`, `ilog10(9) == 0`). Each true half has a
+/// `_cannot_prove_this` twin that the same wrong model would prove, so a green
+/// verdict on the twin fails the test.
+///
+/// The panic-shaped methods carry the opposite evidence: `next_multiple_of` that
+/// overflows, and `ilog2`/`ilog10` of zero, must *fail* with the panic obligation,
+/// and a control (`next_multiple_of_is_panic_free_here`) must verify, so a model
+/// that reported a panic unconditionally cannot pass.
+#[test]
+fn the_new_num_methods_verify_and_their_tripwires_refute() {
+    let verified = [
+        "midpoint_self_is_the_identity",
+        "midpoint_of_an_overflowing_sum",
+        "midpoint_rounds_toward_zero",
+        "midpoint_signed_truncates",
+        "midpoint_is_between",
+        "next_multiple_of_rounds_up",
+        "next_multiple_of_an_exact_multiple_is_the_identity",
+        "next_multiple_of_is_panic_free_here",
+        "ilog2_of_100",
+        "ilog2_of_one_is_zero",
+        "ilog2_of_a_signed_100",
+        "ilog2_is_bounded",
+        "ilog10_of_100",
+        "ilog10_below_ten_is_zero",
+        "ilog10_of_a_u32_thousand",
+        "ilog10_is_bounded",
+    ];
+    let refuted = [
+        "midpoint_of_an_overflowing_sum_cannot_prove_this",
+        "midpoint_rounds_toward_zero_cannot_prove_this",
+        "midpoint_signed_truncates_cannot_prove_this",
+        "midpoint_is_between_cannot_prove_this",
+        "next_multiple_of_rounds_up_cannot_prove_this",
+        "ilog2_of_100_cannot_prove_this",
+        "ilog10_of_100_cannot_prove_this",
+    ];
+    // The panic-shaped fixtures fail with a *panic* obligation, so the kind is
+    // asserted too: a postcondition failure on one of them would be a different
+    // finding and must not satisfy the test.
+    let panics = [
+        "next_multiple_of_that_overflows_panics",
+        "ilog2_of_zero_panics",
+        "ilog10_of_zero_panics",
+    ];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+    }
+    let Some(report) = verify_realistic(&panics) else { return };
+    for name in panics {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` must fail on its panic obligation, got: {o}");
+        };
+        assert!(
+            kind.starts_with("panic"),
+            "`{name}` must fail on a panic obligation, got kind `{kind}`"
+        );
+    }
+}
+
 /// `is_negative`/`is_positive` are modelled as signed comparisons, not bit tests.
 ///
 /// The signedness is the whole point: `i8::MIN` is `0x80`, the *largest* unsigned

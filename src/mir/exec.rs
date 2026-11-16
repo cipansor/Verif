@@ -5377,6 +5377,7 @@ fn try_intrinsic(
             | intrinsics::Intrinsic::Bool(_)
             | intrinsics::Intrinsic::Abs
             | intrinsics::Intrinsic::Signum
+            | intrinsics::Intrinsic::Ilog(_)
             | intrinsics::Intrinsic::BitReverse
             | intrinsics::Intrinsic::ByteSwap
             | intrinsics::Intrinsic::ByteOrder(_)
@@ -5432,15 +5433,34 @@ fn try_intrinsic(
             }
             Outcome::ValueOrPanic { value, fails } => {
                 // `iN::abs` panics at `MIN`, where the magnitude is
-                // unrepresentable. The value is written unconditionally -- a path
-                // where the call panics is reported by the obligation below, so
-                // the value it carries is never used on a live path -- and the
-                // panic is a *reachable-failure* obligation, the same polarity as
-                // a rustc-inserted `assert`: the call is safe exactly where
+                // unrepresentable, and `ilog2`/`ilog10` panic on a non-positive
+                // argument. The value is written unconditionally -- a path where
+                // the call panics is reported by the obligation below, so the value
+                // it carries is never used on a live path -- and the panic is a
+                // *reachable-failure* obligation, the same polarity as a
+                // rustc-inserted `assert`: the call is safe exactly where
                 // `path ∧ fails` is unsatisfiable.
-                env.set(dest, Val::Sym(value, Sign::of_bool(signed)));
+                //
+                // The result's sign is the operand's, except for a logarithm,
+                // whose result is a `u32` whatever the operand's type
+                // (`i32::ilog2` is `u32`). Declaring the index with the operand's
+                // sign would be the wrong type even though the value is small
+                // enough that no obligation here observes the difference, and the
+                // declaration is what a later reader trusts.
+                let result_sign = if matches!(op, intrinsics::Intrinsic::Ilog(_)) {
+                    Sign::Unsigned
+                } else {
+                    Sign::of_bool(signed)
+                };
+                env.set(dest, Val::Sym(value, result_sign));
+                let message = match op {
+                    intrinsics::Intrinsic::Ilog(_) => {
+                        format!("`{name}` of a non-positive value")
+                    }
+                    _ => format!("`{name}` overflows"),
+                };
                 Ok(vec![Obligation {
-                    kind: ObligationKind::Panic { message: format!("`{name}` overflows") },
+                    kind: ObligationKind::Panic { message },
                     verdict: find_obligation(smt::and(path, fails), pins),
                 }])
             }
@@ -5550,6 +5570,10 @@ fn try_intrinsic(
     // it with the operand's sign would read `255` as `-1`.
     let sign = match op {
         intrinsics::Intrinsic::AbsDiff => Sign::Unsigned,
+        // `ilog2`/`ilog10` return a `u32` whatever the operand's type
+        // (`i32::ilog2` is `u32`), so labelling the result with the operand's sign
+        // would read a non-negative index as signed.
+        intrinsics::Intrinsic::Ilog(_) => Sign::Unsigned,
         _ => Sign::of_bool(signed),
     };
     match outcome {
@@ -5585,8 +5609,23 @@ fn try_intrinsic(
         // introduce.
         Outcome::ValueOrPanic { value, fails } => {
             env.set(dest, Val::Sym(value, sign));
+            // The message names what actually failed, because the shapes that
+            // reach here fail for different reasons: a division by zero or
+            // `MIN / -1`, a `next_multiple_of` overflow, a non-positive logarithm.
+            let message = match op {
+                intrinsics::Intrinsic::DivEuclid
+                | intrinsics::Intrinsic::RemEuclid
+                | intrinsics::Intrinsic::DivCeil => format!("`{name}` division overflow"),
+                intrinsics::Intrinsic::NextMultipleOf => {
+                    format!("`{name}` overflows or divides by zero")
+                }
+                intrinsics::Intrinsic::Ilog(_) => {
+                    format!("`{name}` of a non-positive value")
+                }
+                _ => format!("`{name}` overflow"),
+            };
             return Some(Ok(vec![Obligation {
-                kind: ObligationKind::Panic { message: format!("`{name}` division overflow") },
+                kind: ObligationKind::Panic { message },
                 verdict: find_obligation(smt::and(path, fails), pins),
             }]));
         }

@@ -465,6 +465,27 @@ with no new false proof while the independent corpus keeps growing.
     `the_next_core_value_methods_are_modelled_with_their_tripwires` in
     `tests/mir.rs` and by `the_new_shapes_are_modelled_only_on_the_types_that_have_them`
     (the type-membership directions) in `src/mir/intrinsics.rs`.
+  - Progress (cont.): `midpoint`, `next_multiple_of`, `ilog2` and `ilog10` are
+    modelled. `midpoint` is total and computed *without* a sum at the operand
+    width — unsigned `(a & b) + ((a ^ b) >> 1)`, and for the signed case that same
+    form plus a `+1` correction when the result is negative and `(a ^ b)` is odd,
+    which is the truncation toward zero Rust's `iN::midpoint` documents (the floor
+    would give `-4` for `(-5).midpoint(-2)` where Rust gives `-3`). Checked
+    exhaustively against `core` over all of `u8`/`i8`. `next_multiple_of` is
+    unsigned-only (the signed spelling is unstable on this toolchain, so a signed
+    receiver is refused) and is a *value-and-panic* pair: the value is
+    `a + (b - a % b) % b` and the panic fires where `checked_next_multiple_of`
+    returns `None` (a zero divisor, or an overflow), checked together over the
+    whole `u8` domain. `ilog2`/`ilog10` exist on both signednesses and are
+    value-and-panic too: the value is built at the operand width and zero-extended
+    to the `u32` result, and the panic fires on a non-positive argument. The
+    executor labels an `ilog` result *unsigned* — its type is `u32` whatever the
+    operand's — and gives the panic a kind-specific message rather than calling a
+    logarithm an "overflow". Twenty-six fixtures (sixteen true, seven tripwires,
+    three panic) are in `realistic.rs` (**525 of 975**), pinned by
+    `the_new_num_methods_verify_and_their_tripwires_refute` in `tests/mir.rs` and
+    by `the_new_shapes_are_modelled_only_on_the_types_that_have_them` in
+    `src/mir/intrinsics.rs`.
   - Remaining: the *generic* `<[T]>::first/get/len/is_empty` (`first_or<T>`) need
     monomorphisation, which is C10: `first_or`'s element type has no width and its
     slice length is never seeded (the frontend refuses a receiver whose length it

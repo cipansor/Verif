@@ -11045,3 +11045,213 @@ pub fn result_try_widens_the_error_cannot_prove_this(r: Result<u8, u8>) -> Resul
     let v = r?;
     Ok(v)
 }
+
+// ---------------------------------------------------------------------------
+// `iN::midpoint`, `iN::next_multiple_of`, `iN::ilog2` and `iN::ilog10`.
+//
+// Four `core::num` methods added as a group. Each pairs a true contract with a
+// `_cannot_prove_this` twin, so the model is pinned in both directions: a
+// `verified` that came from a constant, or from the wrong rounding, fails the
+// twin. The panic-shaped methods (`next_multiple_of`, the logs) also carry an
+// entry whose *failure* is the evidence, and a control that must not panic.
+// ---------------------------------------------------------------------------
+
+/// `midpoint` is `(a + b) / 2` computed so the sum cannot overflow, and
+/// `midpoint(a, a)` is `a` for every input -- a value, not a constant, so a model
+/// that folded the method away would fail this.
+/// requires: true
+/// ensures: ret == a
+pub fn midpoint_self_is_the_identity(a: u8) -> u8 {
+    a.midpoint(a)
+}
+
+/// `255u8.midpoint(255)` is `255`: the true sum is `510`, whose half is `255`. A
+/// model that formed `a + b` at eight bits would wrap to `254` and refute this.
+/// requires: a == 255 && b == 255
+/// ensures: ret == 255
+pub fn midpoint_of_an_overflowing_sum(a: u8, b: u8) -> u8 {
+    a.midpoint(b)
+}
+
+/// The false direction of [`midpoint_of_an_overflowing_sum`]: the wrapped sum
+/// would give `254`, so this is the claim a width-losing model proves.
+/// requires: a == 255 && b == 255
+/// ensures: ret == 254
+pub fn midpoint_of_an_overflowing_sum_cannot_prove_this(a: u8, b: u8) -> u8 {
+    a.midpoint(b)
+}
+
+/// `midpoint` rounds toward zero, not toward negative infinity: `(3 + 4) / 2` is
+/// `3`, where the floor is `3` too -- but see the signed entry, where the two
+/// differ.
+/// requires: a == 3 && b == 4
+/// ensures: ret == 3
+pub fn midpoint_rounds_toward_zero(a: u8, b: u8) -> u8 {
+    a.midpoint(b)
+}
+
+/// The false direction of [`midpoint_rounds_toward_zero`].
+/// requires: a == 3 && b == 4
+/// ensures: ret == 4
+pub fn midpoint_rounds_toward_zero_cannot_prove_this(a: u8, b: u8) -> u8 {
+    a.midpoint(b)
+}
+
+/// `(-5).midpoint(-2)` is `-3`, which is *truncation* toward zero; the floor of
+/// `-3.5` is `-4`. A model that used a logical shift (or the floor) would give
+/// `-4` and refute this.
+/// requires: a == -5 && b == -2
+/// ensures: ret == -3
+pub fn midpoint_signed_truncates(a: i8, b: i8) -> i8 {
+    a.midpoint(b)
+}
+
+/// The false direction of [`midpoint_signed_truncates`]: the floor, which a model
+/// without the odd-bit correction would prove.
+/// requires: a == -5 && b == -2
+/// ensures: ret == -4
+pub fn midpoint_signed_truncates_cannot_prove_this(a: i8, b: i8) -> i8 {
+    a.midpoint(b)
+}
+
+/// `midpoint` lies between its arguments when they are ordered -- a symbolic
+/// property, so it pins the whole model rather than one point.
+/// requires: a <= b
+/// ensures: ret >= a && ret <= b
+pub fn midpoint_is_between(a: u8, b: u8) -> u8 {
+    a.midpoint(b)
+}
+
+/// The false direction of [`midpoint_is_between`].
+/// requires: a <= b
+/// ensures: ret < a
+pub fn midpoint_is_between_cannot_prove_this(a: u8, b: u8) -> u8 {
+    a.midpoint(b)
+}
+
+/// `100u8.next_multiple_of(7)` is `105` (`7 * 15`), not `100` or `112`.
+/// requires: a == 100 && b == 7
+/// ensures: ret == 105
+pub fn next_multiple_of_rounds_up(a: u8, b: u8) -> u8 {
+    a.next_multiple_of(b)
+}
+
+/// When `a` is already a multiple of `b`, `next_multiple_of` is the identity --
+/// the case a model that always added `b` would get wrong.
+/// requires: a == 21 && b == 7
+/// ensures: ret == 21
+pub fn next_multiple_of_an_exact_multiple_is_the_identity(a: u8, b: u8) -> u8 {
+    a.next_multiple_of(b)
+}
+
+/// The false direction of [`next_multiple_of_rounds_up`].
+/// requires: a == 100 && b == 7
+/// ensures: ret == 112
+pub fn next_multiple_of_rounds_up_cannot_prove_this(a: u8, b: u8) -> u8 {
+    a.next_multiple_of(b)
+}
+
+/// `255u8.next_multiple_of(100)` overflows (`300 > 255`), so the method panics --
+/// the obligation is the evidence the failure predicate is exact.
+/// requires: a == 255 && b == 100
+/// ensures: false
+pub fn next_multiple_of_that_overflows_panics(a: u8, b: u8) -> u8 {
+    a.next_multiple_of(b)
+}
+
+/// The control: `next_multiple_of` is total wherever it does not overflow, so a
+/// model that reported a panic unconditionally would fail here.
+/// requires: a == 100 && b == 7
+/// ensures: ret <= 255
+pub fn next_multiple_of_is_panic_free_here(a: u8, b: u8) -> u8 {
+    a.next_multiple_of(b)
+}
+
+/// `100u8.ilog2()` is `6` (`2^6 = 64 <= 100 < 128 = 2^7`).
+/// requires: a == 100
+/// ensures: ret == 6
+pub fn ilog2_of_100(a: u8) -> u32 {
+    a.ilog2()
+}
+
+/// The false direction of [`ilog2_of_100`].
+/// requires: a == 100
+/// ensures: ret == 7
+pub fn ilog2_of_100_cannot_prove_this(a: u8) -> u32 {
+    a.ilog2()
+}
+
+/// `1u8.ilog2()` is `0` -- the boundary a model built from `leading_zeros` gets
+/// right only if the index is `w - 1 - lz`, not `lz`.
+/// requires: a == 1
+/// ensures: ret == 0
+pub fn ilog2_of_one_is_zero(a: u8) -> u32 {
+    a.ilog2()
+}
+
+/// The result is a `u32` even for an `i8` operand, and the index of the highest
+/// set bit of `100` is `6`.
+/// requires: a == 100
+/// ensures: ret == 6
+pub fn ilog2_of_a_signed_100(a: i8) -> u32 {
+    a.ilog2()
+}
+
+/// `ilog2` is at most `w - 1` on the live path, so it is bounded by `7` at eight
+/// bits -- a symbolic property, and the panic precondition is what makes the
+/// obligation discharge.
+/// requires: a >= 1
+/// ensures: ret <= 7
+pub fn ilog2_is_bounded(a: u8) -> u32 {
+    a.ilog2()
+}
+
+/// `ilog2` panics on `0`, so the obligation is the evidence the failure predicate
+/// fires on exactly the non-positive argument.
+/// requires: a == 0
+/// ensures: false
+pub fn ilog2_of_zero_panics(a: u8) -> u32 {
+    a.ilog2()
+}
+
+/// `100u8.ilog10()` is `2` (`10^2 = 100 <= 100 < 1000`).
+/// requires: a == 100
+/// ensures: ret == 2
+pub fn ilog10_of_100(a: u8) -> u32 {
+    a.ilog10()
+}
+
+/// Below ten, `ilog10` is `0`.
+/// requires: a == 9
+/// ensures: ret == 0
+pub fn ilog10_below_ten_is_zero(a: u8) -> u32 {
+    a.ilog10()
+}
+
+/// The false direction of [`ilog10_of_100`].
+/// requires: a == 100
+/// ensures: ret == 3
+pub fn ilog10_of_100_cannot_prove_this(a: u8) -> u32 {
+    a.ilog10()
+}
+
+/// `ilog10` at a wider width: `1000u32.ilog10()` is `3`.
+/// requires: a == 1000
+/// ensures: ret == 3
+pub fn ilog10_of_a_u32_thousand(a: u32) -> u32 {
+    a.ilog10()
+}
+
+/// `ilog10` panics on `0`.
+/// requires: a == 0
+/// ensures: false
+pub fn ilog10_of_zero_panics(a: u8) -> u32 {
+    a.ilog10()
+}
+
+/// `ilog10` is bounded by the number of powers of ten that fit `w` bits.
+/// requires: a >= 1
+/// ensures: ret <= 2
+pub fn ilog10_is_bounded(a: u8) -> u32 {
+    a.ilog10()
+}

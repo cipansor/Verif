@@ -218,6 +218,27 @@ pub enum Intrinsic {
     /// unlike every other shape it is built at the operand's width and
     /// zero-extended to the destination's. It cannot fail.
     Bits(BitKind),
+    /// `iN::ilog2`/`iN::ilog10`: the integer logarithm, floor.
+    ///
+    /// `ilog2` is the index of the highest set bit and `ilog10` the largest `k`
+    /// with `10^k <= x`. Like a bit count the result is a `u32` regardless of the
+    /// operand's type (`u8::ilog2` is `u32`), so it is built at the operand's
+    /// width and zero-extended. Unlike a bit count it is *not* total: both panic
+    /// on a non-positive argument (an operand `<= 0`, which for an unsigned type
+    /// is `x == 0`), so the shape yields a [`Outcome::ValueOrPanic`] and the
+    /// executor turns the failure predicate into a reachable-panic obligation --
+    /// the same polarity as `iN::abs`'s overflow. `ilog2` exists on both
+    /// signednesses; `ilog10` on both too.
+    Ilog(LogKind),
+    /// `iN::next_multiple_of`: the smallest multiple of `b` that is `>= a`.
+    ///
+    /// A method that *panics*: on a zero divisor, and on an overflow (`u8::MAX`
+    /// `next_multiple_of` `100` overflows and panics in a checked build). So it is
+    /// a [`Outcome::ValueOrPanic`], and the executor reports both failures as one
+    /// reachable-panic obligation. Unsigned-only -- the signed spelling is
+    /// unstable on this toolchain -- so a signed receiver is refused rather than
+    /// read. The value is `a + (b - a % b) % b`, which is `a` when `a % b == 0`.
+    NextMultipleOf,
     /// A `pow` in one of the four families: `wrapping_pow`, `saturating_pow`,
     /// `checked_pow` or `overflowing_pow`.
     ///
@@ -308,8 +329,10 @@ pub enum Intrinsic {
     /// executor emits the same divide-by-zero and overflow obligations for a
     /// `div_euclid` call as for a `/`, from the operands, so the model only has to
     /// supply the *value*. Signed-only (the unsigned spelling is the plain `/`),
-    /// and the value is `q = a / b` adjusted up by one when the remainder is
-    /// negative: `r = a % b; r >= 0 ? q : (b > 0 ? q + 1 : q - 1)`.
+    /// and the value is the truncating quotient adjusted *away* from the remainder
+    /// when the remainder is negative: `r = a % b; r >= 0 ? q : (b > 0 ? q - 1 : q
+    /// + 1)`. The direction is the part that is easy to get backwards -- `-7`
+    /// `div_euclid` `3` is `-3`, not `-2`.
     DivEuclid,
     /// `iN::rem_euclid`: Euclidean remainder, `0 <= r < |b|`.
     ///
@@ -324,6 +347,17 @@ pub enum Intrinsic {
     /// read. The panics are the plain `/` ones (a zero divisor). The value is
     /// `q = a / b` rounded up when the remainder is nonzero: `r != 0 ? q + 1 : q`.
     DivCeil,
+    /// `iN::midpoint`: the midpoint `(a + b) / 2`, rounded toward zero, computed
+    /// *without* the overflow a plain `a + b` would have.
+    ///
+    /// A *total* value method on both signednesses (`u8::midpoint` is `(a + b) / 2`
+    /// with the sum taken at one bit of headroom). The result rounds toward zero,
+    /// not toward negative infinity: `(-5).midpoint(-2)` is `-3`, where the floor
+    /// would be `-4`. The model never forms `a + b` at the operand width -- that is
+    /// the whole point of the method -- so it is written as the classic
+    /// `(a & b) + ((a ^ b) >> 1)` with the sign and rounding corrections a
+    /// fixed-width machine needs: see [`midpoint`].
+    Midpoint,
     /// `iN::reverse_bits`: the operand's bits in reverse order.
     ///
     /// Total, and exists on both signednesses; the result has the operand's type
@@ -334,8 +368,9 @@ pub enum Intrinsic {
     /// byte kept in place (a `u16` swaps its two bytes; a `u8` is unchanged).
     ///
     /// Total, both signednesses, and the model is a byte-level rotation by half the
-    /// width -- which is why it reuses [`rotate`]: `swap_bytes` is exactly a
-    /// rotation by `w/2` bytes, i.e. `w/2 * 8` bits.
+    /// width -- which is why it reuses [`rotate`]: the bytes reverse, so each byte
+    /// travels half the *width*, i.e. `w/2` bits (a `u16` rotates by `8`, a `u32`
+    /// by `16`).
     ByteSwap,
     /// `iN::to_be`/`to_le`: a byte-order conversion.
     ///
@@ -782,6 +817,21 @@ pub enum BitKind {
     TrailingOnes,
 }
 
+/// An integer logarithm: `ilog2` or `ilog10`.
+///
+/// Distinct from [`BitKind`] because a log is not a bit *count*: it is not a sum
+/// over the operand's bits, and unlike a count it *panics* on a non-positive
+/// argument. Keeping it a separate enum is what stops a log from being answered
+/// by the count path, which is total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogKind {
+    /// `ilog2`: the index of the highest set bit, `w - 1 - leading_zeros(x)` for
+    /// `x > 0`.
+    Ilog2,
+    /// `ilog10`: the largest `k` with `10^k <= x`.
+    Ilog10,
+}
+
 /// Which way a rotation turns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RotateKind {
@@ -801,6 +851,7 @@ impl Intrinsic {
             self,
             Intrinsic::Unary(..)
                 | Intrinsic::Bits(_)
+                | Intrinsic::Ilog(_)
                 | Intrinsic::Bool(
                     BoolKind::PowerOfTwo
                         | BoolKind::Ascii(_)
@@ -1089,6 +1140,18 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     }
     if short == "div_ceil" {
         return Some(Intrinsic::DivCeil);
+    }
+    if short == "midpoint" {
+        return Some(Intrinsic::Midpoint);
+    }
+    if short == "next_multiple_of" {
+        return Some(Intrinsic::NextMultipleOf);
+    }
+    if short == "ilog2" {
+        return Some(Intrinsic::Ilog(LogKind::Ilog2));
+    }
+    if short == "ilog10" {
+        return Some(Intrinsic::Ilog(LogKind::Ilog10));
     }
     if short == "reverse_bits" {
         return Some(Intrinsic::BitReverse);
@@ -1450,6 +1513,23 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // `div_ceil` is a *total* method on the unsigned types; the signed one is
         // unstable, so a signed receiver is refused. Bounded like a division.
         Intrinsic::DivCeil => !signed && w <= DIV_MAX_WIDTH,
+        // `midpoint` exists on both signednesses and is total -- the whole point
+        // of the method is that it does not overflow. Its value is built without a
+        // sum at the operand width, so it needs no headroom and is modelled at any
+        // width the engine holds.
+        Intrinsic::Midpoint => true,
+        // `next_multiple_of` is modelled on the *unsigned* types only: the signed
+        // spelling is unstable on this toolchain, so a signed receiver is refused
+        // rather than read. Its value is `a + (b - a % b) % b`, which needs no
+        // headroom to *build* -- the overflow it may cause is the panic the
+        // executor reports, not a value the model must represent -- but it does use
+        // the unsigned divider, so it is bounded like a division.
+        Intrinsic::NextMultipleOf => !signed && w <= DIV_MAX_WIDTH,
+        // `ilog2`/`ilog10`. Both exist on both signednesses, and both panic on a
+        // non-positive argument, which the executor reports. The value is built at
+        // the operand width and zero-extended, so any width the engine holds is
+        // fine.
+        Intrinsic::Ilog(_) => true,
         // The byte permutations and orderings are pure bit/byte moves, so they
         // exist on both signednesses and are total at any width the engine holds.
         Intrinsic::BitReverse | Intrinsic::ByteSwap | Intrinsic::ByteOrder(_) => true,
@@ -1897,6 +1977,42 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             let fails = failure(BinOp::Div, x, y, w, signed)?;
             Outcome::ValueOrPanic { value: smt::truncate(div_ceil_value(x, y, w), result_w), fails }
         }
+        // `midpoint`: `(a + b) / 2` rounded toward zero, without the overflow the
+        // sum would have. Total -- the whole point of the method -- so a plain
+        // value, built by [`midpoint`] without ever forming `a + b` at `w` bits.
+        Intrinsic::Midpoint => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            Outcome::Value(smt::truncate(midpoint(x, y, w, signed), result_w))
+        }
+        // `next_multiple_of`: the smallest multiple of `b` that is `>= a`. The
+        // value is `a + (b - a % b) % b`; the *failure* is a zero divisor or an
+        // overflow, both reported as a reachable-panic obligation. `a % b` and the
+        // adjustment are built at `w` bits, and the addition is the wrapped one --
+        // the wrap is exactly the overflow the panic predicate reports, so the
+        // value the model carries on the failing path is the wrapped sum, which is
+        // never read on a live path.
+        Intrinsic::NextMultipleOf => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            let fails = next_multiple_fails(x, y);
+            Outcome::ValueOrPanic {
+                value: smt::truncate(next_multiple_value(x, y), result_w),
+                fails,
+            }
+        }
+        // `ilog2`/`ilog10`: the integer logarithm. The value is built at `w` bits
+        // and zero-extended to `result_w` (the method returns a `u32`). Both panic
+        // on a non-positive argument, so the outcome is a value-or-panic.
+        Intrinsic::Ilog(kind) => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            let fails = ilog_fails(x, signed);
+            Outcome::ValueOrPanic { value: smt::truncate(ilog_value(kind, x, w), result_w), fails }
+        }
         // The byte permutations and orderings: pure moves, so the result has the
         // operand's own width and sign. Each is its own total expression.
         Intrinsic::BitReverse => Outcome::Value(smt::truncate(bit_reverse(x), result_w)),
@@ -2053,6 +2169,167 @@ fn div_ceil_value(x: Var, y: Var, w: u8) -> Var {
     let r = smt::urem(x, y);
     let one = smt::word(1, w);
     smt::ite(smt::eq_const(r, 0), q, smt::add(q, one))
+}
+
+/// `iN::midpoint`: `(a + b) / 2`, rounded toward zero, without the overflow.
+///
+/// The method exists precisely so that `(a + b) / 2` does not overflow, so the
+/// model must *not* form `a + b` at the operand width. The identity
+/// `a + b == (a & b) * 2 + (a ^ b)` holds in unbounded arithmetic, so halving
+/// gives `floor((a + b) / 2) == (a & b) + ((a ^ b) >> 1)` -- and that value always
+/// fits in `w` bits (it is the true midpoint, which the method guarantees fits),
+/// so the addition in the model cannot wrap either. The shift is arithmetic for a
+/// signed operand, which is exactly `floor((a ^ b) / 2)` there.
+///
+/// `midpoint` truncates toward zero, and the floor and the truncation differ only
+/// for a *negative odd* sum: the floor is then one below the truncation. Since
+/// `a + b` and `a ^ b` have the same parity, the low bit of `a ^ b` is `1` exactly
+/// when the sum is odd, so the correction is "add `(a ^ b) & 1` where the floor is
+/// negative". The sign test is on the *floor* rather than on either operand, which
+/// is the value the correction is applied to -- and `floor < 0` holds exactly when
+/// `a + b < 0`, which is what makes the test the right one. An unsigned operand
+/// never has a negative sum, so it takes no correction.
+///
+/// Both directions were checked exhaustively at `u8`/`i8` against `core`'s own
+/// method in the unit tests below.
+fn midpoint(x: Var, y: Var, w: u8, signed: bool) -> Var {
+    let both = smt::band(x, y);
+    let diff = smt::bxor(x, y);
+    // The halving of `a ^ b` is a `>>` on the operand's own type: arithmetic when
+    // signed (the top bit replicates, giving `floor` of a negative diff) and
+    // logical when unsigned. The two are the same operation on a non-negative
+    // value, which is why the unsigned case needs no sign care.
+    let half = if signed { smt::ashr(diff, 1) } else { smt::lshr(diff, 1) };
+    let floor = smt::add(both, half);
+    if !signed {
+        return floor;
+    }
+    let odd = smt::band(diff, smt::word(1, w));
+    let correction = smt::ite(smt::slt(floor, smt::word(0, w)), odd, smt::word(0, w));
+    smt::add(floor, correction)
+}
+
+/// `iN::next_multiple_of`: the smallest multiple of `b` that is `>= a`.
+///
+/// `a + (b - a % b) % b`. The inner `% b` matters: for `a % b == 0` the delta must
+/// be `0`, not `b`, or the result would be the *next* multiple up. The addition is
+/// the wrapping one; on the path where it overflows the value is never read (the
+/// failure predicate is reported instead), so the wrap is not observable.
+///
+/// The result is unsigned (the method is modelled on the unsigned types only), so
+/// the divider is the plain unsigned one.
+fn next_multiple_value(x: Var, y: Var) -> Var {
+    let r = smt::urem(x, y);
+    let delta = smt::urem(smt::sub(y, r), y);
+    smt::add(x, delta)
+}
+
+/// The failure predicate of `next_multiple_of`: a zero divisor, or an overflow of
+/// the result.
+///
+/// The overflow is the same `Add` overflow the family predicates use -- the result
+/// is `a + delta`, and `delta = (b - a % b) % b` -- so the flag is exact. A zero
+/// divisor is a failure in its own right, which is why the predicate is
+/// `b == 0 || add_overflows`. The two are a *disjunct*, not a guard: the delta term
+/// is still built at `b == 0`, where `a % 0` is the engine's *defined* value rather
+/// than a hole, but its value cannot change the answer because the `b == 0` disjunct
+/// is already true there.
+fn next_multiple_fails(x: Var, y: Var) -> Pred {
+    let delta = smt::urem(smt::sub(y, smt::urem(x, y)), y);
+    let sum = smt::add(x, delta);
+    // `sum < x` is the unsigned-carry test: the wrapped sum is below an addend
+    // exactly when the addition carried out of `w` bits. The same shape the
+    // accumulator proof uses, and it needs no side condition.
+    let overflow = smt::ult(sum, x);
+    smt::or(smt::eq_const(y, 0), overflow)
+}
+
+/// `iN::ilog2`/`iN::ilog10`: the integer logarithm.
+///
+/// Both are built at the operand's width and the caller zero-extends to the
+/// `u32` result. `ilog2` is `w - 1 - leading_zeros(x)`, which is the index of the
+/// highest set bit; `ilog10` counts the `10^k` thresholds `x` reaches. The
+/// argument is `x`'s *unsigned* reading for `ilog10` (`10^k <= x` is an unsigned
+/// test even on a signed operand, because `core` panics on a negative argument
+/// rather than comparing it). `ilog2` on a signed operand is the same: `core`
+/// panics on a non-positive argument, so the operand is non-negative on the live
+/// path and the unsigned bit index is the signed one.
+fn ilog_value(kind: LogKind, x: Var, w: u8) -> Var {
+    match kind {
+        // The highest set bit index: `w - 1` minus the leading zeros. For `x == 0`
+        // this is `-1` at `w` bits, but the failing path never reads it.
+        LogKind::Ilog2 => {
+            let lz = bit_count(BitKind::LeadingZeros, x);
+            smt::sub(smt::word(u64::from(w) - 1, w), lz)
+        }
+        // The number of `10^k` thresholds `x` reaches: `sum_k [10^k <= x]`. The
+        // thresholds are the powers of ten that fit `w` bits, taken from a table
+        // rather than computed with a divider, so the model builds no circuit the
+        // blaster has to hold. A value below `10` contributes nothing, which is
+        // `ilog10(x) == 0`.
+        LogKind::Ilog10 => {
+            let one = smt::word(1, w);
+            let mut acc = smt::word(0, w);
+            for pow in POWERS_OF_TEN {
+                if pow > max_of_width(w) {
+                    break;
+                }
+                acc = smt::add(acc, smt::ite(smt::uge_const(x, pow), one, smt::word(0, w)));
+            }
+            acc
+        }
+    }
+}
+
+/// `10^1` through `10^19`, the powers of ten that fit in 64 bits.
+///
+/// A fixed table because every power the model can need is known up front: the
+/// widest operand the engine holds is 64 bits and `10^19 < 2^64 < 10^20`, so no
+/// operand can reach `10^20`.
+const POWERS_OF_TEN: [u64; 19] = [
+    10,
+    100,
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+    10_000_000_000,
+    100_000_000_000,
+    1_000_000_000_000,
+    10_000_000_000_000,
+    100_000_000_000_000,
+    1_000_000_000_000_000,
+    10_000_000_000_000_000,
+    100_000_000_000_000_000,
+    1_000_000_000_000_000_000,
+    10_000_000_000_000_000_000,
+];
+
+/// The largest value an unsigned `w`-bit word holds. `w >= 1`.
+fn max_of_width(w: u8) -> u64 {
+    if w >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << w) - 1
+    }
+}
+
+/// The failure predicate of `ilog2`/`ilog10`: the argument is non-positive.
+///
+/// For an unsigned operand that is `x == 0`; for a signed one it is `x <= 0`,
+/// which is `core`'s actual test ("argument of integer logarithm must be
+/// positive"). The sign test is `sle(x, 0)` on a signed operand and `eq_const(x,
+/// 0)` on an unsigned one, so a negative *signed* argument is a failure rather
+/// than a huge positive index.
+fn ilog_fails(x: Var, signed: bool) -> Pred {
+    if signed {
+        smt::sle(x, smt::word(0, smt::bits(x)))
+    } else {
+        smt::eq_const(x, 0)
+    }
 }
 
 /// `iN::reverse_bits`: the operand's bits in reversed order.
@@ -5430,6 +5707,203 @@ mod tests {
         );
     }
 
+    /// `midpoint` agrees with Rust's own method over the whole domain, on both
+    /// signednesses, including the overflowing sums a plain `(a + b) / 2` would
+    /// wrap.
+    ///
+    /// `midpoint` is *total* -- it exists so the sum never overflows -- so the
+    /// oracle is a plain value comparison and the exhaustive walk covers the
+    /// boundary cases (`MIN`, `MAX`, `MAX + MAX`) that a sampling test would miss.
+    #[test]
+    fn midpoint_agrees_with_rust() {
+        check_unary_binary_value(
+            Intrinsic::Midpoint,
+            8,
+            false,
+            unident,
+            |x, y| i64::from((x as u8).midpoint(y as u8)),
+            "u8::midpoint",
+        );
+        check_unary_binary_value(
+            Intrinsic::Midpoint,
+            8,
+            true,
+            |b| i8::from_ne_bytes([b as u8]) as i64,
+            |x, y| i64::from((x as i8).midpoint(y as i8)),
+            "i8::midpoint",
+        );
+    }
+
+    /// `next_multiple_of` agrees with Rust's value and its panic predicate over the
+    /// whole `u8` domain.
+    ///
+    /// The oracle uses `checked_next_multiple_of`, which returns `None` exactly
+    /// where the method panics (a zero divisor, or an overflow), so the two are
+    /// checked together: a value mismatch, a predicate that fires where Rust
+    /// returns `Some`, and a predicate that stays silent where Rust returns `None`
+    /// are all caught.
+    #[test]
+    fn next_multiple_of_agrees_with_rust() {
+        smt::with_fresh(|| {
+            let a = smt::var(8);
+            let b = smt::var(8);
+            let outcome = eval(Intrinsic::NextMultipleOf, a, b, 8, false, 8)
+                .expect("next_multiple_of must be modelled at u8");
+            let Outcome::ValueOrPanic { value, fails } = outcome else {
+                panic!("next_multiple_of must produce a value-or-panic outcome");
+            };
+            let (ai, bi) = (smt::index(a), smt::index(b));
+            each_pair(8, |xb, yb| {
+                let (x, y) = (xb as u8, yb as u8);
+                let env = |i: u32| {
+                    if i == ai {
+                        Some(xb)
+                    } else if i == bi {
+                        Some(yb)
+                    } else {
+                        None
+                    }
+                };
+                let want = x.checked_next_multiple_of(y);
+                assert_eq!(
+                    smt::evaluate_pred(fails, env),
+                    Some(want.is_none()),
+                    "next_multiple_of panic predicate at ({x}, {y})"
+                );
+                if let Some(v) = want {
+                    assert_eq!(
+                        smt::evaluate(value, env),
+                        Some(u64::from(v)),
+                        "next_multiple_of value at ({x}, {y})"
+                    );
+                }
+            });
+        });
+    }
+
+    /// `ilog2`/`ilog10` agree with Rust over the whole `u8`/`i8` domain, value and
+    /// panic predicate together.
+    ///
+    /// `core` panics on a non-positive argument, so the oracle calls the real
+    /// method only where it is defined (`x > 0`) and expects the failure predicate
+    /// elsewhere. The result is a `u32`, so `result_w` is `32` and the value is
+    /// zero-extended -- the walk checks the widened term, which is what a caller
+    /// reads.
+    #[test]
+    fn the_integer_logs_agree_with_rust() {
+        for (kind, oracle_u, oracle_i, label) in [
+            (
+                LogKind::Ilog2,
+                (|x: u8| u64::from(x.ilog2())) as fn(u8) -> u64,
+                (|x: i8| u64::from(x.ilog2())) as fn(i8) -> u64,
+                "ilog2",
+            ),
+            (
+                LogKind::Ilog10,
+                (|x: u8| u64::from(x.ilog10())) as fn(u8) -> u64,
+                (|x: i8| u64::from(x.ilog10())) as fn(i8) -> u64,
+                "ilog10",
+            ),
+        ] {
+            for xb in 0..=u8::MAX {
+                let x = xb;
+                check_log(
+                    Intrinsic::Ilog(kind),
+                    8,
+                    false,
+                    xb as u64,
+                    x > 0,
+                    || oracle_u(x),
+                    &format!("u8::{label} at {x}"),
+                );
+            }
+            for xb in 0..=u8::MAX {
+                let x = i8::from_ne_bytes([xb]);
+                check_log(
+                    Intrinsic::Ilog(kind),
+                    8,
+                    true,
+                    xb as u64,
+                    x > 0,
+                    || oracle_i(x),
+                    &format!("i8::{label} at {x}"),
+                );
+            }
+        }
+    }
+
+    /// Evaluate a `uN`/`iN` log model at one input and compare value and panic.
+    ///
+    /// `want` is a closure because `core`'s method *panics* where the model's
+    /// failure predicate fires, so the expectation cannot be computed eagerly for
+    /// every input.
+    fn check_log(
+        op: Intrinsic,
+        w: u8,
+        signed: bool,
+        bits: u64,
+        defined: bool,
+        want: impl Fn() -> u64,
+        label: &str,
+    ) {
+        smt::with_fresh(|| {
+            let a = smt::var(w);
+            let outcome = eval(op, a, a, w, signed, 32)
+                .unwrap_or_else(|| panic!("{label} must be modelled"));
+            let Outcome::ValueOrPanic { value, fails } = outcome else {
+                panic!("{label} must produce a value-or-panic outcome");
+            };
+            let ai = smt::index(a);
+            let env = |i: u32| if i == ai { Some(bits) } else { None };
+            assert_eq!(
+                smt::evaluate_pred(fails, env),
+                Some(!defined),
+                "{label}: panic predicate"
+            );
+            if defined {
+                assert_eq!(smt::evaluate(value, env), Some(want()), "{label}: value");
+            }
+        });
+    }
+
+    /// Compare a two-operand *total* model against Rust over every input pair.
+    ///
+    /// The total counterpart of [`check_value_or_panic_binary`]: no failure
+    /// predicate, so the oracle is called at every input.
+    fn check_unary_binary_value(
+        op: Intrinsic,
+        w: u8,
+        signed: bool,
+        from_bits: impl Fn(u64) -> i64,
+        rust: impl Fn(i64, i64) -> i64,
+        label: &str,
+    ) {
+        smt::with_fresh(|| {
+            let a = smt::var(w);
+            let b = smt::var(w);
+            let outcome = eval(op, a, b, w, signed, w)
+                .unwrap_or_else(|| panic!("{label} at {w} bits must be modelled"));
+            let Outcome::Value(value) = outcome else {
+                panic!("{label} must produce a plain value");
+            };
+            let (ai, bi) = (smt::index(a), smt::index(b));
+            each_pair(w, |xb, yb| {
+                let (x, y) = (from_bits(xb), from_bits(yb));
+                let env = |i: u32| {
+                    if i == ai {
+                        Some(xb)
+                    } else if i == bi {
+                        Some(yb)
+                    } else {
+                        None
+                    }
+                };
+                let want = rust(x, y) as u64 & mask_of(w);
+                assert_eq!(smt::evaluate(value, env), Some(want), "{label} at ({x}, {y})");
+            });
+        });
+    }
+
     /// The byte permutations and orderings agree with Rust over the whole domain.
     ///
     /// `reverse_bits` and `swap_bytes` are bit/byte moves, checked on both
@@ -5532,6 +6006,13 @@ mod tests {
         assert_eq!(classify("core::num::<impl u8>::to_ascii_uppercase"), Some(Intrinsic::AsciiCase(AsciiCaseKind::Upper)));
         assert_eq!(classify("core::num::<impl u8>::to_ascii_lowercase"), Some(Intrinsic::AsciiCase(AsciiCaseKind::Lower)));
         assert_eq!(classify("core::num::<impl u32>::is_multiple_of"), Some(Intrinsic::Bool(BoolKind::MultipleOf)));
+        assert_eq!(classify("core::num::<impl u32>::midpoint"), Some(Intrinsic::Midpoint));
+        assert_eq!(classify("core::num::<impl i32>::midpoint"), Some(Intrinsic::Midpoint));
+        assert_eq!(classify("core::num::<impl u32>::next_multiple_of"), Some(Intrinsic::NextMultipleOf));
+        assert_eq!(classify("core::num::<impl u32>::ilog2"), Some(Intrinsic::Ilog(LogKind::Ilog2)));
+        assert_eq!(classify("core::num::<impl i32>::ilog2"), Some(Intrinsic::Ilog(LogKind::Ilog2)));
+        assert_eq!(classify("core::num::<impl u32>::ilog10"), Some(Intrinsic::Ilog(LogKind::Ilog10)));
+        assert_eq!(classify("core::num::<impl i32>::ilog10"), Some(Intrinsic::Ilog(LogKind::Ilog10)));
         // The `_bytes` forms return an array, so they are left unclassified rather
         // than modelled as a word.
         assert_eq!(classify("core::num::<impl u32>::to_be_bytes"), None);
@@ -5559,6 +6040,19 @@ mod tests {
             assert!(!is_modelled(Intrinsic::DivCeil, w, true));
             assert!(is_modelled(Intrinsic::Bool(BoolKind::MultipleOf), w, false));
             assert!(!is_modelled(Intrinsic::Bool(BoolKind::MultipleOf), w, true));
+            // `midpoint` and the logs exist on both signednesses and are total
+            // (the logs' panic is a *reported* obligation, not a missing model).
+            assert!(is_modelled(Intrinsic::Midpoint, w, true));
+            assert!(is_modelled(Intrinsic::Midpoint, w, false));
+            assert!(is_modelled(Intrinsic::Ilog(LogKind::Ilog2), w, true));
+            assert!(is_modelled(Intrinsic::Ilog(LogKind::Ilog2), w, false));
+            assert!(is_modelled(Intrinsic::Ilog(LogKind::Ilog10), w, true));
+            assert!(is_modelled(Intrinsic::Ilog(LogKind::Ilog10), w, false));
+            // `next_multiple_of` is unsigned-only on this toolchain: the signed
+            // spelling is unstable, so a signed receiver must be refused rather
+            // than read.
+            assert!(is_modelled(Intrinsic::NextMultipleOf, w, false));
+            assert!(!is_modelled(Intrinsic::NextMultipleOf, w, true));
             // The byte permutations and orders exist on both signednesses.
             assert!(is_modelled(Intrinsic::BitReverse, w, true));
             assert!(is_modelled(Intrinsic::BitReverse, w, false));
