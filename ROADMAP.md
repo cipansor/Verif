@@ -339,7 +339,7 @@ with no new false proof while the independent corpus keeps growing.
 
 ### Trust tracking (A1, tracked from Phase 1)
 
-- **A1. Track the false-proof rate.** · P0 · in progress · —
+- **A1. Track the false-proof rate.** · P0 · **done** · —
   - Data: at least 11 false proofs were fixed between 2025-11-04 and 2025-11-12.
     All were caught, but at that rate a `verified` is not yet evidence to rely on.
   - Approach: a `SOUNDNESS.md` listing every false proof with date, commit,
@@ -347,7 +347,11 @@ with no new false proof while the independent corpus keeps growing.
     false proof in the last two weeks.
   - Exit for "beta": four weeks in a row with no new false proof, while the
     independent corpus keeps growing.
-  - Move: **build**. (`AGENTS.md` is the raw material; the extraction is todo.)
+  - Move: **build**. `SOUNDNESS.md` now carries the ledger (21 MIR-frontend rows
+    plus the engine/vacuity/handle classes), and `tests/soundness.rs` extracts the
+    fixture column and fails if any named fixture no longer exists — so a renamed
+    test cannot leave a row pointing at nothing. The clock restarts on each row;
+    the most recent is 2026-11-16.
 
 ---
 

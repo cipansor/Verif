@@ -9229,3 +9229,46 @@ corpus is unchanged (`realistic.rs` 429 of 797, `everyday.rs` 16 of 21 — no
 verdict moved); `cargo clippy --workspace --features std --all-targets` and
 `cargo clippy --no-default-features --lib` both clean; zero dependencies and
 `no_std` untouched.
+
+## A ledger of false proofs, and the test that keeps it from going stale
+
+The PR review's top trust item (A1) was to *track the false-proof rate*: keep a
+`SOUNDNESS.md` listing every false proof with its date, root-cause class and
+fixture, and pause feature work on any layer that produced one in the last two
+weeks. The data behind it is real -- the review counted eleven false proofs fixed
+in the nine days to 2025-11-12, and this session's own log records twenty-one
+wrong verdicts in the MIR frontend across 2026-11-12 … 2026-11-16. At that rate a
+`verified` is evidence that a check *ran*, not yet that it is trustworthy alone.
+
+`SOUNDNESS.md` is now that ledger. The MIR-frontend table has a row per defect:
+the symptom, the class (false proof / false refutation / lost proof / wrong
+verdict), the **fixture** that fails if the fix is undone, and the date. A
+following section records the engine, vacuity and handle classes from `AGENTS.md`
+(a limit that truncates instead of reporting, five instances; vacuity, four; a
+proof object with no lifetime, two; the unbounded kernel rule; the printer; the
+`Fixed` value bugs) so the ledger covers the whole stack rather than only the
+frontend.
+
+The lesson this file keeps teaching is that **a document is a claim, and a claim
+needs a check**. A ledger row naming a fixture is exactly the kind of second copy
+that goes stale silently: rename `a_radix_literal_is_read_at_its_radix` and the
+row still *reads* as evidence while pointing at nothing. So `tests/soundness.rs`
+extracts the fixture column from the markdown, pulls every backticked snake_case
+identifier out of it, and requires each to be a `fn` declared under `tests/` or
+`src/`. It also asserts the four classes are defined (a row in an undefined class
+is unclassifiable) and that at least eighteen fixture names were checked, so the
+test cannot pass vacuously by finding no rows. Teeth were confirmed the only way
+that counts: pointing one row at `a_radix_literal_that_does_not_exist` fails the
+test with the fixture named.
+
+Two smaller points. The ledger names the *class* per row on purpose, because the
+clusters are the finding -- rows 1–9 of the MIR table are all the contract
+reader's value/width model, rows 10–13 are all name resolution, rows 14–17 are all
+a write or a path that was dropped -- and a fix that addresses one shape and not
+its siblings is the recurring cause. And the exit criterion is a *clock*, not a
+count: "four consecutive weeks with no new false proof", which restarts on the
+most recent row (2026-11-16). Until it clears, the README says a `verified` means
+a check ran, and every verdict carries the obligation it discharged.
+
+`SOUNDNESS.md` and `tests/soundness.rs` are the A1 increment; `ROADMAP.md` marks
+A1 done, and the README's layout and link sections name the new file.

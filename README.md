@@ -2424,6 +2424,7 @@ is instantaneous while a 12-bit multiplier equality is not.
 ├── Cargo.lock          committed, and a single package: the dependency set is empty
 ├── README.md           this file
 ├── ROADMAP.md          the open work: one item per gap, with exit criteria
+├── SOUNDNESS.md        the ledger of every false proof fixed, with its fixture
 ├── AGENTS.md           notes for agents, including the traps that cost the most time
 ├── LICENSE             Apache-2.0
 ├── SECURITY.md         how to report a vulnerability (GitHub private advisories)
@@ -2942,6 +2943,9 @@ prover symbols.
   closing move (build / bridge / won't do), and a status.
 - [`SECURITY.md`](SECURITY.md) covers reporting a **soundness bug** — a false
   `Valid` — which is the vulnerability class that matters in a verifier.
+- [`SOUNDNESS.md`](SOUNDNESS.md) is the ledger of every false proof and wrong
+  verdict the project has found, each with the fixture that fails if the fix is
+  undone; `tests/soundness.rs` checks the fixtures still exist.
 - [`AGENTS.md`](AGENTS.md) is the engineering log: why each decision was made,
   including the ones that were reversed.
 
