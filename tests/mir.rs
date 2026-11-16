@@ -10121,10 +10121,14 @@ pub fn for_too_few() -> u32 {
     /// A `for i in a..b` lowers to `Range::new`/`RangeInclusive::new`, an
     /// `IntoIterator::into_iter` identity and a `next(&mut range)` loop, and all
     /// three are answered from the range's struct fields. The `unwind:` bound
-    /// decides the loop without an invariant (the invariant form is blocked on the
-    /// loop-variable name resolution recorded in the ROADMAP). The false twin is
-    /// the evidence the range state is *read*: a model that returned a constant
-    /// would prove it.
+    /// decides the loop without an invariant, and an `invariant:` that does not
+    /// name the loop variable decides it too (`tri_invariant`). An invariant that
+    /// *names* the loop variable is the one shape still refused: the element `i`
+    /// is a `debug` binding inside a nested `scope` block that is not live at the
+    /// loop header (`next` has not returned yet on entry), so `invariant_names`
+    /// does not resolve it -- recorded in `ROADMAP.md` C3. The false twin is the
+    /// evidence the range state is *read*: a model that returned a constant would
+    /// prove it.
     #[test]
     fn the_for_loop_range_desugaring_is_modelled() {
         let src = r#"
@@ -10154,13 +10158,22 @@ pub fn for_exclusive_counts() -> u32 {
     for _i in 0..3u32 { s += 1; }
     s
 }
+
+/// requires: n <= 100
+/// invariant: s <= 5050
+/// ensures: ret <= 5050
+pub fn tri_invariant(n: u32) -> u32 {
+    let mut s = 0;
+    for i in 0..=n { s += i; }
+    s
+}
 "#;
-        for name in ["for_inclusive_sum", "for_exclusive_counts"] {
+        for name in ["for_inclusive_sum", "for_exclusive_counts", "tri_invariant"] {
             let Some(o) = verify_src(name, src) else { return };
             assert!(
                 o.is_verified(),
-                "`{name}` must verify: the range desugaring is modelled and `unwind:` \
-                 decides the loop, got: {o}"
+                "`{name}` must verify: the range desugaring is modelled and the loop is \
+                 decided by `unwind:` or by an invariant, got: {o}"
             );
         }
         let Some(f) = verify_src("for_inclusive_sum_cannot_prove_this", src) else { return };

@@ -10,10 +10,10 @@
 //! whatever it finds. The remainder it does not decide are the *next* gaps, and
 //! each one names itself in the `detail` column rather than being summarised.
 //!
-//! Run it with a nightly named, or it says so and stops:
+//! Run it with a compiler named, or it falls back to `rustc` on `PATH`:
 //!
 //! ```console
-//! $ VERIF_RUSTC=$(rustup which --toolchain nightly rustc) \
+//! $ VERIF_RUSTC="$(rustup which rustc)" \
 //!     cargo run --features std --example mir_coverage
 //! function             outcome      detail
 //! halve_guarded        verified     2 obl, 1 panic
