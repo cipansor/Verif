@@ -3245,6 +3245,25 @@ fn is_ord_callee(name: &str) -> bool {
         | "i32" | "i64" | "i128" | "isize")
 }
 
+/// Whether a name is `core`'s own `PartialEq`/`PartialOrd` comparison for a
+/// primitive type.
+///
+/// The comparison twin of [`is_ord_callee`]: `eq`/`ne`/`lt`/`le`/`gt`/`ge` are
+/// trait methods, so their dump spelling carries no `<impl` -- `<u8 as
+/// PartialEq>::eq` -- and the executor's guard has to admit them by name. The same
+/// narrow rules apply: the trait path must be the standard library's (see
+/// [`intrinsics::names_cmp_trait`]), and the self type must be a primitive, so a
+/// user type's comparison is refused rather than read. A crate-root trait that
+/// prints bare is closed by the caller's same-dump lookup, as for `Ord`.
+fn is_cmp_callee(name: &str) -> bool {
+    if !intrinsics::names_cmp_trait(name) {
+        return false;
+    }
+    let self_ty = call_type(name).unwrap_or_default();
+    matches!(self_ty.as_str(), "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16"
+        | "i32" | "i64" | "i128" | "isize")
+}
+
 /// Answer a widening conversion (`From::from`/`Into::into`), or report why not.
 ///
 /// The two types come from the call's *name* (`<u16 as From<u8>>::from`), because
@@ -5193,6 +5212,7 @@ fn try_intrinsic(
     // `names_option_impl`), and the same-dump lookup answers a real `Option` body
     // first, which is what keeps a local type spelled `Option` out.
     let trait_method = is_ord_callee(name)
+        || is_cmp_callee(name)
         || matches!(
             op,
             intrinsics::Intrinsic::Conversion(_)
@@ -5324,17 +5344,25 @@ fn try_intrinsic(
     // `_1`, not from the `&u8` local (which is a pointer with no bit-vector
     // meaning). Only these shapes need the step: every other modelled method takes
     // `self` by value.
-    let ascii_ref = matches!(
+    // The ASCII class tests, the ASCII case conversions and the `PartialEq`/
+    // `PartialOrd` comparisons take their operands by reference, so the operand is
+    // a reference whose *referent* is the value. rustc prints `_3 = &_1;
+    // is_ascii_digit(move _3)`, and the width and the value both have to come from
+    // `_1`, not from the `&u8` local (which is a pointer with no bit-vector
+    // meaning). Only these shapes need the step: every other modelled method takes
+    // `self` by value.
+    let ref_receiver = matches!(
         op,
         intrinsics::Intrinsic::Bool(intrinsics::BoolKind::Ascii(_))
             | intrinsics::Intrinsic::AsciiCase(_)
+            | intrinsics::Intrinsic::Cmp(_)
     )
     .then(|| match first {
         Operand::Copy(p) | Operand::Move(p) => Some(env.pointee(p)),
         Operand::Const(_) => None,
     })
     .flatten();
-    let w = match &ascii_ref {
+    let w = match &ref_receiver {
         Some(p) => width_of(cur, p),
         None => operand_width(cur, first),
     }?;
@@ -5348,7 +5376,7 @@ fn try_intrinsic(
     // local gives `Unknown` (a pointer has no bit-vector meaning), so the byte is
     // read from the place `pointee` names instead. This is the same value the
     // body's own `*_3` would read.
-    let (x, sign) = match &ascii_ref {
+    let (x, sign) = match &ref_receiver {
         Some(p) => match env.get(p) {
             Val::Sym(v, sign) => (v, sign),
             _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
@@ -5594,6 +5622,17 @@ fn try_intrinsic(
         });
     }
     let y = match args.get(1) {
+        // A `PartialEq`/`PartialOrd` second operand is `&other`, so its *referent*
+        // is the value -- the same step the receiver takes above. Reading the
+        // `&u8` local directly gives `Unknown` (a pointer has no bit-vector
+        // meaning).
+        Some(a) if matches!(op, intrinsics::Intrinsic::Cmp(_)) => match a {
+            Operand::Copy(p) | Operand::Move(p) => match env.get(&env.pointee(p)) {
+                Val::Sym(v, _) => v,
+                _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+            },
+            Operand::Const(_) => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        },
         Some(a) => match operand(env, a) {
             Val::Sym(v, _) => v,
             _ => return Some(Err(format!("unmodelled argument to `{name}`"))),

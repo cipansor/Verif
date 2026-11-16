@@ -8330,6 +8330,40 @@ Corpus coverage `examples/mir_targets/realistic.rs` **349 → 353** verified ove
 local `from` is not consulted at all. No new SMT primitives were needed: `sign_extend` and
 `truncate` already existed.
 
+### The comparison traits: the same exception, with a by-reference receiver
+
+`PartialEq::eq`/`ne` and `PartialOrd::lt`/`le`/`gt`/`ge` are the six comparison
+operators in their *trait-method* spelling, so a call prints as `<u8 as
+PartialOrd>::lt` — no `core::num::<impl …>` path — and they are admitted by exactly
+the same exception as `Ord::min`/`max` and `From`/`Into`: `classify` accepts the
+name only when the trait path is the standard library's (`names_cmp_trait`) and the
+tail belongs to the trait it names (`eq`/`ne` are `PartialEq`'s, the four orderings
+`PartialOrd`'s — the crossed pairing is never emitted and is refused), the
+executor's `<impl` guard gains `is_cmp_callee`, and the caller's same-dump lookup
+answers a crate-root trait before the model.
+
+Two things are specific to these shapes and both are traps:
+
+- **Both operands are `&self`/`&other`, so the executor must follow *two*
+  references, not one.** The receiver goes through the existing `pointee` step (the
+  `is_ascii_*` receivers already do), but the *second* operand is also a reference,
+  and the generic operand read returns `Unknown` for a pointer. The `args.get(1)`
+  arm now follows the referent for a `Cmp` call, the same step as the receiver.
+- **The value is the operator's comparison, not a second implementation of it.**
+  `cmp_pred` builds `smt::eq`/`slt`/`ult`/… — the exact terms the operators build —
+  so a method call and its operator spelling cannot disagree. The sign picks the
+  ordering: an unsigned reading of `i8::MIN < 1` is wrong because `0x80` is the
+  largest unsigned byte, which is why the differential test walks both
+  signednesses against the operators themselves (the oracle is the operator, not
+  the method, or it would just reproduce the model's reading).
+
+The local-trait hazard is pinned in both directions, as for `Ord`: `cmp_shim::PartialOrd`
+(a module-qualified local trait) is refused by the path, and its fixture
+`local_partial_ord_lt_is_answered_by_its_body` verifies only from the body's constant
+while `local_partial_ord_lt_is_not_the_model_tripwire` refutes only if the body — not
+the model — answered. The crate-root collision (`trait PartialOrd` at the crate root,
+which prints bare) is closed by the same-dump lookup, checked by probe.
+
 ### The owner-type gap this work surfaced, and how it was closed
 
 While checking the local-trait case, a probe found a **false proof that predated this

@@ -1924,6 +1924,44 @@ fn ord_min_and_max_are_modelled_and_a_local_trait_still_wins() {
     }
 }
 
+/// `PartialEq::eq`/`ne` and `PartialOrd::lt`/`le`/`gt`/`ge` are modelled as the
+/// comparison operators they denote, and a local trait sharing their name is
+/// answered by its body rather than by the model.
+///
+/// The verifying half pins all six operators, with `partial_ge_method_is_the_operator`
+/// choosing `x < y` so `>=` is separated from `<=`, and
+/// `partial_lt_signed_is_not_unsigned` pinning the ordering choice on `i8::MIN` (the
+/// one value whose bits sort the other way unsigned). The refuting half is the
+/// tripwire on the method form plus the local-trait pair:
+/// `local_partial_ord_lt_is_answered_by_its_body` verifies only from the body's
+/// constant, and `local_partial_ord_lt_is_not_the_model_tripwire` is refuted only
+/// if the body -- not the model -- answered.
+#[test]
+fn partial_cmp_methods_are_modelled_and_a_local_trait_still_wins() {
+    let verified = [
+        "partial_eq_method_is_the_operator",
+        "partial_ne_method_is_the_operator",
+        "partial_lt_method_is_the_operator",
+        "partial_ge_method_is_the_operator",
+        "partial_lt_signed_is_not_unsigned",
+        "local_partial_ord_lt_is_answered_by_its_body",
+    ];
+    let refuted = ["partial_lt_is_not_le_tripwire", "local_partial_ord_lt_is_not_the_model_tripwire"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
 /// A widening conversion (`From::from`/`Into::into`) is modelled, by the source's
 /// signedness.
 ///

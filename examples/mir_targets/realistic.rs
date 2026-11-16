@@ -9136,6 +9136,99 @@ pub fn local_ord_min_is_not_the_model_tripwire(x: u8, y: u8) -> u8 {
     ord_shim::Ord::min(x, y)
 }
 
+/// `PartialEq::eq`/`ne` and `PartialOrd::lt`/`le`/`gt`/`ge` are the six comparison
+/// operators in their *trait-method* spelling, so the dump spells a call `<u8 as
+/// PartialOrd>::lt` -- the trait, with no `core::num::<impl …>` path. They are
+/// modelled as the same comparison the operator builds, so a method call and its
+/// operator form cannot disagree. Both operands are taken by reference, so the
+/// executor follows the `&self`/`&other` references to their referents.
+///
+/// The model is a *fallback*, as for `Ord`: a same-dump body is resolved first, so
+/// a local trait method of the same shape is inlined rather than modelled.
+/// requires: true
+/// ensures: ret == (x == y)
+pub fn partial_eq_method_is_the_operator(x: u8, y: u8) -> bool {
+    x.eq(&y)
+}
+
+/// `ne` is `!=`.
+/// requires: true
+/// ensures: ret == (x != y)
+pub fn partial_ne_method_is_the_operator(x: u8, y: u8) -> bool {
+    x.ne(&y)
+}
+
+/// `lt` is `<`, read unsigned on a `u8`.
+/// requires: true
+/// ensures: ret == (x < y)
+pub fn partial_lt_method_is_the_operator(x: u8, y: u8) -> bool {
+    x.lt(&y)
+}
+
+/// `ge` is `>=`. A model that read `ge` as `le` -- or that swapped the operands --
+/// would refute this; `x == y` is the point where `>=` and `<=` coincide, so the
+/// precondition is chosen to *separate* the orderings rather than to coincide.
+/// requires: x < y
+/// ensures: ret == false
+pub fn partial_ge_method_is_the_operator(x: u8, y: u8) -> bool {
+    x.ge(&y)
+}
+
+/// The signed ordering is not the unsigned one. `i8::MIN`'s bits (`0x80`) are the
+/// largest *unsigned* byte, so a model that read `lt` as `ult` would call
+/// `i8::MIN < 1` false; as a signed value `MIN` is below `1`, so it is true. The
+/// precondition pins the operand to the one value where the two orderings differ.
+/// requires: x == i8::MIN
+/// requires: y == 1
+/// ensures: ret == true
+pub fn partial_lt_signed_is_not_unsigned(x: i8, y: i8) -> bool {
+    x.lt(&y)
+}
+
+/// The false direction: `x.lt(&y)` is not `x <= y`, so with no precondition it
+/// must be refuted at `x == y`. A model that read `lt` as `le` would prove it.
+/// requires: true
+/// ensures: ret == (x <= y)
+pub fn partial_lt_is_not_le_tripwire(x: u8, y: u8) -> bool {
+    x.lt(&y)
+}
+
+/// A local trait whose method shares `PartialOrd`'s `lt` name. Its `lt` returns a
+/// constant, so a call to it must be answered by *this body* and never by `core`'s
+/// ordering. The trait lives in a module, so the dump spells the call `<u8 as
+/// cmp_shim::PartialOrd>::lt`, a trait segment that is not the standard library's,
+/// and `classify` refuses it outright *and* the same-dump lookup finds the body.
+pub mod cmp_shim {
+    pub trait PartialOrd {
+        fn lt(&self, other: &Self) -> bool;
+    }
+    impl PartialOrd for u8 {
+        fn lt(&self, _other: &u8) -> bool {
+            true
+        }
+    }
+}
+
+/// The body returns `true`, so this verifies only if the local trait's body is what
+/// answers the call. If the model answered instead it would return `x < y`, which is
+/// `true` only when `x < y`, so the postcondition would be false at `x == y`.
+/// requires: x == 5
+/// requires: y == 5
+/// ensures: ret == true
+pub fn local_partial_ord_lt_is_answered_by_its_body(x: u8, y: u8) -> bool {
+    cmp_shim::PartialOrd::lt(&x, &y)
+}
+
+/// The false direction on the same call: the *model's* answer (`5 < 5` is `false`)
+/// is what this claims, and the body returns `true`, so it must be refuted. A model
+/// that answered the call would return `false` and *prove* it.
+/// requires: x == 5
+/// requires: y == 5
+/// ensures: ret == false
+pub fn local_partial_ord_lt_is_not_the_model_tripwire(x: u8, y: u8) -> bool {
+    cmp_shim::PartialOrd::lt(&x, &y)
+}
+
 /// A local trait whose *name* collides with a modelled conversion's, and whose
 /// owner type does too.
 ///

@@ -435,6 +435,18 @@ pub enum Intrinsic {
     /// modelled. It is total and reads the sign to pick the ordering, so both
     /// signednesses are modelled.
     MinMax(MinMaxKind),
+    /// `PartialEq::eq`/`ne` and `PartialOrd::lt`/`le`/`gt`/`ge`: the six
+    /// comparison operators in their *trait-method* spelling.
+    ///
+    /// Like [`Intrinsic::MinMax`] this is a trait method, so the dump spells a call
+    /// `<u8 as PartialEq>::eq` or `<u8 as PartialOrd>::lt` rather than a
+    /// `core::num::<impl …>` path, and the model is a fallback behind the same-dump
+    /// lookup. The method is the trait spelling of `<`/`<=`/`==`/`!=`/`>`/`>=`, so
+    /// the value is one comparison at the operands' common width and sign; the
+    /// result is a `bool`, exactly as an `Eq`/`Ult` term would be. Both operands
+    /// take `&self`, so the executor follows the reference as it does for the
+    /// `is_ascii_*` receivers.
+    Cmp(PartialCmpKind),
     /// A widening integer conversion: `From::from` or `Into::into`.
     ///
     /// Like [`Intrinsic::MinMax`] this is a *trait* method, so the dump spells a
@@ -682,6 +694,31 @@ pub enum MinMaxKind {
     Min,
     /// The larger of the two operands: `a >= b ? a : b`.
     Max,
+}
+
+/// `PartialEq` and `PartialOrd`: the six comparison operators as trait methods.
+///
+/// `x.eq(&y)`, `x.lt(&y)`, `x.ge(&y)` and the rest are the method spellings of
+/// `==`, `<`, `>=` and the rest, so the model is the same comparison the operators
+/// build. Both methods are *trait* methods, so the dump spells the call
+/// `<u8 as PartialEq>::eq` -- the trait, with no `core::num::<impl …>` path -- which
+/// is why the model is a fallback behind the same-dump lookup, exactly as
+/// [`Intrinsic::MinMax`] is. The trait path must be the standard library's (see
+/// [`names_cmp_trait`]), so a module-qualified local `m::PartialOrd` is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartialCmpKind {
+    /// `PartialEq::eq`: `a == b`.
+    Eq,
+    /// `PartialEq::ne`: `a != b`.
+    Ne,
+    /// `PartialOrd::lt`: `a < b`.
+    Lt,
+    /// `PartialOrd::le`: `a <= b`.
+    Le,
+    /// `PartialOrd::gt`: `a > b`.
+    Gt,
+    /// `PartialOrd::ge`: `a >= b`.
+    Ge,
 }
 
 /// A byte-order conversion: `to_be` or `to_le`.
@@ -1149,6 +1186,19 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
         let kind = if short == "min" { MinMaxKind::Min } else { MinMaxKind::Max };
         return Some(Intrinsic::MinMax(kind));
     }
+    // `PartialEq::eq`/`ne` and `PartialOrd::lt`/`le`/`gt`/`ge`: the six comparison
+    // operators in their trait-method spelling. They are admitted by the same
+    // narrow rule as `min`/`max` -- the trait path must be the standard library's,
+    // so a module-qualified local `m::PartialOrd` is refused, and the caller's
+    // same-dump lookup answers a crate-root trait before the model is consulted.
+    // The trait is the *only* thing that distinguishes this from an unrelated
+    // `eq`/`lt`, so the check is on the path, not the tail alone.
+    if let Some(kind) = partial_cmp_kind(short) {
+        if !names_cmp_trait(name) {
+            return None;
+        }
+        return Some(Intrinsic::Cmp(kind));
+    }
     // `Ord::clamp`: the same trait-method spelling as `min`/`max`, and admitted
     // the same way for the same reason -- a three-operand method has no
     // `core::num::<impl …>` spelling, so refusing the name would make it
@@ -1351,6 +1401,51 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
 /// collide (a crate-root `Ord`, which the prelude also names `Ord`).
 pub fn names_ord_trait(name: &str) -> bool {
     matches!(trait_path(name), Some("Ord" | "core::cmp::Ord" | "std::cmp::Ord"))
+}
+
+/// The comparison method a `PartialEq`/`PartialOrd` tail names, or `None`.
+///
+/// The six operators are one method each: `eq`/`ne` on `PartialEq`, and
+/// `lt`/`le`/`gt`/`ge` on `PartialOrd`. The tail alone does not say which trait,
+/// so the caller checks the path with [`names_cmp_trait`]; this only maps the
+/// name to the comparison it denotes.
+pub fn partial_cmp_kind(short: &str) -> Option<PartialCmpKind> {
+    Some(match short {
+        "eq" => PartialCmpKind::Eq,
+        "ne" => PartialCmpKind::Ne,
+        "lt" => PartialCmpKind::Lt,
+        "le" => PartialCmpKind::Le,
+        "gt" => PartialCmpKind::Gt,
+        "ge" => PartialCmpKind::Ge,
+        _ => return None,
+    })
+}
+
+/// Whether a comparison name is `PartialEq`'s or `PartialOrd`'s, and the standard
+/// library's alone.
+///
+/// The dump spells a trait call `<u8 as PartialEq>::eq` or `<u8 as
+/// PartialOrd>::lt`, naming the trait between the `as` and the `>`; with `std` in
+/// scope the paths are `std::cmp::PartialEq`/`std::cmp::PartialOrd`, and against
+/// `core` they are the bare names or `core::cmp::…`. The accepted set is exactly
+/// those, so a module-qualified local trait (`m::PartialOrd`) is refused, and the
+/// caller's same-dump lookup is what answers the one spelling that could still
+/// collide (a crate-root trait, which prints bare).
+///
+/// The method tail is checked against the trait: `eq`/`ne` belong to `PartialEq`
+/// and `lt`/`le`/`gt`/`ge` to `PartialOrd`, so a call naming the wrong pairing --
+/// a shape the compiler never emits -- is refused rather than read.
+pub fn names_cmp_trait(name: &str) -> bool {
+    let Some(path) = trait_path(name) else { return false };
+    let Some(short) = name.rsplit("::").next() else { return false };
+    let eq_trait = matches!(path, "PartialEq" | "core::cmp::PartialEq" | "std::cmp::PartialEq");
+    let ord_trait =
+        matches!(path, "PartialOrd" | "core::cmp::PartialOrd" | "std::cmp::PartialOrd");
+    match short {
+        "eq" | "ne" => eq_trait,
+        "lt" | "le" | "gt" | "ge" => ord_trait,
+        _ => false,
+    }
 }
 
 /// Whether a `branch` name is `Try`'s, and the standard library's alone.
@@ -1754,6 +1849,11 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // check -- `Ord` is implemented for every integer -- only the width,
         // which is already bounded above.
         Intrinsic::MinMax(_) => true,
+        // The `PartialEq`/`PartialOrd` comparisons. A comparison is one `cmp`
+        // term at the operands' width, exact at any width the engine holds; the
+        // result is a `bool`. Both signednesses: the sign picks the ordering for
+        // `<`/`<=`/`>`/`>=` and is irrelevant to `==`/`!=`.
+        Intrinsic::Cmp(_) => true,
         // A widening conversion. The *value* is a plain extension, so it is total
         // and can fail only at a width the engine cannot hold -- which the guard
         // above already refused. Whether the call is a real integer widening at
@@ -2022,6 +2122,12 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             }
             Outcome::Value(smt::truncate(min_max_result(kind, x, y, signed), result_w))
         }
+        // The `PartialEq`/`PartialOrd` comparisons: the trait spelling of the six
+        // operators. The value is one comparison at the operands' width and sign,
+        // which is exactly the term the operators themselves build, so a method
+        // call and its operator form cannot disagree. The result is a `bool`, so
+        // no `result_w` is read.
+        Intrinsic::Cmp(kind) => Outcome::Bool(cmp_pred(kind, x, y, signed)),
         // A widening (or same-width) conversion. The operand *is* the source, so
         // its width and signedness are `w` and `signed`, and the destination is
         // `result_w`. The value is the source extended by its own signedness -- the
@@ -2868,6 +2974,48 @@ fn ascii_case_kind(short: &str) -> Option<AsciiCaseKind> {
         "to_ascii_lowercase" => AsciiCaseKind::Lower,
         _ => return None,
     })
+}
+
+/// The comparison a `PartialEq`/`PartialOrd` method denotes.
+///
+/// `eq`/`ne` are `==`/`!=` and do not read the sign; `lt`/`le`/`gt`/`ge` are the
+/// orderings and pick the signed or unsigned comparison from the operand type, the
+/// same choice the operators make. So a method call and its operator spelling build
+/// one term and cannot disagree about a negative operand (`i8::MIN` is the largest
+/// unsigned byte).
+fn cmp_pred(kind: PartialCmpKind, x: Var, y: Var, signed: bool) -> Pred {
+    match kind {
+        PartialCmpKind::Eq => smt::eq(x, y),
+        PartialCmpKind::Ne => smt::not(smt::eq(x, y)),
+        PartialCmpKind::Lt => {
+            if signed {
+                smt::slt(x, y)
+            } else {
+                smt::ult(x, y)
+            }
+        }
+        PartialCmpKind::Le => {
+            if signed {
+                smt::sle(x, y)
+            } else {
+                smt::ule(x, y)
+            }
+        }
+        PartialCmpKind::Gt => {
+            if signed {
+                smt::sgt(x, y)
+            } else {
+                smt::ult(y, x)
+            }
+        }
+        PartialCmpKind::Ge => {
+            if signed {
+                smt::sge(x, y)
+            } else {
+                smt::ule(y, x)
+            }
+        }
+    }
 }
 
 /// The truth value of a `bool`-valued predicate.
@@ -5680,6 +5828,36 @@ mod tests {
         assert!(classify("<u8 as Ord>::min_signed").is_none());
     }
 
+    /// The `PartialEq`/`PartialOrd` comparisons classify only under the standard
+    /// library's traits, and only with the tail that belongs to the trait.
+    #[test]
+    fn the_partial_cmp_names_classify_and_their_neighbours_do_not() {
+        for (name, kind) in [
+            ("<u8 as PartialEq>::eq", PartialCmpKind::Eq),
+            ("<u8 as PartialEq>::ne", PartialCmpKind::Ne),
+            ("<u8 as PartialOrd>::lt", PartialCmpKind::Lt),
+            ("<u8 as PartialOrd>::le", PartialCmpKind::Le),
+            ("<u8 as PartialOrd>::gt", PartialCmpKind::Gt),
+            ("<u8 as PartialOrd>::ge", PartialCmpKind::Ge),
+            ("<i8 as std::cmp::PartialOrd>::lt", PartialCmpKind::Lt),
+            ("<u8 as core::cmp::PartialEq>::eq", PartialCmpKind::Eq),
+        ] {
+            assert_eq!(classify(name), Some(Intrinsic::Cmp(kind)), "{name}");
+        }
+        // A module-qualified local trait is refused: the path is the only thing
+        // distinguishing the library's `PartialOrd` from a local one.
+        assert!(classify("<u8 as m::PartialOrd>::lt").is_none());
+        assert!(classify("<u8 as PartialEq>::lt").is_none());
+        // A tail that does not belong to the named trait is refused: `eq` is
+        // `PartialEq`'s, `lt` is `PartialOrd`'s, and the compiler never emits the
+        // crossed pairing.
+        assert!(classify("<u8 as PartialOrd>::eq").is_none());
+        assert!(classify("<u8 as PartialEq>::lt").is_none());
+        // A different trait's `eq`/`lt` is refused.
+        assert!(classify("<u8 as MyEq>::eq").is_none());
+        assert!(classify("<u8 as PartialOrd>::lt_signed").is_none());
+    }
+
     /// `Ord::min`/`Ord::max` agree with `core` over a whole `u8` and `i8`.
     ///
     /// The signed walk is what pins the ordering choice: a model that used `ule`
@@ -5756,6 +5934,62 @@ mod tests {
             (MinMaxKind::Max, true, 0xff, 0xfe, 0xff, "0xff is -1, above -2"),
         ] {
             assert_eq!(ord(kind, signed, xb, yb), Some(want), "{why} ({xb:#x}, {yb:#x})");
+        }
+    }
+
+    /// The `PartialEq`/`PartialOrd` comparisons agree with the operators Rust
+    /// lowers them to, over every `u8` and `i8` pair.
+    ///
+    /// The oracle is the operator itself (`x < y`, `x == y`, …), which is what
+    /// rustc lowers `x.lt(&y)` to; comparing against the *method* would just
+    /// reproduce the model's own reading. Both signednesses are walked because the
+    /// sign is the whole content of the ordering: `i8::MIN` is the largest unsigned
+    /// byte, so an unsigned reading of `i8::MIN < 1` would be wrong.
+    #[test]
+    fn the_partial_cmp_methods_agree_with_the_operators() {
+        let run = |kind: PartialCmpKind, signed: bool, oracle: fn(i64, i64) -> bool, label: &str| {
+            smt::with_fresh(|| {
+                let a = smt::var(8);
+                let b = smt::var(8);
+                let Outcome::Bool(p) = eval(Intrinsic::Cmp(kind), a, b, 8, signed, 8)
+                    .unwrap_or_else(|| panic!("{label} at 8 bits must be modelled"))
+                else {
+                    panic!("{label} must produce a `bool`");
+                };
+                let (ai, bi) = (smt::index(a), smt::index(b));
+                each_pair(8, |xb, yb| {
+                    let (x, y) = if signed {
+                        (i8::from_ne_bytes([xb as u8]) as i64, i8::from_ne_bytes([yb as u8]) as i64)
+                    } else {
+                        (xb as i64, yb as i64)
+                    };
+                    let env = |i| {
+                        if i == ai {
+                            Some(xb)
+                        } else if i == bi {
+                            Some(yb)
+                        } else {
+                            None
+                        }
+                    };
+                    assert_eq!(
+                        smt::evaluate_pred(p, env),
+                        Some(oracle(x, y)),
+                        "{label} at ({x}, {y})"
+                    );
+                });
+            });
+        };
+        for (kind, oracle, label) in [
+            (PartialCmpKind::Eq, (|x: i64, y: i64| x == y) as fn(i64, i64) -> bool, "eq"),
+            (PartialCmpKind::Ne, |x, y| x != y, "ne"),
+            (PartialCmpKind::Lt, |x, y| x < y, "lt"),
+            (PartialCmpKind::Le, |x, y| x <= y, "le"),
+            (PartialCmpKind::Gt, |x, y| x > y, "gt"),
+            (PartialCmpKind::Ge, |x, y| x >= y, "ge"),
+        ] {
+            run(kind, false, oracle, &format!("u8::{label}"));
+            run(kind, true, oracle, &format!("i8::{label}"));
         }
     }
 

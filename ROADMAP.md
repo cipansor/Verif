@@ -19,7 +19,7 @@ output decides the number, so the table is a measurement rather than a claim:
 | Corpus | Command | Verified / decided |
 |---|---|---|
 | `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 18 / 33 |
-| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 551 / 1015 |
+| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 559 / 1027 |
 | `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **16 / 21 (76%)** |
 
 `everyday.rs` is the honest one: ordinary Rust written by an external reviewer,
@@ -371,7 +371,8 @@ with no new false proof while the independent corpus keeps growing.
     `guarded_match_tripwire` in `realistic.rs`.
   - Move: **built**.
 - **C6. The everyday `core` surface.** · P0 · in progress · Kani, Verus (`vstd`)
-  - Gap: `Ord::min/max/clamp`, `iN::abs`, `abs_diff`, `rotate_*`, `is_ascii_*`,
+  - Gap: `Ord::min/max/clamp`, `PartialEq`/`PartialOrd` comparisons,
+    `iN::abs`, `abs_diff`, `rotate_*`, `is_ascii_*`,
     `is_negative`/`is_positive`, `<[T]>::len/is_empty/first/get`. Evidence:
     `abs_small`, `clamp_builtin`, `digit`, `first_or` incomplete. All but
     `first_or` are now modelled (`min`/`max`, `From`/`Into`, `clamp`,
@@ -571,6 +572,24 @@ with no new false proof while the independent corpus keeps growing.
     swap as `to_be`, and the `to_be`/`from_be` round trip is the identity). Six
     fixtures (three true, three tripwires) in `realistic.rs` (**551 of 1015**),
     pinned by `the_next_core_value_methods_are_modelled_with_their_tripwires`.
+  - Progress (cont.): `PartialEq::eq`/`ne` and `PartialOrd::lt`/`le`/`gt`/`ge` are
+    modelled — the six comparison operators in their *trait-method* spelling, the
+    same shape of exception as `Ord::min`/`max`. The dump spells a call `<u8 as
+    PartialOrd>::lt` (no `core::num::<impl …>` path), so the model is a *fallback*
+    behind the same-dump lookup, admitted only when the trait path is the standard
+    library's and the self type is a primitive; a local trait in a module
+    (`cmp_shim::PartialOrd`) is refused by the path, and a crate-root trait that
+    prints bare is answered by its own body first. Both operands are taken by
+    reference (`&self`/`&other`), so the executor follows the references to their
+    referents, the same step the `is_ascii_*` receivers already take. The value is
+    exactly the comparison the operator builds, so a method call and its operator
+    form cannot disagree; the ordering picks `slt`/`sle`/`sgt`/`sge` on a signed
+    type and `ult`/`ule` on an unsigned one, with `i8::MIN` as the separating
+    point. Checked exhaustively against the operators over all of `u8`/`i8`
+    (`the_partial_cmp_methods_agree_with_the_operators`), with eight fixtures
+    (five true, one local-trait pair, two tripwires) in `realistic.rs` (**559 of
+    1027**), pinned by
+    `partial_cmp_methods_are_modelled_and_a_local_trait_still_wins`.
   - Remaining: the *generic* `<[T]>::first/get/len/is_empty` (`first_or<T>`) need
     monomorphisation, which is C10: `first_or`'s element type has no width and its
     slice length is never seeded (the frontend refuses a receiver whose length it
