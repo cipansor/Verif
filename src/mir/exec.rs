@@ -3539,6 +3539,18 @@ fn resolve_callee(prog: &MirProgram, name: &str) -> Option<usize> {
     }
     let tail = name.rsplit("::").next()?;
     let want_ty = call_type(name)?;
+    // A call whose receiver is literally `Self` is made from inside a trait's
+    // *default* body, where the concrete type is not known. Resolving it to the
+    // right body would need the `Self` type the enclosing call was made with,
+    // which this resolver does not carry; resolving it to the *default* method
+    // would be a false proof whenever an impl overrides it. So it is refused
+    // rather than guessed. This is the `range_shim` hole: a user trait's default
+    // `into_iter` that calls `self.set(42)`, with `set` overridden by the impl,
+    // had the *default* (no-op) `set` inlined, so a caller's contract about the
+    // override's effect was *proved* against a body that does nothing.
+    if want_ty == "Self" {
+        return None;
+    }
     // The trait the call names, when it is a trait call (`<T as Trait<..>>::m`).
     // `None` for a bare `Type::m`, which rustc prints for both an inherent method
     // and a trait method in scope, so no trait check applies there.

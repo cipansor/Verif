@@ -1869,6 +1869,135 @@ fn a_local_trait_named_from_does_not_answer_the_std_trait() {
     }
 }
 
+/// A user type named `Range` must not be answered by the for-loop range model.
+///
+/// rustc 1.85 (the MSRV) prints the standard library's `for`-loop projection with
+/// the type *unqualified* -- `<RangeInclusive<u32> as IntoIterator>::into_iter` --
+/// where current stable qualifies it (`<std::ops::RangeInclusive<u32> as …>`). An
+/// unqualified `Range` is a name a *user* type can carry, so the two `Iterator`
+/// methods are matched on the trait as well as the type. This test pins both
+/// directions with its own source (so it does not depend on a corpus edit):
+///
+/// * a user `struct Range<T>` with a custom `into_iter` (whose default body
+///   *panics*) must never be answered with the model's identity semantics -- the
+///   model would return the range unchanged and prove `ret == 1` for a function
+///   that always panics; the honest verdict is a refutation (`Failed`);
+/// * the standard library's own range projection must still be modelled, so the
+///   fix cannot pass by refusing every range call.
+#[test]
+fn a_user_type_named_range_is_not_answered_by_the_range_model() {
+    let spoof = r#"
+pub mod a {
+    pub trait Custom {
+        fn into_iter(self) -> Self
+        where
+            Self: Sized,
+        {
+            panic!("into_iter is not the identity here")
+        }
+    }
+}
+pub mod b {
+    pub trait Custom {
+        fn into_iter(self) -> Self
+        where
+            Self: Sized,
+        {
+            panic!("the other trait")
+        }
+    }
+}
+pub struct Range<T> {
+    pub start: T,
+    pub end: T,
+}
+impl a::Custom for Range<u8> {}
+
+/// requires: true
+/// ensures: ret == 1
+pub fn caller() -> u8 {
+    let r = Range { start: 1u8, end: 2u8 };
+    let x = <Range<u8> as a::Custom>::into_iter(r);
+    x.start
+}
+"#;
+    let Some(o) = verify_src("caller", spoof) else { return };
+    // The soundness property: the model must never answer this call. If it did, it
+    // would return the range unchanged and *prove* `ret == 1`. On current stable the
+    // default body's panic is modelled, so the verdict is a refutation (`Failed`); on
+    // 1.85 the panic path is not modelled, so the verdict is a refusal (`Incomplete`).
+    // Both are honest; only `verified` would be a false proof.
+    assert!(
+        !o.is_verified(),
+        "a user `Range`'s custom `into_iter` must not be answered by the range \
+         model (the model would prove `ret == 1` for a function that panics), got: {o}"
+    );
+
+    // The positive control: the standard library's own `for` loop is still modelled.
+    let real = r#"
+/// requires: true
+/// ensures: ret == 3
+pub fn sums() -> u32 {
+    let mut c = 0u32;
+    for i in 1u32..=2u32 {
+        c += i;
+    }
+    c
+}
+"#;
+    let Some(o) = verify_src("sums", real) else { return };
+    assert!(
+        o.is_verified(),
+        "the standard library's `for`-loop range must still be modelled, got: {o}"
+    );
+
+    // The sharper shape: a trait *default* body that mutates `self` through a helper
+    // the impl *overrides*. The call inside the default body is `<Self as T>::set`,
+    // whose receiver is literally `Self`, so the concrete type is not known there.
+    // Resolving it to the *default* `set` (a no-op) inlined the wrong body and
+    // *proved* `ret == 1` for a caller whose real result is `42` -- a false proof,
+    // pre-existing and independent of the range model. The call is refused now, so
+    // the soundness property is "never `verified`".
+    let self_receiver = r#"
+#[derive(Clone, Copy)]
+pub struct P {
+    pub v: u8,
+}
+pub trait T: Copy {
+    fn go(mut self) -> Self
+    where
+        Self: Sized,
+    {
+        self.set(42);
+        self
+    }
+    fn set(&mut self, x: u8) {
+        let _ = x;
+    }
+}
+impl T for P {
+    fn set(&mut self, x: u8) {
+        self.v = x;
+    }
+}
+
+/// requires: true
+/// ensures: ret == 1
+pub fn caller() -> u8 {
+    let p = P { v: 1 };
+    let q = <P as T>::go(p);
+    q.v
+}
+"#;
+    let Some(o) = verify_src("caller", self_receiver) else { return };
+    assert!(
+        !o.is_verified(),
+        "a `<Self as T>::m` call inside a trait default body must not be answered \
+         by the default method when an impl overrides it (that proved `ret == 1` for \
+         a body returning `42`), got: {o}"
+    );
+}
+
 /// A bare trait call must not be answered by the model when the crate declares a
 /// crate-root trait of that name with a *default* body.
 ///

@@ -19,7 +19,7 @@ baseline every item is scored against:
 | Corpus | Command | Verified / decided |
 |---|---|---|
 | `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 18 / 33 |
-| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 433 / 803 |
+| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 434 / 806 |
 | `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **16 / 21 (76%)** |
 
 `everyday.rs` is the honest one: ordinary Rust written by an external reviewer,

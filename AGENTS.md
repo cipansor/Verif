@@ -6516,6 +6516,47 @@ way to know the claim holds is to run the second toolchain. The MSRV gate is not
 ceremony around `cargo check` -- it runs the frontend's whole suite against the floor
 rustc, which is what turns "supports 1.85" from a build into a behaviour.
 
+**The unqualified spelling is also a name a user type can carry, so the range model
+was made trait-aware -- and a review of that change found a *different*, pre-existing
+false proof.** Accepting `<RangeInclusive<u32> as …>` accepts an *unqualified* type
+name, and a user can write `struct Range<T>`. So the two `Iterator` methods are now
+matched on the *trait* as well as the type (`names_std_range_trait`): `into_iter` only
+for the standard library's `IntoIterator`, `next` only for `Iterator`. A user
+`struct Range<T>` with a custom `into_iter` (`<Range<u8> as a::Custom>::into_iter`) is
+refused, which is what the reviewer's report asked for.
+
+Probing that shape turned up the real bug, and it was **not** the range model. The
+reviewer's literal example -- a default `into_iter` that *panics* -- is already
+**refuted** on the unmodified tree (`resolve_callee` finds the default body and inlines
+it, so the panic is found). But the reviewer's *mechanism* is real: a trait **default
+body** that calls a helper through `Self`:
+
+```rust
+pub trait T: Copy {
+    fn go(mut self) -> Self where Self: Sized { self.set(42); self }
+    fn set(&mut self, x: u8) { let _ = x; }        // default: a no-op
+}
+impl T for P { fn set(&mut self, x: u8) { self.v = x; } }   // the real one
+```
+
+The call inside `go` prints as `<Self as T>::set`. `call_type` gives `Self`, which no
+`impl` candidate matches, so the search fell through to the *default-body* branch and
+inlined the no-op `set` -- and a caller's `ensures: ret == 1` was **proved** against a
+body whose real result is `42`. A false proof, **pre-existing** (it reproduces with the
+`names_range` change stashed), and independent of the range model (it reproduces with
+the model disabled entirely). `resolve_callee` now refuses a `Self` receiver outright:
+resolving it would need the concrete `Self` the enclosing call was made with, which the
+resolver does not carry, and answering it with the default is exactly the false proof.
+The shape is a *refusal* now -- a lost proof, not a wrong one -- which is the honest
+direction. Pinned by `a_user_type_named_range_is_not_answered_by_the_range_model` (the
+range spoof, the `Self`-receiver false proof, and a positive control that a real `for`
+loop still verifies); teeth confirmed by reverting the guard, which restores `verified`.
+
+The general lesson, and it is the one this file keeps meeting: **when a report names a
+mechanism, reproduce the mechanism, not the example.** The reported example was already
+sound; the mechanism it described was a real hole one shape over, in a resolver the
+report did not name. The probe is what separated the two.
+
 ## A tuple struct is a struct too: its fields are numbered by position
 
 `struct_head` recognised only a *braced* body, so `pub struct Pair(pub u8, pub u8)`

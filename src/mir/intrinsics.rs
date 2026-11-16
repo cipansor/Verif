@@ -989,36 +989,80 @@ pub fn names_result_impl(name: &str) -> bool {
 /// The desugaring spells the calls as `std::ops::RangeInclusive::<u32>::new`,
 /// `<std::ops::RangeInclusive<u32> as IntoIterator>::into_iter` and
 /// `<std::ops::RangeInclusive<u32> as Iterator>::next`, so the *type* segment is
-/// `ops::RangeInclusive`/`ops::Range` (or the `core::ops` spelling). A user type
-/// spelled `RangeInclusive` in a local module is `m::RangeInclusive::<…>::new`,
-/// which has no `ops::` segment and is refused. `Range::new` is the *exclusive*
-/// range's constructor; `Range` itself has no `next` (only `RangeInclusive` does),
-/// but the desugaring never calls one, so the shared `new` spelling is enough.
+/// `ops::RangeInclusive`/`ops::Range` (or the `core::ops` spelling). rustc 1.85 (the
+/// MSRV) prints the same projection with the type *unqualified* -- `<RangeInclusive<u32>
+/// as IntoIterator>::into_iter` -- which is also accepted, because an unqualified
+/// `Range`/`RangeInclusive` is a name a user type can carry and the two spellings are
+/// otherwise identical. A user type spelled `RangeInclusive` in a local module is
+/// `m::RangeInclusive::<…>::new`, which has no `ops::` segment and is refused.
+///
+/// Because the unqualified spelling is one a user type can carry, the two `Iterator`
+/// methods are additionally matched on the *trait* ([`names_std_range_trait`]): a user
+/// `struct Range<T>` with a custom `into_iter` (`<Range<u8> as a::Custom>::into_iter`)
+/// is refused rather than answered with the model's identity semantics, which would be
+/// a false proof of a call the compiler resolved to the user's own method.
+///
+/// `Range::new` is the *exclusive* range's constructor; `Range` itself has no `next`
+/// (only `RangeInclusive` does), but the desugaring never calls one, so the shared
+/// `new` spelling is enough.
 pub fn names_range(name: &str) -> bool {
-    // `ops::RangeInclusive` or `ops::Range` followed by a segment boundary, so
-    // `ops::RangeFrom`/`ops::RangeTo` -- which are not `Iterator`s and so never
-    // drive a `for` loop -- are not matched. A path printed with generics puts a
-    // `<`, `>` or `::` right after the type segment; a bare `Range::new` starts
-    // with the type name.
-    let has_segment = |seg: &str| {
+    // The type segment, followed by a segment boundary, so `RangeFrom`/`RangeTo` --
+    // which are not `Iterator`s and so never drive a `for` loop -- are not matched.
+    // A path printed with generics puts a `<`, `>` or `::` right after the type
+    // segment; a bare `Range::new` starts with the type name.
+    let has_type = |seg: &str| {
         name.match_indices(seg).any(|(i, _)| {
             matches!(name[i + seg.len()..].chars().next(), None | Some(':') | Some('<') | Some('>'))
         })
     };
-    has_segment("ops::RangeInclusive")
-        || has_segment("ops::Range")
+    let is_range = has_type("ops::RangeInclusive")
+        || has_type("ops::Range")
+        || name.starts_with("RangeInclusive::")
+        || name.starts_with("Range::")
         // rustc 1.85 (the MSRV) prints the `as`-projection form with the type
         // *unqualified* -- `<RangeInclusive<u32> as IntoIterator>::into_iter`,
         // `<Range<u32> as Iterator>::next` -- where current stable qualifies it
-        // (`<std::ops::RangeInclusive<u32> as …>`). Both are the standard library's
-        // type; a user type named `RangeInclusive` in a local module prints
-        // `m::RangeInclusive`, which this arm would also match, but the same-dump
-        // body is resolved before the model, so a local type is answered by its own
-        // body and never reaches here.
+        // (`<std::ops::RangeInclusive<u32> as …>`).
         || name.starts_with("<RangeInclusive<")
-        || name.starts_with("<Range<")
-        || name.starts_with("RangeInclusive::")
-        || name.starts_with("Range::")
+        || name.starts_with("<Range<");
+    if !is_range {
+        return false;
+    }
+    // The type name alone is not enough, because an *unqualified* `Range`/`RangeInclusive`
+    // is a name a user type can carry, and rustc 1.85 prints the standard library's
+    // projection unqualified. So the two `Iterator` methods are matched on the
+    // *trait* as well as the type: `into_iter` only when the projection names the
+    // standard library's `IntoIterator`, `next` only for `Iterator`. A user
+    // `struct Range<T>` with a custom `into_iter` (`<Range<u8> as a::Custom>::into_iter`)
+    // is therefore refused -- answering it with the range model's identity semantics
+    // would be a false proof of a call the compiler resolved to the user's method.
+    // `new` is inherent on the range type (it carries no trait), so it is matched on
+    // the type alone; a user's inherent `new` has a body, and the same-dump lookup
+    // answers it before the model is ever consulted.
+    match name.rsplit("::").next() {
+        Some("new") => true,
+        Some("into_iter") => names_std_range_trait(name, "IntoIterator"),
+        Some("next") => names_std_range_trait(name, "Iterator"),
+        _ => false,
+    }
+}
+
+/// Whether an `as`-projection names the standard library's `IntoIterator`/`Iterator`.
+///
+/// `<RangeInclusive<u32> as IntoIterator>::into_iter` and
+/// `<std::ops::Range<u32> as Iterator>::next` carry the trait between ` as ` and the
+/// `>` that closes the projection. The trait must be the bare standard-library name
+/// (`IntoIterator`/`Iterator`), never a module-qualified one: `<Range<u8> as
+/// a::Custom>::into_iter` and `<Range<u8> as m::IntoIterator>::into_iter` are both
+/// refused, so a user type named `Range` cannot be answered by the range model. A
+/// *crate-root* user trait named `IntoIterator` prints bare too; the caller's
+/// declared-trait guard ([`crate::mir::exec`]'s `try_intrinsic`) refuses that case,
+/// and a same-dump body always wins the lookup first.
+fn names_std_range_trait(name: &str, want: &str) -> bool {
+    let Some(after) = name.rsplit_once(" as ").map(|(_, a)| a) else {
+        return false;
+    };
+    after.starts_with(&format!("{want}>")) || after.starts_with(&format!("{want}<"))
 }
 
 /// Whether a `from`/`into` name is `core`'s own `From`/`Into`, and theirs alone.
@@ -2899,6 +2943,19 @@ mod tests {
         // loop, so they are refused.
         assert_eq!(classify("std::ops::RangeFrom::<u32>::new"), None);
         assert_eq!(classify("std::ops::RangeTo::<u32>::new"), None);
+        // The `Iterator` methods are matched on the *trait* as well as the type, so a
+        // user type named `Range` with a custom `into_iter` is refused -- answering it
+        // with the model's identity semantics would be a false proof of a call the
+        // compiler resolved to the user's own method. This is the hole an unqualified
+        // `Range` (which rustc 1.85 prints for the standard library) would otherwise
+        // open, because a user can name a type `Range` too.
+        assert_eq!(classify("<Range<u8> as a::Custom>::into_iter"), None);
+        assert_eq!(classify("<Range<u8> as a::Custom>::next"), None);
+        assert_eq!(classify("<RangeInclusive<u8> as m::IntoIterator>::into_iter"), None);
+        assert_eq!(classify("<Range<u8> as m::Iterator>::next"), None);
+        // An `as`-projection whose type is the standard library's but whose trait is a
+        // user's is still refused (the trait, not the type, is what a user can spoof).
+        assert_eq!(classify("<Range<u8> as core::ops::RangeBounds<u8>>::into_iter"), None);
     }
 
     /// The `overflowing_*` family, two-operand, against `core` over all of `u8`

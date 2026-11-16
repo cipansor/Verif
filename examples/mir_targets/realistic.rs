@@ -8377,6 +8377,112 @@ pub fn unsigned_source_widens_to_signed_destination(x: u8) -> i16 {
     i16::from(x)
 }
 
+// ---------------------------------------------------------------------------
+// A user type named `Range` must not be answered by the for-loop range model.
+//
+// rustc 1.85 (the MSRV) prints the standard library's `for`-loop projection with
+// the type *unqualified* (`<RangeInclusive<u32> as IntoIterator>::into_iter`),
+// which is also a name a user type can carry. `names_range` therefore matches the
+// `Iterator` methods on the *trait* as well as the type, so a custom `into_iter`
+// on a user `Range` is refused rather than answered with the model's identity
+// semantics. The panic is the sharpest test: a model that returned the range
+// unchanged would give `ret == 1` and prove a function that always panics.
+// ---------------------------------------------------------------------------
+
+/// A user `Range` with a trait whose `into_iter` is *not* the identity. Two traits
+/// share the method name (`a::Custom` and `b::Custom`) so rustc prints the call
+/// with the qualified trait path, the spelling a bare `Range::into_iter` would not
+/// reach.
+pub mod range_shim {
+    pub mod a {
+        pub trait Custom {
+            fn into_iter(self) -> Self
+            where
+                Self: Sized,
+            {
+                panic!("into_iter is not the identity here")
+            }
+        }
+    }
+    pub mod b {
+        pub trait Custom {
+            fn into_iter(self) -> Self
+            where
+                Self: Sized,
+            {
+                panic!("the other trait")
+            }
+        }
+    }
+    pub struct Range<T> {
+        pub start: T,
+        pub end: T,
+    }
+    impl a::Custom for Range<u8> {}
+}
+
+/// A call to a user `Range`'s custom `into_iter` must never be answered by the
+/// range model. The model would return the range unchanged and *prove* `ret == 1`;
+/// the real method always panics, so the honest verdict is a refutation (the panic
+/// fires on every input). This is the tripwire for the unqualified-`Range` hole.
+/// requires: true
+/// ensures: ret == 1
+pub fn user_range_into_iter_is_not_the_model_cannot_prove_this() -> u8 {
+    let r = range_shim::Range { start: 1u8, end: 2u8 };
+    let x = <range_shim::Range<u8> as range_shim::a::Custom>::into_iter(r);
+    x.start
+}
+
+/// A trait *default* body that mutates `self` through a helper the impl overrides.
+///
+/// The call inside `go` prints as `<Self as Sized2>::set`, whose receiver is
+/// literally `Self`, so the concrete type is not known there. `resolve_callee` used
+/// to fall through to the *default* `set` (a no-op) and inline it, so this contract
+/// -- `ret == 1`, the seed -- was **proved** for a body whose real result is `42`.
+/// The call is refused now, so the verdict is not `verified`. The companion below
+/// verifies, which pins that the impl's override is read where the type *is* known.
+pub trait Sized2: Copy {
+    fn go(mut self) -> Self
+    where
+        Self: Sized,
+    {
+        self.set(42);
+        self
+    }
+    fn set(&mut self, _x: u8) {}
+}
+
+#[derive(Clone, Copy)]
+pub struct Marker {
+    pub v: u8,
+}
+
+impl Sized2 for Marker {
+    fn set(&mut self, x: u8) {
+        self.v = x;
+    }
+}
+
+/// The false direction: the real `set` writes `42`, so `ret == 1` is false. A model
+/// that inlined the *default* `set` would leave the seed `1` and *prove* this.
+/// requires: true
+/// ensures: ret == 1
+pub fn default_body_self_call_is_not_the_default_cannot_prove_this() -> u8 {
+    let p = Marker { v: 1 };
+    let q = <Marker as Sized2>::go(p);
+    q.v
+}
+
+/// The true direction on the same shape, read where the concrete type *is* known:
+/// `Marker::set` is called directly, so the override's `42` is what answers.
+/// requires: true
+/// ensures: ret == 42
+pub fn impl_override_is_read_when_the_type_is_known() -> u8 {
+    let mut p = Marker { v: 1 };
+    Sized2::set(&mut p, 42);
+    p.v
+}
+
 
 // ---------------------------------------------------------------------------
 // Trait-identity soundness: a bare call name must not be answered by a
