@@ -177,6 +177,15 @@ pub const SOME_TAG: u64 = 1;
 /// assuming [`SOME_TAG`].
 pub const OK_TAG: u64 = 0;
 
+/// The discriminant of `ControlFlow`'s `Continue` variant, which carries the
+/// value a `?` *yields*. rustc numbers `Continue` 0 and `Break` 1, so `Break` --
+/// the residual that `?` returns early -- is [`BREAK_TAG`].
+pub const CONTINUE_TAG: u64 = 0;
+
+/// The discriminant of `ControlFlow`'s `Break` variant, which carries the
+/// residual (the error) a `?` propagates. See [`CONTINUE_TAG`].
+pub const BREAK_TAG: u64 = 1;
+
 /// What a modelled intrinsic computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intrinsic {
@@ -329,6 +338,25 @@ pub enum Intrinsic {
     /// standard library's own, so the *type path* is checked (see [`names_range`]);
     /// a same-dump body always wins the lookup first.
     Range(RangeMethod),
+    /// `Try::branch`, the `?` operator's first call.
+    ///
+    /// `expr?` lowers to `<T as Try>::branch(expr)` producing a
+    /// `ControlFlow<Residual, T>`, whose `Continue` arm carries the success value
+    /// and whose `Break` arm carries the residual (the error, wrapped). The
+    /// executor answers it from the receiver's enum state and writes the
+    /// `ControlFlow`'s tag and both payloads, so the `switchInt` on
+    /// `discriminant(_)` and the `(_ as Continue).0` / `(_ as Break).0` downcasts
+    /// that follow decide. Like [`Intrinsic::MinMax`] this is a *trait* method
+    /// (`<Result<u8, u8> as Try>::branch`), so the model is a fallback behind the
+    /// same-dump lookup. `eval` returns `None` for it.
+    TryBranch,
+    /// `FromResidual::from_residual`, the `?` operator's second call.
+    ///
+    /// On the `Break` arm `from_residual` converts the residual back into the
+    /// function's return enum (`Result::Err(e)` / `Option::None`). It is the
+    /// mirror of [`Intrinsic::TryBranch`]: the residual's failure tag and payload
+    /// become the result enum's. `eval` returns `None` for it.
+    FromResidual,
 }
 
 /// A method on a `for`-loop range.
@@ -827,6 +855,26 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             _ => {}
         }
     }
+    // `Try::branch` and `FromResidual::from_residual`, the two calls the `?`
+    // operator's desugaring makes. Both are *trait* methods -- the dump spells
+    // them `<Result<u8, u8> as Try>::branch` and `<Result<u8, u8> as
+    // FromResidual<Result<!, u8>>>::from_residual` -- so there is no
+    // `core::num::<impl …>` path and they are admitted by name like `Ord::min`.
+    // The trait path must be the standard library's `Try`/`FromResidual` (see
+    // `names_try`/`names_from_residual`), so a module-qualified local `m::Try` is
+    // refused, and the same-dump lookup answers a real body before the model.
+    if short == "branch" {
+        if !names_try(name) {
+            return None;
+        }
+        return Some(Intrinsic::TryBranch);
+    }
+    if short == "from_residual" {
+        if !names_from_residual(name) {
+            return None;
+        }
+        return Some(Intrinsic::FromResidual);
+    }
     // `Ord::min`/`Ord::max`. These are *trait* methods, so the name is matched on
     // the trait path rather than a `core::num::<impl …>` path: the dump spells the
     // call `<u8 as Ord>::min`, naming the trait itself. `min`/`max` are matched
@@ -957,6 +1005,28 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
 /// collide (a crate-root `Ord`, which the prelude also names `Ord`).
 pub fn names_ord_trait(name: &str) -> bool {
     matches!(trait_path(name), Some("Ord" | "core::cmp::Ord" | "std::cmp::Ord"))
+}
+
+/// Whether a `branch` name is `Try`'s, and the standard library's alone.
+///
+/// The `?` desugaring spells the call `<Result<u8, u8> as Try>::branch` (or the
+/// `std::ops::Try` spelling), naming the trait. A local trait in a module prints
+/// `m::Try`, which is refused, and a crate-root `Try` -- which prints bare -- is
+/// closed by the caller's same-dump lookup, exactly as for `Ord`. A user cannot
+/// define items inside `core`/`std`, so the qualified set cannot name a local
+/// item.
+pub fn names_try(name: &str) -> bool {
+    matches!(trait_path(name), Some("Try" | "core::ops::Try" | "std::ops::Try"))
+}
+
+/// Whether a `from_residual` name is `FromResidual`'s, and the standard library's
+/// alone. The `Try` twin of [`names_try`]: the desugaring spells the call
+/// `<Result<u8, u8> as FromResidual<Result<!, u8>>>::from_residual`.
+pub fn names_from_residual(name: &str) -> bool {
+    matches!(
+        trait_path(name),
+        Some("FromResidual" | "core::ops::FromResidual" | "std::ops::FromResidual")
+    )
 }
 
 /// True when a call names an inherent method on a *slice* `[T]`.
@@ -1179,6 +1249,12 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // `eval` never sees them and the executor answers them from the fields (or
         // refuses a receiver whose range state it does not hold).
         Intrinsic::Range(_) => true,
+        // The `?` operator's two calls. Like the `Option` methods they read the
+        // receiver's enum state (or, for `from_residual`, the residual argument's)
+        // rather than a bit-vector operand, so there is no width or sign to check
+        // here; `eval` never sees them and the executor answers them from the
+        // stores (or refuses a receiver whose enum state it does not hold).
+        Intrinsic::TryBranch | Intrinsic::FromResidual => true,
         // `abs_diff` computes at one bit of headroom, so it needs a width below the
         // engine's 64. It exists on both signednesses -- on an unsigned type it is
         // a plain magnitude -- so there is no membership fact to check.
@@ -1313,6 +1389,13 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
     if matches!(op, Intrinsic::Range(_)) {
         return None;
     }
+    // The `?` operator's two calls read the receiver's (or residual's) enum state
+    // from the executor's stores, not from an operand term, so `eval` has nothing
+    // to compute for them either. The executor answers them (see `try_branch` /
+    // `from_residual`).
+    if matches!(op, Intrinsic::TryBranch | Intrinsic::FromResidual) {
+        return None;
+    }
     Some(match op {
         // Answered by `eval_slice` from the executor's length variable; the early
         // return above keeps them from reaching here.
@@ -1328,6 +1411,11 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         // the early return above keeps them from reaching here.
         Intrinsic::Range(_) => {
             unreachable!("range methods are answered from the struct field store")
+        }
+        // Answered by the executor's `try_branch`/`from_residual` from the enum
+        // stores; the early return above keeps them from reaching here.
+        Intrinsic::TryBranch | Intrinsic::FromResidual => {
+            unreachable!("the `?` operator's calls are answered from the enum stores")
         }
         // The bit counts, each built at the operand's width and widened to the
         // result type. A count cannot exceed the operand width, so `w` bits hold

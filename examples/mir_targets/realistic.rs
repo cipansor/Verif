@@ -10550,3 +10550,149 @@ pub fn keep_bool_ref(c: &mut bool) {
     let _ = *c;
 }
 
+
+// ---------------------------------------------------------------------------
+// The `?` operator (`Try::branch` + `FromResidual::from_residual`). `expr?`
+// lowers to `<T as Try>::branch(expr)` producing a `ControlFlow`, a `switchInt`
+// on its discriminant, and (on `Break`) a `from_residual` call that re-wraps the
+// error as the function's return enum. The model answers both calls from the
+// receiver's enum state; the residual's tag is fixed by the receiver type, and
+// `from_residual` re-numbers it for the return enum. The `_propagate` pair pins
+// the `Err` path, the `_value` pair the `Ok` path, and each `_cannot_prove_this`
+// the opposite direction.
+// ---------------------------------------------------------------------------
+
+/// `?` on a `Result`, success path: the value flows through unchanged.
+/// requires: r.is_ok()
+/// ensures: ret.is_ok() && ret.Ok == r.Ok
+pub fn result_try_ok_value(r: Result<u8, u8>) -> Result<u8, u8> {
+    let v = r?;
+    Ok(v)
+}
+
+/// The false direction of [`result_try_ok_value`]: under `is_ok` the result is
+/// `Ok`, so a claim of `Err` is refutable.
+/// requires: r.is_ok()
+/// ensures: ret.is_err()
+pub fn result_try_ok_value_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
+    let v = r?;
+    Ok(v)
+}
+
+/// `?` on a `Result`, failure path: the error propagates as `Err`.
+/// requires: r.is_err()
+/// ensures: ret.is_err() && ret.Err == r.Err
+pub fn result_try_err_propagates(r: Result<u8, u8>) -> Result<u8, u8> {
+    let v = r?;
+    Ok(v)
+}
+
+/// The false direction of [`result_try_err_propagates`]: under `is_err` the
+/// result is `Err`, so a claim of `Ok` is refutable.
+/// requires: r.is_err()
+/// ensures: ret.is_ok()
+pub fn result_try_err_propagates_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
+    let v = r?;
+    Ok(v)
+}
+
+/// `?` whose yielded value is then *used*: the `Continue` payload reaches the
+/// arithmetic, so a model that bound the payload to the wrong variant would
+/// refute the `+ 1` relation.
+/// requires: r.is_ok() && r.Ok < 100
+/// ensures: ret.is_ok() && ret.Ok == r.Ok + 1
+pub fn result_try_value_used(r: Result<u8, u8>) -> Result<u8, u8> {
+    let v = r?;
+    Ok(v + 1)
+}
+
+/// The false direction of [`result_try_value_used`]: the result is `r.Ok + 1`,
+/// not `r.Ok`, so claiming the value passed through unchanged is refutable.
+/// requires: r.is_ok() && r.Ok < 100
+/// ensures: ret.Ok == r.Ok
+pub fn result_try_value_used_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
+    let v = r?;
+    Ok(v + 1)
+}
+
+/// `?` on an `Option`, success path: the value flows through.
+/// requires: x.is_some()
+/// ensures: ret.is_some()
+pub fn option_try_some_value(x: Option<u8>) -> Option<u8> {
+    let v = x?;
+    Some(v)
+}
+
+/// The false direction of [`option_try_some_value`]: under `is_some` the result
+/// is `Some`, so a claim of `None` is refutable.
+/// requires: x.is_some()
+/// ensures: ret.is_none()
+pub fn option_try_some_value_cannot_prove_this(x: Option<u8>) -> Option<u8> {
+    let v = x?;
+    Some(v)
+}
+
+/// `?` on an `Option`, failure path: `None` propagates.
+/// requires: x.is_none()
+/// ensures: ret.is_none()
+pub fn option_try_none_propagates(x: Option<u8>) -> Option<u8> {
+    let v = x?;
+    Some(v)
+}
+
+/// The false direction of [`option_try_none_propagates`]: under `is_none` the
+/// result is `None`, so a claim of `Some` is refutable.
+/// requires: x.is_none()
+/// ensures: ret.is_some()
+pub fn option_try_none_propagates_cannot_prove_this(x: Option<u8>) -> Option<u8> {
+    let v = x?;
+    Some(v)
+}
+
+/// `?` on a *locally constructed* `Ok`: the receiver's tag is a known constant,
+/// so the `branch` is decided statically and the value flows through.
+/// requires: true
+/// ensures: ret.is_ok() && ret.Ok == 6
+pub fn result_try_of_a_known_ok() -> Result<u8, u8> {
+    let r: Result<u8, u8> = Ok(5);
+    let v = r?;
+    Ok(v + 1)
+}
+
+/// `?` on a locally constructed `Err`: the early return is taken unconditionally.
+/// requires: true
+/// ensures: ret.is_err()
+pub fn result_try_of_a_known_err() -> Result<u8, u8> {
+    let r: Result<u8, u8> = Err(3);
+    let v = r?;
+    Ok(v)
+}
+
+/// The false direction of [`result_try_of_a_known_err`]: the known `Err` always
+/// returns `Err`, so a claim of `Ok` is refutable.
+/// requires: true
+/// ensures: ret.is_ok()
+pub fn result_try_of_a_known_err_cannot_prove_this() -> Result<u8, u8> {
+    let r: Result<u8, u8> = Err(3);
+    let v = r?;
+    Ok(v)
+}
+
+/// `?` on a locally constructed `None`: the early return is taken, `None` flows.
+/// requires: true
+/// ensures: ret.is_none()
+pub fn option_try_of_a_known_none() -> Option<u8> {
+    let r: Option<u8> = None;
+    let v = r?;
+    Some(v)
+}
+
+/// The false direction of [`option_try_of_a_known_none`]: a known `None` always
+/// returns `None`, so a claim of `Some` is refutable.
+/// requires: true
+/// ensures: ret.is_some()
+pub fn option_try_of_a_known_none_cannot_prove_this() -> Option<u8> {
+    let r: Option<u8> = None;
+    let v = r?;
+    Some(v)
+}

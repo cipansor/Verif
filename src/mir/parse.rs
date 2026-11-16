@@ -926,6 +926,13 @@ pub fn variant_index(name: &str, enums: &BTreeMap<String, EnumLayout>) -> Option
     match short {
         "None" | "Ok" => return Some(0),
         "Some" | "Err" => return Some(1),
+        // `ControlFlow`'s variants, from the `?` desugaring's `(_2 as Continue)` /
+        // `(_2 as Break)` downcasts. rustc numbers `Continue` 0 and `Break` 1. No
+        // source file declares `ControlFlow`, and a *declared* enum with those
+        // variant names has already been given the chance to answer above, so this
+        // default cannot shadow one.
+        "Continue" => return Some(0),
+        "Break" => return Some(1),
         _ => {}
     }
     // A bare variant name is looked up in every layout. Two layouts claiming the

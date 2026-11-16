@@ -154,9 +154,29 @@ with no new false proof while the independent corpus keeps growing.
     is the *divider* wall (`n / d <= n` at `u32`), not the `Option`; the same body
     decides at `u8`. Sixteen fixtures (true/tripwire/panic pairs, both families) in
     `realistic.rs` (**424 of 789**).
-  - Remaining: `?` (the `Try` desugaring needs `From` on the error type), and
-    `map`/`map_err`/`and_then` (closures). `ok_or`/`ok`/`err` are now modelled (see
-    below), so they are off this list.
+  - Remaining: `map`/`map_err`/`and_then`/`unwrap_or_else` (closures). `ok_or`/`ok`/`err`
+    are now modelled (see below), and the `?` operator is modelled (see the last
+    progress note), so both are off this list.
+  - Progress (the `?` operator): `expr?` is modelled. The desugaring is
+    `<T as Try>::branch(expr)` producing a `ControlFlow<Residual, T>`, a
+    `switchInt` on its discriminant, and — on the `Break` arm — a
+    `FromResidual::from_residual` call that re-wraps the error as the function's
+    return enum. Both calls are modelled (`Intrinsic::TryBranch` /
+    `Intrinsic::FromResidual`, answered by the executor's `try_branch` /
+    `from_residual` from the receiver's enum stores, exactly as the `Option`
+    methods are). `branch` writes the `ControlFlow`'s tag — `Continue` iff the
+    receiver is on its success variant (`Ok` = 0, `Some` = 1) — and both payloads
+    (the success value, and the error value on the failure variant); the
+    `(_2 as Continue).0` / `(_2 as Break).0` downcasts then resolve through
+    `variant_index`'s `Continue`/`Break` numbering. The residual's own tag is fixed
+    by the receiver type (`Err`/`None`), so it is not stored; `from_residual`
+    re-numbers it for the *return* enum (read from the call's self type) and moves
+    the error value onto the `Err` payload. A locally constructed `Ok`/`Err`/`None`
+    receiver has a *known* tag, so the branch is decided statically (the
+    `smt::evaluate` known-tag arm). Fifteen fixtures in `realistic.rs`
+    (verify/tripwire pairs on both paths for both families, plus the three
+    known-tag receivers), pinned by `the_try_operator_decides_on_both_paths`.
+    `realistic.rs` **472 of 881 -> 488 of 912**.
   - Progress (enum-return contract): a contract on an `Option`/`Result`-returning
     function can now name the **discriminant** methods — `ret.is_ok()`,
     `ret.is_some()`, `ret.is_err()`, `ret.is_none()`. A function returning an enum
@@ -252,8 +272,8 @@ with no new false proof while the independent corpus keeps growing.
     branch-vacuity pair, and two refusals — a non-enum return and a unit variant),
     pinned by `an_enum_return_contract_can_name_a_payload`. This closes the last
     named C2 sub-item; `realistic.rs` **467 of 869 -> 472 of 881**.
-  - Remaining: `?` (the `Try` desugaring needs `From` on the error type) and
-    `map`/`map_err`/`and_then`/`unwrap_or_else` (closures).
+  - Remaining: `map`/`map_err`/`and_then`/`unwrap_or_else` (closures). The `?`
+    operator is modelled (see the `?` progress note above).
 - **C3. Ranges and `for` loops.** · P0 · done · Kani, Verus, Prusti
   - Gap: `RangeInclusive::new`, `Range`, `Iterator::next` unmodelled, so the
     commonest loop in Rust is out of reach. Evidence: `tri` incomplete.

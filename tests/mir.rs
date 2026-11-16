@@ -5875,6 +5875,73 @@ fn payload_summaries_cannot_prove_a_false_claim() {
     );
 }
 
+/// The `?` operator decides, on both the `Ok`/`Some` and the `Err`/`None` paths,
+/// and its false directions are refuted.
+///
+/// `expr?` lowers to three steps the model has to agree on: `<T as Try>::branch`
+/// produces a `ControlFlow<Residual, T>`, a `switchInt` reads its discriminant,
+/// and on `Break` a `FromResidual::from_residual` call re-wraps the error as the
+/// function's return enum. The test pins each step's own observable:
+///
+/// * the *success* value: `result_try_value_used` uses the yielded value
+///   (`r.Ok + 1`), so a model that bound the `Continue` payload to the wrong
+///   variant, or to the wrong width, would refute it.
+/// * the *tag* the `switchInt` reads: the `Err`-propagation pair, where the
+///   failure path must produce `ret.is_err()` and the opposite claim is refuted.
+/// * `from_residual`'s re-wrap: `ret.Err == r.Err`, so the error value has to
+///   survive the conversion, not just the tag.
+///
+/// Both families (`Result` and `Option`) are covered, because they differ in
+/// where the payload lives (`Ok` is 0, `Some` is 1) and in whether the residual
+/// carries a value (`Result` does, `Option`'s `None` does not).
+#[test]
+fn the_try_operator_decides_on_both_paths() {
+    let names = [
+        "result_try_ok_value",
+        "result_try_ok_value_cannot_prove_this",
+        "result_try_err_propagates",
+        "result_try_err_propagates_cannot_prove_this",
+        "result_try_value_used",
+        "result_try_value_used_cannot_prove_this",
+        "option_try_some_value",
+        "option_try_some_value_cannot_prove_this",
+        "option_try_none_propagates",
+        "option_try_none_propagates_cannot_prove_this",
+        "result_try_of_a_known_ok",
+        "result_try_of_a_known_err",
+        "result_try_of_a_known_err_cannot_prove_this",
+        "option_try_of_a_known_none",
+        "option_try_of_a_known_none_cannot_prove_this",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "result_try_ok_value",
+        "result_try_err_propagates",
+        "result_try_value_used",
+        "option_try_some_value",
+        "option_try_none_propagates",
+        "result_try_of_a_known_ok",
+        "result_try_of_a_known_err",
+        "option_try_of_a_known_none",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "result_try_ok_value_cannot_prove_this",
+        "result_try_err_propagates_cannot_prove_this",
+        "result_try_value_used_cannot_prove_this",
+        "option_try_some_value_cannot_prove_this",
+        "option_try_none_propagates_cannot_prove_this",
+        "result_try_of_a_known_err_cannot_prove_this",
+        "option_try_of_a_known_none_cannot_prove_this",
+    ] {
+        assert_refuted(&report, name);
+    }
+}
+
 /// The `Option`↔`Result` conversions -- `Option::ok_or`, `Result::ok`,
 /// `Result::err` -- decide, and both the *tag* and the *payload* cross.
 ///

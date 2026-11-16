@@ -4894,6 +4894,123 @@ fn enum_method(
     })
 }
 
+/// Answer `Try::branch`, the first call of the `?` desugaring.
+///
+/// `expr?` is `<T as Try>::branch(expr)`, producing a
+/// `ControlFlow<Residual, T>`. `branch` *is* `Continue(expr)` on the success
+/// variant and `Break(residual)` on the failure one, so the model writes the
+/// `ControlFlow`'s tag and both payloads into the destination's stores and lets
+/// the `switchInt` on `discriminant(_)` -- and the `(_ as Continue).0` /
+/// `(_ as Break).0` downcasts -- decide:
+///
+/// * tag `Continue` ([`intrinsics::CONTINUE_TAG`]) on the receiver's success
+///   variant, carrying the success payload, which is what the `?` *yields*;
+/// * tag `Break` ([`intrinsics::BREAK_TAG`]) on the receiver's failure variant,
+///   carrying the *error value*. The residual the desugaring builds from it is
+///   always `Err(e)` (for a `Result`) or `None` (for an `Option`) -- `branch`
+///   only breaks on failure -- so the residual's own tag is fixed by the receiver
+///   type and does not have to be stored. [`from_residual`] re-wraps the error
+///   under the return enum's numbering.
+///
+/// The receiver is a `Result` or an `Option` (the two the desugaring's `Try`
+/// impls are modelled for), so the success variant is `Ok` (tag 0) or `Some`
+/// (tag 1), and the failure variant is the other. A receiver whose enum state is
+/// not modelled is refused rather than given an invented tag.
+fn try_branch(name: &str, args: &[Operand], dest: &Place, env: &mut Env) -> Result<(), String> {
+    let receiver = args.first().ok_or_else(|| format!("`{name}` has no receiver"))?;
+    let p = match receiver {
+        Operand::Copy(p) | Operand::Move(p) => p,
+        Operand::Const(_) => return Err(format!("unmodelled argument to `{name}`")),
+    };
+    let opt = env.pointee(p);
+    // The receiver's type: `Result` or `Option`, read from the call's self type
+    // (`<Result<u8, u8> as Try>::branch` -> `Result`). Only these two have a
+    // modelled `Try`.
+    let (is_result, success_disc) = match call_type(name).as_deref() {
+        Some(t) if t.starts_with("Result") => (true, intrinsics::OK_TAG),
+        Some(t) if t.starts_with("Option") => (false, intrinsics::SOME_TAG),
+        _ => return Err(format!("`{name}` is not a modelled `Try`")),
+    };
+    let Some(Val::Sym(tag, _)) = env.discriminants.get(&opt.local).copied() else {
+        return Err(format!("`{name}` on a receiver whose enum state is not modelled"));
+    };
+    let tag_w = env.tag_width(opt.local).or_else(|| env.option_width(opt.local)).unwrap_or(64);
+    let tag = smt::truncate(tag, tag_w);
+    let is_success = smt::eq_const(tag, success_disc);
+    // The success value: the payload on the receiver's success variant. A receiver
+    // whose tag is a *known* non-success discriminant cannot reach the `Continue`
+    // arm, so leaving it unbound is exact (the read never happens on that path); a
+    // symbolic or success tag still needs it.
+    let success_payload = match env.payloads.get(&(opt.local, success_disc)).copied() {
+        Some((Val::Sym(v, s), w)) => Some((v, s, w)),
+        Some(_) => return Err(format!("`{name}` on a receiver whose payload is not modelled")),
+        None => match smt::evaluate(tag, |_| None) {
+            Some(v) if v != success_disc => None,
+            _ => return Err(format!("`{name}` on a receiver whose payload is not modelled")),
+        },
+    };
+    // The `ControlFlow`'s tag: `Continue` iff the receiver is on its success
+    // variant, `Break` otherwise. The arm constants are small, so the word is the
+    // tag's own width -- the same width `discriminant(_)` will read it back at.
+    let cf_tag = smt::ite(
+        is_success,
+        smt::word(intrinsics::CONTINUE_TAG, tag_w),
+        smt::word(intrinsics::BREAK_TAG, tag_w),
+    );
+    env.set_discriminant(dest.local, Val::Sym(cf_tag, Sign::Unsigned));
+    if let Some((v, s, w)) = success_payload {
+        env.set_payload(dest.local, intrinsics::CONTINUE_TAG, Val::Sym(v, s), w);
+    }
+    // The `Break` payload is the error value, which `from_residual` re-wraps. It is
+    // read off the receiver's failure variant; a receiver that cannot reach the
+    // failure path leaves it unbound, and the `from_residual` call refuses if that
+    // arm is actually taken. An `Option`'s `None` carries no payload.
+    if is_result {
+        if let Some((Val::Sym(v, s), w)) = env.payloads.get(&(opt.local, 1)).copied() {
+            env.set_payload(dest.local, intrinsics::BREAK_TAG, Val::Sym(v, s), w);
+        }
+    }
+    Ok(())
+}
+
+/// Answer `FromResidual::from_residual`, the second call of the `?` desugaring.
+///
+/// On the `Break` arm the residual (the error value `branch` recorded) is
+/// converted back into the function's return enum: `Result::Err(e)` for a `Result`
+/// return, `Option::None` for an `Option` return. The return type is read from the
+/// call's own self type (`<Result<u8, u8> as FromResidual<…>>::from_residual`), so
+/// the destination's tag is the failure variant's -- `Err` (1) for a `Result`,
+/// `None` (0) for an `Option` -- and the error value, when there is one, becomes
+/// the `Err` payload. The destination is the function's return place, so this is
+/// what the postcondition's `ret.is_err()` / `ret.Err` reads.
+fn from_residual(name: &str, args: &[Operand], dest: &Place, env: &mut Env) -> Result<(), String> {
+    // The return enum's kind, from the call's self type. `Result`'s residual
+    // carries an error value; `Option`'s is the unit `None`.
+    let is_result = match call_type(name).as_deref() {
+        Some(t) if t.starts_with("Result") => true,
+        Some(t) if t.starts_with("Option") => false,
+        _ => return Err(format!("`{name}` is not a modelled `FromResidual`")),
+    };
+    let dest_w = env.tag_width(dest.local).unwrap_or(8);
+    if !is_result {
+        // `Option`'s `?` returns `None` early; the residual is the unit `None`.
+        env.set_discriminant(dest.local, Val::Sym(smt::word(0, dest_w), Sign::Unsigned));
+        return Ok(());
+    }
+    // `Result`'s `?` returns `Err(e)`; the residual argument (the `Break` payload
+    // `branch` recorded, copied into a local) is the error value.
+    let err = match args.first() {
+        Some(Operand::Copy(p) | Operand::Move(p)) => operand(env, &Operand::Copy(env.pointee(p))),
+        Some(Operand::Const(_)) | None => Val::Unknown,
+    };
+    env.set_discriminant(dest.local, Val::Sym(smt::word(1, dest_w), Sign::Unsigned));
+    match err {
+        Val::Sym(v, s) => env.set_payload(dest.local, 1, Val::Sym(v, s), smt::bits(v)),
+        _ => return Err(format!("`{name}` on a residual whose payload is not modelled")),
+    }
+    Ok(())
+}
+
 /// Answer a modelled `core::num` call, if the callee is one.
 ///
 /// `None` means the callee is not a modelled intrinsic, and the caller falls
@@ -4960,6 +5077,8 @@ fn try_intrinsic(
             intrinsics::Intrinsic::Conversion(_)
                 | intrinsics::Intrinsic::OptionMethod(_)
                 | intrinsics::Intrinsic::Range(_)
+                | intrinsics::Intrinsic::TryBranch
+                | intrinsics::Intrinsic::FromResidual
         );
     if !name.contains("<impl") && !trait_method {
         return None;
@@ -5053,6 +5172,16 @@ fn try_intrinsic(
     // like any other loop).
     if let intrinsics::Intrinsic::Range(kind) = op {
         return Some(range_method(name, kind, args, dest, env));
+    }
+    // The `?` operator's two calls. Like the `Option`/range methods they read the
+    // receiver's enum state from the executor's stores rather than from an operand
+    // term, so they are answered here. They run *before* the generic operand read
+    // below, which assumes a bit-vector operand and a single width.
+    if let intrinsics::Intrinsic::TryBranch = op {
+        return Some(try_branch(name, args, dest, env).map(|()| Vec::new()));
+    }
+    if let intrinsics::Intrinsic::FromResidual = op {
+        return Some(from_residual(name, args, dest, env).map(|()| Vec::new()));
     }
     // The ASCII class tests take `&self`, so the operand is a reference whose
     // *referent* is the byte. rustc prints `_3 = &_1; is_ascii_digit(move _3)`,
