@@ -9079,3 +9079,77 @@ by the `tests/mir.rs` Drop tests and the `realistic.rs` fixtures; the no-op tabl
 `a_glue_free_type_has_a_noop_drop` (which can run without a compiler). The
 `rustc_public` oracle agrees (862 of 881 on `realistic.rs`, 0 differ), which is what
 confirms the parser reads the terminator's real shape.
+
+## A `for`-loop invariant is over the loop's *carried* state, not the element
+
+The `for i in a..b` desugaring is modelled (`RangeInclusive::new`/`Range::new`,
+`into_iter`, `next`), so a `for` loop decides through the existing loop machinery.
+Two facts about the loop variable cost time to rediscover, and both are in the MIR:
+
+- **`i` is a scoped `debug` binding, not a `local_names` entry.** rustc prints
+  `scope 3 { debug i => _9; }` and `_9` is assigned only *inside* the loop body
+  (`_9 = copy ((_6 as Some).0)` in the `Some` arm of the `next` match). So at the
+  loop *header* `_9` has no value: an `invariant: s <= i` is refused as
+  `unknown name i`, and the refusal is *correct*. Resolving the name would read a
+  variable the header state does not contain -- a wrong value, not a missing one.
+  A `for`-loop invariant must be written over the state the loop *carries*
+  (`s <= 5050`), which is exactly what the header havocs and the invariant is
+  quantified over.
+- **`next(&mut range)` mutates the range in place.** The `&mut` is followed with
+  `pointee` to the range local, so the `start`/`end`/`exhausted` fields `new` wrote
+  are the ones `next` advances -- and the advance is what makes the loop progress,
+  so a `variant:` can be proved against it. The inclusive range's `exhausted` flag
+  is set from `forward_overflowing`, so `for i in 0..=u8::MAX` marks itself
+  exhausted rather than looping forever; reproducing that boundary exactly is what
+  keeps a range loop from being a wrong proof.
+
+## An unbounded loop is a *missing contract*, and the message must say so
+
+`DEFAULT_UNWIND` stops a loop with no `invariant:` and no `unwind:` bound, and the
+path is reported incomplete. That is honest, but the message read like a frontend
+gap. It now names the remedy: "this is a missing loop contract, not an unmodelled
+construct: declare `invariant:` or `unwind:` to decide it". The distinction
+matters because the two incompletenesses mean opposite things to a reader -- one
+says "the tool does not understand this", the other says "you did not tell the
+tool what to prove" -- and a `for` loop over a range is now the second, not the
+first.
+
+## The three "failures" on this branch were all environmental
+
+Three tests appeared to fail and none was a code defect:
+
+- `counterexamples_really_panic` and `the_min_constant_is_the_top_bit` fail under
+  `cargo test --release` because the test profile turns overflow checks *off*, so
+  a body the engine says panics does not. The documented command is
+  `cargo test --features std` (debug).
+- `a_package_that_omits_an_edition_is_verified_as_2015` fails when
+  `VERIF_EDITION=2024` is exported in the shell -- the env override outranks the
+  manifest, by design. `env -u VERIF_EDITION cargo test --features std` is green.
+  This is the same ambient-variable trap the edition gate's comment already
+  names; a "failure" that survives only in one shell is the variable, not the code.
+
+## The PR #8 review, and what the fixes had in common
+
+Nine findings from an adversarial review on upstream PR #8, all in the MIR
+frontend, each reproduced before being fixed:
+
+- **Drop glue is a *path*, not a flag.** A struct whose field has its own `Drop`
+  ran the outer destructor and stopped, so a panicking field destructor was never
+  seen and the function was a false `Verified`. The fix is to *refuse* the shape
+  when a field's glue is unmodelled, not to assume it is fine.
+- **A bound counts the thing the caller means.** `unwind: N` counted raw block
+  entries, so a loop running exactly `N` iterations was rejected (the last entry
+  evaluates the guard and exits) and a loop-free helper called twice tripped it.
+  The counter now counts *latch traversals* -- one per iteration -- via a
+  per-function latch set. The general shape: a budget's unit must match the
+  quantity the user is reasoning about.
+- **A `for` desugaring is not the only thing with a bound.** The same accounting
+  bug applied to a call, so the fix is in the shared counter, not the loop arm.
+- **A quoted TOML key is a key.** `"edition" = "2024"` read as *absent* and the
+  2015 default applied -- a verification of a different edition from the one the
+  crate builds under. `workspace = "../ws"` pointing outside the ancestor chain
+  was not resolved either.
+- **A width rule is about the *value*, not the range.** `Rotate` was admitted at
+  every width up to 64, but `n mod w` is a reduction only for a power-of-two `w`;
+  a non-power-of-two width would be a wrong value. The rule is now `w` a power of
+  two, and it was a *false-proof* class, not a refusal.

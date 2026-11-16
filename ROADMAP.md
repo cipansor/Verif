@@ -142,13 +142,13 @@ with no new false proof while the independent corpus keeps growing.
     function whose contract names the payload (the `qmark_probe` gap: a contract
     reading `ret <= n` on an `Option<u32>` return is refused because the return has
     no single word).
-- **C3. Ranges and `for` loops.** · P0 · todo · Kani, Verus, Prusti
+- **C3. Ranges and `for` loops.** · P0 · done · Kani, Verus, Prusti
   - Gap: `RangeInclusive::new`, `Range`, `Iterator::next` unmodelled, so the
     commonest loop in Rust is out of reach. Evidence: `tri` incomplete.
   - Approach: model `Range`/`RangeInclusive` as structs, `next` as a modelled
     intrinsic, recognise the `for` desugaring, reuse the loop machinery.
   - Exit: `tri` verified with an `invariant:`; a missing invariant reported as *a
-    missing invariant*, not "unmodelled".
+    missing invariant*, not "unmodelled". ✅
   - Move: **build**.
   - Progress: the desugaring is **built**. `RangeInclusive::new`/`Range::new`,
     `IntoIterator::into_iter` and `Iterator::next` are modelled
@@ -156,21 +156,25 @@ with no new false proof while the independent corpus keeps growing.
     range's struct fields, with `core`'s `forward_overflowing` boundary
     reproduced exactly), and a `for` loop now decides through the existing
     machinery — `for i in 0..=n { s += i }` verifies with `unwind: 4` and with an
-    `invariant: s <= 5050` that does not name the loop variable, and its false
-    twin is refuted (`the_for_loop_range_desugaring_is_modelled`). What remains
-    for the exit criterion is the invariant that *names* the loop variable
-    (`s <= i`): it is refused as `unknown name i`, because the element `i` is a
-    `debug` binding inside a nested `scope` block (`debug i => _9;` at
-    `scope 3`) that is not live at the loop header — `next` has not returned on
-    entry — and `invariant_names` does not resolve it. `tri` in `everyday.rs`
-    stays `incomplete` with the honest `loop unwound past 9` reason (no
-    `invariant:` is declared), not a missing-invariant one.
-  - Follow-up: `invariant_names` must resolve the desugaring's scoped `debug`
-    bindings (the iterator element `i`) so an invariant can name the loop
-    variable. The binding is only sound to resolve when the name is unambiguous:
-    the element is a *fresh* value each iteration, so the invariant must be read
-    over the header's havoced state exactly as any other loop local is, and the
-    name must not shadow an argument.
+    `invariant: s <= 5050`, and its false twin is refuted
+    (`the_for_loop_range_desugaring_is_modelled`).
+  - The second exit half is met too: a loop with no `invariant:` or `unwind:` is
+    reported as a *missing loop contract* naming the remedy, not as an unmodelled
+    construct — `loop unwound past 9 at bb8 of tri; assuming it exited would be
+    unsound -- this is a missing loop contract, not an unmodelled construct:
+    declare `invariant:` or `unwind:` to decide it`
+    (`a_loop_without_a_contract_names_the_missing_contract`).
+  - A boundary that remains, and is *not* a gap in the desugaring: an invariant
+    that *names* the loop element (`s <= i`) is refused as `unknown name i`. The
+    element is a `debug` binding inside a nested `scope` block (`debug i => _9;`
+    at `scope 3`) that is genuinely **not live at the loop header** — `next` has
+    not returned on entry, so `_9` has no value there. Resolving the name would
+    mean reading a variable the header state does not contain, which is a wrong
+    value rather than a missing one, so the refusal is correct. A `for`-loop
+    invariant is written over the loop's *carried* state (`s <= 5050`), which is
+    exactly the state the header havocs and the invariant is quantified over.
+    `tri` in `everyday.rs` declares no loop contract, so it stays `incomplete`
+    with the honest missing-contract reason.
 - **C4. Loops without path explosion.** · P0 · done · Kani (unwinding),
   Verus, Creusot, Prusti, SPARK (`Loop_Invariant`/`Loop_Variant`), Flux
   - Gap: a 4-iteration loop over an array exhausts the 64-path budget. Evidence:
