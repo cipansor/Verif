@@ -326,3 +326,68 @@ fn the_ledger_has_a_row_for_every_class_the_roadmap_names() {
         );
     }
 }
+
+/// The helpers above are the check, so their own logic is pinned here — the
+/// integration tests would pass even if `fns_in` silently treated a non-test as
+/// a test (which is exactly the review's finding #4), because the real ledger
+/// names no such fixture. These tests close that gap without a mutated file.
+#[cfg(test)]
+mod helpers {
+    use super::*;
+
+    #[test]
+    fn a_test_annotation_is_required_to_count_as_a_fixture() {
+        let src = "#[test]\nfn a_real_test() {}\nfn a_helper() {}\n\
+                   #[test]\n#[should_panic]\nfn a_panicking_test() {}\n\
+                   pub fn a_pub_helper() {}\n";
+        let (tests, plain) = fns_in(src);
+        assert!(tests.contains("a_real_test"), "a `#[test] fn` is a test");
+        assert!(
+            tests.contains("a_panicking_test"),
+            "an attribute after `#[test]` must not clear it"
+        );
+        assert!(!tests.contains("a_helper"), "a plain `fn` is not a test");
+        assert!(!tests.contains("a_pub_helper"), "a `pub fn` is not a test");
+        assert!(plain.contains("a_helper") && plain.contains("a_pub_helper"));
+    }
+
+    #[test]
+    fn a_date_must_be_iso_and_numeric() {
+        assert!(is_date("2026-11-16"));
+        assert!(!is_date("2026-1-16"), "month must be two digits");
+        assert!(!is_date("26-11-16"), "year must be four digits");
+        assert!(!is_date("2026/11/16"), "separator must be `-`");
+        assert!(!is_date("today"));
+        assert!(!is_date(""));
+    }
+
+    #[test]
+    fn utc_today_is_a_plausible_iso_date() {
+        let t = utc_today();
+        assert!(is_date(&t), "utc_today must be `YYYY-MM-DD`, got `{t}`");
+        // A sanity floor: the crate did not exist before 2020, and no sane clock
+        // reads a year below it, so a broken conversion is caught here.
+        assert!(t.as_str() >= "2020-01-01", "utc_today looks wrong: `{t}`");
+    }
+
+    #[test]
+    fn backticked_returns_every_span() {
+        assert_eq!(backticked("`a_b` and `c_d`"), vec!["a_b", "c_d"]);
+        assert_eq!(backticked("no spans here"), Vec::<String>::new());
+        // An unbalanced backtick is ignored rather than panicking on the slice.
+        assert_eq!(backticked("`open only"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn rows_reads_both_tables() {
+        let md = "| # | Symptom | Class | Fixture | Commit | Fixed |\n\
+                  |---|---|---|---|---|---|\n\
+                  | 1 | x | false proof | `a_fixture` | `abc1234` | 2026-01-01 |\n";
+        let r = rows(md);
+        assert_eq!(r.len(), 1, "the header and the rule must not be rows");
+        assert_eq!(r[0].fixture.trim(), "`a_fixture`");
+        assert_eq!(r[0].commit.trim(), "`abc1234`");
+        assert_eq!(r[0].date.trim(), "2026-01-01");
+    }
+}
+
