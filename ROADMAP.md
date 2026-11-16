@@ -523,6 +523,14 @@ with no new false proof while the independent corpus keeps growing.
     (three true, one tripwire, one `requires: true` panic-freedom control) in
     `realistic.rs` (**535 of 990**), pinned by
     `abs_and_clamp_are_modelled_with_their_panics` in `tests/mir.rs`.
+  - Progress (cont.): `iN::checked_next_multiple_of` is modelled — the `Option`
+    counterpart of the panicking `next_multiple_of`, with `None` exactly where the
+    plain call would panic (a zero divisor, or an overflow), so its tag is the
+    negation of the same failure predicate and no panic obligation is emitted. Four
+    fixtures (three true, one tripwire) in `realistic.rs` (**538 of 994**), pinned
+    by `the_new_num_methods_verify_and_their_tripwires_refute`; checked
+    exhaustively against `core`'s own `checked_next_multiple_of` over the whole
+    `u8` domain (`checked_next_multiple_of_agrees_with_rust`).
   - Remaining: the *generic* `<[T]>::first/get/len/is_empty` (`first_or<T>`) need
     monomorphisation, which is C10: `first_or`'s element type has no width and its
     slice length is never seeded (the frontend refuses a receiver whose length it

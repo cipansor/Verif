@@ -2131,14 +2131,18 @@ refused. `src/mir/intrinsics.rs` holds the model:
   at `DIV_MAX_WIDTH`, like every divider-backed model. Each is checked against
   Rust's own method at every input the call does not panic on, with the panic
   predicate compared at *every* input.
-- `iN::midpoint`, `iN::next_multiple_of`, `iN::ilog2`/`ilog10` and the
+- `iN::midpoint`, `iN::next_multiple_of` (and its `checked_` counterpart),
+  `iN::ilog2`/`ilog10` and the
   `next_power_of_two` pair are the rounding and magnitude helpers. `midpoint` is
   total and computed without a sum at the operand width — `(a & b) + ((a ^ b) >> 1)`,
   plus a `+1` correction for the signed case when the result is negative and
   `(a ^ b)` is odd, which is the truncation toward zero `core` documents (`-5` and
   `-2` mid at `-3`, not the floor `-4`). `next_multiple_of` is unsigned-only and
   value-and-panic (`a + (b - a % b) % b`, panicking on a zero divisor or an
-  overflow). `ilog2`/`ilog10` exist on both signednesses, are value-and-panic (a
+  overflow), and `checked_next_multiple_of` is the same value and condition as an
+  `Option` (`None` exactly where the plain call would panic, so its tag is a term
+  and no panic obligation is emitted). `ilog2`/`ilog10` exist on both signednesses,
+  are value-and-panic (a
   non-positive argument panics), and return a `u32` whatever the operand's type.
   `next_power_of_two` (unsigned-only) and its `checked_` counterpart are the
   rounding sibling of `is_power_of_two`: the classic smear-and-add (`p = x - 1`,

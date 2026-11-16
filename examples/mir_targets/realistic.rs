@@ -11207,6 +11207,41 @@ pub fn next_multiple_of_is_panic_free_here(a: u8, b: u8) -> u8 {
     a.next_multiple_of(b)
 }
 
+/// The `Option` counterpart: `100u8.checked_next_multiple_of(7)` is `Some(105)`,
+/// so the tag is `1` and the payload is the same value the plain method returns.
+/// A model that swapped the tag would have `None` here.
+/// requires: a == 100 && b == 7
+/// ensures: ret.is_some() && ret.Some == 105
+pub fn checked_next_multiple_of_rounds_up(a: u8, b: u8) -> Option<u8> {
+    a.checked_next_multiple_of(b)
+}
+
+/// `255u8.checked_next_multiple_of(100)` would overflow, so it is `None` -- the
+/// `Option` spelling of the panic the plain method reports. The tag is a *term*,
+/// so a model that wrote a constant tag would take one arm always and prove this.
+/// requires: a == 255 && b == 100
+/// ensures: ret.is_none()
+pub fn checked_next_multiple_of_that_overflows_is_none(a: u8, b: u8) -> Option<u8> {
+    a.checked_next_multiple_of(b)
+}
+
+/// A zero divisor is the other `None`: `10u8.checked_next_multiple_of(0)` is
+/// `None` where the plain method panics.
+/// requires: a == 10 && b == 0
+/// ensures: ret.is_none()
+pub fn checked_next_multiple_of_by_zero_is_none(a: u8, b: u8) -> Option<u8> {
+    a.checked_next_multiple_of(b)
+}
+
+/// The false direction: an overflowing input is `None`, so claiming it is `Some`
+/// must be refuted. A model that ignored the failure predicate and always wrote
+/// the tag `1` would prove this.
+/// requires: a == 255 && b == 100
+/// ensures: ret.is_some()
+pub fn checked_next_multiple_of_overflow_is_some_cannot_prove_this(a: u8, b: u8) -> Option<u8> {
+    a.checked_next_multiple_of(b)
+}
+
 /// `100u8.ilog2()` is `6` (`2^6 = 64 <= 100 < 128 = 2^7`).
 /// requires: a == 100
 /// ensures: ret == 6

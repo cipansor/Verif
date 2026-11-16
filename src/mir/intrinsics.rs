@@ -239,6 +239,14 @@ pub enum Intrinsic {
     /// unstable on this toolchain -- so a signed receiver is refused rather than
     /// read. The value is `a + (b - a % b) % b`, which is `a` when `a % b == 0`.
     NextMultipleOf,
+    /// `iN::checked_next_multiple_of`: the same value as
+    /// [`Intrinsic::NextMultipleOf`], as an `Option`.
+    ///
+    /// The `Option` counterpart of the panicking plain method: `None` exactly
+    /// where the plain call would panic (a zero divisor, or an overflow), so the
+    /// tag is the *negation* of the same failure predicate and no panic obligation
+    /// is emitted. Unsigned-only, like the plain method.
+    CheckedNextMultipleOf,
     /// `iN::next_power_of_two`: the smallest power of two `>= x`.
     ///
     /// Unsigned-only (there is no such method on the signed types), and a
@@ -1184,6 +1192,13 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if short == "next_multiple_of" {
         return Some(Intrinsic::NextMultipleOf);
     }
+    // The `checked_` spelling: the same value and failure as the plain method, as
+    // an `Option`. It is its own shape rather than a `Family` member because the
+    // plain method is a `ValueOrPanic` (it panics), not a `Value`, so the family
+    // split has nothing to attach to.
+    if short == "checked_next_multiple_of" {
+        return Some(Intrinsic::CheckedNextMultipleOf);
+    }
     // The "round up to a power of two" pair, the sibling of `is_power_of_two`.
     // Unsigned-only (there is no such method on the signed types), and matched by
     // their exact names so no prefix split can mistake `next_power_of_two` for
@@ -1572,6 +1587,8 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // executor reports, not a value the model must represent -- but it does use
         // the unsigned divider, so it is bounded like a division.
         Intrinsic::NextMultipleOf => !signed && w <= DIV_MAX_WIDTH,
+        // The `checked_` spelling has the same domain as the plain one.
+        Intrinsic::CheckedNextMultipleOf => !signed && w <= DIV_MAX_WIDTH,
         // `ilog2`/`ilog10`. Both exist on both signednesses, and both panic on a
         // non-positive argument, which the executor reports. The value is built at
         // the operand width and zero-extended, so any width the engine holds is
@@ -2068,6 +2085,23 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             Outcome::ValueOrPanic {
                 value: smt::truncate(next_multiple_value(x, y), result_w),
                 fails,
+            }
+        }
+        // `checked_next_multiple_of`: the same value and the same failure
+        // condition as the plain method, as an `Option`. The tag is a *term* --
+        // `1` where the value fits, `0` where the plain call would panic -- so the
+        // `switchInt` that consumes it takes the right arm on each path, exactly
+        // as the other `checked_*` tags do. The tag is built at the *operand*
+        // width, not `result_w`, because the two-operand call path passes `result_w
+        // == w` but the tag's own width must follow the operand regardless.
+        Intrinsic::CheckedNextMultipleOf => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            let fails = next_multiple_fails(x, y);
+            Outcome::Option {
+                tag: smt::ite(fails, smt::word(0, w), smt::word(1, w)),
+                payload: smt::truncate(next_multiple_value(x, y), result_w),
             }
         }
         // `ilog2`/`ilog10`: the integer logarithm. The value is built at `w` bits
@@ -5926,6 +5960,54 @@ mod tests {
         });
     }
 
+    /// `checked_next_multiple_of` agrees with Rust's `Option` over the whole `u8`
+    /// domain, tag and payload together.
+    ///
+    /// The `Option` counterpart of `next_multiple_of`: the oracle is `core`'s own
+    /// `checked_next_multiple_of`, so the tag is checked against `Some`/`None`
+    /// exactly, and the payload against the value the plain method returns. A
+    /// model that swapped the tag (a `None` where Rust returns `Some`), or that
+    /// carried the payload on the `None` path, is caught here rather than at a
+    /// corpus fixture.
+    #[test]
+    fn checked_next_multiple_of_agrees_with_rust() {
+        smt::with_fresh(|| {
+            let a = smt::var(8);
+            let b = smt::var(8);
+            let outcome = eval(Intrinsic::CheckedNextMultipleOf, a, b, 8, false, 8)
+                .expect("checked_next_multiple_of must be modelled at u8");
+            let Outcome::Option { tag, payload } = outcome else {
+                panic!("checked_next_multiple_of must produce an `Option` outcome");
+            };
+            let (ai, bi) = (smt::index(a), smt::index(b));
+            each_pair(8, |xb, yb| {
+                let (x, y) = (xb as u8, yb as u8);
+                let env = |i: u32| {
+                    if i == ai {
+                        Some(xb)
+                    } else if i == bi {
+                        Some(yb)
+                    } else {
+                        None
+                    }
+                };
+                let want = x.checked_next_multiple_of(y);
+                assert_eq!(
+                    smt::evaluate(tag, env),
+                    Some(if want.is_some() { 1 } else { 0 }),
+                    "checked_next_multiple_of tag at ({x}, {y})"
+                );
+                if let Some(v) = want {
+                    assert_eq!(
+                        smt::evaluate(payload, env),
+                        Some(u64::from(v)),
+                        "checked_next_multiple_of payload at ({x}, {y})"
+                    );
+                }
+            });
+        });
+    }
+
     /// `ilog2`/`ilog10` agree with Rust over the whole `u8`/`i8` domain, value and
     /// panic predicate together.
     ///
@@ -6241,6 +6323,10 @@ mod tests {
         assert_eq!(classify("core::num::<impl u32>::midpoint"), Some(Intrinsic::Midpoint));
         assert_eq!(classify("core::num::<impl i32>::midpoint"), Some(Intrinsic::Midpoint));
         assert_eq!(classify("core::num::<impl u32>::next_multiple_of"), Some(Intrinsic::NextMultipleOf));
+        assert_eq!(
+            classify("core::num::<impl u32>::checked_next_multiple_of"),
+            Some(Intrinsic::CheckedNextMultipleOf)
+        );
         assert_eq!(classify("core::num::<impl u32>::ilog2"), Some(Intrinsic::Ilog(LogKind::Ilog2)));
         assert_eq!(classify("core::num::<impl i32>::ilog2"), Some(Intrinsic::Ilog(LogKind::Ilog2)));
         assert_eq!(classify("core::num::<impl u32>::ilog10"), Some(Intrinsic::Ilog(LogKind::Ilog10)));

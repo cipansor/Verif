@@ -1655,8 +1655,8 @@ fn is_power_of_two_branches_on_the_predicate() {
     }
 }
 
-/// `midpoint`, `next_multiple_of`, the two logarithms and the
-/// `next_power_of_two` pair, pinned in both directions.
+/// `midpoint`, `next_multiple_of` (and its `checked_` counterpart), the two
+/// logarithms and the `next_power_of_two` pair, pinned in both directions.
 ///
 /// `core::num` methods added as a group. The true halves pin the *value* --
 /// `midpoint` of an overflowing sum (`255.midpoint(255) == 255`, not the wrapped
@@ -1674,8 +1674,9 @@ fn is_power_of_two_branches_on_the_predicate() {
 /// *fail* with the panic obligation, and a control
 /// (`next_multiple_of_is_panic_free_here`, `next_power_of_two_is_panic_free_here`)
 /// must verify, so a model that reported a panic unconditionally cannot pass. The
-/// `checked_` counterpart is the value-shaped one: `Some(128)` where the plain
-/// method would not panic, `None` where it would.
+/// `checked_` counterparts are the value-shaped ones: `Some(128)` where the plain
+/// method would not panic, `None` where it would -- for both the power-of-two and
+/// the multiple-of pairs, including the zero divisor for the latter.
 #[test]
 fn the_new_num_methods_verify_and_their_tripwires_refute() {
     let verified = [
@@ -1687,6 +1688,9 @@ fn the_new_num_methods_verify_and_their_tripwires_refute() {
         "next_multiple_of_rounds_up",
         "next_multiple_of_an_exact_multiple_is_the_identity",
         "next_multiple_of_is_panic_free_here",
+        "checked_next_multiple_of_rounds_up",
+        "checked_next_multiple_of_that_overflows_is_none",
+        "checked_next_multiple_of_by_zero_is_none",
         "ilog2_of_100",
         "ilog2_of_one_is_zero",
         "ilog2_of_a_signed_100",
@@ -1709,6 +1713,7 @@ fn the_new_num_methods_verify_and_their_tripwires_refute() {
         "midpoint_signed_truncates_cannot_prove_this",
         "midpoint_is_between_cannot_prove_this",
         "next_multiple_of_rounds_up_cannot_prove_this",
+        "checked_next_multiple_of_overflow_is_some_cannot_prove_this",
         "ilog2_of_100_cannot_prove_this",
         "ilog10_of_100_cannot_prove_this",
         "next_power_of_two_rounds_up_cannot_prove_this",
