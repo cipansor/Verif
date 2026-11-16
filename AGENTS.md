@@ -9284,10 +9284,33 @@ incidents were grouped as class summaries ("a limit that truncates, five
 instances"), and the review's eleven earlier false proofs appeared only as a
 count. That leaves those layers out of the two-week pause and makes the four-week
 clock unverifiable, because a summary has no date to compute from. The fix is a
-second table — rows 22–35, one per instance, with a fixture, a commit and a date —
-so "when did the engine last produce a false proof" is a lookup (2026-11-12, the
-`ensures false` divergence) rather than a guess. The class summaries survive as
+second table — rows 28–43, one per instance, with a fixture, a commit and a date —
+so "when did the engine last produce a false proof" is a lookup (2026-11-16, the
+unwind-bound miscount) rather than a guess. The class summaries survive as
 the *clusters* paragraph, which is the finding; the rows are the evidence.
+
+**A follow-up review found the ledger was still over-claiming, and row 22 was the
+proof.** The prose said "the review's eleven earlier false proofs are rows 22–35",
+but row 22 cited `a_declared_frame_longer_than_the_cap_is_refused` — which tests an
+*oversized declared* frame (the havoc-buffer cap), not the *under-declared* frame
+the row's symptom names. The matching regression is
+`under_declaring_the_frame_is_rejected` (`1b64205`). The wrong fixture came from
+the same place the earlier ones did: I read `AGENTS.md`'s prose and picked the
+test it *mentioned*, instead of the test that *fails on the unfixed code*. Two
+more rows had the same defect (row 36 named a MIR fixture for the wp-layer
+`DivergentCall`; the wp test is `a_call_to_a_never_returning_proc_is_not_total`).
+Worse, the claim itself was false: the review named **seven** commits
+(`08a6065`, `d6a4690`, `dd1ca69`, `b7769c1`, `e4543d0`, `496e416`, `653a340`) and
+the ledger's MIR table was missing five of their false proofs entirely. The fix
+is to *verify each row's fixture against the commit that introduced it* — `git log
+--all -S"fn <fixture>"` and check the cited hash appears — and to add the missing
+rows (the MIR table grew to 27, the engine table to 16). The lesson is the one the
+review's own finding states: **a row's symptom and its fixture must be the same
+defect**, and "the commit introduced the fixture" is not enough — the fixture must
+be the one that *fails* when that specific fix is reverted. The mechanical check
+in `tests/soundness.rs` now also asserts the two tables' row counts, so a row that
+silently vanishes is a failure.
+
 
 **The MIR row dates were all wrong.** Every row said `2026-11-13` (the date the
 ledger was written, not the date of the fix). The real dates came from

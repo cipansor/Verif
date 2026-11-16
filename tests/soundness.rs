@@ -141,6 +141,39 @@ fn is_date(s: &str) -> bool {
 }
 
 #[test]
+fn the_ledger_keeps_a_row_for_every_defect_in_both_tables() {
+    // The two tables are a *record*, so a row that silently vanishes is a lost
+    // piece of evidence. The split is the section header between them: rows before
+    // it are the MIR frontend, rows after it are the engine and imperative layer.
+    let ledger = std::fs::read_to_string(root().join("SOUNDNESS.md")).expect("ledger");
+    let split = ledger
+        .find("## The engine and the imperative layer")
+        .expect("the engine section header must exist");
+    let (mir, engine) = ledger.split_at(split);
+    // The MIR table's rows are numbered 1..=27 and the engine table's 28..=43; the
+    // counts are asserted exactly so adding or dropping a defect is a deliberate
+    // edit to this number, made in the same commit as the row.
+    assert_eq!(rows(mir).len(), 27, "the MIR table must keep its 27 rows");
+    assert_eq!(rows(engine).len(), 16, "the engine table must keep its 16 rows");
+    // And the numbering is contiguous across the two, so a row cannot be renumbered
+    // into a gap without the check noticing.
+    let nums: Vec<u32> = ledger
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            let rest = l.strip_prefix("| ")?;
+            let n = rest.split('|').next()?.trim();
+            n.parse::<u32>().ok()
+        })
+        .collect();
+    assert_eq!(
+        nums,
+        (1..=43).collect::<Vec<u32>>(),
+        "the ledger's row numbers must be 1..=43 with no gaps or duplicates"
+    );
+}
+
+#[test]
 fn the_soundness_ledger_names_fixtures_that_are_tests() {
     let path = root().join("SOUNDNESS.md");
     let ledger = std::fs::read_to_string(&path)
@@ -162,8 +195,8 @@ fn the_soundness_ledger_names_fixtures_that_are_tests() {
 
     let rows = rows(&ledger);
     assert!(
-        rows.len() >= 35,
-        "the ledger must keep its rows (21 MIR + 14 engine); found {}",
+        rows.len() >= 40,
+        "the ledger must keep its rows (27 MIR + 16 engine); found {}",
         rows.len()
     );
 
@@ -210,7 +243,7 @@ fn the_soundness_ledger_names_fixtures_that_are_tests() {
         }
     }
     assert!(
-        checked >= 30,
+        checked >= 35,
         "the ledger must name real fixtures, not only prose; checked {checked}"
     );
 }
