@@ -170,6 +170,43 @@ pub fn get_method_out_of_range_panics(xs: &[u8]) -> u8 {
     *xs.get(1).unwrap()
 }
 
+/// The `match` form of `first`, as opposed to the `unwrap` form: the desugaring
+/// reads the payload through a downcast temp (`_4 = copy ((_2 as Some).0)`) and
+/// dereferences *that*, so the element reference has to be carried onto the temp.
+/// A model that only answered `unwrap` would leave this `incomplete` in both
+/// directions -- which is a coverage gap, since a `match` on the `Option` is at
+/// least as common as an `unwrap`.
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 5
+pub fn first_match_reads_the_element(xs: &[u8]) -> u8 {
+    match xs.first() {
+        Some(v) => *v,
+        None => 0,
+    }
+}
+
+/// The false direction for the `match` form: a claim about a different element
+/// fails, which only happens if the downcast temp names the slice's own element.
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 6
+pub fn first_match_tripwire(xs: &[u8]) -> u8 {
+    match xs.first() {
+        Some(v) => *v,
+        None => 0,
+    }
+}
+
+/// The empty case takes the `None` arm, so `first`'s tag is the same predicate
+/// the `match` switches on.
+/// requires: xs.len() == 0
+/// ensures: ret == 0
+pub fn first_match_empty_takes_none(xs: &[u8]) -> u8 {
+    match xs.first() {
+        Some(v) => *v,
+        None => 0,
+    }
+}
+
 /// A fixed-size array argument. Unlike a slice the length is a *type*
 /// constant, so `a.len()` is not an input and the bounds check is against a
 /// literal: `_3 = Lt(_2, const 4_usize)`. That literal is what makes this shape

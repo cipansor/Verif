@@ -427,13 +427,16 @@ with no new false proof while the independent corpus keeps growing.
     and records the payload as the slice's *own* element variable — the same one
     `xs[k]` names — so `*xs.first().unwrap()` and `xs[0]` agree by construction.
     The reference's deref (`*_2`) resolves through a new `Env::slice_elem_ref`
-    store, and `unwrap` carries the element to its destination. `get`'s index must
+    store; both `unwrap` and the `match` desugaring (which reads the payload
+    through a downcast temp, `_4 = copy ((_2 as Some).0)`) carry the element to
+    their destination, so the two spellings decide alike. `get`'s index must
     be a *constant* (a slice's length is symbolic, so a symbolic index has no
     finite domain and reading "some element" would be a wrong proof). `first_or`
     stays incomplete because it is *generic* (`<T: Copy>`) — that is C10, not this
     item — and the earlier note that `first`/`get` were "blocked on
     monomorphisation" was wrong for a concrete `&[u8]`. Seven fixtures (four true,
-    two tripwires, one panic) are in `realistic.rs` (**494 of 924**), pinned by
+    two tripwires, one panic) plus three `match`-form fixtures are in
+    `realistic.rs` (**496 of 927**), pinned by
     `slice_first_and_get_reach_the_slices_own_element` in `tests/mir.rs`.
   - Remaining: the *generic* `<[T]>::first/get/len/is_empty` (`first_or<T>`) need
     monomorphisation, which is C10: `first_or`'s element type has no width and its

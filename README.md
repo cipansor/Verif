@@ -2042,11 +2042,13 @@ refused. `src/mir/intrinsics.rs` holds the model:
   obligation rather than an assumed `Some`. The payload is the slice's *own*
   element variable, the same one `xs[k]` names, so `*xs.first().unwrap()` and
   `xs[0]` agree by construction; the returned reference's deref (`*_2`) reads
-  through a dedicated `Env::slice_elem_ref` store, and `unwrap` carries the element
-  to its destination. `get`'s index must be a *constant*: a slice's length is
-  symbolic, so a symbolic index has no finite domain and reading "some element"
-  would be a wrong proof, not a missing one. The *generic* `first_or<T>` is not
-  this shape — it needs monomorphisation — so it stays refused.
+  through a dedicated `Env::slice_elem_ref` store, and both `unwrap` and the
+  `match` desugaring (which reads the payload through a downcast temp) carry the
+  element to their destination, so the two spellings decide alike. `get`'s index
+  must be a *constant*: a slice's length is symbolic, so a symbolic index has no
+  finite domain and reading "some element" would be a wrong proof, not a missing
+  one. The *generic* `first_or<T>` is not this shape — it needs monomorphisation —
+  so it stays refused.
 - `Ord::min` and `Ord::max` are the two modelled *trait* methods, so a dump spells
   a call `<u8 as Ord>::min` (or `<i8 as std::cmp::Ord>::max` with `std` in scope)
   rather than a `core::num::<impl …>` inherent path. The model is one `ite` over

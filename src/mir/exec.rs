@@ -7480,6 +7480,21 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
                     }
                 }
             }
+            // A `&T` read out of a `first`/`get` Option's payload -- the `match`
+            // desugaring's `_4 = copy ((_2 as Some).0)`, as opposed to `unwrap`'s
+            // dedicated arm -- names the same slice element, so the reference's
+            // later deref (`*_4`) must resolve. Propagating the entry onto the
+            // destination is what lets the `match` form decide; without it the
+            // deref finds no entry and the postcondition is unreadable.
+            if dest.proj.is_empty() {
+                if let Operand::Copy(q) | Operand::Move(q) = o {
+                    if q.proj.iter().any(|p| matches!(p, Proj::Downcast(_))) {
+                        if let Some(e) = env.slice_elem_ref.get(&q.local).copied() {
+                            env.slice_elem_ref.insert(dest.local, e);
+                        }
+                    }
+                }
+            }
             v
         }
         Rvalue::Binary(op, a, b) => {

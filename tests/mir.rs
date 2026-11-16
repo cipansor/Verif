@@ -6464,6 +6464,30 @@ pub fn get_wrong_element_cannot_prove_this(xs: &[u8]) -> u8 {
 pub fn get_out_of_range_unwrap_panics(xs: &[u8]) -> u8 {
     *xs.get(1).unwrap()
 }
+
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 5
+pub fn first_match_reads_the_element(xs: &[u8]) -> u8 {
+    match xs.first() { Some(v) => *v, None => 0 }
+}
+
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 6
+pub fn first_match_tripwire(xs: &[u8]) -> u8 {
+    match xs.first() { Some(v) => *v, None => 0 }
+}
+
+/// requires: xs.len() == 0
+/// ensures: ret == 0
+pub fn first_match_empty_takes_none(xs: &[u8]) -> u8 {
+    match xs.first() { Some(v) => *v, None => 0 }
+}
+
+/// requires: i < xs.len() && xs.len() <= 64
+/// ensures: true
+pub fn get_symbolic_index_is_refused(xs: &[u8], i: usize) -> u8 {
+    *xs.get(i).unwrap()
+}
 "#;
     let Some(o) = verify_src("first_reads_the_element", src) else { return };
     assert!(
@@ -6497,6 +6521,33 @@ pub fn get_out_of_range_unwrap_panics(xs: &[u8]) -> u8 {
         matches!(&o, FnOutcome::Failed { kind, .. } if kind.starts_with("panic")),
         "`get(1)` past the end is `None`, so `unwrap` panics -- a real obligation, not \
          an assumed `Some`; got: {o}"
+    );
+    // The `match` form reads the payload through a downcast temp, a different
+    // desugaring from `unwrap`; both must decide, and a `match` on the empty
+    // slice must take the `None` arm.
+    let Some(o) = verify_src("first_match_reads_the_element", src) else { return };
+    assert!(
+        o.is_verified(),
+        "a `match` on `first()` names the same element `unwrap` does; got: {o}"
+    );
+    let Some(o) = verify_src("first_match_tripwire", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "the `match` payload is the slice's element, so a claim about another value \
+         must be refuted; got: {o}"
+    );
+    let Some(o) = verify_src("first_match_empty_takes_none", src) else { return };
+    assert!(
+        o.is_verified(),
+        "an empty slice takes the `None` arm, which returns the constant; got: {o}"
+    );
+    // A symbolic index has no finite domain on a slice, so the read is refused
+    // rather than guessed -- a wrong value would be worse than a missing one.
+    let Some(o) = verify_src("get_symbolic_index_is_refused", src) else { return };
+    assert!(
+        !o.is_verified()
+            && matches!(&o, FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. }),
+        "`xs.get(i)` for a symbolic `i` must be refused, not modelled; got: {o}"
     );
 }
 

@@ -3611,6 +3611,14 @@ Two things follow, and both are the honest direction rather than a convenience:
   argument case it was written for. `unwrap` carries the element to its
   destination, so the read works whether the caller dereferences the `Option`'s
   payload directly or through an intermediate `let`.
+- **The `match` desugaring is a *second* read path, and it had to be taught the
+  same thing.** `match xs.first() { Some(v) => *v, None => 0 }` does not call
+  `unwrap`; it reads the payload through a downcast temp (`_4 = copy ((_2 as
+  Some).0: &u8)`) and dereferences *that*. The `unwrap` arm alone left every
+  `match` form `incomplete` in both directions, which is a coverage gap and not a
+  soundness one -- but a `match` on the `Option` is at least as common as an
+  `unwrap`, so the `Rvalue::Use` arm now propagates the entry onto the downcast
+  destination. One rule, two spellings, and the fixtures pin both.
 
 **The tag is a predicate, and that is the point.** `first` is `Some` exactly when
 the slice is non-empty (`len != 0`), and `get(k)` exactly when `k < len`
