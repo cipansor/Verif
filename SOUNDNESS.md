@@ -71,10 +71,11 @@ are the defects where it produced a wrong verdict.
 | 25 | A local `impl From<u8> for u16` answered a real `<u16 as std::convert::From<u8>>::from` call (shared tail and owner), proving `ret == 7` | false proof | `a_local_trait_named_from_does_not_answer_the_std_trait` | `e4543d0` | 2026-11-11 |
 | 26 | A bare crate-root trait call was answered by a same-named module trait's impl, and a local impl of an *imported* trait answered the library call | false proof | `a_bare_crate_root_trait_call_is_not_answered_by_the_model`, `a_local_impl_of_an_imported_trait_does_not_answer_the_model` | `496e416` | 2026-11-11 |
 | 27 | An inherited trait contract bound parameters by *name*, so an impl naming them in the other order was checked against the wrong argument; a return type wrapped to the next line was read as unsigned | false proof | `an_inherited_contract_binds_parameters_by_position_not_by_name`, `a_return_type_on_one_line_is_read_and_refutes_the_false_claim` | `653a340` | 2026-11-12 |
+| 28 | A `<Self as T>::m` call inside a trait *default* body resolved to the default method, so an impl's override was ignored and a caller's contract about its effect was proved against a no-op | false proof | `a_user_type_named_range_is_not_answered_by_the_range_model` (`tests/mir.rs`) | `9b13340` | 2026-11-16 |
 
 The clusters are the lesson: rows 1–9 are all the *contract reader's* value and
 width model; rows 10–13 are all *name resolution* (a name bound to the wrong
-thing); rows 14–17 are all a *write or a path* that was dropped; rows 22–27 are
+thing); rows 14–17 are all a *write or a path* that was dropped; rows 22–28 are
 the *call and trait resolution* family (a call answered by the wrong body). A fix
 that addresses one shape and not its siblings is the recurring cause — the reader
 had three `align_widths` sites, four operator levels, five `push` sites, and each
@@ -89,22 +90,22 @@ summary would leave their fix dates unfindable.
 
 | # | Class | Symptom | Fixture | Commit | Fixed |
 |---|---|---|---|---|---|
-| 28 | false proof | An under-declared call frame let a caller prove a clobbered variable survived the call | `under_declaring_the_frame_is_rejected` (`tests/call.rs`) | `1b64205` | 2026-10-24 |
-| 29 | false proof | A callee writing more than the cap made the caller's derived frame look complete, so a prefix of the truth passed | `a_call_to_an_over_cap_callee_makes_the_caller_frame_incomplete` (`tests/call.rs`) | `fd15f98` | 2026-10-27 |
-| 30 | false proof | `Report::terminates` *counted* variant obligations instead of discharging them, so a non-decreasing measure read `Total` | `a_total_claim_is_not_made_for_a_divergent_loop` (`tests/modular_differential.rs`) | `fa178ef` | 2026-10-25 |
-| 31 | false proof | `MAX_OBLIGATIONS` dropped obligations silently, so a failing `LoopExit` sat outside the buffer and the report said `verified` | `assertions_beyond_the_cap_are_reported_not_hidden` (`tests/wp.rs`) | `8d7120c` | 2026-10-27 |
-| 32 | false proof | `exists_guarded` truncated the index to the bound's width, so a concrete index wrapped and was treated as inside | `the_guarded_quantifiers_do_not_truncate_their_index` (`tests/quant.rs`) | `40f94c0` | 2026-10-25 |
-| 33 | vacuity | An unsatisfiable precondition made `pre => wp(body, post)` a theorem for any body | `an_unreachable_precondition_is_not_a_proof` (`tests/wp.rs`) | `8c812d8` | 2026-10-25 |
-| 34 | vacuity | An unsatisfiable `Assume` inside the body made everything downstream vacuously true | `an_unreachable_assume_is_not_a_proof` (`tests/wp.rs`) | `779f1e9` | 2026-10-26 |
-| 35 | vacuity | A bound exactly as wide as the address could not name `len`, so the standard postcondition was unsatisfiable | `a_bound_the_same_width_as_the_address_is_rejected` (`tests/mem.rs`) | `a85ebe6` | 2026-10-25 |
-| 36 | vacuity | A call to `ensures false` never returns, so the post-call state was empty and the continuation vacuously true | `a_call_to_a_never_returning_proc_is_not_total` (`tests/call.rs`) | `3754e1d` | 2026-10-26 |
-| 37 | false proof | `Certificate` stored a bare term id, so one from a reset scope named a different formula and certified a falsehood | `a_certificate_does_not_survive_an_arena_reset` (`tests/kernel.rs`) | `f9f6f4d` | 2026-10-25 |
-| 38 | false proof | `Report` held term ids with no arena generation, so a report read after a reset answered `Unknown` for every obligation | `a_report_is_only_valid_in_the_arena_that_built_it` (`tests/wp.rs`) | `732aebf` | 2026-10-28 |
-| 39 | false proof | The kernel's `Imp<P, Q>` had no `Theorem` bound, so `assert_proof!(Imp<Truth, Falsity>)` compiled | `the_imp_associated_proof_type_is_a_function_between_proofs` (`tests/kernel.rs`) | `4601e9d` | 2026-10-26 |
-| 40 | false proof | The SMT-LIB printer's polarity, sort and direction bugs made the external evidence not apply (a solver proved a different formula) | `the_export_checker_rejects_what_the_old_exporter_printed` (`tests/differential.rs`) | `d687a45` | 2026-10-26 |
-| 41 | wrong verdict | `Fixed::to_int` floored instead of truncating and `from_int` wrapped instead of saturating — both total, so the proof layer could not see them | `fixed_to_int_truncates_toward_zero`, `fixed_from_int_saturates_instead_of_wrapping` (`src/logic.rs`) | `c35b456` | 2026-10-26 |
-| 42 | vacuity | The MIR frontend's twin of row 36: a call to a bodyless `ensures false` callee made every claim after it vacuously true, so the caller read `verified` | `a_call_to_a_callee_whose_postcondition_is_unsatisfiable_fails` (`tests/mir.rs`) | `c60ff40` | 2026-11-12 |
-| 43 | false proof | `prove_implies` decided a closed true goal without reading the premise, so a `pre` saved from an earlier arena returned `Valid` for a premise that was not the one passed | `a_closed_goal_does_not_bypass_a_stale_premise` (`tests/sym.rs`) | `dd1ca69` | 2026-11-09 |
+| 29 | false proof | An under-declared call frame let a caller prove a clobbered variable survived the call | `under_declaring_the_frame_is_rejected` (`tests/call.rs`) | `1b64205` | 2026-10-24 |
+| 30 | false proof | A callee writing more than the cap made the caller's derived frame look complete, so a prefix of the truth passed | `a_call_to_an_over_cap_callee_makes_the_caller_frame_incomplete` (`tests/call.rs`) | `fd15f98` | 2026-10-27 |
+| 31 | false proof | `Report::terminates` *counted* variant obligations instead of discharging them, so a non-decreasing measure read `Total` | `a_total_claim_is_not_made_for_a_divergent_loop` (`tests/modular_differential.rs`) | `fa178ef` | 2026-10-25 |
+| 32 | false proof | `MAX_OBLIGATIONS` dropped obligations silently, so a failing `LoopExit` sat outside the buffer and the report said `verified` | `assertions_beyond_the_cap_are_reported_not_hidden` (`tests/wp.rs`) | `8d7120c` | 2026-10-27 |
+| 33 | false proof | `exists_guarded` truncated the index to the bound's width, so a concrete index wrapped and was treated as inside | `the_guarded_quantifiers_do_not_truncate_their_index` (`tests/quant.rs`) | `40f94c0` | 2026-10-25 |
+| 34 | vacuity | An unsatisfiable precondition made `pre => wp(body, post)` a theorem for any body | `an_unreachable_precondition_is_not_a_proof` (`tests/wp.rs`) | `8c812d8` | 2026-10-25 |
+| 35 | vacuity | An unsatisfiable `Assume` inside the body made everything downstream vacuously true | `an_unreachable_assume_is_not_a_proof` (`tests/wp.rs`) | `779f1e9` | 2026-10-26 |
+| 36 | vacuity | A bound exactly as wide as the address could not name `len`, so the standard postcondition was unsatisfiable | `a_bound_the_same_width_as_the_address_is_rejected` (`tests/mem.rs`) | `a85ebe6` | 2026-10-25 |
+| 37 | vacuity | A call to `ensures false` never returns, so the post-call state was empty and the continuation vacuously true | `a_call_to_a_never_returning_proc_is_not_total` (`tests/call.rs`) | `3754e1d` | 2026-10-26 |
+| 38 | false proof | `Certificate` stored a bare term id, so one from a reset scope named a different formula and certified a falsehood | `a_certificate_does_not_survive_an_arena_reset` (`tests/kernel.rs`) | `f9f6f4d` | 2026-10-25 |
+| 39 | false proof | `Report` held term ids with no arena generation, so a report read after a reset answered `Unknown` for every obligation | `a_report_is_only_valid_in_the_arena_that_built_it` (`tests/wp.rs`) | `732aebf` | 2026-10-28 |
+| 40 | false proof | The kernel's `Imp<P, Q>` had no `Theorem` bound, so `assert_proof!(Imp<Truth, Falsity>)` compiled | `the_imp_associated_proof_type_is_a_function_between_proofs` (`tests/kernel.rs`) | `4601e9d` | 2026-10-26 |
+| 41 | false proof | The SMT-LIB printer's polarity, sort and direction bugs made the external evidence not apply (a solver proved a different formula) | `the_export_checker_rejects_what_the_old_exporter_printed` (`tests/differential.rs`) | `d687a45` | 2026-10-26 |
+| 42 | wrong verdict | `Fixed::to_int` floored instead of truncating and `from_int` wrapped instead of saturating — both total, so the proof layer could not see them | `fixed_to_int_truncates_toward_zero`, `fixed_from_int_saturates_instead_of_wrapping` (`src/logic.rs`) | `c35b456` | 2026-10-26 |
+| 43 | vacuity | The MIR frontend's twin of row 37: a call to a bodyless `ensures false` callee made every claim after it vacuously true, so the caller read `verified` | `a_call_to_a_callee_whose_postcondition_is_unsatisfiable_fails` (`tests/mir.rs`) | `c60ff40` | 2026-11-12 |
+| 44 | false proof | `prove_implies` decided a closed true goal without reading the premise, so a `pre` saved from an earlier arena returned `Valid` for a premise that was not the one passed | `a_closed_goal_does_not_bypass_a_stale_premise` (`tests/sym.rs`) | `dd1ca69` | 2026-11-09 |
 
 ## Unavailable evidence
 
@@ -117,10 +118,10 @@ stating so a reader does not mistake a gap for completeness:
   repository root (`3797cf2`, 2026-10-27). A fixture whose commit predates the
   move is not reached by `git log -S` on the current path; `git log --all -S`
   is. Every engine row above was recovered that way.
-- **The review's eleven earlier false proofs are rows 10, 14, 22–27 and 43 here,
+- **The review's eleven earlier false proofs are rows 10, 14, 22–28 and 43 here,
   not a count.** The review named seven commits that fixed them (`08a6065`,
   `d6a4690`, `dd1ca69`, `b7769c1`, `e4543d0`, `496e416`, `653a340`); each false
-  proof in those commits is its own dated row — eight in the MIR table and one
+  proof in those commits is its own dated row — nine in the MIR table and one
   in the engine table. "When did the engine last produce a false proof" is
   therefore answerable (2026-11-16, row 15) rather than hidden in a summary.
 - **A defect with no surviving fixture is not recorded as a row.** The ledger is
@@ -132,7 +133,7 @@ stating so a reader does not mistake a gap for completeness:
 ## The rate, and the exit criterion
 
 The review's data (2025-11-04 … 2025-11-12) counted at least eleven false proofs;
-the tables above record forty-three wrong verdicts across 2026-10-24 … 2026-11-16,
+the tables above record forty-four wrong verdicts across 2026-10-24 … 2026-11-16,
 which is the same order of magnitude and the same pattern — most found by a
 differential oracle or a hand probe, not by a unit test written after the fact.
 The densest cluster is the contract reader (rows 1–9, 2026-10-29 … 2026-11-02),

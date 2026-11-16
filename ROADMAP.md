@@ -359,8 +359,8 @@ with no new false proof while the independent corpus keeps growing.
     false proof in the last two weeks.
   - Exit for "beta": four weeks in a row with no new false proof, while the
     independent corpus keeps growing.
-  - Move: **build**. `SOUNDNESS.md` carries the ledger: 27 MIR-frontend rows and
-    16 engine/imperative rows — 43 in all, so the review's "at least eleven
+  - Move: **build**. `SOUNDNESS.md` carries the ledger: 28 MIR-frontend rows and
+    16 engine/imperative rows — 44 in all, so the review's "at least eleven
     earlier false proofs" is now that many *dated rows* rather than a count (the
     seven commits the review named each contribute their own row). Every row has a
     **commit**, a **date** and a fixture. `tests/soundness.rs` checks it
