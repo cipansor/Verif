@@ -2123,6 +2123,22 @@ refused. `src/mir/intrinsics.rs` holds the model:
   at `DIV_MAX_WIDTH`, like every divider-backed model. Each is checked against
   Rust's own method at every input the call does not panic on, with the panic
   predicate compared at *every* input.
+- `iN::midpoint`, `iN::next_multiple_of`, `iN::ilog2`/`ilog10` and the
+  `next_power_of_two` pair are the rounding and magnitude helpers. `midpoint` is
+  total and computed without a sum at the operand width — `(a & b) + ((a ^ b) >> 1)`,
+  plus a `+1` correction for the signed case when the result is negative and
+  `(a ^ b)` is odd, which is the truncation toward zero `core` documents (`-5` and
+  `-2` mid at `-3`, not the floor `-4`). `next_multiple_of` is unsigned-only and
+  value-and-panic (`a + (b - a % b) % b`, panicking on a zero divisor or an
+  overflow). `ilog2`/`ilog10` exist on both signednesses, are value-and-panic (a
+  non-positive argument panics), and return a `u32` whatever the operand's type.
+  `next_power_of_two` (unsigned-only) and its `checked_` counterpart are the
+  rounding sibling of `is_power_of_two`: the classic smear-and-add (`p = x - 1`,
+  forced to `0` for `x <= 1`; `p |= p >> 1; p |= p >> 2; …`; `p + 1`), which is
+  total at `w` bits — the plain form panics where the result does not fit
+  (`x > 2^(w-1)`) and the `checked_` form returns `None` there. Each is checked
+  exhaustively against Rust's own method (the `next_power_of_two` pair at 1/4/8/16
+  bits, with the oracle computed at the *model's* width).
 - `Option`'s `unwrap`, `unwrap_or`, `expect`, `is_some` and `is_none`, and
   `Result`'s `is_ok`, `is_err`, `unwrap` and `unwrap_or`, are the first modelled
   calls that read an *enum* rather than a bit-vector operand: the receiver's tag

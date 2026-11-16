@@ -5378,6 +5378,8 @@ fn try_intrinsic(
             | intrinsics::Intrinsic::Abs
             | intrinsics::Intrinsic::Signum
             | intrinsics::Intrinsic::Ilog(_)
+            | intrinsics::Intrinsic::NextPowerOfTwo
+            | intrinsics::Intrinsic::CheckedNextPowerOfTwo
             | intrinsics::Intrinsic::BitReverse
             | intrinsics::Intrinsic::ByteSwap
             | intrinsics::Intrinsic::ByteOrder(_)

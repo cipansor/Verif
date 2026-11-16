@@ -1655,22 +1655,27 @@ fn is_power_of_two_branches_on_the_predicate() {
     }
 }
 
-/// `midpoint`, `next_multiple_of`, `ilog2` and `ilog10`, pinned in both
-/// directions.
+/// `midpoint`, `next_multiple_of`, the two logarithms and the
+/// `next_power_of_two` pair, pinned in both directions.
 ///
-/// Four `core::num` methods added as a group. The true halves pin the *value* --
+/// `core::num` methods added as a group. The true halves pin the *value* --
 /// `midpoint` of an overflowing sum (`255.midpoint(255) == 255`, not the wrapped
 /// `254`), the truncating rounding (`(-5).midpoint(-2) == -3`, not the floor
 /// `-4`), `next_multiple_of` of an exact multiple (the identity, which a model
-/// that always added `b` gets wrong), and the logs at their boundary values
-/// (`ilog2(1) == 0`, `ilog10(9) == 0`). Each true half has a
+/// that always added `b` gets wrong), the logs at their boundary values
+/// (`ilog2(1) == 0`, `ilog10(9) == 0`), and `next_power_of_two` at the three
+/// boundaries that separate a right model from a plausible wrong one (`0 -> 1`,
+/// a power of two rounding to itself, and `100 -> 128`). Each true half has a
 /// `_cannot_prove_this` twin that the same wrong model would prove, so a green
 /// verdict on the twin fails the test.
 ///
 /// The panic-shaped methods carry the opposite evidence: `next_multiple_of` that
-/// overflows, and `ilog2`/`ilog10` of zero, must *fail* with the panic obligation,
-/// and a control (`next_multiple_of_is_panic_free_here`) must verify, so a model
-/// that reported a panic unconditionally cannot pass.
+/// overflows, `ilog2`/`ilog10` of zero, and `next_power_of_two` of `129` must
+/// *fail* with the panic obligation, and a control
+/// (`next_multiple_of_is_panic_free_here`, `next_power_of_two_is_panic_free_here`)
+/// must verify, so a model that reported a panic unconditionally cannot pass. The
+/// `checked_` counterpart is the value-shaped one: `Some(128)` where the plain
+/// method would not panic, `None` where it would.
 #[test]
 fn the_new_num_methods_verify_and_their_tripwires_refute() {
     let verified = [
@@ -1690,6 +1695,13 @@ fn the_new_num_methods_verify_and_their_tripwires_refute() {
         "ilog10_below_ten_is_zero",
         "ilog10_of_a_u32_thousand",
         "ilog10_is_bounded",
+        "next_power_of_two_rounds_up",
+        "next_power_of_two_of_a_power_is_itself",
+        "next_power_of_two_of_zero_is_one",
+        "next_power_of_two_of_a_u32_thousand",
+        "next_power_of_two_is_panic_free_here",
+        "checked_next_power_of_two_in_range",
+        "checked_next_power_of_two_out_of_range_is_none",
     ];
     let refuted = [
         "midpoint_of_an_overflowing_sum_cannot_prove_this",
@@ -1699,6 +1711,9 @@ fn the_new_num_methods_verify_and_their_tripwires_refute() {
         "next_multiple_of_rounds_up_cannot_prove_this",
         "ilog2_of_100_cannot_prove_this",
         "ilog10_of_100_cannot_prove_this",
+        "next_power_of_two_rounds_up_cannot_prove_this",
+        "checked_next_power_of_two_in_range_cannot_prove_this",
+        "checked_next_power_of_two_payload_cannot_prove_this",
     ];
     // The panic-shaped fixtures fail with a *panic* obligation, so the kind is
     // asserted too: a postcondition failure on one of them would be a different
@@ -1707,6 +1722,7 @@ fn the_new_num_methods_verify_and_their_tripwires_refute() {
         "next_multiple_of_that_overflows_panics",
         "ilog2_of_zero_panics",
         "ilog10_of_zero_panics",
+        "next_power_of_two_that_overflows_panics",
     ];
     let Some(report) = verify_realistic(&verified) else { return };
     for name in verified {

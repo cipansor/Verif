@@ -380,6 +380,9 @@ with no new false proof while the independent corpus keeps growing.
     incomplete because it is *generic* (`<T: Copy>`), which is C10, not this item
     — the earlier note that `first`/`get` were "blocked on monomorphisation" was
     wrong for a concrete `&[u8]`, which is what `everyday.rs` uses.
+  - Also modelled since: `signum`, `div_euclid`/`rem_euclid`, `div_ceil`,
+    `midpoint`, `next_multiple_of`, `ilog2`/`ilog10`, and the `next_power_of_two`
+    pair — see the progress notes below.
   - Approach: the C2 contract library, plus a published list of the modelled
     `core` items with each item's oracle.
   - Exit: `abs_small`, `clamp_builtin`, `digit`, `first_or` verified; the list is
@@ -486,6 +489,29 @@ with no new false proof while the independent corpus keeps growing.
     `the_new_num_methods_verify_and_their_tripwires_refute` in `tests/mir.rs` and
     by `the_new_shapes_are_modelled_only_on_the_types_that_have_them` in
     `src/mir/intrinsics.rs`.
+  - Progress (cont.): `next_power_of_two` and `checked_next_power_of_two` are
+    modelled — the rounding sibling of the already-modelled `is_power_of_two`, and
+    the second half of the `next_multiple_of` family. Both are unsigned-only (the
+    signed types have no such method) and both are built by the classic
+    smear-and-add: `p = x - 1` with the `x <= 1` case forced to `0` (core's own
+    pre-step), `p |= p >> 1; p |= p >> 2; …` to smear the highest set bit down,
+    then `p + 1`. The `- 1` is load-bearing — without it an *already*-power-of-two
+    input would smear to `2^w - 1` and round to `0` instead of staying itself — and
+    the `x <= 1` guard is what keeps `0.next_power_of_two()` at `1` rather than the
+    all-ones wrap of an unguarded `x - 1`. `next_power_of_two` is a
+    `ValueOrPanic` (the result does not fit for `x > 2^(w-1)`, so `129u8` panics in
+    a checked build and wraps to `0` otherwise); `checked_next_power_of_two` is
+    the `Option` counterpart, whose tag is a *term* (`1` where the value fits, `0`
+    where it does not), so the `switchInt` consuming it takes the right arm on each
+    path. The failure predicate is written as `value == 0` on the *computed value*,
+    which is exact at the boundary (`x == 2^(w-1)` fits and yields `2^(w-1)`, not
+    `0`). Checked exhaustively against Rust at 1/4/8/16 bits
+    (`the_next_power_of_two_pair_agrees_with_rust`), with the oracle computed at
+    the *model's* width (a `u8` oracle has a different overflow boundary from a
+    four-bit model — the first cut used the host method and failed at 4 bits).
+    Eleven fixtures (seven true, three tripwires, one panic) are in `realistic.rs`
+    (**532 of 986**), pinned by `the_new_num_methods_verify_and_their_tripwires_refute`
+    in `tests/mir.rs`.
   - Remaining: the *generic* `<[T]>::first/get/len/is_empty` (`first_or<T>`) need
     monomorphisation, which is C10: `first_or`'s element type has no width and its
     slice length is never seeded (the frontend refuses a receiver whose length it

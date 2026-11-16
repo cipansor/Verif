@@ -11255,3 +11255,90 @@ pub fn ilog10_of_zero_panics(a: u8) -> u32 {
 pub fn ilog10_is_bounded(a: u8) -> u32 {
     a.ilog10()
 }
+
+/// `100u8.next_power_of_two()` is `128` (`2^7`, the smallest power of two that
+/// is `>= 100`), not `100` or `64`.
+/// requires: a == 100
+/// ensures: ret == 128
+pub fn next_power_of_two_rounds_up(a: u8) -> u8 {
+    a.next_power_of_two()
+}
+
+/// An input that is already a power of two rounds to itself -- the case a model
+/// that smeared the value without first subtracting one would get wrong.
+/// requires: a == 128
+/// ensures: ret == 128
+pub fn next_power_of_two_of_a_power_is_itself(a: u8) -> u8 {
+    a.next_power_of_two()
+}
+
+/// `0.next_power_of_two()` is `1`, which `core` defines specially (`x <= 1 => 1`)
+/// -- the input an unguarded `x - 1` would wrap to all-ones on.
+/// requires: a == 0
+/// ensures: ret == 1
+pub fn next_power_of_two_of_zero_is_one(a: u8) -> u8 {
+    a.next_power_of_two()
+}
+
+/// The false direction of [`next_power_of_two_rounds_up`].
+/// requires: a == 100
+/// ensures: ret == 100
+pub fn next_power_of_two_rounds_up_cannot_prove_this(a: u8) -> u8 {
+    a.next_power_of_two()
+}
+
+/// At a wider width the rounding is the same: `1000u32.next_power_of_two()` is
+/// `1024`.
+/// requires: a == 1000
+/// ensures: ret == 1024
+pub fn next_power_of_two_of_a_u32_thousand(a: u32) -> u32 {
+    a.next_power_of_two()
+}
+
+/// `129u8.next_power_of_two()` overflows (`256` does not fit), so the method
+/// panics -- the obligation is the evidence the failure predicate fires exactly
+/// where the result does not fit.
+/// requires: a == 129
+/// ensures: false
+pub fn next_power_of_two_that_overflows_panics(a: u8) -> u8 {
+    a.next_power_of_two()
+}
+
+/// The control: `next_power_of_two` is total wherever it does not overflow, so a
+/// model that reported a panic unconditionally would fail here.
+/// requires: a == 100
+/// ensures: ret <= 255
+pub fn next_power_of_two_is_panic_free_here(a: u8) -> u8 {
+    a.next_power_of_two()
+}
+
+/// `100u8.checked_next_power_of_two()` is `Some(128)`, so the payload of the
+/// `Some` arm is the rounded value.
+/// requires: a == 100
+/// ensures: ret.is_some() && ret.Some == 128
+pub fn checked_next_power_of_two_in_range(a: u8) -> Option<u8> {
+    a.checked_next_power_of_two()
+}
+
+/// The false direction of [`checked_next_power_of_two_in_range`].
+/// requires: a == 100
+/// ensures: ret.is_none()
+pub fn checked_next_power_of_two_in_range_cannot_prove_this(a: u8) -> Option<u8> {
+    a.checked_next_power_of_two()
+}
+
+/// The payload of the `Some` arm is `128`, so claiming `127` is refutable.
+/// requires: a == 100
+/// ensures: ret.Some == 127
+pub fn checked_next_power_of_two_payload_cannot_prove_this(a: u8) -> Option<u8> {
+    a.checked_next_power_of_two()
+}
+
+/// `129u8.checked_next_power_of_two()` is `None`, where the plain method panics
+/// -- the `checked_` shape turning a panic into a value.
+/// requires: a == 129
+/// ensures: ret.is_none()
+pub fn checked_next_power_of_two_out_of_range_is_none(a: u8) -> Option<u8> {
+    a.checked_next_power_of_two()
+}
+

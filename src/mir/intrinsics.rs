@@ -239,6 +239,24 @@ pub enum Intrinsic {
     /// unstable on this toolchain -- so a signed receiver is refused rather than
     /// read. The value is `a + (b - a % b) % b`, which is `a` when `a % b == 0`.
     NextMultipleOf,
+    /// `iN::next_power_of_two`: the smallest power of two `>= x`.
+    ///
+    /// Unsigned-only (there is no such method on the signed types), and a
+    /// *panicking* method: the result does not fit for `x > 2^(w-1)`, so
+    /// `u8::MAX.next_power_of_two()` panics in a checked build and is `0` in a
+    /// wrapping one. So it is a [`Outcome::ValueOrPanic`], and the failure
+    /// predicate is exactly "the rounded value came out `0`" -- which is `false`
+    /// at `x == 0` (the value is `1`, the one input where the wrap-around would
+    /// otherwise look like a failure). The value is computed by the classic
+    /// smear-and-add, which is total at `w` bits.
+    NextPowerOfTwo,
+    /// `iN::checked_next_power_of_two`: `Some(next_power_of_two)` where the plain
+    /// method does not overflow, `None` where it does.
+    ///
+    /// The same value and the same condition as [`Intrinsic::NextPowerOfTwo`],
+    /// packaged as an `Option` -- the `checked_*` counterpart, so a caller that
+    /// guards on `is_some` proves its result is in range.
+    CheckedNextPowerOfTwo,
     /// A `pow` in one of the four families: `wrapping_pow`, `saturating_pow`,
     /// `checked_pow` or `overflowing_pow`.
     ///
@@ -860,6 +878,8 @@ impl Intrinsic {
                 )
                 | Intrinsic::Abs
                 | Intrinsic::Signum
+                | Intrinsic::NextPowerOfTwo
+                | Intrinsic::CheckedNextPowerOfTwo
                 | Intrinsic::BitReverse
                 | Intrinsic::ByteSwap
                 | Intrinsic::ByteOrder(_)
@@ -1146,6 +1166,16 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     }
     if short == "next_multiple_of" {
         return Some(Intrinsic::NextMultipleOf);
+    }
+    // The "round up to a power of two" pair, the sibling of `is_power_of_two`.
+    // Unsigned-only (there is no such method on the signed types), and matched by
+    // their exact names so no prefix split can mistake `next_power_of_two` for
+    // `next_multiple_of` or an operator.
+    if short == "next_power_of_two" {
+        return Some(Intrinsic::NextPowerOfTwo);
+    }
+    if short == "checked_next_power_of_two" {
+        return Some(Intrinsic::CheckedNextPowerOfTwo);
     }
     if short == "ilog2" {
         return Some(Intrinsic::Ilog(LogKind::Ilog2));
@@ -1530,6 +1560,10 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // the operand width and zero-extended, so any width the engine holds is
         // fine.
         Intrinsic::Ilog(_) => true,
+        // `next_power_of_two`/`checked_next_power_of_two` are unsigned-only (the
+        // signed types have no such method) and build no divider, so any width the
+        // engine holds is fine.
+        Intrinsic::NextPowerOfTwo | Intrinsic::CheckedNextPowerOfTwo => !signed,
         // The byte permutations and orderings are pure bit/byte moves, so they
         // exist on both signednesses and are total at any width the engine holds.
         Intrinsic::BitReverse | Intrinsic::ByteSwap | Intrinsic::ByteOrder(_) => true,
@@ -2013,6 +2047,32 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             let fails = ilog_fails(x, signed);
             Outcome::ValueOrPanic { value: smt::truncate(ilog_value(kind, x, w), result_w), fails }
         }
+        // `next_power_of_two`: the smallest power of two `>= x`. Unsigned-only. The
+        // value is the smear-and-add, which is total at `w` bits; the failure is a
+        // rounding that wrapped to `0`, and `x == 0` is excluded because there the
+        // value legitimately *is* the wrapped-looking `1` (the add carried, but the
+        // answer fits). The result is the operand's own width, so `result_w` must
+        // equal `w`.
+        Intrinsic::NextPowerOfTwo => {
+            if result_w != w {
+                return None;
+            }
+            Outcome::ValueOrPanic { value: next_power_of_two_value(x, w), fails: next_power_of_two_fails(x, w) }
+        }
+        // `checked_next_power_of_two`: the same value and the same condition, as an
+        // `Option`. The tag is a *term* -- `1` where the value fits, `0` where it
+        // does not -- so the `switchInt` that consumes it takes the right arm on
+        // each path, exactly as `checked_*`'s tag does.
+        Intrinsic::CheckedNextPowerOfTwo => {
+            if result_w != w {
+                return None;
+            }
+            let fails = next_power_of_two_fails(x, w);
+            Outcome::Option {
+                tag: smt::ite(fails, smt::word(0, w), smt::word(1, w)),
+                payload: next_power_of_two_value(x, w),
+            }
+        }
         // The byte permutations and orderings: pure moves, so the result has the
         // operand's own width and sign. Each is its own total expression.
         Intrinsic::BitReverse => Outcome::Value(smt::truncate(bit_reverse(x), result_w)),
@@ -2330,6 +2390,45 @@ fn ilog_fails(x: Var, signed: bool) -> Pred {
     } else {
         smt::eq_const(x, 0)
     }
+}
+
+/// `iN::next_power_of_two`: the smallest power of two `>= x`, at `w` bits.
+///
+/// The classic smear-and-add, with the `- 1` that makes an *already*-power-of-two
+/// input round to itself: subtract one, smear the highest set bit down into every
+/// lower bit (`p |= p >> 1; p |= p >> 2; …`) so `p` becomes `2^k - 1`, and add one
+/// to get `2^k`. Without the `- 1`, `128` would smear to `255` and round to `0`
+/// instead of staying `128`.
+///
+/// `core` defines the pre-step as `x <= 1 => 0`, so the wrap of `x - 1` at `x == 0`
+/// must be forced back to `0` -- otherwise `0.next_power_of_two` would smear the
+/// all-ones `255` and give `0` where `core` gives `1`. The value is *total* at `w`
+/// bits: when the true power of two does not fit (`x > 2^(w-1)`) the add wraps to
+/// `0`, which is exactly the condition the failure predicate reports, so a live
+/// path never reads it.
+fn next_power_of_two_value(x: Var, w: u8) -> Var {
+    let one = smt::word(1, w);
+    // `p = x - 1`, with the `x <= 1` case forced to `0` (core's definition).
+    let p = smt::ite(smt::ule_const(x, 1), smt::word(0, w), smt::sub(x, one));
+    let mut acc = p;
+    let mut shift = 1u32;
+    while shift < u32::from(w) {
+        acc = smt::bor(acc, smt::lshr(acc, shift));
+        shift <<= 1;
+    }
+    smt::add(acc, one)
+}
+
+/// The failure predicate of `next_power_of_two`: the rounding does not fit `w` bits.
+///
+/// That is exactly "the rounded value came out `0`", because the smear-and-add
+/// wraps to zero precisely when the true power of two is `2^w`. The one input
+/// where the value is `0` without a wrap is `x == 0`, and there the value is `1`
+/// (not `0`), so no extra guard is needed -- but the predicate is written as
+/// `value == 0` on the *value* rather than on a bound, which is what makes it
+/// exact at the boundary (`x == 2^(w-1)` fits and yields `2^(w-1)`, not `0`).
+fn next_power_of_two_fails(x: Var, w: u8) -> Pred {
+    smt::eq_const(next_power_of_two_value(x, w), 0)
 }
 
 /// `iN::reverse_bits`: the operand's bits in reversed order.
@@ -3607,7 +3706,13 @@ mod tests {
         assert_eq!(classify("core::num::<impl u8>::pow"), None);
         assert_eq!(classify("unchecked_pow"), None);
         assert_eq!(classify("powf"), None);
-        assert_eq!(classify("next_power_of_two"), None);
+        // `next_power_of_two` is modelled now, but the prefix split must not read
+        // it as a `pow`: it is its own shape, not `Intrinsic::Pow`.
+        assert_eq!(classify("next_power_of_two"), Some(Intrinsic::NextPowerOfTwo));
+        assert_eq!(
+            classify("checked_next_power_of_two"),
+            Some(Intrinsic::CheckedNextPowerOfTwo)
+        );
     }
 
     /// The `Option`/`Result` method names classify, and a *user* type spelled
@@ -5866,6 +5971,93 @@ mod tests {
         });
     }
 
+    /// The width-aware oracle for `next_power_of_two`: `Some(2^ceil(log2 x))`
+    /// when that fits `w` bits, `None` when it does not.
+    ///
+    /// Written from the definition rather than by calling a host method, because
+    /// the model is parameterised by a width the host types do not share: at four
+    /// bits the overflow boundary is `8`, not the `u8`'s `128`. `0` and `1` both
+    /// round to `1`; otherwise the result is the smallest power of two `>= x`,
+    /// which is `None` exactly when it is `2^w`.
+    fn next_power_of_two_oracle(xb: u64, w: u8) -> Option<u64> {
+        let x = xb & mask_of(w);
+        if x <= 1 {
+            return Some(1);
+        }
+        let k = 64 - (x - 1).leading_zeros();
+        if k >= u32::from(w) {
+            None
+        } else {
+            Some(1u64 << k)
+        }
+    }
+
+    /// `next_power_of_two` and its `checked_` counterpart agree with Rust
+    /// everywhere, value and failure condition together.
+    ///
+    /// The whole `u8`/`u16` domain is walked. The oracle is `checked_next_power_of_two`,
+    /// which returns `None` exactly where the plain method panics (the result does
+    /// not fit), so a value mismatch, a predicate that fires where Rust returns
+    /// `Some`, and a predicate that stays silent where Rust returns `None` are all
+    /// caught -- and the `x == 0` case (value `1`, no failure) is the input an
+    /// off-by-one in the `x <= 1` pre-step would get wrong.
+    #[test]
+    fn the_next_power_of_two_pair_agrees_with_rust() {
+        for w in [1u8, 4, 8, 16] {
+            for (op, is_checked) in
+                [(Intrinsic::NextPowerOfTwo, false), (Intrinsic::CheckedNextPowerOfTwo, true)]
+            {
+                smt::with_fresh(|| {
+                    let a = smt::var(w);
+                    let outcome = eval(op, a, a, w, false, w).expect("modelled");
+                    let ai = smt::index(a);
+                    for xb in 0..(1u64 << w) {
+                        // The oracle is computed at the *model's* width, not the
+                        // host's: `checked_next_power_of_two` on a `u8` has a
+                        // different overflow boundary from the four-bit model, so
+                        // the width has to be part of the oracle.
+                        let want = next_power_of_two_oracle(xb, w);
+                        let env = |i: u32| if i == ai { Some(xb) } else { None };
+                        match &outcome {
+                            Outcome::ValueOrPanic { value, fails } => {
+                                assert!(!is_checked);
+                                assert_eq!(
+                                    smt::evaluate_pred(*fails, env),
+                                    Some(want.is_none()),
+                                    "next_power_of_two panic at {w} bits, {xb:#x}"
+                                );
+                                if let Some(v) = want {
+                                    assert_eq!(
+                                        smt::evaluate(*value, env),
+                                        Some(v),
+                                        "next_power_of_two value at {w} bits, {xb:#x}"
+                                    );
+                                }
+                            }
+                            Outcome::Option { tag, payload } => {
+                                assert!(is_checked);
+                                let want_tag = if want.is_some() { 1 } else { 0 };
+                                assert_eq!(
+                                    smt::evaluate(*tag, env),
+                                    Some(want_tag),
+                                    "checked_next_power_of_two tag at {w} bits, {xb:#x}"
+                                );
+                                if let Some(v) = want {
+                                    assert_eq!(
+                                        smt::evaluate(*payload, env),
+                                        Some(v),
+                                        "checked_next_power_of_two payload at {w} bits, {xb:#x}"
+                                    );
+                                }
+                            }
+                            _ => panic!("next_power_of_two must be a value-or-panic or an Option"),
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     /// Compare a two-operand *total* model against Rust over every input pair.
     ///
     /// The total counterpart of [`check_value_or_panic_binary`]: no failure
@@ -6053,6 +6245,13 @@ mod tests {
             // than read.
             assert!(is_modelled(Intrinsic::NextMultipleOf, w, false));
             assert!(!is_modelled(Intrinsic::NextMultipleOf, w, true));
+            // `next_power_of_two` and its `checked_` counterpart are unsigned-only
+            // too: `core` has no such method on the signed types, so a signed
+            // receiver must be refused rather than read.
+            assert!(is_modelled(Intrinsic::NextPowerOfTwo, w, false));
+            assert!(!is_modelled(Intrinsic::NextPowerOfTwo, w, true));
+            assert!(is_modelled(Intrinsic::CheckedNextPowerOfTwo, w, false));
+            assert!(!is_modelled(Intrinsic::CheckedNextPowerOfTwo, w, true));
             // The byte permutations and orders exist on both signednesses.
             assert!(is_modelled(Intrinsic::BitReverse, w, true));
             assert!(is_modelled(Intrinsic::BitReverse, w, false));
