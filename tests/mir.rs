@@ -5766,6 +5766,91 @@ fn an_enum_return_contract_can_name_a_payload() {
     }
 }
 
+/// A parenthesized comparison used as an operand is a `bool` value, and a bare
+/// one-bit word at the predicate position reads as the value itself.
+///
+/// `ret == (x == 1)` is the natural spelling of a `bool`-returning function's
+/// postcondition, and the arithmetic parser refused it with "missing `)`" -- a
+/// dropped obligation for an ordinary shape. The group's predicate is turned into a
+/// one-bit value, so the surrounding `==` compares two `bool`s as Rust does. The
+/// true/tripwire pairs pin that the group is read as the comparison's *value*: a
+/// reader that dropped the group would prove the tripwire, and one that read it as
+/// a constant could not verify the true direction at every input.
+#[test]
+fn a_parenthesized_comparison_is_a_bool_operand() {
+    let names = [
+        "bool_ret_is_comparison",
+        "bool_ret_is_comparison_tripwire",
+        "bool_ret_grouped_arithmetic",
+        "bool_ret_bare",
+        "bool_ret_bare_tripwire",
+        "bool_ret_negated",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "bool_ret_is_comparison",
+        "bool_ret_grouped_arithmetic",
+        "bool_ret_bare",
+        "bool_ret_negated",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in ["bool_ret_is_comparison_tripwire", "bool_ret_bare_tripwire"] {
+        assert_refuted(&report, name);
+    }
+}
+
+/// Three payload-summary defects, each of which let a *false* claim be verified.
+///
+/// * **A parenthesized conjunction of payload clauses** re-guarded both payloads
+///   with a combined `tag == 0 && tag == 1` -- unsatisfiable -- so the group was
+///   vacuously true and `(ret.Ok == 9 && ret.Err == 8)` was *verified* on a body
+///   returning `Err(7)`. The grouped and ungrouped spellings must now agree: both
+///   refuted. The true companion pins that the fix did not simply refuse every
+///   group.
+/// * **A multi-field payload variant** wrote every operand to the single-valued
+///   payload store, so the last field won and `ret.Pair` (field 0) denoted field 1.
+///   `ret.Pair == 2` was verified; it is refuted now, and `ret.Pair == 1` verifies.
+/// * **An argument named like the generated payload binding** (`ret__v_Ok`) was
+///   overwritten by it, so `ret.Ok == ret__v_Ok` compared the payload with itself
+///   and verified. The binding is now dropped on a collision, so the contract is
+///   refused -- a skip, never a proof against the wrong value.
+#[test]
+fn payload_summaries_cannot_prove_a_false_claim() {
+    let names = [
+        "grouped_payload_conjunction_cannot_prove_this",
+        "grouped_payload_conjunction_ok",
+        "ungrouped_payload_conjunction_cannot_prove_this",
+        "duo_pair_first_field",
+        "duo_pair_second_field_cannot_prove_this",
+        "payload_binding_shadow_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    let o = outcome(&report, "grouped_payload_conjunction_ok");
+    assert!(o.is_verified(), "`grouped_payload_conjunction_ok` must verify, got: {o}");
+    let o = outcome(&report, "duo_pair_first_field");
+    assert!(o.is_verified(), "`duo_pair_first_field` must verify, got: {o}");
+    for name in [
+        "grouped_payload_conjunction_cannot_prove_this",
+        "ungrouped_payload_conjunction_cannot_prove_this",
+        "duo_pair_second_field_cannot_prove_this",
+    ] {
+        assert_refuted(&report, name);
+    }
+    // The shadowing argument's contract is *unreadable* (the binding is dropped),
+    // so the function is skipped -- the refusal, not a verdict.
+    let o = outcome(&report, "payload_binding_shadow_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "`payload_binding_shadow_tripwire` must be refused, got: {o}"
+    );
+}
+
 /// The `Option`↔`Result` conversions -- `Option::ok_or`, `Result::ok`,
 /// `Result::err` -- decide, and both the *tag* and the *payload* cross.
 ///

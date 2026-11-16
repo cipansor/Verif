@@ -7348,7 +7348,17 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             for (i, o) in ops.iter().enumerate() {
                 let v = operand(env, o);
                 let pw = operand_width(f, o).unwrap_or(0);
-                env.set_payload(dest.local, variant, v, pw);
+                // The payload store holds *one* value per variant -- the field a
+                // contract names as `ret.Variant` / `m.Variant`, which the binder
+                // reads as `payload.first()` (field 0). Writing every operand here
+                // left the *last* field, so `E::Pair(1, 2)` made `ret.Pair` denote
+                // field 1 and `ensures: ret.Pair == 2` was *verified* against a
+                // field-0 value of 1. Each field keeps its own identity in
+                // `fields` (below), so a downcast read of `.1` is unaffected; only
+                // the single-valued payload summary is pinned to field 0.
+                if i == 0 {
+                    env.set_payload(dest.local, variant, v, pw);
+                }
                 env.set(&Place { local: dest.local, proj: vec![Proj::Field(i as u32)] }, v);
             }
             Val::Agg

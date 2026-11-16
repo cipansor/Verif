@@ -3355,6 +3355,18 @@ impl FieldEnv {
     /// `ret.Ok` and the body's `((_0 as Ok).0)` name one value.
     pub fn bind_ret_payload(&mut self, vname: &str, var: Var, tag: Var, disc: u64, signed: bool) {
         let mangled = format!("ret__v_{vname}");
+        // The generated name must not shadow a source name. `eval_ensures` merges
+        // the field bindings *after* the arguments, so an argument literally named
+        // `ret__v_Ok` would be replaced by the payload binding -- and
+        // `ensures: ret.Ok == ret__v_Ok` then compares the payload with itself and
+        // is *verified* for every argument value. Every other generated binding is
+        // checked against `declared`; this one was inserted unconditionally, so it
+        // is checked here too. On a collision the binding is dropped, and the
+        // parser refuses `ret.Ok` as a name the return type does not have -- a
+        // refusal, never a proof against the wrong value.
+        if !self.name_is_free(&mangled) {
+            return;
+        }
         self.vars.insert(mangled.clone(), var);
         // `ret.Ok` and its alias `result.Ok` name the same value, so both rewrite
         // targets are recorded; the parser accepts either spelling of the return.
@@ -4469,6 +4481,19 @@ struct Parser<'a> {
     /// set tells `parse_neg` apart that case from a literal *inside* a fold, whose
     /// magnitude is checked as written (`-(128 - 63)` is rejected for its `128`).
     bare_literals: BTreeSet<u32>,
+    /// The `[start, end)` token ranges of *parenthesized predicate groups* whose
+    /// inner conjuncts already carry their per-variant payload guards.
+    ///
+    /// `parse_and` guards each conjunct by scanning the tokens it consumed. A group
+    /// re-enters the predicate grammar, so its inner conjuncts are guarded per
+    /// variant -- and then the enclosing conjunct's scan would find both payload
+    /// names again and add a *combined* guard `tag == 0 && tag == 1`, which is
+    /// unsatisfiable and makes the whole group vacuously true:
+    /// `(ret.Ok == 9 && ret.Err == 8)` was *verified* on a body returning `Err(7)`.
+    /// The scan skips any token inside a recorded range, so the inner guards are the
+    /// only ones applied -- each payload restricted to its own variant, which is the
+    /// correct reading.
+    guarded_groups: Vec<(usize, usize)>,
     /// The width a shift amount's bare literals are floored at, or `0` outside an
     /// amount.
     ///
@@ -4672,6 +4697,7 @@ impl<'a> Parser<'a> {
             ret_payload_guards: BTreeMap::new(),
             range: BTreeMap::new(),
             bare_literals: BTreeSet::new(),
+            guarded_groups: Vec::new(),
             amount_floor: 0,
             ret_absent: "`ret` is only meaningful in `ensures`",
         }
@@ -4937,7 +4963,19 @@ impl<'a> Parser<'a> {
             return p;
         }
         let mut guard: Option<Pred> = None;
-        for t in &self.toks[from..to.min(self.toks.len())] {
+        for (i, t) in self.toks[from..to.min(self.toks.len())].iter().enumerate() {
+            // A payload name inside a parenthesized group is already guarded by the
+            // group's own inner conjuncts; re-guarding it here would combine two
+            // different discriminants into an unsatisfiable guard (see
+            // `guarded_groups`).
+            let idx = from + i;
+            if self
+                .guarded_groups
+                .iter()
+                .any(|(s, e)| idx >= *s && idx < *e)
+            {
+                continue;
+            }
             if let Tok::Ident(name) = t {
                 if let Some((tag, disc)) = self.ret_payload_guards.get(name) {
                     let g = smt::eq_const(*tag, *disc);
@@ -5705,11 +5743,18 @@ impl<'a> Parser<'a> {
         // comparator appears at that level it is a predicate, otherwise it is
         // arithmetic and `parse_expr` below handles it.
         if matches!(self.peek(), Some(Tok::Op(o)) if o == "(") && self.paren_is_predicate() {
+            let group_start = self.pos;
             self.pos += 1;
             let inner = self.parse_or()?;
             if !self.eat_op(")") {
                 return Err(self.err("missing `)`"));
             }
+            // The group's inner conjuncts are already guarded per variant by
+            // `parse_and`. Record the group's token range so the enclosing
+            // conjunct's scan does not guard the *same* payload names a second time
+            // with a combined `tag == a && tag == b`, which is unsatisfiable and
+            // makes the group vacuously true (see `guarded_groups`).
+            self.guarded_groups.push((group_start, self.pos));
             return Ok(inner);
         }
         let (left, ls) = self.parse_expr()?;
@@ -5779,6 +5824,15 @@ impl<'a> Parser<'a> {
                     _ => unreachable!(),
                 });
             }
+        }
+        // A bare one-bit value at the predicate position *is* a `bool`: a
+        // `bool`-returning function's `ensures: ret`, a bare bool argument, or
+        // `!ret` (a one-bit complement). Rust requires a `bool` here, and a
+        // one-bit word is exactly what a `bool` is, so reading it as `v != 0` is
+        // the value the type means. A word wider than one bit has no such reading
+        // and is still refused -- a bare `u32` is not a predicate.
+        if smt::bits(left) == 1 {
+            return Ok(smt::not(smt::eq_const(left, 0)));
         }
         Err(self.err("expected a comparison operator"))
     }
@@ -6764,10 +6818,32 @@ impl<'a> Parser<'a> {
                 Err(self.err(format!("unknown name `{name}` (not an argument)")))
             }
             Some(Tok::Op(o)) if o == "(" => {
+                // The lookahead must run with the cursor *on* the `(`, so it is
+                // taken before the cursor advances.
+                let is_pred = self.paren_is_predicate();
                 self.pos += 1;
-                // A parenthesized *arithmetic* expression is fine; only a
-                // parenthesized predicate is refused, and that is caught by the
-                // grammar because `parse_expr` cannot consume `&&`.
+                // A group whose contents are a *predicate* (`(x == 1)`) is a
+                // `bool`-typed operand, not arithmetic: `ret == (x == 1)` is the
+                // natural way to write a `bool`-returning function's postcondition,
+                // and reading the group with `parse_expr` (which cannot consume a
+                // comparator) refused it with "missing `)`". The predicate is turned
+                // into a one-bit value (`ite(p, 1, 0)`), the width a `bool` has, so
+                // the surrounding `==` compares two `bool`s exactly as Rust does.
+                // Which meaning a `(` has is decided by the same lookahead the
+                // comparison level uses, so a parenthesized *arithmetic* expression
+                // (`(x + 1)`) still parses as arithmetic.
+                if is_pred {
+                    let group_start = self.pos - 1;
+                    let p = self.parse_or()?;
+                    if !self.eat_op(")") {
+                        return Err(self.err("missing `)`"));
+                    }
+                    // Record the group so an enclosing conjunct's payload-guard scan
+                    // does not re-guard its inner payload names (see
+                    // `guarded_groups`).
+                    self.guarded_groups.push((group_start, self.pos));
+                    return Ok((smt::ite(p, smt::word(1, 1), smt::word(0, 1)), Sign::Unsigned));
+                }
                 let (v, s) = self.parse_expr()?;
                 if !self.eat_op(")") {
                     return Err(self.err("missing `)`"));
@@ -8065,6 +8141,87 @@ mod tests {
                 "`{text}` at the Err tag (1)"
             );
         }
+    }
+
+    /// A parenthesized comparison used as an *operand* is a `bool` value, not
+    /// arithmetic: `ret == (x == 1)` is the natural spelling of a
+    /// `bool`-returning function's postcondition, and reading the group with the
+    /// arithmetic parser refused it with "missing `)`". The group's predicate is
+    /// turned into a one-bit value, so the surrounding `==` compares two `bool`s
+    /// exactly as Rust does. A parenthesized *arithmetic* group still parses as
+    /// arithmetic, and a bare one-bit name at the predicate position (`ret`) reads
+    /// as `ret != 0` -- the value a `bool` means. A wider bare name is still
+    /// refused, because a `u32` is not a predicate.
+    #[test]
+    fn a_parenthesized_comparison_is_a_bool_operand() {
+        // `ret` is a one-bit word (as a `bool` return is bound), and `x` is an
+        // 8-bit variable. `ret` is index 0, `x` index 1.
+        let ret = smt::var_named(0, 1);
+        let x = smt::var_named(1, 8);
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), x);
+        let unsigned = BTreeSet::new();
+        let old = BTreeMap::new();
+        let fields = FieldEnv::default();
+        let read = |text: &str| {
+            eval_ensures(
+                text,
+                &args,
+                Some(ret),
+                RET_IS_UNKNOWN,
+                &unsigned,
+                false,
+                &fields,
+                &old,
+            )
+            .unwrap_or_else(|e| panic!("`{text}` must parse: {e}"))
+        };
+        // Evaluate with `ret = r` and `x = xv`.
+        let eval = |p, r: u64, xv: u64| {
+            smt::evaluate_pred(p, move |i| match i {
+                0 => Some(r),
+                _ => Some(xv),
+            })
+        };
+
+        // Every true spelling of "`ret` is `x == 1`" reads and holds exactly when
+        // `ret` equals the comparison's truth value -- so the group is read as a
+        // `bool` value, not dropped and not a constant.
+        for text in [
+            "ret == (x == 1)",
+            "ret == ((x) == 1)",
+            "ret == (x + 1 == 2)",
+            "ret == ((x + 1) == 2)",
+            "!ret == !(x == 1)",
+        ] {
+            let p = read(text);
+            for xv in [0u64, 1, 2, 255] {
+                let truth = xv == 1;
+                assert_eq!(eval(p, 1, xv), Some(truth), "`{text}` ret=1 x={xv}");
+                assert_eq!(eval(p, 0, xv), Some(!truth), "`{text}` ret=0 x={xv}");
+            }
+        }
+
+        // A parenthesized *arithmetic* group still parses as arithmetic, and a
+        // bare one-bit name at the predicate position reads as `v != 0`.
+        let mut p = Parser::new("(x + 1) == 2", &args, None, &unsigned, false);
+        let pred = p.parse_cmp().expect("`(x + 1) == 2` parses");
+        assert_eq!(smt::evaluate_pred(pred, |i| Some(if i == 1 { 1 } else { 0 })), Some(true));
+        assert_eq!(eval(read("ret"), 1, 0), Some(true), "a bare `ret` reads as `ret != 0`");
+        assert_eq!(eval(read("!ret"), 1, 0), Some(false), "`!ret` negates the bit");
+
+        // A bare *wider* name has no predicate reading and is refused.
+        let err = eval_ensures(
+            "x",
+            &args,
+            Some(ret),
+            RET_IS_UNKNOWN,
+            &unsigned,
+            false,
+            &fields,
+            &old,
+        );
+        assert!(err.is_err(), "a bare `u32` is not a predicate");
     }
 
     /// A contract cast sets the target's width *and* sign, and a chain applies

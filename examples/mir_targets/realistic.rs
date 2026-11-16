@@ -409,6 +409,14 @@ pub enum Msg { Ping, Data(u8), Stop }
 /// numbering by position would put the contract and the arm in disagreement.
 pub enum Gap { A, B = 3, C }
 
+/// An enum whose payload variant has *two* fields, for the payload-summary shape.
+///
+/// A contract's `ret.Pair` denotes the field the binder reads (`payload.first()`,
+/// field 0), so a construction `Pair(1, 2)` must make `ret.Pair` mean `1`. Writing
+/// every operand to the single-valued payload store left the *last* field, so
+/// `ret.Pair == 2` was *verified* against a field-0 value of `1`.
+pub enum Duo { Pair(u8, u8), Empty }
+
 /// A struct with *signed* fields, for the signed-comparison shapes.
 ///
 /// `Config`'s fields are `u8`, so a contract that needs `i8::MIN` cannot use it:
@@ -2657,6 +2665,114 @@ pub fn ret_payload_on_non_enum(x: u8) -> u8 {
 /// ensures: ret.None == 5
 pub fn ret_payload_on_unit_variant(x: Option<u8>) -> Option<u8> {
     x
+}
+
+/// A parenthesized comparison as an *operand* is a `bool` value: `ret == (x == 1)`
+/// is the natural spelling of a `bool`-returning function's postcondition. The body
+/// returns `x == 1`, so the two agree on every input.
+/// requires: true
+/// ensures: ret == (x == 1)
+pub fn bool_ret_is_comparison(x: u8) -> bool {
+    x == 1
+}
+
+/// The tripwire: the body returns `x == 1`, so `ret == (x == 2)` is false at `x == 1`.
+/// A reader that dropped the group -- or read it as a constant -- would prove this.
+/// requires: true
+/// ensures: ret == (x == 2)
+pub fn bool_ret_is_comparison_tripwire(x: u8) -> bool {
+    x == 1
+}
+
+/// The group may hold an arithmetic expression: `((x + 1) == 2)` is `x == 1`, which
+/// the body returns.
+/// requires: true
+/// ensures: ret == ((x + 1) == 2)
+pub fn bool_ret_grouped_arithmetic(x: u8) -> bool {
+    x == 1
+}
+
+/// A bare `bool` at the predicate position reads as the value itself: under
+/// `x == 1` the body returns `true`, so `ensures: ret` holds.
+/// requires: x == 1
+/// ensures: ret
+pub fn bool_ret_bare(x: u8) -> bool {
+    x == 1
+}
+
+/// The tripwire for a bare bool: `ret` is false at `x == 0`, so the unguarded claim
+/// is refuted. A reader that treated a bare one-bit word as always true would prove
+/// it.
+/// requires: true
+/// ensures: ret
+pub fn bool_ret_bare_tripwire(x: u8) -> bool {
+    x == 1
+}
+
+/// A negated bare bool: under `x != 1` the body returns `false`, so `!ret` holds.
+/// requires: x != 1
+/// ensures: !ret
+pub fn bool_ret_negated(x: u8) -> bool {
+    x == 1
+}
+
+/// A parenthesized conjunction of payload clauses must not collapse to a vacuous
+/// guard. `(ret.Ok == 9 && ret.Err == 8)` on a `Result` pass-through: the body
+/// returns `Err(7)`, so `ret.Ok` is unconstrained on the `Err` path and `ret.Err`
+/// is `7` there, making the conjunction false. Before the fix the group re-guarded
+/// both payloads with a combined `tag == 0 && tag == 1` -- unsatisfiable -- and the
+/// claim was *verified* on a body that refutes it.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: (ret.Ok == 9 && ret.Err == 8)
+pub fn grouped_payload_conjunction_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The true companion: the same grouped conjunction with the payload values the
+/// body actually produces. A fix that refused every grouped conjunction would
+/// pass the tripwire above but fail this.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: (ret.Err == 7)
+pub fn grouped_payload_conjunction_ok(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The ungrouped spelling of the same claim, which must agree with the grouped
+/// one: both refuted, so the fix cannot have changed only one reading.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: ret.Ok == 9 && ret.Err == 8
+pub fn ungrouped_payload_conjunction_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// `ret.Pair` denotes the payload variant's *first* field: `Duo::Pair(1, 2)` makes
+/// it `1`. Before the fix the construction wrote every operand to the
+/// single-valued payload store, so the last field (`2`) won and this was refuted
+/// while `ret.Pair == 2` was *verified*.
+/// requires: true
+/// ensures: ret.Pair == 1
+pub fn duo_pair_first_field() -> Duo {
+    Duo::Pair(1, 2)
+}
+
+/// The tripwire: the second field is `2`, which is *not* what `ret.Pair` denotes,
+/// so this must be refuted. A model that left the last field in the payload store
+/// would prove it.
+/// requires: true
+/// ensures: ret.Pair == 2
+pub fn duo_pair_second_field_cannot_prove_this() -> Duo {
+    Duo::Pair(1, 2)
+}
+
+/// An argument named like the generated payload binding (`ret__v_Ok`) must not be
+/// shadowed by it: the contract compares `ret.Ok` with the *argument*, which is a
+/// real input, so it is refuted (the body returns `Ok(9)`, and the argument is
+/// unconstrained). Before the fix the binding overwrote the argument and the
+/// clause compared the payload with itself, so it was *verified*.
+/// requires: true
+/// ensures: ret.Ok == ret__v_Ok
+pub fn payload_binding_shadow_tripwire(ret__v_Ok: u8) -> Result<u8, u8> {
+    Ok(9)
 }
 
 /// A *non-enum* return must refuse the methods: `ret.is_ok()` on a `u8` names a
