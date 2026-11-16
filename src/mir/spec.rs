@@ -255,6 +255,14 @@ pub struct Specs {
     /// contract text itself comes from, which keeps the two consistent by
     /// construction. A struct with no entry here has no readable fields, and a
     /// contract naming one is refused rather than guessed.
+    ///
+    /// A struct declared inside a `mod` is keyed by its *module-qualified* path
+    /// (`m::Outer`), with the bare name also inserted when it is unique
+    /// crate-wide. Two modules that each declare `Outer` must not share one
+    /// layout: the drop-glue check would read whichever `Outer` was inserted last,
+    /// and if that one is glue-free a panicking field destructor disappears from
+    /// the proof. Lookups go through [`Specs::struct_of`], which prefers the
+    /// qualified key and falls back to the bare one.
     pub structs: BTreeMap<String, StructDef>,
     /// Enum layouts read from the same source, keyed by enum name.
     ///
@@ -513,6 +521,27 @@ impl Specs {
         } else {
             None
         }
+    }
+
+    /// The struct layout for a type name, qualified-first.
+    ///
+    /// `name` is a `Ty::Other` spelling, which may be module-qualified
+    /// (`m::Outer`), carry generic arguments (`Vec<u8>`), or be bare. The lookup
+    /// tries, in order:
+    ///
+    /// 1. the full name as written (`m::Outer`);
+    /// 2. the name with generics stripped (`Vec`);
+    /// 3. the bare tail (`Outer`), for a struct declared at the crate root or whose
+    ///    qualified key was not recorded.
+    ///
+    /// The qualified key wins, which is what keeps two same-named structs in
+    /// different modules apart. Falling back to the bare tail is only safe because
+    /// the scanner inserts a bare key solely for a struct whose bare name is
+    /// unique crate-wide; when two share a name, only the qualified keys exist and
+    /// a bare-tail miss is a refusal (the caller reports "not modelled"), not a
+    /// wrong layout.
+    pub fn struct_of(&self, name: &str) -> Option<&StructDef> {
+        struct_lookup(&self.structs, name)
     }
 
     /// A second contract the `impl` method `name` carries, when it has both its
@@ -2033,6 +2062,11 @@ pub fn extract(source: &str) -> Specs {
     // rather than a list of fields, so it needs its own cursor; a struct and an
     // enum cannot be open at once, so the two cursors never interleave.
     let mut cur_enum: Option<(String, EnumDef)> = None;
+    // Struct names whose qualified key was recorded, so the bare-name
+    // back-insertion can be deferred to the end and skipped when two structs
+    // share a bare name. See `Specs::structs` and `Specs::struct_of`.
+    let mut struct_paths: BTreeMap<String, String> = BTreeMap::new();
+    let mut struct_name_counts: BTreeMap<String, u32> = BTreeMap::new();
 
     for (lineno, raw_line) in source.lines().enumerate() {
         let line = raw_line.trim();
@@ -2094,6 +2128,22 @@ pub fn extract(source: &str) -> Specs {
             // written above. Carrying it to the next `fn` was a false proof when
             // the leaked `requires` was satisfiable.
             pending = FnContract::default();
+            // The layout is keyed by the struct's *module-qualified* source path
+            // (`m::Outer`), and the bare name is back-inserted at the end only
+            // when it is unique crate-wide. Two modules that each declare `Outer`
+            // must not share one layout: the drop-glue check would otherwise read
+            // whichever was recorded last, and if that one is glue-free a
+            // panicking field destructor vanishes from the proof.
+            let scope = scope_path.get(lineno).cloned().unwrap_or_default();
+            let key_of = |name: &str| -> String {
+                if scope.is_empty() {
+                    name.to_string()
+                } else {
+                    let mut p = scope.clone();
+                    p.push(name.to_string());
+                    p.join("::")
+                }
+            };
             match head {
                 // A tuple struct carries its fields in the head, numbered by
                 // position, so there is no body to cursor over.
@@ -2102,7 +2152,24 @@ pub fn extract(source: &str) -> Specs {
                     for (fname, fty) in fields {
                         def.fields.push((fname, Ty::parse(&fty)));
                     }
-                    specs.structs.insert(name, def);
+                    let key = key_of(&name);
+                    *struct_name_counts.entry(name.clone()).or_insert(0) += 1;
+                    if key != name {
+                        struct_paths.insert(name, key.clone());
+                    }
+                    specs.structs.insert(key, def);
+                }
+                // A unit struct (`struct Guard;`) is a zero-field layout: the
+                // drop-glue check must find no fields rather than refuse the type
+                // as an unknown container, and a contract naming `.0` on it is
+                // still an "unknown field" refusal because there is no field 0.
+                StructHead::Unit { name } => {
+                    let key = key_of(&name);
+                    *struct_name_counts.entry(name.clone()).or_insert(0) += 1;
+                    if key != name {
+                        struct_paths.insert(name, key.clone());
+                    }
+                    specs.structs.insert(key, StructDef::default());
                 }
                 StructHead::Named { name, closed_inline } => {
                     // A one-line body is complete already; opening a cursor would run
@@ -2123,9 +2190,19 @@ pub fn extract(source: &str) -> Specs {
                                 }
                             }
                         }
-                        specs.structs.insert(name, def);
+                        let key = key_of(&name);
+                        *struct_name_counts.entry(name.clone()).or_insert(0) += 1;
+                        if key != name {
+                            struct_paths.insert(name, key.clone());
+                        }
+                        specs.structs.insert(key, def);
                     } else {
-                        cur_struct = Some((name, StructDef::default()));
+                        let key = key_of(&name);
+                        *struct_name_counts.entry(name.clone()).or_insert(0) += 1;
+                        if key != name {
+                            struct_paths.insert(name, key.clone());
+                        }
+                        cur_struct = Some((key, StructDef::default()));
                     }
                 }
             }
@@ -2271,6 +2348,25 @@ pub fn extract(source: &str) -> Specs {
         // an unrelated function further down the file.
         if !line.is_empty() && !line.starts_with('#') {
             pending = FnContract::default();
+        }
+    }
+    // Back-insert a bare key for every struct whose bare name is unique
+    // crate-wide, so a lookup by the bare tail still resolves. When two structs
+    // share a bare name the bare key is *not* created: a bare-tail lookup then
+    // misses, and the caller reports the layout as not modelled rather than
+    // reading whichever of the two happened to be inserted last (the false proof
+    // this keying exists to prevent).
+    for (bare, count) in &struct_name_counts {
+        if *count != 1 {
+            continue;
+        }
+        if specs.structs.contains_key(bare) {
+            continue;
+        }
+        if let Some(qualified) = struct_paths.get(bare) {
+            if let Some(def) = specs.structs.get(qualified).cloned() {
+                specs.structs.insert(bare.clone(), def);
+            }
         }
     }
     specs
@@ -3042,7 +3138,7 @@ impl FieldEnv {
     ) {
         // The fields of this aggregate, in field order, which *is* the MIR index.
         let fields: Vec<(String, Ty)> = match ty {
-            Ty::Other(name) => match w.structs.get(name) {
+            Ty::Other(name) => match struct_lookup(w.structs, name) {
                 Some(def) => def.fields.clone(),
                 None => return,
             },
@@ -6382,18 +6478,42 @@ impl<'a> Parser<'a> {
 /// A *tuple* struct (`pub struct P(pub u8, pub u8);`) carries its fields in the
 /// head itself, numbered by position, and needs no cursor.
 ///
-/// A unit struct is neither: it has no fields to project, so returning `None`
-/// leaves a contract naming `.0` as an "unknown name" refusal rather than
-/// inventing a layout with no fields.
+/// A unit struct is neither: it has no fields to project, so it is recorded as a
+/// *zero-field* layout. That is what lets a `Drop` on a unit struct run (the
+/// field-glue check finds no fields rather than refusing the type as an unknown
+/// container), while a contract naming `.0` on it is still an "unknown field"
+/// refusal, because the layout has no field 0.
 enum StructHead {
     Named { name: String, closed_inline: bool },
     Tuple { name: String, fields: Vec<(String, String)> },
+    /// A unit struct: `struct Guard;` — a layout with no fields.
+    Unit { name: String },
+}
+
+/// The struct layout for a type name, qualified-first.
+///
+/// Shared by [`Specs::struct_of`] and the drop-glue check, so the two cannot
+/// disagree about which layout a type name names. See `Specs::struct_of` for the
+/// lookup order and why the bare fallback is safe.
+pub(crate) fn struct_lookup<'a>(
+    structs: &'a BTreeMap<String, StructDef>,
+    name: &str,
+) -> Option<&'a StructDef> {
+    if let Some(def) = structs.get(name) {
+        return Some(def);
+    }
+    let no_generics = name.split('<').next().unwrap_or(name);
+    if let Some(def) = structs.get(no_generics) {
+        return Some(def);
+    }
+    let bare = no_generics.rsplit("::").next().unwrap_or(no_generics);
+    structs.get(bare)
 }
 
 fn struct_head(line: &str) -> Option<StructHead> {
     let t = line.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
     let rest = t.strip_prefix("struct ")?;
-    let name = rest.split(|c: char| c == '{' || c == '(' || c == '<' || c.is_whitespace()).next()?;
+    let name = rest.split(|c: char| c == '{' || c == '(' || c == '<' || c == ';' || c.is_whitespace()).next()?;
     if name.is_empty() {
         return None;
     }
@@ -6429,7 +6549,21 @@ fn struct_head(line: &str) -> Option<StructHead> {
         }
     }
     // Only a brace body on this line is a named-field struct.
-    let open = rest.find('{')?;
+    let Some(open) = rest.find('{') else {
+        // A `;`-terminated head with no `(` and no `{` is a unit struct
+        // (`struct Guard;`) or a generic unit struct (`struct Marker<T>;`). Both
+        // are a zero-field layout, which is what the drop-glue check needs.
+        //
+        // The `;` is required: a head whose brace is on a *later* line (a
+        // `where`-clause, say) must not be read as unit here, or its real fields
+        // would be lost and a field with its own destructor would look glue-free.
+        // That shape stays `None` — an unrecorded layout, which refuses rather
+        // than guesses.
+        if rest.trim_end().ends_with(';') {
+            return Some(StructHead::Unit { name: name.to_string() });
+        }
+        return None;
+    };
     // Closed on the head line iff a `}` follows the `{`.
     let closed_inline = rest[open + 1..].contains('}');
     Some(StructHead::Named { name: name.to_string(), closed_inline })
@@ -6905,7 +7039,7 @@ pub fn field_env_named(
         // gets a message about the field even when the struct's definition was not
         // readable.
         env.declare_arg(&arg);
-        let Some(def) = structs.get(name) else { continue };
+        let Some(def) = struct_lookup(structs, name) else { continue };
         for (i, (fname, fty)) in def.fields.iter().enumerate() {
             env.bind(l, &arg, fname, i as u32, fty);
             // An array-typed field is subscriptable: `o.a[0]`. Recorded so a contract's

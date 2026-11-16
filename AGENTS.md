@@ -9153,3 +9153,79 @@ frontend, each reproduced before being fixed:
   every width up to 64, but `n mod w` is a reduction only for a power-of-two `w`;
   a non-power-of-two width would be a wrong value. The rule is now `w` a power of
   two, and it was a *false-proof* class, not a refusal.
+
+## The range and layout review round (PR #8 follow-up)
+
+A second pass over the same review found six more items, this time in the range
+model and the struct layout the drop-glue check reads. Two were *false proofs*
+(a wrong value that decided), the rest lost proofs or wrong verdicts. Each was
+reproduced against real `rustc` output before being fixed.
+
+- **R1: a signed inclusive range's overflow flag tested the *unsigned* `MIN`.**
+  `RangeInclusive::next` marks itself exhausted when `start + 1` overflows, and
+  the flag was `succ == 0`. That is the unsigned rule; on a signed range `MAX + 1`
+  wraps to `MIN` (`1 << (w-1)`), not zero, so the flag never fired: `127i8..=127i8`
+  kept yielding past `127` into `-128`, `-127`, … until the `unwind:` bound. A
+  *true* contract became a bound failure. The flag is now
+  `succ == (1 << (w-1))` for a signed range. The tell is the same one the
+  `MIN`-is-not-zero note records for the contract reader: a boundary test written
+  as "wrapped to zero" is the unsigned half of a two-sided rule.
+
+- **R4: `next` advanced an empty range.** The advance (`start := start + 1`) was
+  unguarded, so an empty `255u8..=254u8` had its `start` wrapped to `0` and the
+  *second* `next` returned `Some(0)` — an element Rust never yields. Rust's
+  `Iterator::next` leaves the range unchanged on `None`, so the advance is now
+  guarded by `!empty`. The exclusive twin (`255u8..255u8`) had the same hole.
+
+  Both were validated the way this crate validates a value model: a differential
+  oracle. 23 ranges at the `u8`/`i8` boundaries (every combination of `MIN`, `MAX`
+  and `0`) were counted against a compiled `rustc` execution, and the model agreed
+  on all 23. The oracle is what makes the fix evidence rather than a claim.
+
+- **R2/R3: the unwind bound counted one latch, not the loop.** The counter was
+  keyed by the source block holding the back edge. A loop body that reaches its
+  header from two latches — an `if` whose arms both loop, or two `continue`s — had
+  each counted separately, so the *combined* trip count could exceed a declared
+  `unwind:` while neither latch's own count did: a two-iteration loop verified
+  under `unwind: 1`. A `switchInt` block also reset the count on every arm it took,
+  which is exactly where a `while` header (whose guard is a `switchInt`) hid the
+  bug — a `for` loop's header does not end in a `switchInt`, which is why the
+  earlier fixture passed. The counter is now keyed by the loop *header* (merging
+  the latches of one loop), the switch reset is removed, and `unwind: N` means `N`
+  iterations of the loop however the body reaches the back edge. The general
+  shape, again: **a budget's unit must match the quantity the caller reasons
+  about**, and "which block is the latch" is not that quantity — "which loop" is.
+
+- **R5: the struct layout was keyed by the bare name.** `m::Outer` and `n::Outer`
+  collided in the layout table, so the drop-glue check read whichever was recorded
+  last. When that one is glue-free, a field with a panicking destructor vanishes
+  and the function is a **false `Verified`** — the worst direction. Layouts are now
+  keyed by the module-qualified source path (`m::Outer`), with a bare key
+  back-inserted at the end *only* when the bare name is unique crate-wide; two
+  modules sharing a name make the bare lookup miss, so the glue check reports the
+  shape unmodelled rather than reading the wrong layout. A miss is a refusal, which
+  is the honest answer when the dump's `drop(_1)` names a type two layouts claim.
+
+- **R6: a unit struct was not a struct.** `struct Guard;` was not read as a struct
+  at all, so the drop-glue check saw an unknown type and refused the function — a
+  lost proof for one of the commonest shapes in Rust (a zero-sized marker type with
+  a `Drop` impl). A unit struct now has a zero-field layout, so its `Drop` body is
+  the only glue, and a panicking one is a real obligation. The name reader also had
+  to stop at `;`, or the trailing semicolon rode into the name and the lookup
+  missed.
+
+- **A test that failed only because of the environment.** The `VERIF_EDITION`
+  override is process-global and a deliberate *override* (it is what the edition
+  matrix uses to force a file under another edition), so it wins over the
+  manifest — which is why `a_package_that_omits_an_edition_is_verified_as_2015`
+  failed in a shell that had it exported. The test now guards on it exactly as its
+  sibling unit test already did, so the suite's verdict does not depend on the
+  caller's environment. The same shape as the "a skipped test still reports `ok`"
+  note: a test whose result depends on ambient state is not a check.
+
+**Evidence.** `scripts/test-count.sh` **914 passed / 0 failed** (was 909);
+`tests/mir.rs` **318 passed / 0 failed** in debug with a nightly `rustc`; the
+corpus is unchanged (`realistic.rs` 429 of 797, `everyday.rs` 16 of 21 — no
+verdict moved); `cargo clippy --workspace --features std --all-targets` and
+`cargo clippy --no-default-features --lib` both clean; zero dependencies and
+`no_std` untouched.

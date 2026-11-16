@@ -2318,8 +2318,9 @@ pub struct CalleeEnv<'a> {
     prog: &'a MirProgram,
     /// The contracts read from the source.
     specs: &'a spec::Specs,
-    /// For each function index, the blocks that hold a back edge (a jump to a
-    /// block that appears no later in layout order).
+    /// For each function index, a map from each block that holds a back edge (a
+    /// jump to a block that appears no later in layout order) to the *header* that
+    /// edge returns to.
     ///
     /// The unwind bound counts *these* rather than raw block entries. Counting
     /// entries to the loop header counts it once more than the loop runs (the last
@@ -2327,24 +2328,41 @@ pub struct CalleeEnv<'a> {
     /// runs exactly `N` times. The latch is executed once per iteration, which is
     /// the quantity the bound is about. Precomputed because it is consulted on
     /// every state and `is_latch` is a hot path.
-    latches: BTreeMap<usize, BTreeSet<usize>>,
+    ///
+    /// The value is the *header*, not just a flag, so the counter can be keyed by
+    /// the loop rather than by the source block. A loop whose body branches can
+    /// reach its header from two different latches (two `continue`s, or an `if`
+    /// whose arms both loop); counting each block separately lets the combined
+    /// iteration count exceed a declared bound while neither block's own count
+    /// does. Keying by the header merges them, so `unwind: N` means `N` iterations
+    /// of the *loop*, however the body reaches the back edge.
+    latches: BTreeMap<usize, BTreeMap<usize, usize>>,
 }
 
 impl<'a> CalleeEnv<'a> {
     /// Build for one program and its specs.
     pub fn new(prog: &'a MirProgram, specs: &'a spec::Specs) -> Self {
-        let mut latches: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        let mut latches: BTreeMap<usize, BTreeMap<usize, usize>> = BTreeMap::new();
         for (i, f) in prog.fns.iter().enumerate() {
             let position: BTreeMap<usize, usize> =
                 f.blocks.iter().enumerate().map(|(k, b)| (b.id, k)).collect();
-            let mut set = BTreeSet::new();
+            let mut set = BTreeMap::new();
             for b in &f.blocks {
                 let Some(&from) = position.get(&b.id) else { continue };
-                if successors(&b.term)
-                    .iter()
-                    .any(|t| position.get(t).is_some_and(|&to| to <= from))
-                {
-                    set.insert(b.id);
+                // The earliest backward target is the loop header, matching
+                // `detect_loop`'s choice so the two agree on which loop a latch
+                // belongs to.
+                let mut header: Option<usize> = None;
+                for t in successors(&b.term) {
+                    if position.get(&t).is_some_and(|&to| to <= from) {
+                        match header {
+                            Some(h) if position[&h] <= position[&t] => {}
+                            _ => header = Some(t),
+                        }
+                    }
+                }
+                if let Some(h) = header {
+                    set.insert(b.id, h);
                 }
             }
             latches.insert(i, set);
@@ -2352,9 +2370,9 @@ impl<'a> CalleeEnv<'a> {
         CalleeEnv { prog, specs, latches }
     }
 
-    /// Whether `block` of function `func` holds a back edge.
-    fn is_latch(&self, func: usize, block: usize) -> bool {
-        self.latches.get(&func).is_some_and(|s| s.contains(&block))
+    /// The loop header `block` of `func` returns to, if `block` holds a back edge.
+    fn latch_header(&self, func: usize, block: usize) -> Option<usize> {
+        self.latches.get(&func).and_then(|m| m.get(&block)).copied()
     }
 
     /// The contract for a call, or `None` when there is none to assume.
@@ -4515,13 +4533,22 @@ fn range_method(
             };
             // `start + 1`, and whether it overflowed. `forward_overflowing(start, 1)`
             // is `overflowing_add(start, 1)`, so the successor is `start + 1` and the
-            // overflow flag is "the result is `MIN`". The inclusive range marks
-            // itself exhausted exactly when the successor overflows, and the last
-            // element (the `end` value) is yielded on the pass where `start == end`
-            // before that flag is set.
+            // overflow flag is "the result is the type's `MIN`". The inclusive range
+            // marks itself exhausted exactly when the successor overflows, and the
+            // last element (the `end` value) is yielded on the pass where `start ==
+            // end` before that flag is set.
+            //
+            // The `MIN` depends on the sign: for an *unsigned* range the successor
+            // wraps to `0`, but for a *signed* one `MAX + 1` wraps to `MIN` (`1 <<
+            // (w-1)`), not to zero. Testing only for zero is the unsigned rule, and on
+            // a signed inclusive range it never fires: `127i8..=127i8` would keep
+            // yielding past `127` (into `-128`, `-127`, ...) and the loop would run to
+            // the `unwind:` bound instead of ending after one iteration, turning a
+            // true contract into a bound failure.
             let one = smt::word(1, w);
             let succ = smt::add(start, one);
-            let overflowed = smt::eq_const(succ, 0);
+            let min = if signed { 1u64 << (w - 1) } else { 0 };
+            let overflowed = smt::eq_const(succ, min);
             // The yielded value is `start` (both ranges yield `start`), the tag is
             // `Some` unless the range is empty. The tag is a term at width 1: the
             // loop's `switchInt` on the `Option<Idx>` discriminant compares it
@@ -4534,10 +4561,24 @@ fn range_method(
             // inclusive range `exhausted := overflowed`. This is the mutation the
             // `&mut self` performs, and it is what makes the loop progress -- and
             // what a `variant:` can be proved against.
-            env.set(&start_p, Val::Sym(succ, start_sign));
+            //
+            // Rust's `Iterator::next` leaves the range *unchanged* when it returns
+            // `None`, so the advance is guarded by `!empty`. Advancing an empty range
+            // would let a later call resurrect an element Rust never yields: an
+            // exclusive `255u8..255` is empty (`start >= end`), and wrapping its start
+            // to `0` would make the *next* call return `Some(0)`. Both calls return
+            // `None` in Rust.
+            let start_next = smt::ite(empty, start, succ);
+            env.set(&start_p, Val::Sym(start_next, start_sign));
             if inclusive {
                 let ex_p = Place { local: range.local, proj: vec![Proj::Field(2)] };
-                env.set(&ex_p, Val::Sym(smt::ite(overflowed, smt::word(1, 1), smt::word(0, 1)), Sign::Unsigned));
+                let ex = exhausted.expect("inclusive range carries an exhausted flag");
+                let ex_next = smt::ite(
+                    empty,
+                    ex,
+                    smt::ite(overflowed, smt::word(1, 1), smt::word(0, 1)),
+                );
+                env.set(&ex_p, Val::Sym(ex_next, Sign::Unsigned));
             }
             Ok(Vec::new())
         }
@@ -5402,8 +5443,13 @@ where
     // ends in a `switchInt` that zeroes its own count). The *latch* -- the block
     // holding the edge back to the header -- is executed exactly once per
     // iteration, so it is the quantity the bound is about.
-    let key = (st.frame.func, st.block);
-    if callees.is_latch(st.frame.func, st.block) {
+    if let Some(header) = callees.latch_header(st.frame.func, st.block) {
+        // Count by the *loop* (its header), not by the source block, so a loop
+        // whose body reaches its back edge from two different latches is counted
+        // once per iteration rather than once per latch. Keying by block let the
+        // combined trip count exceed a declared bound while neither latch's own
+        // count did.
+        let key = (st.frame.func, header);
         let n = st.visits.entry(key).or_insert(0);
         *n += 1;
         if *n > unwind {
@@ -6265,13 +6311,17 @@ where
                     report.unknown_paths.push("unmodelled switch discriminant".into());
                     return;
                 };
-                let mut visits = st.visits.clone();
-                visits.insert(key, 0);
+                // The visit counts carry through the switch unchanged. They used to
+                // be reset for this block here, which cleared a latch's count on every
+                // branch it took: a `switchInt` block can itself hold the back edge
+                // (an `if` whose arms both loop), and clearing the count on each arm
+                // let the loop re-enter with a fresh count, so a declared `unwind:`
+                // never fired.
                 let next = State {
                     block: *target,
                     path: smt::and(st.path, cond),
                     env: st.env.clone(),
-                    visits,
+                    visits: st.visits.clone(),
                     frame: st.frame.clone(),
                     depth: st.depth,
                     cut: st.cut.clone(),
@@ -6287,13 +6337,11 @@ where
                 };
                 negs.push(n);
             }
-            let mut visits = st.visits.clone();
-            visits.insert(key, 0);
             let next = State {
                 block: *otherwise,
                 path: smt::and(st.path, smt::all(&negs)),
                 env: st.env.clone(),
-                visits,
+                visits: st.visits.clone(),
                 frame: st.frame.clone(),
                 depth: st.depth,
                 cut: st.cut.clone(),
@@ -6699,9 +6747,7 @@ fn has_drop_glue(
             if drop_destructor(prog, ty).is_some() {
                 return Ok(true);
             }
-            let bare = name.rsplit("::").next().unwrap_or(name);
-            let bare = bare.split('<').next().unwrap_or(bare);
-            match structs.get(bare).or_else(|| structs.get(name)) {
+            match spec::struct_lookup(structs, name) {
                 Some(def) => {
                     for (_, fty) in &def.fields {
                         if has_drop_glue(prog, structs, fty)? {
@@ -6762,9 +6808,7 @@ fn has_field_glue(
         }
         Ty::Array(inner, _) | Ty::Slice(inner) => has_drop_glue(prog, structs, inner),
         Ty::Other(name) => {
-            let bare = name.rsplit("::").next().unwrap_or(name);
-            let bare = bare.split('<').next().unwrap_or(bare);
-            match structs.get(bare).or_else(|| structs.get(name)) {
+            match spec::struct_lookup(structs, name) {
                 Some(def) => {
                     for (_, fty) in &def.fields {
                         if has_drop_glue(prog, structs, fty)? {

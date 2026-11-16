@@ -1207,6 +1207,14 @@ fn a_2021_only_file_is_verified_under_its_own_edition() {
 #[test]
 fn a_package_that_omits_an_edition_is_verified_as_2015() {
     let Some(rustc) = rustc() else { return };
+    // `VERIF_EDITION` is a deliberate *override* -- it is what the edition matrix
+    // uses to force a file that has a manifest under another edition -- so it wins
+    // over the manifest and this test cannot assert the manifest default while it
+    // is set. The environment is process-global, so the sibling unit test guards
+    // the same way.
+    if std::env::var("VERIF_EDITION").map(|v| !v.is_empty()).unwrap_or(false) {
+        return;
+    }
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("verif-pkg2015-{}-{seq}", std::process::id()));
@@ -10225,5 +10233,241 @@ pub fn tri(n: u32) -> u32 {
                  got: {other}"
             ),
         }
+    }
+}
+
+/// Regression tests for the signed-inclusive-range review (R1–R6).
+///
+/// These live outside `review_round` because they pin a *different* surface:
+/// the `RangeInclusive::next` model's boundary arithmetic (R1), its state on an
+/// exhausted range (R4), the unwind counter's key (R2/R3), and the struct layout
+/// the drop-glue check reads (R5/R6). Every case was cross-checked against a real
+/// `rustc` execution oracle, so the expected counts are Rust's, not the model's.
+mod range_and_layout_review {
+    use super::*;
+
+    /// R1/R4: a signed inclusive range's `next` must stop at the boundary and must
+    /// not advance an exhausted range.
+    ///
+    /// The successor's overflow flag was tested only for the *unsigned* rule
+    /// (`succ == 0`), which never fires on a signed range: `127i8..=127i8` kept
+    /// yielding past `127` into `-128`, `-127`, ... until the `unwind:` bound, so a
+    /// true contract became a bound failure. The flag must test the *signed* `MIN`.
+    /// And `next` on an empty range must leave the range unchanged (Rust does not
+    /// advance `start` on `None`), or a later call resurrects an element.
+    ///
+    /// The counts are Rust's own, read from a compiled oracle, so the assertion is
+    /// the language's semantics rather than the model's.
+    #[test]
+    fn a_signed_inclusive_range_stops_at_its_boundary() {
+        let src = r#"
+/// requires: true
+/// unwind: 8
+/// ensures: ret == 1
+pub fn single_signed_incl() -> u32 {
+    let mut c = 0u32;
+    for _ in 127i8..=127i8 { c += 1; }
+    c
+}
+
+/// requires: true
+/// unwind: 8
+/// ensures: ret == 2
+pub fn two_signed_incl() -> u32 {
+    let mut c = 0u32;
+    for _ in 126i8..=127i8 { c += 1; }
+    c
+}
+
+/// requires: true
+/// unwind: 8
+/// ensures: ret == 3
+pub fn three_signed_incl() -> u32 {
+    let mut c = 0u32;
+    for _ in (-128i8)..=(-126i8) { c += 1; }
+    c
+}
+
+/// requires: true
+/// unwind: 4
+/// ensures: ret == 1
+pub fn single_unsigned_incl() -> u32 {
+    let mut c = 0u32;
+    for _ in 255u8..=255u8 { c += 1; }
+    c
+}
+"#;
+        for (name, want) in [
+            ("single_signed_incl", 1u32),
+            ("two_signed_incl", 2),
+            ("three_signed_incl", 3),
+            ("single_unsigned_incl", 1),
+        ] {
+            let Some(o) = verify_src(name, src) else { return };
+            assert!(
+                o.is_verified(),
+                "`{name}` must verify with {want} iteration(s); a signed range whose \
+                 overflow flag tests zero keeps yielding past its bound, got: {o}"
+            );
+        }
+    }
+
+    /// R4: `next` on an empty inclusive range is idempotent.
+    ///
+    /// `255u8..=254u8` is empty, so both `next` calls are `None`. A model that
+    /// advanced `start` on the first `None` would resurrect an element on the
+    /// second call (`Some(0)`), turning a true contract into a refutation.
+    #[test]
+    fn an_empty_inclusive_range_stays_empty() {
+        let src = r#"
+/// requires: true
+/// ensures: ret == 0
+pub fn empty_incl_twice() -> u8 {
+    let mut r = 255u8..=254u8;
+    let _a = r.next();
+    let b = r.next();
+    match b { Some(_) => 1, None => 0 }
+}
+
+/// requires: true
+/// ensures: ret == 0
+pub fn empty_excl_twice() -> u8 {
+    let mut r = 255u8..255u8;
+    let _a = r.next();
+    let b = r.next();
+    match b { Some(_) => 1, None => 0 }
+}
+"#;
+        for name in ["empty_incl_twice", "empty_excl_twice"] {
+            let Some(o) = verify_src(name, src) else { return };
+            assert!(
+                o.is_verified(),
+                "`{name}` must verify: `next` leaves an empty range unchanged, so the \
+                 second call is `None` too, got: {o}"
+            );
+        }
+    }
+
+    /// R2/R3: the unwind bound counts iterations of the *loop*, not of one latch.
+    ///
+    /// A loop body with two back-edge blocks (an `if` whose arms both reach the
+    /// header) had each latch counted separately, so the combined trip count could
+    /// exceed a declared `unwind:` while neither latch's own count did -- a
+    /// two-iteration loop verified under `unwind: 1`. The counter is now keyed by
+    /// the loop header, and a `switchInt` block no longer clears it.
+    #[test]
+    fn the_unwind_bound_counts_the_whole_loop_not_one_latch() {
+        let src = r#"
+/// requires: n == 2
+/// unwind: 1
+/// ensures: ret == 2
+pub fn two_latches(n: u8) -> u8 {
+    let mut i = 0u8;
+    while i < n {
+        if i == 0 { i += 1; } else { i += 1; }
+    }
+    i
+}
+
+/// requires: n == 1
+/// unwind: 1
+/// ensures: ret == 1
+pub fn one_latch(n: u8) -> u8 {
+    let mut i = 0u8;
+    while i < n {
+        if i == 0 { i += 1; } else { i += 1; }
+    }
+    i
+}
+"#;
+        let Some(f) = verify_src("two_latches", src) else { return };
+        assert!(
+            !f.is_verified(),
+            "a two-iteration loop under `unwind: 1` must run off the bound, got: {f}"
+        );
+        let Some(o) = verify_src("one_latch", src) else { return };
+        assert!(
+            o.is_verified(),
+            "a one-iteration loop under `unwind: 1` must verify (positive control), got: {o}"
+        );
+    }
+
+    /// R5: two structs of the same bare name in different modules must not share a
+    /// layout.
+    ///
+    /// The struct table was keyed by the bare name, so `m::Outer` and `n::Outer`
+    /// collided and the drop-glue check read whichever was recorded last. When that
+    /// one is glue-free, a panicking field destructor vanishes and the function is
+    /// a false `Verified`. The layout is now keyed by the module-qualified path.
+    #[test]
+    fn two_same_named_structs_do_not_share_a_layout() {
+        let src = r#"
+pub mod m {
+    pub struct Outer { pub inner: Inner }
+    pub struct Inner(pub u8);
+    impl Drop for Inner {
+        fn drop(&mut self) { if self.0 == 0 { panic!("inner"); } }
+    }
+    impl Drop for Outer { fn drop(&mut self) {} }
+}
+pub mod n {
+    pub struct Outer { pub only: u8 }
+}
+
+/// requires: true
+/// ensures: ret == 1
+pub fn same_name() -> u8 {
+    let _g = m::Outer { inner: m::Inner(0) };
+    1
+}
+"#;
+        let Some(o) = verify_src("same_name", src) else { return };
+        assert!(
+            !o.is_verified(),
+            "`m::Outer` has a field with a panicking destructor; sharing a layout with \
+             `n::Outer` would hide it and prove this, got: {o}"
+        );
+    }
+
+    /// R6: a unit struct with a `Drop` impl is a zero-field layout, not an unknown
+    /// container.
+    ///
+    /// `struct Guard;` was not read as a struct at all, so the drop-glue check saw
+    /// an unknown type and refused the function. A unit struct has no fields, so its
+    /// layout is empty and its `Drop` body is the only glue -- which runs, and a
+    /// panicking one must be a real obligation.
+    #[test]
+    fn a_unit_struct_runs_its_destructor() {
+        let src = r#"
+pub struct Guard;
+impl Drop for Guard { fn drop(&mut self) {} }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn unit_drop() -> u8 {
+    let _g = Guard;
+    1
+}
+
+pub struct Boom;
+impl Drop for Boom { fn drop(&mut self) { panic!("boom"); } }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn panics_on_drop() -> u8 {
+    let _g = Boom;
+    1
+}
+"#;
+        let Some(o) = verify_src("unit_drop", src) else { return };
+        assert!(
+            o.is_verified(),
+            "a unit struct with a no-op destructor must verify, got: {o}"
+        );
+        let Some(p) = verify_src("panics_on_drop", src) else { return };
+        assert!(
+            !p.is_verified(),
+            "a unit struct whose destructor panics must not verify, got: {p}"
+        );
     }
 }

@@ -109,6 +109,20 @@ with no new false proof while the independent corpus keeps growing.
       reference write-back is keyed on a whole local, so a projection would land
       the post-state on the wrong storage. rustc does not emit that shape for a
       glue-bearing place.
+    - **R5 (done): the struct layout is keyed by its module path.** The layout
+      table was keyed by the bare struct name, so `m::Outer` and `n::Outer` collided
+      and the drop-glue check read whichever was recorded last — when that one is
+      glue-free, a panicking field destructor vanishes and the function is a false
+      `Verified`. Layouts are now keyed by the module-qualified path, with a bare
+      key back-inserted only when the bare name is unique crate-wide; a shared name
+      makes the bare lookup miss, so the glue check reports the shape unmodelled
+      rather than reading the wrong layout (`two_same_named_structs_do_not_share_a_
+      layout`).
+    - **R6 (done): a unit struct is a zero-field layout.** `struct Guard;` was not
+      read as a struct at all, so the drop-glue check saw an unknown type and
+      refused the function. A unit struct now has an empty layout, so its `Drop`
+      body is the only glue — and a panicking one is a real obligation
+      (`a_unit_struct_runs_its_destructor`).
   - Exit (done): `guard_guarded` / `guard_is_dropped_cleanly` verified,
     `guard_misguarded` FAILED with a counterexample. ✅
   - Who has it: Kani, Prusti, Creusot, Verus, SPARK (finalization).
@@ -175,6 +189,21 @@ with no new false proof while the independent corpus keeps growing.
     exactly the state the header havocs and the invariant is quantified over.
     `tri` in `everyday.rs` declares no loop contract, so it stays `incomplete`
     with the honest missing-contract reason.
+  - Boundary hardening from the PR #8 review round (R1, R4). Both are cases where
+    the range model *decided*, so a wrong value was a wrong verdict, not a refusal:
+    - **R1: the successor's overflow flag must test the *signed* `MIN`.** The flag
+      was `succ == 0`, the unsigned rule. On a signed inclusive range it never
+      fires, so `127i8..=127i8` kept yielding past `127` (into `-128`, `-127`, …)
+      until the `unwind:` bound — a true contract became a bound failure. The flag
+      is now `succ == (1 << (w-1))` for a signed range.
+    - **R4: `next` leaves an empty range unchanged.** The advance was unguarded, so
+      `255u8..=254u8` (empty) had its `start` wrapped to `0` and the *second* `next`
+      returned `Some(0)` — an element Rust never yields. The advance is now guarded
+      by `!empty`.
+    - Validated by a differential oracle: 23 ranges at the `u8`/`i8` boundaries
+      (every combination of `MIN`/`MAX`/`0`) counted against a compiled `rustc`
+      execution, all agreeing (`a_signed_inclusive_range_stops_at_its_boundary`,
+      `an_empty_inclusive_range_stays_empty`).
 - **C4. Loops without path explosion.** · P0 · done · Kani (unwinding),
   Verus, Creusot, Prusti, SPARK (`Loop_Invariant`/`Loop_Variant`), Flux
   - Gap: a 4-iteration loop over an array exhausts the 64-path budget. Evidence:
@@ -195,6 +224,16 @@ with no new false proof while the independent corpus keeps growing.
     fails_with_a_small_one`); the invariant half is pinned by
     `an_invariant_decides_a_loop_that_unwinding_could_not`. `everyday.rs` scores
     16 of 21 (up from 9).
+  - **R2/R3 (done): the bound counts the *loop*, not one latch.** The counter was
+    keyed by the source block holding the back edge, so a loop body that reaches
+    its header from two latches (an `if` whose arms both loop, two `continue`s) had
+    each counted separately and the combined trip count could exceed a declared
+    `unwind:` while neither latch's own count did — a two-iteration loop verified
+    under `unwind: 1`. A `switchInt` block additionally reset the count on every
+    arm it took, which is where a `while` header hid the bug. The counter is now
+    keyed by the loop *header* (merged latches), the switch reset is removed, and
+    `unwind: N` means `N` iterations of the loop however the body reaches the back
+    edge (`the_unwind_bound_counts_the_whole_loop_not_one_latch`).
   - Move: **build**.
   - Follow-up (not in the exit criterion): a *sufficient* invariant for `max_of`
     needs an implication in the contract language (`i > k => m >= a[k]`), which
