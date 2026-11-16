@@ -9467,3 +9467,57 @@ and every field of it needs a reader.** The commit column was added to make A1
 computable; the test reads it. The date column was added for the clock; the test
 reads it. The fixture column was there from the start; the test now reads it as a
 *test*, not merely a name. A column nothing reads is the same as no column.
+
+## The `?` operator: two calls, two enum stores, and one boundary left refused
+
+`expr?` is modelled, and the desugaring has three steps the model has to agree on
+(the dump, `--crate-type=lib`):
+
+```text
+_2 = <Result<u8, u8> as Try>::branch(copy _1) -> [return: bb1, unwind continue];
+_3 = discriminant(_2);
+switchInt(move _3) -> [0: bb3, 1: bb4, otherwise: bb2];      // Continue=0, Break=1
+_0 = <Result<u8, u8> as FromResidual<Result<!, u8>>>::from_residual(copy _4) -> …;
+```
+
+Two modelled calls (`Intrinsic::TryBranch` / `Intrinsic::FromResidual`), both
+answered from the executor's enum stores the way the `Option` methods are:
+
+* **`branch`** writes the `ControlFlow`'s tag (`Continue` iff the receiver is on
+  its *success* variant: `Ok` = 0, `Some` = 1) and both payloads -- the success
+  value under `Continue`, the error value under `Break`. The `(_2 as
+  Continue).0` / `(_2 as Break).0` downcasts then resolve through
+  `variant_index`'s new `Continue`/`Break` numbering. A locally constructed
+  `Ok`/`Err`/`None` receiver has a *known* tag, so the branch is decided
+  statically by `smt::evaluate`.
+* **`from_residual`** re-wraps the residual for the *return* enum. The residual's
+  own tag is not stored: it is fixed by the receiver type (`Err` for a `Result`,
+  `None` for an `Option`), so storing it would be a constant the caller could
+  never see differ. The return enum is read from the call's *self type*
+  (`<Result<u8, u16> as FromResidual<…>>`), which is also where the error's
+  conversion comes from: `Result<u8, u8>` into a function returning
+  `Result<u8, u16>` widens the residual through `From`, so the value is
+  *converted*, not copied. A model that copied it refutes the true `ret.Err == 200`
+  -- pinned by `result_try_widens_the_error` and its `_cannot_prove_this` twin.
+
+Two things are worth keeping:
+
+* **The residual tag is not the `ControlFlow` tag.** `Break` is `ControlFlow`'s
+  discriminant `1`; the error's *variant* number in the receiver (`Err` = 1,
+  `None` = 1) happens to coincide for `Result`/`Option` but is a different fact,
+  and `from_residual` needs the *return* enum's numbering, not the receiver's. A
+  cross-error-type `?` (`Result<u8, u8>` -> `Result<u8, u16>`) is the case that
+  separates them.
+* **A nested `?` is refused, not guessed.** `Result<Result<u8, u8>, u8>` has a
+  `ControlFlow` whose *payload* is itself an enum, and the chain's element is an
+  aggregate rather than a word -- so `branch` reports "a receiver whose payload is
+  not modelled" and the function is `incomplete`. That is the honest boundary: the
+  inner payload has no single bit-vector value, and inventing one would be a wrong
+  value rather than a missing one.
+
+Nineteen fixtures in `realistic.rs` cover both families, both paths, the three
+known-tag receivers, a chained pair (`r?; s?`), a two-branch pair, and the
+cross-error-type pair; each has its `_cannot_prove_this` twin, so the corpus-wide
+`no_cannot_prove_entry_is_ever_verified` invariant holds them too. The model was
+checked for teeth by neutering the `TryBranch` classification: the test then fails
+on the first `verified` assertion.
