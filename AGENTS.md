@@ -4309,8 +4309,18 @@ by design, because they panic on a zero divisor and modelling them as total woul
 hide that panic; `overflowing_div`/`overflowing_rem` join them for the same reason.
 `pow` and the mixed-signedness additions are now modelled, so neither is a reachable
 gap. `rotate_*` and `abs_diff` were gaps when this was written and are modelled now
-(see C6 in `ROADMAP.md`); the `next_multiple_of`/`div_*` helpers remain reachable
-and unmodelled. The bit-count proofs do **not** go in `verif-arithmetic`: their oracle here is Rust's own method, checked
+(see C6 in `ROADMAP.md`), and so are the remaining total value methods -- `signum`,
+`reverse_bits`, `swap_bytes`, `to_be`/`to_le`, the ASCII case conversions and
+`is_multiple_of` -- plus the Euclidean pair (`div_euclid`/`rem_euclid`) and
+`div_ceil`, which are value-and-panic pairs because each panics on a zero divisor.
+Three facts cost time here and are worth keeping: `swap_bytes` is a rotation by
+`w/2` *bits*, not `w/2 * 8` (the differential test caught the first cut);
+`div_euclid` adjusts the truncating quotient *away* from zero when the remainder is
+negative, which is the opposite of the natural reading (also caught by the test);
+and `core` has no `to_ne` *value* method, only `to_ne_bytes`, so the byte-order
+model has two variants and not three. The `next_multiple_of`/`div_*` helpers and
+the `_bytes` byte-order forms (which return an array, not an integer) remain
+reachable and unmodelled. The bit-count proofs do **not** go in `verif-arithmetic`: their oracle here is Rust's own method, checked
 exhaustively over the whole operand domain, which is a stronger oracle than a
 small-domain enumeration would be. A third engine with less coverage is not a proof,
 so the split the roadmap proposed is not made.

@@ -438,6 +438,33 @@ with no new false proof while the independent corpus keeps growing.
     two tripwires, one panic) plus three `match`-form fixtures are in
     `realistic.rs` (**496 of 927**), pinned by
     `slice_first_and_get_reach_the_slices_own_element` in `tests/mir.rs`.
+  - Progress (cont.): the remaining total `core` value methods are modelled:
+    `signum` (`-1`/`0`/`1`, signed-only — the signedness is the content, since
+    `i8::MIN`'s `0x80` is the largest *unsigned* byte); `reverse_bits` (a shift-OR
+    fold, both signednesses); `swap_bytes` (a rotation by `w/2` *bits*, which is
+    the byte reversal — the first cut used `w/2 * 8` and the differential test
+    caught it); `to_be`/`to_le` (a byte swap or the identity according to the
+    *target's* endianness, read from `cfg!(target_endian)`; `core` has no `to_ne`
+    *value* method, only `to_ne_bytes`, so only two variants exist); the ASCII case
+    conversions `to_ascii_uppercase`/`to_ascii_lowercase` (`u8`-only, a range test,
+    and `&self`, so the executor follows the reference as it does for `is_ascii_*`);
+    and `is_multiple_of` (unsigned-only, `a % b == 0` with `b == 0` defined as `a ==
+    0`, so both the `b != 0` guard and the `|| a == 0` disjunct carry — the engine's
+    `urem(x, 0)` is a *defined* value, not a hole, so the guard is what makes the
+    corner exact). The `_bytes` byte-order forms return an array, not an integer, so
+    they stay unmodelled rather than written as a word. `div_euclid`/`rem_euclid`
+    (signed) and `div_ceil` (unsigned) are the division shapes that are not the
+    truncating `/`/`%`; each is a *value-and-panic* pair, because each panics on a
+    zero divisor (`div_euclid`/`rem_euclid` also on `MIN / -1`), and modelling it as
+    total would hide a panic. The Euclidean quotient adjusts the *other* way from
+    the truncating one when the remainder is negative (`-7.div_euclid(3)` is `-3`),
+    which the first cut got backwards and the differential test caught. All are
+    checked against Rust's own method over the whole `u8`/`i8` domain, with the
+    panic predicate compared at *every* input. Twenty-two fixtures (thirteen true,
+    nine tripwires) are in `realistic.rs` (**509 of 949**), pinned by
+    `the_next_core_value_methods_are_modelled_with_their_tripwires` in
+    `tests/mir.rs` and by `the_new_shapes_are_modelled_only_on_the_types_that_have_them`
+    (the type-membership directions) in `src/mir/intrinsics.rs`.
   - Remaining: the *generic* `<[T]>::first/get/len/is_empty` (`first_or<T>`) need
     monomorphisation, which is C10: `first_or`'s element type has no width and its
     slice length is never seeded (the frontend refuses a receiver whose length it

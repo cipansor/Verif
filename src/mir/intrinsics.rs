@@ -293,6 +293,64 @@ pub enum Intrinsic {
     /// is a barrel shifter in each direction OR-ed together, with the amount read
     /// modulo the width. It exists on both signednesses and is total.
     Rotate(RotateKind),
+    /// `iN::signum`: `-1`, `0` or `1` according to the sign of the operand.
+    ///
+    /// It exists only on the *signed* types (`u32::signum` is not a method), so a
+    /// signed operand is the method's own meaning and an unsigned one is refused
+    /// rather than read. Total, and the result has the operand's own type and
+    /// width: `slt(x, 0) ? -1 : (sgt(x, 0) ? 1 : 0)`.
+    Signum,
+    /// `iN::div_euclid`: Euclidean division, the quotient `q` with `a == q*b + r`
+    /// and `0 <= r < |b|`.
+    ///
+    /// A *total* value method: `iN::div_euclid` panics on a zero divisor and on
+    /// `MIN / -1`, and both of those are what the plain `/` already reports -- the
+    /// executor emits the same divide-by-zero and overflow obligations for a
+    /// `div_euclid` call as for a `/`, from the operands, so the model only has to
+    /// supply the *value*. Signed-only (the unsigned spelling is the plain `/`),
+    /// and the value is `q = a / b` adjusted up by one when the remainder is
+    /// negative: `r = a % b; r >= 0 ? q : (b > 0 ? q + 1 : q - 1)`.
+    DivEuclid,
+    /// `iN::rem_euclid`: Euclidean remainder, `0 <= r < |b|`.
+    ///
+    /// The companion of [`Self::DivEuclid`], with the same totality: the panics are
+    /// a zero divisor and `MIN / -1`, both reported by the plain `/` obligations.
+    /// The value is `r = a % b; r >= 0 ? r : r + |b|`.
+    RemEuclid,
+    /// `iN::div_ceil`: division rounding toward positive infinity.
+    ///
+    /// A *total* value method on the unsigned types (`u32::div_ceil`); on the
+    /// signed types it is unstable and refused, so only an unsigned operand is
+    /// read. The panics are the plain `/` ones (a zero divisor). The value is
+    /// `q = a / b` rounded up when the remainder is nonzero: `r != 0 ? q + 1 : q`.
+    DivCeil,
+    /// `iN::reverse_bits`: the operand's bits in reverse order.
+    ///
+    /// Total, and exists on both signednesses; the result has the operand's type
+    /// and width. The model is a shift-OR fold over the bits, so it is a plain
+    /// bit permutation rather than a table.
+    BitReverse,
+    /// `iN::swap_bytes`: the operand's bytes in reverse order, with an odd trailing
+    /// byte kept in place (a `u16` swaps its two bytes; a `u8` is unchanged).
+    ///
+    /// Total, both signednesses, and the model is a byte-level rotation by half the
+    /// width -- which is why it reuses [`rotate`]: `swap_bytes` is exactly a
+    /// rotation by `w/2` bytes, i.e. `w/2 * 8` bits.
+    ByteSwap,
+    /// `iN::to_be`/`to_le`: a byte-order conversion.
+    ///
+    /// `to_be` on a little-endian target is `swap_bytes`, and on a big-endian one
+    /// it is the identity; `to_le` is the reverse. The *target* endianness is not
+    /// something the dump states, so the model reads it from the compilation and
+    /// applies the matching of the two. Total, both signednesses. The `_bytes`
+    /// forms are not modelled (they return an array, not an integer).
+    ByteOrder(ByteOrderKind),
+    /// `iN::to_ascii_uppercase`/`to_ascii_lowercase`: the ASCII case of a `u8`.
+    ///
+    /// Total, `u8`-only: `b'a'..=b'z'` becomes `b'A'..=b'Z'` (and the reverse),
+    /// every other byte unchanged. The model is one `ite` over the range, so the
+    /// two cannot disagree about the boundaries.
+    AsciiCase(AsciiCaseKind),
     /// `Ord::min` or `Ord::max`: the smaller or larger of two operands of one
     /// type.
     ///
@@ -460,6 +518,15 @@ pub enum BoolKind {
     /// `is_positive`: the value is above zero. The model is `sgt(x, 0)`, on the
     /// signed types only for the same reason as [`Self::Negative`].
     Positive,
+    /// `is_multiple_of`: true exactly when `b != 0 && a % b == 0`.
+    ///
+    /// The `b != 0` half is what makes it total: `core` defines `is_multiple_of(0)`
+    /// as `a == 0` (so `0.is_multiple_of(0)` is `true` and `5.is_multiple_of(0)` is
+    /// `false`), which is the same predicate `a % b == 0 && b != 0 || a == 0`. It
+    /// exists only on the *unsigned* types -- `i32::is_multiple_of` does not exist
+    /// on this toolchain -- so a signed receiver is refused rather than read, and
+    /// the model is `b != 0 && urem(a, b) == 0 || a == 0`.
+    MultipleOf,
 }
 
 /// The ASCII class a `u8` byte belongs to, for [`BoolKind::Ascii`].
@@ -510,6 +577,30 @@ pub enum MinMaxKind {
     Min,
     /// The larger of the two operands: `a >= b ? a : b`.
     Max,
+}
+
+/// A byte-order conversion: `to_be` or `to_le`.
+///
+/// `core` has no `to_ne` *value* method (only `to_ne_bytes`), so there are two
+/// variants, not three. Both depend on the *target's* endianness, which the dump
+/// does not state; the model reads it from the compilation
+/// (`cfg!(target_endian)`) so a big-endian target gets the identity for `to_be`
+/// and the swap for `to_le`, and a little-endian target the reverse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ByteOrderKind {
+    /// `to_be`: big-endian byte order.
+    Be,
+    /// `to_le`: little-endian byte order.
+    Le,
+}
+
+/// `to_ascii_uppercase`/`to_ascii_lowercase` on a `u8`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AsciiCaseKind {
+    /// `to_ascii_uppercase`: `b'a'..=b'z'` -> the matching uppercase letter.
+    Upper,
+    /// `to_ascii_lowercase`: `b'A'..=b'Z'` -> the matching lowercase letter.
+    Lower,
 }
 
 /// A standard-library enum method the model knows: `Option`'s `unwrap`,
@@ -710,8 +801,18 @@ impl Intrinsic {
             self,
             Intrinsic::Unary(..)
                 | Intrinsic::Bits(_)
-                | Intrinsic::Bool(_)
+                | Intrinsic::Bool(
+                    BoolKind::PowerOfTwo
+                        | BoolKind::Ascii(_)
+                        | BoolKind::Negative
+                        | BoolKind::Positive
+                )
                 | Intrinsic::Abs
+                | Intrinsic::Signum
+                | Intrinsic::BitReverse
+                | Intrinsic::ByteSwap
+                | Intrinsic::ByteOrder(_)
+                | Intrinsic::AsciiCase(_)
                 | Intrinsic::OptionMethod(
                     OptionMethod::Unwrap
                         | OptionMethod::Expect
@@ -806,6 +907,12 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     }
     if short == "is_positive" {
         return Some(Intrinsic::Bool(BoolKind::Positive));
+    }
+    // `is_multiple_of`, which like `is_power_of_two` has no family prefix. It is
+    // unsigned-only (see `is_modelled`), so it is matched by its exact name and
+    // read only on a `core::num::<impl …>` path.
+    if short == "is_multiple_of" {
+        return Some(Intrinsic::Bool(BoolKind::MultipleOf));
     }
     // The ASCII class tests on `u8`. Their receiver is `&u8`, not `u8` -- the dump
     // prints `_3 = &_1; is_ascii_digit(move _3)` -- but that is the *executor's*
@@ -964,6 +1071,36 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     }
     if short == "rotate_right" {
         return Some(Intrinsic::Rotate(RotateKind::Right));
+    }
+    // The remaining total, family-less value methods. Like `abs_diff` and the
+    // rotations they are matched before the family split, which would otherwise
+    // look for an operator of that name. `signum`, the Euclidean pair and
+    // `div_ceil` are signed/unsigned-specific in different directions (see
+    // `is_modelled`); the byte permutations and orderings exist on both
+    // signednesses and are pure bit/byte moves.
+    if short == "signum" {
+        return Some(Intrinsic::Signum);
+    }
+    if short == "div_euclid" {
+        return Some(Intrinsic::DivEuclid);
+    }
+    if short == "rem_euclid" {
+        return Some(Intrinsic::RemEuclid);
+    }
+    if short == "div_ceil" {
+        return Some(Intrinsic::DivCeil);
+    }
+    if short == "reverse_bits" {
+        return Some(Intrinsic::BitReverse);
+    }
+    if short == "swap_bytes" {
+        return Some(Intrinsic::ByteSwap);
+    }
+    if let Some(kind) = byte_order_kind(short) {
+        return Some(Intrinsic::ByteOrder(kind));
+    }
+    if let Some(kind) = ascii_case_kind(short) {
+        return Some(Intrinsic::AsciiCase(kind));
     }
     let (family, op) = if let Some(rest) = short.strip_prefix("wrapping_") {
         (Family::Wrapping, rest)
@@ -1254,6 +1391,11 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // unsigned receiver is a different method (or not one), and reading the
         // top bit as a sign would answer a call `core` has no definition for.
         Intrinsic::Bool(BoolKind::Negative | BoolKind::Positive) => signed,
+        // `is_multiple_of` exists only on the *unsigned* types (`i32::is_multiple_of`
+        // does not exist on this toolchain), so a signed receiver is refused. It is
+        // total -- `is_multiple_of(0)` is defined -- so the only question is the
+        // width, already bounded above.
+        Intrinsic::Bool(BoolKind::MultipleOf) => !signed,
         // The slice length, emptiness and element access. All read the executor's
         // own stores (the length variable, the element variable), so none reads the
         // operand width or sign -- they are answered from the executor's state, and
@@ -1296,6 +1438,24 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // non-power-of-two width is refused rather than answered with the wrong
         // rotation.
         Intrinsic::Rotate(_) => (1..=64).contains(&w) && w.is_power_of_two(),
+        // `signum` exists only on the *signed* types, so an unsigned receiver is
+        // not this method. Total.
+        Intrinsic::Signum => signed,
+        // The Euclidean pair exist only on the *signed* types (the unsigned
+        // spelling is the plain `/` and `%`), and their value is built from the
+        // signed divider, so the width is bounded like `checked_div`'s. The panics
+        // (a zero divisor, `MIN / -1`) are the plain `/` obligations the executor
+        // already emits from the operands, not part of the value.
+        Intrinsic::DivEuclid | Intrinsic::RemEuclid => signed && w <= DIV_MAX_WIDTH,
+        // `div_ceil` is a *total* method on the unsigned types; the signed one is
+        // unstable, so a signed receiver is refused. Bounded like a division.
+        Intrinsic::DivCeil => !signed && w <= DIV_MAX_WIDTH,
+        // The byte permutations and orderings are pure bit/byte moves, so they
+        // exist on both signednesses and are total at any width the engine holds.
+        Intrinsic::BitReverse | Intrinsic::ByteSwap | Intrinsic::ByteOrder(_) => true,
+        // The ASCII case is `u8`-only, like the ASCII class tests: a wider or
+        // signed operand is a different method (or not one).
+        Intrinsic::AsciiCase(_) => !signed && w == 8,
         // The unary operators. Two membership facts decide whether a call can be
         // modelled at all, and both are about the *type*, not the width:
         //
@@ -1470,7 +1630,7 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         // `result_w` to read: a `bool` is one bit and the destination local's
         // type says so. The executor writes it as a `Val::Bool`, which is what
         // the `if` that consumes it reads.
-        Intrinsic::Bool(kind) => Outcome::Bool(bool_pred(kind, x)),
+        Intrinsic::Bool(kind) => Outcome::Bool(bool_pred(kind, x, y)),
         Intrinsic::Unary(family, un) => {
             if result_w == 0 || result_w > 64 {
                 return None;
@@ -1694,6 +1854,59 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             }
             Outcome::Value(rotate(x, y, w, kind))
         }
+        // `signum`: `-1`, `0` or `1`. The two comparisons are the engine's signed
+        // ones, so `MIN` is below zero; `-1` is the all-ones pattern at `w` bits.
+        Intrinsic::Signum => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            let zero = smt::word(0, w);
+            let minus_one = smt::all_ones(w);
+            let one = smt::word(1, w);
+            let v = smt::ite(smt::slt(x, zero), minus_one, smt::ite(smt::sgt(x, zero), one, zero));
+            Outcome::Value(smt::truncate(v, result_w))
+        }
+        // `div_euclid`: `q = a / b`, adjusted up when the remainder is negative.
+        // The *value* is built from the signed divider; the panics (`b == 0`,
+        // `MIN / -1`) are exactly the plain `/` failure predicate, so they are
+        // reported the same way `abs`'s overflow is -- a reachable-failure
+        // obligation -- rather than silently assumed away.
+        Intrinsic::DivEuclid => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            let fails = failure(BinOp::Div, x, y, w, signed)?;
+            Outcome::ValueOrPanic { value: smt::truncate(div_euclid_value(x, y, w), result_w), fails }
+        }
+        // `rem_euclid`: `r = a % b`, adjusted by `+ |b|` when negative. Same
+        // totality note as `div_euclid`.
+        Intrinsic::RemEuclid => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            let fails = failure(BinOp::Rem, x, y, w, signed)?;
+            Outcome::ValueOrPanic { value: smt::truncate(rem_euclid_value(x, y, w), result_w), fails }
+        }
+        // `div_ceil`: `q = a / b` rounded up when the remainder is nonzero.
+        // Unsigned-only, so the plain unsigned divider is exact and the only panic
+        // is a zero divisor.
+        Intrinsic::DivCeil => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            let fails = failure(BinOp::Div, x, y, w, signed)?;
+            Outcome::ValueOrPanic { value: smt::truncate(div_ceil_value(x, y, w), result_w), fails }
+        }
+        // The byte permutations and orderings: pure moves, so the result has the
+        // operand's own width and sign. Each is its own total expression.
+        Intrinsic::BitReverse => Outcome::Value(smt::truncate(bit_reverse(x), result_w)),
+        Intrinsic::ByteSwap => Outcome::Value(smt::truncate(byte_swap(x, w), result_w)),
+        Intrinsic::ByteOrder(kind) => {
+            Outcome::Value(smt::truncate(byte_order_value(x, w, kind), result_w))
+        }
+        Intrinsic::AsciiCase(kind) => {
+            Outcome::Value(smt::truncate(ascii_case_value(x, kind), result_w))
+        }
         // `Ord::clamp` is three-operand and is evaluated by [`clamp`] rather than
         // here, because `eval` reads exactly two operands. Reaching this arm means
         // a caller used `eval` for a shape it does not serve.
@@ -1790,6 +2003,135 @@ fn min_max_result(kind: MinMaxKind, x: Var, y: Var, signed: bool) -> Var {
         (MinMaxKind::Max, false) => smt::ule(y, x),
     };
     smt::ite(take_x, x, y)
+}
+
+/// `iN::div_euclid`: the quotient `q` with `a == q*b + r` and `0 <= r < |b|`.
+///
+/// The Euclidean quotient is the truncating quotient `a / b` adjusted up by one
+/// exactly when the truncating remainder is negative: `r = a % b; r >= 0 ? q :
+/// (b > 0 ? q + 1 : q - 1)`. The adjustment is needed because the two operators
+/// disagree about rounding direction only for a negative `a`, where the remainder
+/// is negative.
+///
+/// The operands are read with the *signed* engine, which is the method's own
+/// meaning (`div_euclid` is signed-only; see [`is_modelled`]). The panics (`b ==
+/// 0`, `MIN / -1`) are not part of this value -- they are the plain `/` failure
+/// predicate the caller reports separately.
+fn div_euclid_value(x: Var, y: Var, w: u8) -> Var {
+    let q = smt::sdiv(x, y);
+    let r = smt::srem(x, y);
+    let zero = smt::word(0, w);
+    let one = smt::word(1, w);
+    // A negative truncating remainder means `|b|` was added to `r`, and the
+    // identity `a == q*b + r` then needs `q` moved the *other* way: `q - 1` for a
+    // positive divisor, `q + 1` for a negative one. (`-128 div_euclid 3` is `-43`,
+    // not `-41`: the truncating pair is `(-42, -2)`, and `-2 + 3 == 1` forces
+    // `-43 * 3 + 1`.)
+    let bump = smt::ite(smt::sgt(y, zero), smt::sub(q, one), smt::add(q, one));
+    smt::ite(smt::slt(r, zero), bump, q)
+}
+
+/// `iN::rem_euclid`: the remainder `r` with `0 <= r < |b|`.
+///
+/// `r = a % b` adjusted by `+ |b|` when it is negative. `|b|` is `b` negated when
+/// `b` is negative, which is the one place the sign of the *divisor* matters (the
+/// remainder's own sign is what decides whether to adjust).
+fn rem_euclid_value(x: Var, y: Var, w: u8) -> Var {
+    let r = smt::srem(x, y);
+    let zero = smt::word(0, w);
+    let abs_y = smt::ite(smt::slt(y, zero), smt::sub(zero, y), y);
+    smt::ite(smt::slt(r, zero), smt::add(r, abs_y), r)
+}
+
+/// `uN::div_ceil`: the quotient rounded toward positive infinity.
+///
+/// `q = a / b`, plus one when the remainder is nonzero. Unsigned-only, so the
+/// plain unsigned divider is exact; the only panic is a zero divisor, reported
+/// separately by the caller.
+fn div_ceil_value(x: Var, y: Var, w: u8) -> Var {
+    let q = smt::udiv(x, y);
+    let r = smt::urem(x, y);
+    let one = smt::word(1, w);
+    smt::ite(smt::eq_const(r, 0), q, smt::add(q, one))
+}
+
+/// `iN::reverse_bits`: the operand's bits in reversed order.
+///
+/// A shift-OR fold: bit `k` of the result is bit `w-1-k` of the operand, so the
+/// result is the OR over `k` of `((x >> (w-1-k)) & 1) << k`. Written as the
+/// *swaps* of a bit-reversal network it would be shorter, but the fold is the
+/// direct statement of the definition, which is what makes it checkable against
+/// `core`'s own method.
+fn bit_reverse(x: Var) -> Var {
+    let w = smt::bits(x);
+    let mut acc = smt::word(0, w);
+    for k in 0..w {
+        let src = (w - 1 - k) as u32;
+        let bit = smt::band(smt::lshr(x, src), smt::word(1, w));
+        acc = smt::bor(acc, smt::shl(bit, k as u32));
+    }
+    acc
+}
+
+/// `iN::swap_bytes`: the operand's bytes in reversed order.
+///
+/// That is exactly a rotation by half the width in *bits* (`w/2 * 8`), because a
+/// rotation moves each byte to the position the byte-swap would. A `u8` (one
+/// byte) rotates by `4` bits, which is not the identity, so the rotation is only
+/// taken when there is more than one byte; a single-byte type is unchanged.
+fn byte_swap(x: Var, w: u8) -> Var {
+    if w <= 8 {
+        return x;
+    }
+    // Swapping the bytes of a `w`-bit value is a bit rotation by `w/2` bits: the
+    // `w/8` bytes reverse, so each byte travels half the width. `rotate` takes the
+    // amount as a term, and the amount is a constant here, so it is a word at the
+    // operand's own width (a `u16` amount in an 8-bit field would be ill-formed).
+    let half = smt::word(u64::from(w) / 2, w);
+    // `rotate` reads the amount modulo the width; the amount is exact here, so
+    // the low-bit reduction is the identity.
+    rotate(x, half, w, RotateKind::Left)
+}
+
+/// `iN::to_be`/`to_le`/`to_ne`: a byte-order conversion.
+///
+/// `to_ne` is the identity. `to_be`/`to_le` depend on the *target's* endianness:
+/// on a little-endian target `to_be` is a byte swap and `to_le` the identity, and
+/// on a big-endian target the reverse. The endianness is read from the
+/// compilation (`cfg!(target_endian = "big")`) rather than guessed, so the model
+/// matches the target the MIR was produced for.
+fn byte_order_value(x: Var, w: u8, kind: ByteOrderKind) -> Var {
+    let big_endian = cfg!(target_endian = "big");
+    let swap = match kind {
+        ByteOrderKind::Be => !big_endian,
+        ByteOrderKind::Le => big_endian,
+    };
+    if swap {
+        byte_swap(x, w)
+    } else {
+        x
+    }
+}
+
+/// `u8::to_ascii_uppercase`/`to_ascii_lowercase`.
+///
+/// `b'a'..=b'z'` becomes `b'A'..=b'Z'` by subtracting `32` (and the reverse by
+/// adding it); every other byte is unchanged. The `ite` is over the method's own
+/// range, so the boundaries cannot drift from `core`'s.
+fn ascii_case_value(x: Var, kind: AsciiCaseKind) -> Var {
+    let w = smt::bits(x);
+    let (lo, hi, delta) = match kind {
+        AsciiCaseKind::Upper => (b'a' as u64, b'z' as u64, -32i64),
+        AsciiCaseKind::Lower => (b'A' as u64, b'Z' as u64, 32i64),
+    };
+    let in_range =
+        smt::and(smt::ule_const(x, hi), smt::ule(smt::word(lo, w), x));
+    let shifted = if delta < 0 {
+        smt::sub(x, smt::word(delta.unsigned_abs(), w))
+    } else {
+        smt::add(x, smt::word(delta as u64, w))
+    };
+    smt::ite(in_range, shifted, x)
 }
 
 /// The wrapped result of a unary operator, before any family reads it.
@@ -1936,6 +2278,30 @@ fn ascii_kind(short: &str) -> Option<AsciiKind> {
     })
 }
 
+/// The byte-order method a name is, if any.
+///
+/// Only the *integer*-returning forms are matched: `to_be`, `to_le` and `to_ne`.
+/// The `_bytes` forms (`to_be_bytes`) return an *array*, not an integer, so the
+/// model has no single word to produce for them; they are left unclassified and
+/// stay unmodelled, which is the honest answer rather than writing a word into an
+/// array local.
+fn byte_order_kind(short: &str) -> Option<ByteOrderKind> {
+    Some(match short {
+        "to_be" => ByteOrderKind::Be,
+        "to_le" => ByteOrderKind::Le,
+        _ => return None,
+    })
+}
+
+/// The ASCII case method a name is, if any.
+fn ascii_case_kind(short: &str) -> Option<AsciiCaseKind> {
+    Some(match short {
+        "to_ascii_uppercase" => AsciiCaseKind::Upper,
+        "to_ascii_lowercase" => AsciiCaseKind::Lower,
+        _ => return None,
+    })
+}
+
 /// The truth value of a `bool`-valued predicate.
 ///
 /// `is_power_of_two` is `x != 0 && x & (x - 1) == 0`, which is the standard
@@ -1950,7 +2316,7 @@ fn ascii_kind(short: &str) -> Option<AsciiKind> {
 /// the byte. `is_ascii` is the one that is a single comparison (`x < 128`); the
 /// others are a disjunction of ranges, which is exactly how `core` writes them,
 /// so the boundaries cannot drift from the standard library's.
-fn bool_pred(kind: BoolKind, x: Var) -> Pred {
+fn bool_pred(kind: BoolKind, x: Var, y: Var) -> Pred {
     match kind {
         BoolKind::PowerOfTwo => {
             let w = smt::bits(x);
@@ -1965,6 +2331,16 @@ fn bool_pred(kind: BoolKind, x: Var) -> Pred {
         // no unsigned reading to fall back to.
         BoolKind::Negative => smt::slt(x, smt::word(0, smt::bits(x))),
         BoolKind::Positive => smt::sgt(x, smt::word(0, smt::bits(x))),
+        // `is_multiple_of`: `a % b == 0`, with `b == 0` defined as `a == 0`.
+        // `urem(x, 0)` is a *defined* value in the engine (the dividend), not a
+        // hole, so the `b != 0` guard is what keeps `5.is_multiple_of(0)` from
+        // reading as `5 % 0 == 0` (which would be `false` only by accident of that
+        // defined value). The `|| x == 0` covers the `b == 0 && a == 0` case, which
+        // `core` defines as `true`.
+        BoolKind::MultipleOf => smt::or(
+            smt::and(smt::not(smt::eq_const(y, 0)), smt::eq_const(smt::urem(x, y), 0)),
+            smt::eq_const(x, 0),
+        ),
     }
 }
 
@@ -4898,6 +5274,316 @@ mod tests {
             });
             assert_eq!(got, Some(want as u64), "{why} ({x:#x}, {n})");
         }
+    }
+
+    /// Check a two-operand value-or-panic model against Rust.
+    ///
+    /// The *value* is compared only where the call does **not** panic -- a path
+    /// where it panics is reported by the predicate, and the value it carries
+    /// there is never used on a live path, so pinning it would pin an arbitrary
+    /// choice. The *predicate* is compared at every input, which is the half that
+    /// matters: a predicate that is false where Rust panics would hide a panic.
+    fn check_value_or_panic_binary(
+        op: Intrinsic,
+        w: u8,
+        signed: bool,
+        from_bits: impl Fn(u64) -> i64,
+        rust: impl Fn(i64, i64) -> i64,
+        panics: impl Fn(i64, i64) -> bool,
+        label: &str,
+    ) {
+        smt::with_fresh(|| {
+            let a = smt::var(w);
+            let b = smt::var(w);
+            let outcome = eval(op, a, b, w, signed, w)
+                .unwrap_or_else(|| panic!("{label} at {w} bits must be modelled"));
+            let Outcome::ValueOrPanic { value, fails } = outcome else {
+                panic!("{label} must produce a value-or-panic outcome");
+            };
+            let (ai, bi) = (smt::index(a), smt::index(b));
+            each_pair(w, |xb, yb| {
+                let (x, y) = (from_bits(xb), from_bits(yb));
+                let env = |i: u32| {
+                    if i == ai {
+                        Some(xb)
+                    } else if i == bi {
+                        Some(yb)
+                    } else {
+                        None
+                    }
+                };
+                let p = panics(x, y);
+                assert_eq!(
+                    smt::evaluate_pred(fails, env),
+                    Some(p),
+                    "{label} panic predicate at ({x}, {y})"
+                );
+                if !p {
+                    let got = smt::evaluate(value, env);
+                    let want = rust(x, y) as u64 & mask_of(w);
+                    assert_eq!(got, Some(want), "{label} value at ({x}, {y})");
+                }
+            });
+        });
+    }
+
+    /// Check a two-operand `bool` predicate against Rust over every input pair.
+    fn check_bool_binary(
+        op: Intrinsic,
+        w: u8,
+        signed: bool,
+        from_bits: impl Fn(u64) -> i64,
+        oracle: impl Fn(i64, i64) -> bool,
+        label: &str,
+    ) {
+        smt::with_fresh(|| {
+            let a = smt::var(w);
+            let b = smt::var(w);
+            let outcome = eval(op, a, b, w, signed, w)
+                .unwrap_or_else(|| panic!("{label} at {w} bits must be modelled"));
+            let Outcome::Bool(p) = outcome else {
+                panic!("{label} must produce a `bool`");
+            };
+            let (ai, bi) = (smt::index(a), smt::index(b));
+            each_pair(w, |xb, yb| {
+                let (x, y) = (from_bits(xb), from_bits(yb));
+                let env = |i: u32| {
+                    if i == ai {
+                        Some(xb)
+                    } else if i == bi {
+                        Some(yb)
+                    } else {
+                        None
+                    }
+                };
+                assert_eq!(
+                    smt::evaluate_pred(p, env),
+                    Some(oracle(x, y)),
+                    "{label} at ({x}, {y})"
+                );
+            });
+        });
+    }
+
+    /// `is_multiple_of` agrees with Rust over the whole `u8` domain, including the
+    /// `b == 0` corner (`core` defines `a.is_multiple_of(0)` as `a == 0`).
+    #[test]
+    fn is_multiple_of_agrees_with_rust() {
+        check_bool_binary(
+            Intrinsic::Bool(BoolKind::MultipleOf),
+            8,
+            false,
+            unident,
+            |x, y| (x as u8).is_multiple_of(y as u8),
+            "u8::is_multiple_of",
+        );
+    }
+
+    /// `signum` agrees with Rust over the whole `i8` domain.
+    #[test]
+    fn signum_agrees_with_rust() {
+        check_unary(
+            Intrinsic::Signum,
+            8,
+            8,
+            true,
+            |xb| signed_of(xb, 8).signum() as u64 & 0xff,
+            "i8::signum",
+        );
+    }
+
+    /// The Euclidean pair and `div_ceil` agree with Rust's value everywhere the
+    /// call is defined, and their panic predicate fires exactly where it panics.
+    ///
+    /// `div_euclid`/`rem_euclid` panic on a zero divisor and on `MIN / -1`;
+    /// `div_ceil` (unsigned) panics only on a zero divisor. The oracle calls the
+    /// real method only on the non-panicking inputs, so it cannot itself panic.
+    #[test]
+    fn the_euclidean_pair_and_div_ceil_agree_with_rust() {
+        let i8_min = i8::MIN as i64;
+        check_value_or_panic_binary(
+            Intrinsic::DivEuclid,
+            8,
+            true,
+            |b| i8::from_ne_bytes([b as u8]) as i64,
+            |x, y| i64::from((x as i8).div_euclid(y as i8)),
+            |x, y| y == 0 || (x == i8_min && y == -1),
+            "i8::div_euclid",
+        );
+        check_value_or_panic_binary(
+            Intrinsic::RemEuclid,
+            8,
+            true,
+            |b| i8::from_ne_bytes([b as u8]) as i64,
+            |x, y| i64::from((x as i8).rem_euclid(y as i8)),
+            |x, y| y == 0 || (x == i8_min && y == -1),
+            "i8::rem_euclid",
+        );
+        check_value_or_panic_binary(
+            Intrinsic::DivCeil,
+            8,
+            false,
+            unident,
+            |x, y| i64::from((x as u8).div_ceil(y as u8)),
+            |_, y| y == 0,
+            "u8::div_ceil",
+        );
+    }
+
+    /// The byte permutations and orderings agree with Rust over the whole domain.
+    ///
+    /// `reverse_bits` and `swap_bytes` are bit/byte moves, checked on both
+    /// signednesses (the result is the operand's type, so a signed oracle reads it
+    /// back through `u8`). `to_be`/`to_le`/`to_ne` depend on the *target's*
+    /// endianness, so the oracle is Rust's own method, which agrees with the model
+    /// by construction only if both read the same target -- which they do, since
+    /// the model uses `cfg!(target_endian)`.
+    #[test]
+    fn the_byte_permutations_and_orderings_agree_with_rust() {
+        for w in [8u8, 16] {
+            check_unary(
+                Intrinsic::BitReverse,
+                w,
+                w,
+                false,
+                move |xb| match w {
+                    8 => u8::try_from(xb).unwrap().reverse_bits() as u64,
+                    16 => u16::try_from(xb).unwrap().reverse_bits() as u64,
+                    _ => unreachable!(),
+                },
+                "reverse_bits",
+            );
+            check_unary(
+                Intrinsic::ByteSwap,
+                w,
+                w,
+                false,
+                move |xb| match w {
+                    8 => u8::try_from(xb).unwrap().swap_bytes() as u64,
+                    16 => u16::try_from(xb).unwrap().swap_bytes() as u64,
+                    _ => unreachable!(),
+                },
+                "swap_bytes",
+            );
+            for (kind, label) in
+                [(ByteOrderKind::Be, "to_be"), (ByteOrderKind::Le, "to_le")]
+            {
+                check_unary(
+                    Intrinsic::ByteOrder(kind),
+                    w,
+                    w,
+                    false,
+                    move |xb| match w {
+                        8 => {
+                            let x = u8::try_from(xb).unwrap();
+                            match kind {
+                                ByteOrderKind::Be => x.to_be() as u64,
+                                ByteOrderKind::Le => x.to_le() as u64,
+                            }
+                        }
+                        16 => {
+                            let x = u16::try_from(xb).unwrap();
+                            match kind {
+                                ByteOrderKind::Be => x.to_be() as u64,
+                                ByteOrderKind::Le => x.to_le() as u64,
+                            }
+                        }
+                        _ => unreachable!(),
+                    },
+                    label,
+                );
+            }
+        }
+    }
+
+    /// The ASCII case conversions agree with Rust over the whole `u8` domain.
+    #[test]
+    fn the_ascii_case_conversions_agree_with_rust() {
+        check_unary(
+            Intrinsic::AsciiCase(AsciiCaseKind::Upper),
+            8,
+            8,
+            false,
+            |xb| u8::try_from(xb).unwrap().to_ascii_uppercase() as u64,
+            "u8::to_ascii_uppercase",
+        );
+        check_unary(
+            Intrinsic::AsciiCase(AsciiCaseKind::Lower),
+            8,
+            8,
+            false,
+            |xb| u8::try_from(xb).unwrap().to_ascii_lowercase() as u64,
+            "u8::to_ascii_lowercase",
+        );
+    }
+
+    /// The new names classify, and the neighbours that only *look* like them do
+    /// not.
+    #[test]
+    fn the_new_value_names_classify_and_their_neighbours_do_not() {
+        assert_eq!(classify("core::num::<impl i32>::signum"), Some(Intrinsic::Signum));
+        assert_eq!(classify("core::num::<impl i32>::div_euclid"), Some(Intrinsic::DivEuclid));
+        assert_eq!(classify("core::num::<impl i32>::rem_euclid"), Some(Intrinsic::RemEuclid));
+        assert_eq!(classify("core::num::<impl u32>::div_ceil"), Some(Intrinsic::DivCeil));
+        assert_eq!(classify("core::num::<impl u8>::reverse_bits"), Some(Intrinsic::BitReverse));
+        assert_eq!(classify("core::num::<impl u16>::swap_bytes"), Some(Intrinsic::ByteSwap));
+        assert_eq!(classify("core::num::<impl u32>::to_be"), Some(Intrinsic::ByteOrder(ByteOrderKind::Be)));
+        assert_eq!(classify("core::num::<impl u32>::to_le"), Some(Intrinsic::ByteOrder(ByteOrderKind::Le)));
+        assert_eq!(classify("core::num::<impl u8>::to_ascii_uppercase"), Some(Intrinsic::AsciiCase(AsciiCaseKind::Upper)));
+        assert_eq!(classify("core::num::<impl u8>::to_ascii_lowercase"), Some(Intrinsic::AsciiCase(AsciiCaseKind::Lower)));
+        assert_eq!(classify("core::num::<impl u32>::is_multiple_of"), Some(Intrinsic::Bool(BoolKind::MultipleOf)));
+        // The `_bytes` forms return an array, so they are left unclassified rather
+        // than modelled as a word.
+        assert_eq!(classify("core::num::<impl u32>::to_be_bytes"), None);
+        assert_eq!(classify("core::num::<impl u32>::to_le_bytes"), None);
+        // Names that merely end in a modelled name are not the method.
+        assert_eq!(classify("core::num::<impl u32>::signum_thing"), None);
+        assert_eq!(classify("core::num::<impl u32>::no_div_ceil"), None);
+        assert_eq!(classify("core::num::<impl u8>::to_ascii_uppercase_thing"), None);
+    }
+
+    /// The type-specific membership of the new shapes: `signum` and the Euclidean
+    /// pair are signed-only, `div_ceil` and `is_multiple_of` are unsigned-only, and
+    /// the ASCII case conversions are `u8`-only. A wrong direction here would read
+    /// a method `core` does not define on that type.
+    #[test]
+    fn the_new_shapes_are_modelled_only_on_the_types_that_have_them() {
+        for w in [8u8, 16, 32] {
+            assert!(is_modelled(Intrinsic::Signum, w, true), "iN::signum exists");
+            assert!(!is_modelled(Intrinsic::Signum, w, false), "uN::signum does not exist");
+            assert!(is_modelled(Intrinsic::DivEuclid, w, true));
+            assert!(!is_modelled(Intrinsic::DivEuclid, w, false));
+            assert!(is_modelled(Intrinsic::RemEuclid, w, true));
+            assert!(!is_modelled(Intrinsic::RemEuclid, w, false));
+            assert!(is_modelled(Intrinsic::DivCeil, w, false));
+            assert!(!is_modelled(Intrinsic::DivCeil, w, true));
+            assert!(is_modelled(Intrinsic::Bool(BoolKind::MultipleOf), w, false));
+            assert!(!is_modelled(Intrinsic::Bool(BoolKind::MultipleOf), w, true));
+            // The byte permutations and orders exist on both signednesses.
+            assert!(is_modelled(Intrinsic::BitReverse, w, true));
+            assert!(is_modelled(Intrinsic::BitReverse, w, false));
+            assert!(is_modelled(Intrinsic::ByteSwap, w, true));
+            assert!(is_modelled(Intrinsic::ByteOrder(ByteOrderKind::Be), w, false));
+        }
+        // `signum`, the permutations and the orders are total at 64 bits too, but
+        // the divider-backed shapes are not -- they are bounded at `DIV_MAX_WIDTH`.
+        for op in [
+            Intrinsic::BitReverse,
+            Intrinsic::ByteSwap,
+            Intrinsic::ByteOrder(ByteOrderKind::Le),
+        ] {
+            assert!(is_modelled(op, 64, true));
+            assert!(is_modelled(op, 64, false));
+        }
+        assert!(is_modelled(Intrinsic::Signum, 64, true));
+        // The ASCII case is `u8`-only.
+        assert!(is_modelled(Intrinsic::AsciiCase(AsciiCaseKind::Upper), 8, false));
+        assert!(!is_modelled(Intrinsic::AsciiCase(AsciiCaseKind::Upper), 16, false));
+        assert!(!is_modelled(Intrinsic::AsciiCase(AsciiCaseKind::Upper), 8, true));
+        // The division shapes are bounded at `DIV_MAX_WIDTH`, like the other
+        // divider-backed models.
+        assert!(!is_modelled(Intrinsic::DivEuclid, 64, true));
+        assert!(!is_modelled(Intrinsic::DivCeil, 64, false));
     }
 
     /// The inherent `abs` value and panic predicate agree with Rust everywhere.

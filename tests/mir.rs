@@ -10635,6 +10635,87 @@ fn abs_diff_and_rotations_are_modelled_with_their_boundaries() {
     }
 }
 
+/// The next batch of `core` value methods is modelled: `signum`, the Euclidean
+/// pair (`div_euclid`/`rem_euclid`), `div_ceil`, the byte permutations
+/// (`reverse_bits`/`swap_bytes`), the byte orders (`to_be`/`to_le`), the ASCII
+/// case conversions and `is_multiple_of`.
+///
+/// Each shape has a true pin and a tripwire that claims the value a *plausible
+/// wrong model* would produce (the truncating `/` for the Euclidean pair, the
+/// identity for the permutations, an unconditional `+32` for the ASCII case, an
+/// unguarded `%` for `is_multiple_of`). The tripwires must be refuted on the
+/// *postcondition*, so the model cannot pass by answering a constant, and the
+/// signedness pins (`signum_of_min`) fail for a model that read the top bit
+/// unsigned.
+#[test]
+fn the_next_core_value_methods_are_modelled_with_their_tripwires() {
+    let names = [
+        "signum_of_min_is_minus_one",
+        "signum_of_a_negative_cannot_prove_this",
+        "div_euclid_rounds_toward_negative_infinity",
+        "div_euclid_is_not_truncating_division_cannot_prove_this",
+        "rem_euclid_is_non_negative",
+        "rem_euclid_is_not_the_truncating_remainder_cannot_prove_this",
+        "div_ceil_rounds_toward_positive_infinity",
+        "div_ceil_is_not_truncating_division_cannot_prove_this",
+        "reverse_bits_of_the_top_bit",
+        "reverse_bits_is_not_the_identity_cannot_prove_this",
+        "swap_bytes_reverses_the_bytes",
+        "swap_bytes_is_not_the_identity_cannot_prove_this",
+        "to_be_on_a_little_endian_target_swaps",
+        "to_be_is_not_the_identity_here_cannot_prove_this",
+        "to_le_on_a_little_endian_target_is_the_identity",
+        "to_ascii_uppercase_of_a_lowercase_letter",
+        "to_ascii_uppercase_leaves_uppercase_cannot_prove_this",
+        "to_ascii_lowercase_of_an_uppercase_letter",
+        "is_multiple_of_six_by_three",
+        "is_multiple_of_seven_by_three_cannot_prove_this",
+        "is_multiple_of_zero_by_zero",
+        "is_multiple_of_five_by_zero",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+
+    for name in [
+        "signum_of_min_is_minus_one",
+        "div_euclid_rounds_toward_negative_infinity",
+        "rem_euclid_is_non_negative",
+        "div_ceil_rounds_toward_positive_infinity",
+        "reverse_bits_of_the_top_bit",
+        "swap_bytes_reverses_the_bytes",
+        "to_be_on_a_little_endian_target_swaps",
+        "to_le_on_a_little_endian_target_is_the_identity",
+        "to_ascii_uppercase_of_a_lowercase_letter",
+        "to_ascii_lowercase_of_an_uppercase_letter",
+        "is_multiple_of_six_by_three",
+        "is_multiple_of_zero_by_zero",
+        "is_multiple_of_five_by_zero",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    for name in [
+        "signum_of_a_negative_cannot_prove_this",
+        "div_euclid_is_not_truncating_division_cannot_prove_this",
+        "rem_euclid_is_not_the_truncating_remainder_cannot_prove_this",
+        "div_ceil_is_not_truncating_division_cannot_prove_this",
+        "reverse_bits_is_not_the_identity_cannot_prove_this",
+        "swap_bytes_is_not_the_identity_cannot_prove_this",
+        "to_be_is_not_the_identity_here_cannot_prove_this",
+        "to_ascii_uppercase_leaves_uppercase_cannot_prove_this",
+        "is_multiple_of_seven_by_three_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.starts_with("postcondition"),
+                "`{name}` must be refuted on the postcondition, got `{kind}`"
+            ),
+            other => panic!("`{name}` claims a false value and must be refuted, got: {other}"),
+        }
+    }
+}
+
 /// The `u32` product surface is modelled: `wrapping_mul` as a value, and a
 /// `saturating_mul` whose widened `2w == 64` failure predicate is built.
 ///

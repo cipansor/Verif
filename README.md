@@ -2098,6 +2098,31 @@ refused. `src/mir/intrinsics.rs` holds the model:
   modelled width is a power of two the reduction is one `and` and no divider. Both
   are checked exhaustively over `u8`/`i8` against Rust's own methods, so the
   rotation's wrap cannot drift from the standard library's.
+- The remaining total `core` value methods are modelled as plain values, each
+  checked exhaustively against Rust's own method over the whole `u8`/`i8` domain:
+  `signum` (`-1`/`0`/`1`, signed-only, so `i8::MIN`'s top bit is read as a sign
+  rather than the largest unsigned byte); `reverse_bits` (a shift-OR fold, both
+  signednesses); `swap_bytes` (a rotation by `w/2` bits — the byte reversal, not a
+  rotation by `w/2 * 8`); `to_be`/`to_le` (a byte swap or the identity according to
+  the *target's* endianness, read from `cfg!(target_endian)` rather than guessed;
+  `core` has no `to_ne` value method, only `to_ne_bytes`); the ASCII case
+  conversions `to_ascii_uppercase`/`to_ascii_lowercase` (`u8`-only, a range test
+  over `b'a'..=b'z'`/`b'A'..=b'Z'`); and `is_multiple_of` (unsigned-only, `a % b ==
+  0` with `b == 0` defined as `a == 0`, so the `b != 0` guard and the `|| a == 0`
+  disjunct both carry). The `_bytes` forms of the byte orders return an array, not
+  an integer, so they are left unmodelled rather than written as a word.
+- `iN::div_euclid`/`rem_euclid` and `uN::div_ceil` are the division shapes that are
+  *not* the truncating `/`/`%`. Each has a value *and* a panic predicate, because
+  each panics on a zero divisor (and `div_euclid`/`rem_euclid` also on `MIN / -1`,
+  the same predicate `checked_div` reports) — modelling them as total would hide a
+  panic. The Euclidean quotient is `a / b` adjusted *the other way* when the
+  truncating remainder is negative (`q - 1` for a positive divisor, `q + 1` for a
+  negative one; `-7.div_euclid(3)` is `-3`, not `-2`), the Euclidean remainder is
+  `a % b + |b|` when negative, and `div_ceil` is `a / b` rounded up. They are
+  signed-only (`div_euclid`/`rem_euclid`) or unsigned-only (`div_ceil`) and bounded
+  at `DIV_MAX_WIDTH`, like every divider-backed model. Each is checked against
+  Rust's own method at every input the call does not panic on, with the panic
+  predicate compared at *every* input.
 - `Option`'s `unwrap`, `unwrap_or`, `expect`, `is_some` and `is_none`, and
   `Result`'s `is_ok`, `is_err`, `unwrap` and `unwrap_or`, are the first modelled
   calls that read an *enum* rather than a bit-vector operand: the receiver's tag

@@ -10433,6 +10433,196 @@ pub fn rotate_by_more_than_the_width_wraps() -> u8 {
     0x81u8.rotate_left(9)
 }
 
+/// `signum` is `-1`, `0` or `1`. This pins the negative arm, which is the one an
+/// unsigned reading of the top bit would get wrong: `i8::MIN`'s bits (`0x80`) are
+/// the largest unsigned byte, so an unsigned `signum` would return `1`, not `-1`.
+/// requires: x == i8::MIN
+/// ensures: ret == -1
+pub fn signum_of_min_is_minus_one(x: i8) -> i8 {
+    x.signum()
+}
+
+/// The tripwire: `signum` is not `x / |x|` rounded toward zero, so it is not `0`
+/// for a negative input. A model that answered `0` for every negative value, or
+/// that read the sign unsigned, would prove it.
+/// requires: x == -5
+/// ensures: ret == 0
+pub fn signum_of_a_negative_cannot_prove_this(x: i8) -> i8 {
+    x.signum()
+}
+
+/// `div_euclid` rounds the quotient so the remainder is non-negative, which is
+/// what separates it from `/` for a negative dividend. `-7 / 3` is `-2` (the
+/// truncating quotient) but `-7.div_euclid(3)` is `-3`.
+/// requires: true
+/// ensures: ret == -3
+pub fn div_euclid_rounds_toward_negative_infinity() -> i32 {
+    (-7i32).div_euclid(3)
+}
+
+/// The tripwire: `div_euclid` is *not* the truncating `/` for a negative dividend.
+/// A model that used `/` would prove this.
+/// requires: true
+/// ensures: ret == -2
+pub fn div_euclid_is_not_truncating_division_cannot_prove_this() -> i32 {
+    (-7i32).div_euclid(3)
+}
+
+/// `rem_euclid` returns a *non-negative* remainder, unlike `%`: `-7 % 3` is `-1`,
+/// but `-7.rem_euclid(3)` is `2`.
+/// requires: true
+/// ensures: ret == 2
+pub fn rem_euclid_is_non_negative() -> i32 {
+    (-7i32).rem_euclid(3)
+}
+
+/// The tripwire: `rem_euclid` is not `%` for a negative dividend. A model that
+/// used `%` would prove this.
+/// requires: true
+/// ensures: ret == -1
+pub fn rem_euclid_is_not_the_truncating_remainder_cannot_prove_this() -> i32 {
+    (-7i32).rem_euclid(3)
+}
+
+/// `div_ceil` rounds toward positive infinity: `7 / 2` is `3` with a remainder,
+/// so `7u32.div_ceil(2)` is `4`. It is the unsigned, *stable* counterpart of
+/// `div_euclid` rounding, and it is modelled only on the unsigned types.
+/// requires: true
+/// ensures: ret == 4
+pub fn div_ceil_rounds_toward_positive_infinity() -> u32 {
+    7u32.div_ceil(2)
+}
+
+/// The tripwire: `div_ceil` is not the truncating `/`, so it is not `3` here. A
+/// model that used `/` would prove it.
+/// requires: true
+/// ensures: ret == 3
+pub fn div_ceil_is_not_truncating_division_cannot_prove_this() -> u32 {
+    7u32.div_ceil(2)
+}
+
+/// `reverse_bits` reverses the bit order: `0b1000_0000` (`128`) becomes `1`. A
+/// model that returned the operand unchanged, or applied a rotation, would fail.
+/// requires: true
+/// ensures: ret == 1
+pub fn reverse_bits_of_the_top_bit() -> u8 {
+    0x80u8.reverse_bits()
+}
+
+/// The tripwire: `reverse_bits` is not a byte swap on a single-byte type (both
+/// are the identity there), so this pins that the *bits* are reversed at all. A
+/// model that returned the operand unchanged would prove it.
+/// requires: true
+/// ensures: ret == 0x80
+pub fn reverse_bits_is_not_the_identity_cannot_prove_this() -> u8 {
+    0x80u8.reverse_bits()
+}
+
+/// `swap_bytes` reverses the *bytes*: `0x1234u16.swap_bytes()` is `0x3412`. This
+/// is the multi-byte case, which the rotation model has to get right (a rotation
+/// by `w/2` bits, not by `w/2 * 8`).
+/// requires: true
+/// ensures: ret == 0x3412
+pub fn swap_bytes_reverses_the_bytes() -> u16 {
+    0x1234u16.swap_bytes()
+}
+
+/// The tripwire: `swap_bytes` is not the identity on a multi-byte type. A model
+/// that returned the operand unchanged (or that took the rotation amount at the
+/// wrong width) would prove this.
+/// requires: true
+/// ensures: ret == 0x1234
+pub fn swap_bytes_is_not_the_identity_cannot_prove_this() -> u16 {
+    0x1234u16.swap_bytes()
+}
+
+/// `to_be` on a little-endian target is a byte swap; the model reads the target
+/// endianness from the compilation rather than guessing. This is the shape a
+/// plain `#[cfg]`-free body has, and the value is Rust's own `to_be`.
+/// requires: true
+/// ensures: ret == 0x3412
+pub fn to_be_on_a_little_endian_target_swaps() -> u16 {
+    0x1234u16.to_be()
+}
+
+/// The tripwire: on a little-endian target `to_be` is *not* the identity. A model
+/// that read the target as big-endian would prove this.
+/// requires: true
+/// ensures: ret == 0x1234
+pub fn to_be_is_not_the_identity_here_cannot_prove_this() -> u16 {
+    0x1234u16.to_be()
+}
+
+/// `to_le` on a little-endian target is the identity (the value is already in
+/// little-endian order), which is the mirror of `to_be` above.
+/// requires: true
+/// ensures: ret == 0x1234
+pub fn to_le_on_a_little_endian_target_is_the_identity() -> u16 {
+    0x1234u16.to_le()
+}
+
+/// `to_ascii_uppercase` maps `b'a'..=b'z'` to their uppercase letters and leaves
+/// every other byte alone. This is the boundary: `b'a'` becomes `b'A'`. The
+/// receiver is an *argument* rather than a literal, because a literal receiver
+/// lowers to a promoted `const` reference (`const f::promoted[0]: &u8`), which is
+/// a separate shape the frontend does not model; the argument form is the one a
+/// contract can pin.
+/// requires: b == 97
+/// ensures: ret == 65
+pub fn to_ascii_uppercase_of_a_lowercase_letter(b: u8) -> u8 {
+    b.to_ascii_uppercase()
+}
+
+/// The tripwire: a byte outside the lowercase range is unchanged, so `b'A'`
+/// (already uppercase) stays `b'A'` -- a model that added `32` unconditionally
+/// would prove the wrong value here.
+/// requires: b == 65
+/// ensures: ret == 97
+pub fn to_ascii_uppercase_leaves_uppercase_cannot_prove_this(b: u8) -> u8 {
+    b.to_ascii_uppercase()
+}
+
+/// `to_ascii_lowercase` is the mirror of the uppercase conversion.
+/// requires: b == 65
+/// ensures: ret == 97
+pub fn to_ascii_lowercase_of_an_uppercase_letter(b: u8) -> u8 {
+    b.to_ascii_lowercase()
+}
+
+/// `is_multiple_of` is `a % b == 0`, with `b == 0` defined as `a == 0`. This pins
+/// the ordinary true case.
+/// requires: true
+/// ensures: ret == true
+pub fn is_multiple_of_six_by_three() -> bool {
+    6u32.is_multiple_of(3)
+}
+
+/// The tripwire: seven is not a multiple of three, so a model that answered
+/// `true` unconditionally would prove it.
+/// requires: true
+/// ensures: ret == true
+pub fn is_multiple_of_seven_by_three_cannot_prove_this() -> bool {
+    7u32.is_multiple_of(3)
+}
+
+/// The `b == 0` corner, which `core` defines as `a == 0`: `0.is_multiple_of(0)`
+/// is `true`. A model that read `a % 0` without the `b != 0` guard would take the
+/// engine's defined `urem(a, 0)` value and could answer `false`.
+/// requires: true
+/// ensures: ret == true
+pub fn is_multiple_of_zero_by_zero() -> bool {
+    0u32.is_multiple_of(0)
+}
+
+/// The complement of the zero corner: `5.is_multiple_of(0)` is `false`, because
+/// `core` defines it as `a == 0` and `a` is not zero. A model that answered `true`
+/// for every zero divisor would prove this.
+/// requires: true
+/// ensures: ret == false
+pub fn is_multiple_of_five_by_zero() -> bool {
+    5u32.is_multiple_of(0)
+}
+
 /// A guard whose destructor is empty. Its `drop` has a body in the dump, so the
 /// executor runs it; because it touches nothing, the function decides instead of
 /// reporting an unmodelled `drop`.

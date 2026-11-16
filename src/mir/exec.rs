@@ -5318,17 +5318,22 @@ fn try_intrinsic(
     if let intrinsics::Intrinsic::FromResidual = op {
         return Some(from_residual(name, args, dest, env).map(|()| Vec::new()));
     }
-    // The ASCII class tests take `&self`, so the operand is a reference whose
-    // *referent* is the byte. rustc prints `_3 = &_1; is_ascii_digit(move _3)`,
-    // and the width and the value both have to come from `_1`, not from the `&u8`
-    // local (which is a pointer with no bit-vector meaning). Only this shape needs
-    // the step: every other modelled method takes `self` by value.
-    let ascii_ref = matches!(op, intrinsics::Intrinsic::Bool(intrinsics::BoolKind::Ascii(_)))
-        .then(|| match first {
-            Operand::Copy(p) | Operand::Move(p) => Some(env.pointee(p)),
-            Operand::Const(_) => None,
-        })
-        .flatten();
+    // The ASCII class tests and the ASCII case conversions take `&self`, so the
+    // operand is a reference whose *referent* is the byte. rustc prints `_3 = &_1;
+    // is_ascii_digit(move _3)`, and the width and the value both have to come from
+    // `_1`, not from the `&u8` local (which is a pointer with no bit-vector
+    // meaning). Only these shapes need the step: every other modelled method takes
+    // `self` by value.
+    let ascii_ref = matches!(
+        op,
+        intrinsics::Intrinsic::Bool(intrinsics::BoolKind::Ascii(_))
+            | intrinsics::Intrinsic::AsciiCase(_)
+    )
+    .then(|| match first {
+        Operand::Copy(p) | Operand::Move(p) => Some(env.pointee(p)),
+        Operand::Const(_) => None,
+    })
+    .flatten();
     let w = match &ascii_ref {
         Some(p) => width_of(cur, p),
         None => operand_width(cur, first),
@@ -5370,7 +5375,12 @@ fn try_intrinsic(
         let signed = match op {
             intrinsics::Intrinsic::Unary(..)
             | intrinsics::Intrinsic::Bool(_)
-            | intrinsics::Intrinsic::Abs => sign.known()?,
+            | intrinsics::Intrinsic::Abs
+            | intrinsics::Intrinsic::Signum
+            | intrinsics::Intrinsic::BitReverse
+            | intrinsics::Intrinsic::ByteSwap
+            | intrinsics::Intrinsic::ByteOrder(_)
+            | intrinsics::Intrinsic::AsciiCase(_) => sign.known()?,
             _ => false,
         };
         // A bit count returns a type wider than its operand (`u8` -> `u32`), so
@@ -5561,11 +5571,24 @@ fn try_intrinsic(
             env.set(&field(0), Val::Sym(value, sign));
             env.set(&field(1), Val::Bool(overflowed));
         }
-        // A `bool` predicate is unary, so it never reaches the two-operand path.
-        Outcome::Bool(_) => unreachable!("a bool predicate is unary"),
-        // The value-or-panic shapes (`abs`, `clamp`) are handled before this path.
-        Outcome::ValueOrPanic { .. } => {
-            unreachable!("a value-or-panic outcome is not a two-operand family")
+        // A `bool` predicate: `is_power_of_two` and the ASCII classes are unary,
+        // but `is_multiple_of` reads two operands, so it reaches *this* path and
+        // its predicate is written as a `Val::Bool` -- the same value the `if`
+        // that consumes it branches on.
+        Outcome::Bool(p) => env.set(dest, Val::Bool(p)),
+        // The Euclidean pair and `div_ceil`: their *value* is written
+        // unconditionally, and the divide-by-zero (or `MIN / -1`) panic is a
+        // reachable-failure obligation, the same polarity as `abs`'s overflow --
+        // the call is safe exactly where `path ∧ fails` is unsatisfiable. Without
+        // this arm a `div_euclid(x, 0)` would be written as a plain value with no
+        // panic reported, which is exactly the hidden panic the model must not
+        // introduce.
+        Outcome::ValueOrPanic { value, fails } => {
+            env.set(dest, Val::Sym(value, sign));
+            return Some(Ok(vec![Obligation {
+                kind: ObligationKind::Panic { message: format!("`{name}` division overflow") },
+                verdict: find_obligation(smt::and(path, fails), pins),
+            }]));
         }
     }
     Some(Ok(Vec::new()))
