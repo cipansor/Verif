@@ -541,6 +541,16 @@ with no new false proof while the independent corpus keeps growing.
     exhaustively against `core`'s own `checked_ilog2`/`checked_ilog10` over the
     whole `u8`/`i8` domain, tag and payload together
     (`the_checked_logs_agree_with_rust`).
+  - Progress (cont.): `iN::cast_unsigned`/`uN::cast_signed` are modelled. The
+    value is the operand unchanged — a same-width signedness cast is a
+    re-interpretation, not a conversion — so the model carries only the *type*:
+    it is the one shape whose result sign is the *opposite* of the operand's, and
+    the executor reads it from the call's destination type rather than deriving it
+    from the operand. Five fixtures (three true, two tripwires) in `realistic.rs`
+    (**546 of 1006**), pinned by
+    `the_next_core_value_methods_are_modelled_with_their_tripwires`; the value is
+    checked exhaustively against Rust's own methods over the whole `u8`/`i8`
+    domain (`the_signedness_casts_agree_with_rust`).
   - Remaining: the *generic* `<[T]>::first/get/len/is_empty` (`first_or<T>`) need
     monomorphisation, which is C10: `first_or`'s element type has no width and its
     slice length is never seeded (the frontend refuses a receiver whose length it

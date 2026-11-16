@@ -462,6 +462,17 @@ pub enum Intrinsic {
     /// `abs` cannot represent -- so `unsigned_abs` is total where `abs` panics.
     /// Signed-only, like `abs`.
     UnsignedAbs,
+    /// `iN::cast_unsigned` / `uN::cast_signed`: reinterpret the same `w` bits at
+    /// the opposite signedness.
+    ///
+    /// The *value* is the operand unchanged -- a cast between same-width
+    /// signednesses is a re-interpretation, not a conversion -- so the model
+    /// carries only the resulting *type*, which is what a later comparison or
+    /// division reads. It is the one shape whose result signedness is the
+    /// *opposite* of the operand's, so it cannot be folded into the "result has
+    /// the operand's sign" rule the rest of `eval` follows. Total, and the same
+    /// width as the operand (`i32::cast_unsigned` is `u32`).
+    SignednessCast,
     /// The inherent `Ord::clamp`: `x.clamp(lo, hi)`.
     ///
     /// Three operands, so it does not fit `eval`'s two-operand signature and is
@@ -906,6 +917,7 @@ impl Intrinsic {
                 )
                 | Intrinsic::Abs
                 | Intrinsic::UnsignedAbs
+                | Intrinsic::SignednessCast
                 | Intrinsic::Signum
                 | Intrinsic::NextPowerOfTwo
                 | Intrinsic::CheckedNextPowerOfTwo
@@ -1186,6 +1198,13 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     // signednesses and are pure bit/byte moves.
     if short == "signum" {
         return Some(Intrinsic::Signum);
+    }
+    // The same-width signedness re-interpretation: `i32::cast_unsigned` is `u32`
+    // and `u32::cast_signed` is `i32`. The value is the operand unchanged, so the
+    // model only has to carry the *type*; matched by their exact names so no
+    // prefix split can mistake them.
+    if short == "cast_unsigned" || short == "cast_signed" {
+        return Some(Intrinsic::SignednessCast);
     }
     if short == "div_euclid" {
         return Some(Intrinsic::DivEuclid);
@@ -1649,6 +1668,10 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // signed value), but unlike `abs` it is *total*: the magnitude at `MIN`
         // fits the unsigned result, so there is no failure predicate.
         Intrinsic::UnsignedAbs => signed,
+        // The signedness re-interpretation exists on both signednesses (it is the
+        // cast *between* them) and is total at any width the engine holds. A sign
+        // that could not be read is refused like every other sign-reading shape.
+        Intrinsic::SignednessCast => true,
         // `Ord::clamp`. It has a value at every input, and the one panic
         // (`lo > hi`) is a failure predicate the executor discharges. Modelled on
         // both signednesses: the comparisons are the type's own, which the model
@@ -2000,6 +2023,17 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
                 return None;
             }
             Outcome::Value(smt::truncate(unary_result(UnOp::Abs, x, w), result_w))
+        }
+        // The same-width signedness re-interpretation: the value is the operand
+        // unchanged, and only the *result type* differs -- which the executor
+        // reads from the call's destination type, not from this term. So the model
+        // returns the operand at the destination width (a same-width cast is the
+        // identity; `result_w == w` for every real call).
+        Intrinsic::SignednessCast => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            Outcome::Value(smt::truncate(x, result_w))
         }
         // `abs_diff`: `|x - y|`, computed at one bit of headroom so the
         // subtraction cannot wrap, then narrowed back. The result is the *unsigned*
@@ -5885,6 +5919,35 @@ mod tests {
         );
     }
 
+    /// `cast_unsigned`/`cast_signed` agree with Rust over the whole `i8`/`u8`
+    /// domain.
+    ///
+    /// The value is the operand unchanged -- the cast is a *re-interpretation*, not
+    /// a conversion -- so the oracle is Rust's own method, and a model that
+    /// sign-extended, zero-extended or negated would disagree at the boundary
+    /// values (`-1` and `MIN`) this walk reaches.
+    #[test]
+    fn the_signedness_casts_agree_with_rust() {
+        // `i8::cast_unsigned` reinterprets the same bits as `u8`.
+        check_unary(
+            Intrinsic::SignednessCast,
+            8,
+            8,
+            true,
+            |xb| u64::from(signed_of(xb, 8).cast_unsigned() as u8),
+            "i8::cast_unsigned",
+        );
+        // `u8::cast_signed` reinterprets the same bits as `i8`.
+        check_unary(
+            Intrinsic::SignednessCast,
+            8,
+            8,
+            false,
+            |xb| (u8::try_from(xb).unwrap().cast_signed() as u8) as u64,
+            "u8::cast_signed",
+        );
+    }
+
     /// The Euclidean pair and `div_ceil` agree with Rust's value everywhere the
     /// call is defined, and their panic predicate fires exactly where it panics.
     ///
@@ -6428,6 +6491,14 @@ mod tests {
     #[test]
     fn the_new_value_names_classify_and_their_neighbours_do_not() {
         assert_eq!(classify("core::num::<impl i32>::signum"), Some(Intrinsic::Signum));
+        assert_eq!(
+            classify("core::num::<impl i32>::cast_unsigned"),
+            Some(Intrinsic::SignednessCast)
+        );
+        assert_eq!(
+            classify("core::num::<impl u32>::cast_signed"),
+            Some(Intrinsic::SignednessCast)
+        );
         assert_eq!(classify("core::num::<impl i32>::div_euclid"), Some(Intrinsic::DivEuclid));
         assert_eq!(classify("core::num::<impl i32>::rem_euclid"), Some(Intrinsic::RemEuclid));
         assert_eq!(classify("core::num::<impl u32>::div_ceil"), Some(Intrinsic::DivCeil));

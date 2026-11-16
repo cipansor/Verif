@@ -5377,6 +5377,7 @@ fn try_intrinsic(
             | intrinsics::Intrinsic::Bool(_)
             | intrinsics::Intrinsic::Abs
             | intrinsics::Intrinsic::UnsignedAbs
+            | intrinsics::Intrinsic::SignednessCast
             | intrinsics::Intrinsic::Signum
             | intrinsics::Intrinsic::Ilog(_)
             | intrinsics::Intrinsic::CheckedIlog(_)
@@ -5411,6 +5412,15 @@ fn try_intrinsic(
                 // for.
                 let sign = match op {
                     intrinsics::Intrinsic::UnsignedAbs => Sign::Unsigned,
+                    // The signedness re-interpretation's result type is the
+                    // *opposite* of the operand's, so it is read from the call's
+                    // destination rather than derived from the operand. A
+                    // destination with no readable type is refused (the shape is
+                    // sign-reading for exactly this reason).
+                    intrinsics::Intrinsic::SignednessCast => match type_of_place(cur, dest) {
+                        Some(ty) => Sign::of(&ty),
+                        None => return Some(Err(format!("unmodelled destination of `{name}`"))),
+                    },
                     _ => Sign::of_bool(signed),
                 };
                 env.set(dest, Val::Sym(v, sign));

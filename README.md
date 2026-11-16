@@ -2109,7 +2109,12 @@ refused. `src/mir/intrinsics.rs` holds the model:
 - The remaining total `core` value methods are modelled as plain values, each
   checked exhaustively against Rust's own method over the whole `u8`/`i8` domain:
   `signum` (`-1`/`0`/`1`, signed-only, so `i8::MIN`'s top bit is read as a sign
-  rather than the largest unsigned byte); `reverse_bits` (a shift-OR fold, both
+  rather than the largest unsigned byte); `cast_unsigned`/`cast_signed` (the
+  same-width signedness re-interpretation: the value is the operand *unchanged*,
+  and only the result *type* differs, so it is the one shape whose result sign is
+  the opposite of the operand's — read from the call's destination type, not
+  derived from the operand, which is what a later comparison or division then
+  consults); `reverse_bits` (a shift-OR fold, both
   signednesses); `swap_bytes` (a rotation by `w/2` bits — the byte reversal, not a
   rotation by `w/2 * 8`); `to_be`/`to_le` (a byte swap or the identity according to
   the *target's* endianness, read from `cfg!(target_endian)` rather than guessed;

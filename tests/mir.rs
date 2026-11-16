@@ -10779,6 +10779,11 @@ fn the_next_core_value_methods_are_modelled_with_their_tripwires() {
     let names = [
         "signum_of_min_is_minus_one",
         "signum_of_a_negative_cannot_prove_this",
+        "cast_unsigned_reinterprets_negative_as_large",
+        "cast_unsigned_reinterprets_negative_cannot_prove_this",
+        "cast_signed_reinterprets_large_as_negative",
+        "cast_signed_reinterprets_large_cannot_prove_this",
+        "cast_unsigned_makes_a_comparison_unsigned",
         "div_euclid_rounds_toward_negative_infinity",
         "div_euclid_is_not_truncating_division_cannot_prove_this",
         "rem_euclid_is_non_negative",
@@ -10804,6 +10809,9 @@ fn the_next_core_value_methods_are_modelled_with_their_tripwires() {
 
     for name in [
         "signum_of_min_is_minus_one",
+        "cast_unsigned_reinterprets_negative_as_large",
+        "cast_signed_reinterprets_large_as_negative",
+        "cast_unsigned_makes_a_comparison_unsigned",
         "div_euclid_rounds_toward_negative_infinity",
         "rem_euclid_is_non_negative",
         "div_ceil_rounds_toward_positive_infinity",
@@ -10823,6 +10831,8 @@ fn the_next_core_value_methods_are_modelled_with_their_tripwires() {
 
     for name in [
         "signum_of_a_negative_cannot_prove_this",
+        "cast_unsigned_reinterprets_negative_cannot_prove_this",
+        "cast_signed_reinterprets_large_cannot_prove_this",
         "div_euclid_is_not_truncating_division_cannot_prove_this",
         "rem_euclid_is_not_the_truncating_remainder_cannot_prove_this",
         "div_ceil_is_not_truncating_division_cannot_prove_this",

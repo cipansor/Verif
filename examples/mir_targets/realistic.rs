@@ -10491,6 +10491,49 @@ pub fn signum_of_a_negative_cannot_prove_this(x: i8) -> i8 {
     x.signum()
 }
 
+/// `i32::cast_unsigned` reinterprets the same 32 bits as `u32`: `-1i32` is
+/// `0xffff_ffff`, which reads as `4294967295u32`, not `-1`.
+/// requires: x == -1
+/// ensures: ret == 4294967295
+pub fn cast_unsigned_reinterprets_negative_as_large(x: i32) -> u32 {
+    x.cast_unsigned()
+}
+
+/// The false direction: an unsigned reading of `-1i32` is `4294967295`, so a
+/// model that carried the operand's *signed* type would prove this.
+/// requires: x == -1
+/// ensures: ret == 0
+pub fn cast_unsigned_reinterprets_negative_cannot_prove_this(x: i32) -> u32 {
+    x.cast_unsigned()
+}
+
+/// `u32::cast_signed` reinterprets `0xffff_ffff` as `-1i32`.
+/// requires: x == 4294967295
+/// ensures: ret == -1
+pub fn cast_signed_reinterprets_large_as_negative(x: u32) -> i32 {
+    x.cast_signed()
+}
+
+/// The false direction: a model that kept the *unsigned* type would read
+/// `4294967295` and prove this.
+/// requires: x == 4294967295
+/// ensures: ret == 0
+pub fn cast_signed_reinterprets_large_cannot_prove_this(x: u32) -> i32 {
+    x.cast_signed()
+}
+
+/// The type the cast produces is what a *later* comparison reads: `-1i32` cast
+/// to `u32` is greater than `0` unsigned, where the signed `-1` is not.
+/// requires: x == -1
+/// ensures: ret == 1
+pub fn cast_unsigned_makes_a_comparison_unsigned(x: i32) -> u8 {
+    if x.cast_unsigned() > 0 {
+        1
+    } else {
+        0
+    }
+}
+
 /// `div_euclid` rounds the quotient so the remainder is non-negative, which is
 /// what separates it from `/` for a negative dividend. `-7 / 3` is `-2` (the
 /// truncating quotient) but `-7.div_euclid(3)` is `-3`.
