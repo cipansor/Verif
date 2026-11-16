@@ -117,22 +117,24 @@ updates its status there.
 
 ## Installation
 
-```console
-$ cargo add verif
-```
-
-Or, in `Cargo.toml`:
+> **Not on crates.io yet.** The two crates are packaged and release-ready
+> (`scripts/publish.py`, a tag-driven release workflow), but the registry upload is
+> a human step that has not run, so a `cargo add` of the crate would fail. Depend on
+> the git repository until it is published:
 
 ```toml
 [dependencies]
-verif = "0.1"
+verif = { git = "https://github.com/cipansor/verif", tag = "verif-v0.1.0" }
 
 # The host-side tools (the MIR frontend, the file-backed helpers) need `std`.
 # The engine itself does not: the default build is `no_std` and links `core`
 # and nothing else, which is what a bare-metal safety build wants.
 [dev-dependencies]
-verif = { version = "0.1", features = ["std"] }
+verif = { git = "https://github.com/cipansor/verif", tag = "verif-v0.1.0", features = ["std"] }
 ```
+
+Once the crates are published, the same dependencies read `verif = "0.1"` and
+`verif = { version = "0.1", features = ["std"] }`.
 
 The crate has **no dependencies**, so there is nothing else to add and nothing
 from crates.io in your artifact's supply chain. The proved integer primitives

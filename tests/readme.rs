@@ -20,3 +20,35 @@ fn readme_flagship_example_proves_a_bound() {
     });
     assert!(proved);
 }
+
+/// The Installation section must not tell a reader to run a command that fails.
+///
+/// The crates are packaged and release-ready but not on crates.io (the registry
+/// answers "does not exist"), so the README depends on the git repository by tag
+/// and says so. This pins the *shape* of that instruction: it must be a git
+/// dependency and must carry the "not on crates.io" note. When the crates are
+/// published, this test is the deliberate edit that flips it -- the failure is the
+/// reminder, not a surprise.
+#[test]
+fn readme_install_is_a_git_dependency_until_published() {
+    let readme = include_str!("../README.md");
+    let install = readme
+        .split("## Installation")
+        .nth(1)
+        .expect("README must have an Installation section")
+        .split("\n## ")
+        .next()
+        .expect("the Installation section must end at the next heading");
+    assert!(
+        install.contains("Not on crates.io yet"),
+        "Installation must say the crates are not published; got:\n{install}"
+    );
+    assert!(
+        install.contains("git = \"https://github.com/cipansor/verif\""),
+        "Installation must point at the git repository until the crates are published"
+    );
+    assert!(
+        !install.contains("cargo add verif"),
+        "Installation must not advertise `cargo add verif` while the crate is unpublished"
+    );
+}
