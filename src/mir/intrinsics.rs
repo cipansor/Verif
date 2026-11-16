@@ -1625,12 +1625,14 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // `signum` exists only on the *signed* types, so an unsigned receiver is
         // not this method. Total.
         Intrinsic::Signum => signed,
-        // The Euclidean pair exist only on the *signed* types (the unsigned
-        // spelling is the plain `/` and `%`), and their value is built from the
-        // signed divider, so the width is bounded like `checked_div`'s. The panics
-        // (a zero divisor, `MIN / -1`) are the plain `/` obligations the executor
-        // already emits from the operands, not part of the value.
-        Intrinsic::DivEuclid | Intrinsic::RemEuclid => signed && w <= DIV_MAX_WIDTH,
+        // The Euclidean pair exist on both signednesses: on the *signed* types
+        // the value is built from the signed divider (the adjustment is what makes
+        // it Euclidean), and on the *unsigned* types the remainder is never
+        // negative so the Euclidean and truncating forms coincide -- the plain
+        // unsigned divider. Either way the width is bounded like `checked_div`'s.
+        // The panics (a zero divisor, `MIN / -1` signed) are the plain `/`
+        // obligations the executor already emits from the operands.
+        Intrinsic::DivEuclid | Intrinsic::RemEuclid => w <= DIV_MAX_WIDTH,
         // `div_ceil` is a *total* method on the unsigned types; the signed one is
         // unstable, so a signed receiver is refused. Bounded like a division.
         Intrinsic::DivCeil => !signed && w <= DIV_MAX_WIDTH,
@@ -2124,22 +2126,36 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         // The *value* is built from the signed divider; the panics (`b == 0`,
         // `MIN / -1`) are exactly the plain `/` failure predicate, so they are
         // reported the same way `abs`'s overflow is -- a reachable-failure
-        // obligation -- rather than silently assumed away.
+        // obligation -- rather than silently assumed away. On an *unsigned*
+        // receiver the remainder is never negative, so the Euclidean quotient is
+        // the truncating one -- the plain unsigned divider, whose only panic is a
+        // zero divisor.
         Intrinsic::DivEuclid => {
             if result_w == 0 || result_w > 64 {
                 return None;
             }
             let fails = failure(BinOp::Div, x, y, w, signed)?;
-            Outcome::ValueOrPanic { value: smt::truncate(div_euclid_value(x, y, w), result_w), fails }
+            let value = if signed {
+                div_euclid_value(x, y, w)
+            } else {
+                smt::udiv(x, y)
+            };
+            Outcome::ValueOrPanic { value: smt::truncate(value, result_w), fails }
         }
         // `rem_euclid`: `r = a % b`, adjusted by `+ |b|` when negative. Same
-        // totality note as `div_euclid`.
+        // totality note as `div_euclid`, and on an unsigned receiver the remainder
+        // is already in `0..|b|`, so it is the plain unsigned remainder.
         Intrinsic::RemEuclid => {
             if result_w == 0 || result_w > 64 {
                 return None;
             }
             let fails = failure(BinOp::Rem, x, y, w, signed)?;
-            Outcome::ValueOrPanic { value: smt::truncate(rem_euclid_value(x, y, w), result_w), fails }
+            let value = if signed {
+                rem_euclid_value(x, y, w)
+            } else {
+                smt::urem(x, y)
+            };
+            Outcome::ValueOrPanic { value: smt::truncate(value, result_w), fails }
         }
         // `div_ceil`: `q = a / b` rounded up when the remainder is nonzero.
         // Unsigned-only, so the plain unsigned divider is exact and the only panic
@@ -6053,6 +6069,29 @@ mod tests {
             |_, y| y == 0,
             "u8::div_ceil",
         );
+        // The unsigned Euclidean pair: the remainder is never negative, so the
+        // Euclidean and truncating forms coincide, and the only panic is a zero
+        // divisor. The oracle is Rust's own `div_euclid`/`rem_euclid` on `u8`,
+        // which is the plain `/`/`%` there -- so a model that kept the signed
+        // adjustment would disagree at every pair with a "negative" bit pattern.
+        check_value_or_panic_binary(
+            Intrinsic::DivEuclid,
+            8,
+            false,
+            unident,
+            |x, y| i64::from((x as u8).div_euclid(y as u8)),
+            |_, y| y == 0,
+            "u8::div_euclid",
+        );
+        check_value_or_panic_binary(
+            Intrinsic::RemEuclid,
+            8,
+            false,
+            unident,
+            |x, y| i64::from((x as u8).rem_euclid(y as u8)),
+            |_, y| y == 0,
+            "u8::rem_euclid",
+        );
     }
 
     /// `midpoint` agrees with Rust's own method over the whole domain, on both
@@ -6622,9 +6661,9 @@ mod tests {
             assert!(is_modelled(Intrinsic::Signum, w, true), "iN::signum exists");
             assert!(!is_modelled(Intrinsic::Signum, w, false), "uN::signum does not exist");
             assert!(is_modelled(Intrinsic::DivEuclid, w, true));
-            assert!(!is_modelled(Intrinsic::DivEuclid, w, false));
+            assert!(is_modelled(Intrinsic::DivEuclid, w, false));
             assert!(is_modelled(Intrinsic::RemEuclid, w, true));
-            assert!(!is_modelled(Intrinsic::RemEuclid, w, false));
+            assert!(is_modelled(Intrinsic::RemEuclid, w, false));
             assert!(is_modelled(Intrinsic::DivCeil, w, false));
             assert!(!is_modelled(Intrinsic::DivCeil, w, true));
             assert!(is_modelled(Intrinsic::Bool(BoolKind::MultipleOf), w, false));

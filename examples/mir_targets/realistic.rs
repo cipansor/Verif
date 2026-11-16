@@ -10607,6 +10607,41 @@ pub fn rem_euclid_is_not_the_truncating_remainder_cannot_prove_this() -> i32 {
     (-7i32).rem_euclid(3)
 }
 
+/// On an *unsigned* receiver the remainder is never negative, so `rem_euclid` is
+/// the plain `%` and `7u32.rem_euclid(3)` is `1`. This pins that the model does
+/// not apply the signed adjustment where the sign cannot be negative.
+/// requires: true
+/// ensures: ret == 1
+pub fn unsigned_rem_euclid_is_the_plain_remainder() -> u32 {
+    7u32.rem_euclid(3)
+}
+
+/// The tripwire: on an unsigned receiver `rem_euclid` is not `% + 3` (the signed
+/// adjustment). A model that kept the signed path for an unsigned operand would
+/// compute `1 + 3 == 4` here.
+/// requires: true
+/// ensures: ret == 4
+pub fn unsigned_rem_euclid_is_not_the_signed_adjustment_cannot_prove_this() -> u32 {
+    7u32.rem_euclid(3)
+}
+
+/// On an unsigned receiver `div_euclid` is the truncating `/`: `7u32.div_euclid(3)`
+/// is `2`.
+/// requires: true
+/// ensures: ret == 2
+pub fn unsigned_div_euclid_is_the_plain_quotient() -> u32 {
+    7u32.div_euclid(3)
+}
+
+/// The tripwire: on an unsigned receiver `div_euclid` is not the signed
+/// Euclidean quotient (which would subtract one where the signed remainder was
+/// negative, a case that cannot arise for an unsigned operand).
+/// requires: true
+/// ensures: ret == 1
+pub fn unsigned_div_euclid_is_not_the_signed_adjustment_cannot_prove_this() -> u32 {
+    7u32.div_euclid(3)
+}
+
 /// `div_ceil` rounds toward positive infinity: `7 / 2` is `3` with a remainder,
 /// so `7u32.div_ceil(2)` is `4`. It is the unsigned, *stable* counterpart of
 /// `div_euclid` rounding, and it is modelled only on the unsigned types.

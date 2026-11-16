@@ -13,13 +13,13 @@ five fields, so "is this done?" is a check rather than an opinion:
 
 A PR that closes an item updates its status here in the same PR.
 
-The starting numbers, measured on the branch that created this file, are the
-baseline every item is scored against:
+The corpus scoreboard, re-measured on this branch. Each row is a command whose
+output decides the number, so the table is a measurement rather than a claim:
 
 | Corpus | Command | Verified / decided |
 |---|---|---|
 | `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 18 / 33 |
-| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 434 / 806 |
+| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 551 / 1015 |
 | `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **16 / 21 (76%)** |
 
 `everyday.rs` is the honest one: ordinary Rust written by an external reviewer,
@@ -456,15 +456,19 @@ with no new false proof while the independent corpus keeps growing.
     `urem(x, 0)` is a *defined* value, not a hole, so the guard is what makes the
     corner exact). The `_bytes` byte-order forms return an array, not an integer, so
     they stay unmodelled rather than written as a word. `div_euclid`/`rem_euclid`
-    (signed) and `div_ceil` (unsigned) are the division shapes that are not the
-    truncating `/`/`%`; each is a *value-and-panic* pair, because each panics on a
-    zero divisor (`div_euclid`/`rem_euclid` also on `MIN / -1`), and modelling it as
+    and `div_ceil` (unsigned) are the division shapes that are not the truncating
+    `/`/`%`; each is a *value-and-panic* pair, because each panics on a zero
+    divisor (`div_euclid`/`rem_euclid` also on `MIN / -1`), and modelling it as
     total would hide a panic. The Euclidean quotient adjusts the *other* way from
     the truncating one when the remainder is negative (`-7.div_euclid(3)` is `-3`),
-    which the first cut got backwards and the differential test caught. All are
+    which the first cut got backwards and the differential test caught. On an
+    *unsigned* receiver the remainder is never negative, so the Euclidean and
+    truncating forms coincide and the model falls back to the plain unsigned
+    divider — the sign is the whole difference, so the unsigned spelling is now
+    modelled rather than refused. All are
     checked against Rust's own method over the whole `u8`/`i8` domain, with the
-    panic predicate compared at *every* input. Twenty-two fixtures (thirteen true,
-    nine tripwires) are in `realistic.rs` (**509 of 949**), pinned by
+    panic predicate compared at *every* input. Twenty-six fixtures (fifteen true,
+    eleven tripwires) are in `realistic.rs` (**553 of 1019**), pinned by
     `the_next_core_value_methods_are_modelled_with_their_tripwires` in
     `tests/mir.rs` and by `the_new_shapes_are_modelled_only_on_the_types_that_have_them`
     (the type-membership directions) in `src/mir/intrinsics.rs`.

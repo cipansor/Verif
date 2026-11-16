@@ -1120,8 +1120,8 @@ fn the_independent_corpus_does_not_regress() {
         .filter(|(_, o)| matches!(o, FnOutcome::Verified { .. }))
         .count();
     assert!(
-        verified >= 13,
-        "everyday.rs verified {verified} of {} functions, down from 13 (62%); a regression \
+        verified >= 16,
+        "everyday.rs verified {verified} of {} functions, down from 16 (76%); a regression \
          dropped coverage of ordinary Rust. Run: cargo run --features std --example \
          mir_coverage -- {EVERYDAY}",
         report.outcomes.len()
@@ -10833,6 +10833,10 @@ fn the_next_core_value_methods_are_modelled_with_their_tripwires() {
         "div_euclid_is_not_truncating_division_cannot_prove_this",
         "rem_euclid_is_non_negative",
         "rem_euclid_is_not_the_truncating_remainder_cannot_prove_this",
+        "unsigned_rem_euclid_is_the_plain_remainder",
+        "unsigned_rem_euclid_is_not_the_signed_adjustment_cannot_prove_this",
+        "unsigned_div_euclid_is_the_plain_quotient",
+        "unsigned_div_euclid_is_not_the_signed_adjustment_cannot_prove_this",
         "div_ceil_rounds_toward_positive_infinity",
         "div_ceil_is_not_truncating_division_cannot_prove_this",
         "reverse_bits_of_the_top_bit",
@@ -10864,6 +10868,8 @@ fn the_next_core_value_methods_are_modelled_with_their_tripwires() {
         "cast_unsigned_makes_a_comparison_unsigned",
         "div_euclid_rounds_toward_negative_infinity",
         "rem_euclid_is_non_negative",
+        "unsigned_rem_euclid_is_the_plain_remainder",
+        "unsigned_div_euclid_is_the_plain_quotient",
         "div_ceil_rounds_toward_positive_infinity",
         "reverse_bits_of_the_top_bit",
         "swap_bytes_reverses_the_bytes",
@@ -10888,6 +10894,8 @@ fn the_next_core_value_methods_are_modelled_with_their_tripwires() {
         "cast_signed_reinterprets_large_cannot_prove_this",
         "div_euclid_is_not_truncating_division_cannot_prove_this",
         "rem_euclid_is_not_the_truncating_remainder_cannot_prove_this",
+        "unsigned_rem_euclid_is_not_the_signed_adjustment_cannot_prove_this",
+        "unsigned_div_euclid_is_not_the_signed_adjustment_cannot_prove_this",
         "div_ceil_is_not_truncating_division_cannot_prove_this",
         "reverse_bits_is_not_the_identity_cannot_prove_this",
         "swap_bytes_is_not_the_identity_cannot_prove_this",
