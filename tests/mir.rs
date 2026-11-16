@@ -5707,6 +5707,65 @@ fn an_enum_return_contract_can_name_the_discriminant_methods() {
     );
 }
 
+/// An enum-returning function's contract can name a *payload*: `ret.Ok`,
+/// `ret.Some`, `ret.Err`, `ret.Data` (a user enum's variant).
+///
+/// A payload exists only on the variant's paths, so the clause naming it is
+/// *guarded on the discriminant* (`tag == disc => clause`) and is vacuous on the
+/// other variant. The true entries verify because the contract's `ret.Ok` and the
+/// body's `((_0 as Ok).0)` are one variable; the tripwires claim a value the
+/// payload cannot be, so a model that bound the payload to a fresh unconstrained
+/// variable (or dropped the guard) would prove them. The two refusals pin the
+/// boundary: a non-enum return and a unit variant have no payload to read.
+#[test]
+fn an_enum_return_contract_can_name_a_payload() {
+    let names = [
+        "ret_ok_payload",
+        "ret_ok_payload_tripwire",
+        "ret_some_payload",
+        "ret_some_payload_tripwire",
+        "ret_err_payload",
+        "ret_err_payload_tripwire",
+        "ret_payload_guarded_vacuous",
+        "ret_payload_guarded_vacuous_tripwire",
+        "ret_user_enum_payload",
+        "ret_user_enum_payload_tripwire",
+        "ret_payload_on_non_enum",
+        "ret_payload_on_unit_variant",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "ret_ok_payload",
+        "ret_some_payload",
+        "ret_err_payload",
+        "ret_payload_guarded_vacuous",
+        "ret_user_enum_payload",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "ret_ok_payload_tripwire",
+        "ret_some_payload_tripwire",
+        "ret_err_payload_tripwire",
+        "ret_payload_guarded_vacuous_tripwire",
+        "ret_user_enum_payload_tripwire",
+    ] {
+        assert_refuted(&report, name);
+    }
+    // The refusals: a non-enum return and a unit variant have no payload, so the
+    // contract is unreadable -- a skip, never a verdict against a fabricated value.
+    for name in ["ret_payload_on_non_enum", "ret_payload_on_unit_variant"] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Skipped { .. }),
+            "`{name}` must be refused (no such payload), got: {o}"
+        );
+    }
+}
+
 /// The `Option`↔`Result` conversions -- `Option::ok_or`, `Result::ok`,
 /// `Result::err` -- decide, and both the *tag* and the *payload* cross.
 ///

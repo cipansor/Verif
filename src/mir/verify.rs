@@ -762,13 +762,26 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         // word (the enum's discriminant type), which is the width the run passes.
         // The probe discards its result, so a throwaway variable is enough; it must
         // only be the right *width* for `eq_const` to be well-formed.
-        if let Some((ok, err)) = spec::enum_ret_discriminants(&f.ret_ty, &specs.enums) {
+        //
+        // The *payload* bindings (`ret.Ok`, `ret.Run`) are probed too, and they are
+        // gated on the enum layout rather than on the success/failure pair: a user
+        // enum with neither `Ok` nor `Some` has no `is_ok`, but its payloads are
+        // still meaningful.
+        if spec::ret_enum_def(&f.ret_ty, &specs.enums).is_some() {
             // A throwaway tag, above every slot the run will use so it cannot
             // collide with a live variable (see `probe_ret_enum_slot`). The probe
             // discards its result; it only has to be the right *width* for
             // `eq_const` to be well-formed.
             if let Some(tag) = probe_fields.probe_ret_enum_slot(USIZE_WIDTH) {
-                probe_fields.bind_ret_enum(tag, ok, err);
+                if let Some((ok, err)) = spec::enum_ret_discriminants(&f.ret_ty, &specs.enums) {
+                    probe_fields.bind_ret_enum(tag, ok, err);
+                }
+                // A contract naming a payload (`ret.Ok`, `ret.Some`, `ret.Err`,
+                // `ret.None`, `ret.Run`) binds a variable of the payload's own width
+                // and sign, guarded on the discriminant. The payload type comes from
+                // the enum's layout (`Result<u8, u8>` gives `Ok: u8`, `Err: u8`),
+                // which is the same table the run reads.
+                probe_fields.probe_ret_payloads(&f.ret_ty, &specs.enums, tag, &ensures);
             }
         }
         if let Some(err) = ensures.iter().find_map(|e| {
@@ -850,6 +863,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         let enum_ret = spec::enum_ret_discriminants(&f.ret_ty, &specs.enums);
         Some(move |ret: Option<smt::Var>,
                    projs: &[(u32, smt::Var)],
+                   ret_payloads: &[(u64, smt::Var)],
                    ref_final: &[(u32, smt::Var)]| {
             // A reference argument's name denotes the value the body left at the
             // target, so a bare `c` in the postcondition is bound to the *final*
@@ -888,8 +902,30 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             // read the tag the body produced. `ret` here is the tag variable the
             // executor passed (the return word for an enum-returning function), and
             // the discriminants are the same ones the body's `switchInt` compares.
-            if let (Some((ok, err)), Some(tag)) = (enum_ret, ret) {
-                fields.bind_ret_enum(tag, ok, err);
+            if let Some(tag) = ret {
+                // `ret.is_ok()`/`is_some()` need a success/failure pair, which only
+                // `Result`/`Option` and a user enum with `Ok`/`Some` have. A user
+                // enum with neither is refused those methods, but its *payloads*
+                // (`ret.Run`) are still bound below: a payload is meaningful
+                // whenever the layout names the variant, regardless of the
+                // success/failure reading.
+                if let Some((ok, err)) = enum_ret {
+                    fields.bind_ret_enum(tag, ok, err);
+                }
+                // The payloads a contract names (`ret.Ok`, `ret.Some`, `ret.Run`),
+                // each bound to the variable the executor holds for it and guarded
+                // on the discriminant. The payload values come from `ret_payloads`,
+                // keyed by the payload's *discriminant* -- the executor writes a
+                // downcast payload under the variant's own number, so the two agree
+                // by construction.
+                spec::bind_ret_payloads(
+                    &mut fields,
+                    &f.ret_ty,
+                    &specs.enums,
+                    tag,
+                    ret_payloads,
+                    &ensures,
+                );
             }
             // `ret` is `None` when the return value is an aggregate: there is no
             // single word to stand for it, and the parser refuses a bare `ret`

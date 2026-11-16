@@ -128,8 +128,11 @@ with no new false proof while the independent corpus keeps growing.
   - Who has it: Kani, Prusti, Creusot, Verus, SPARK (finalization).
   - Move: **build**.
 - **C2. `Option`/`Result` and `?`.** · P0 · in progress · Kani, Verus, Prusti, Creusot
-  - Gap: `unwrap`, `unwrap_or`, `expect`, `ok_or`, `map`, `is_some` and `?` are
-    unmodelled. Evidence: `checked_or_max`, `div_unwrap` incomplete.
+  - Gap: `?`, `map`/`map_err`/`and_then`/`unwrap_or_else` (closures) are
+    unmodelled; `unwrap`, `unwrap_or`, `expect`, `ok_or`/`ok`/`err`, `is_some`,
+    the enum-return discriminant methods and bare payload reads are modelled (see
+    the progress notes). Evidence: `checked_or_max` verified, `div_unwrap`
+    incomplete (the divider wall, not the `Option`).
   - Approach: the enum payload/discriminant model exists; add a **contract library
     for std/core** in the spirit of Prusti `#[extern_spec]` / Verus `vstd`, each
     spec differential-tested against the real implementation.
@@ -228,11 +231,29 @@ with no new false proof while the independent corpus keeps growing.
       fixtures plus a toolchain-free `spec` unit test
       (`a_grouped_or_negated_enum_method_is_a_predicate`).
     `realistic.rs` **457 of 850 -> 467 of 869** (11 verify, 11 refute).
-  - Remaining: `?` (the `Try` desugaring needs `From` on the error type),
-    `map`/`map_err`/`and_then`/`unwrap_or_else` (closures), and a bare payload read
-    on an enum *return* (`ret.Ok <= n` / `ret.Some <= n`). The last needs the
-    payload to cross the return boundary *guarded* on the discriminant (a payload
-    read is meaningful only on the variant's paths), which is the next sub-item.
+  - Progress (a bare payload read on an enum return): `ret.Ok`, `ret.Some`,
+    `ret.Err` and a *user* enum's variant (`ret.Data`) are modelled. A payload
+    exists only on the variant's paths, so the clause naming it is **guarded on
+    the discriminant** (`tag == disc => clause`): on the other variant's paths it is
+    vacuously true, which is the only meaningful reading. Binding the payload with
+    no guard would compare it on *every* path, against a value it does not have —
+    a wrong value, not a weaker proof. The guard is applied per top-level `&&`
+    conjunct (`Parser::guard_ret_payloads`), so `ret.Ok <= n && ret.Err <= m`
+    checks each payload only on its own variant's paths. The payload variable is
+    the executor's own (`ret_payloads`, collected from `payloads`/`fields` under
+    local `_0` keyed by discriminant), so the contract's `ret.Ok` and the body's
+    `((_0 as Ok).0)` are one value; the layout is one lookup
+    (`spec::ret_enum_def`), shared with `ret.is_ok()` so the numbering and the
+    payload width cannot drift. The *probe* binds only the variants a contract
+    actually names (`names_ret_variant`), at a throwaway slot above the run's, so a
+    contract that never mentions a payload pays nothing and a payload with no
+    bit-vector width is refused only when it is asked for. Twelve fixtures in
+    `realistic.rs` (true/tripwire pairs for `Ok`/`Some`/`Err`/a user enum, a
+    branch-vacuity pair, and two refusals — a non-enum return and a unit variant),
+    pinned by `an_enum_return_contract_can_name_a_payload`. This closes the last
+    named C2 sub-item; `realistic.rs` **467 of 869 -> 472 of 881**.
+  - Remaining: `?` (the `Try` desugaring needs `From` on the error type) and
+    `map`/`map_err`/`and_then`/`unwrap_or_else` (closures).
 - **C3. Ranges and `for` loops.** · P0 · done · Kani, Verus, Prusti
   - Gap: `RangeInclusive::new`, `Range`, `Iterator::next` unmodelled, so the
     commonest loop in Rust is out of reach. Evidence: `tri` incomplete.

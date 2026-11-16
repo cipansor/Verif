@@ -2879,6 +2879,16 @@ pub struct FieldEnv {
     /// discriminant. Only the four methods -- which say what they test -- read the
     /// tag.
     pub ret_enum_tags: Option<(Var, u64, u64)>,
+    /// `ret.<Variant>` → the discriminant the payload belongs to, so a contract
+    /// clause that names a return payload is guarded on the tag.
+    ///
+    /// Keyed by the *mangled* variable name the rewrite emits (`ret__v_Ok`), because
+    /// that is what the parser sees once `rewrite_fields` has run. A payload exists
+    /// only on the variant's paths, so the parser wraps the clause containing it in
+    /// `tag == discriminant` -- the guard travels with the *binding*, not with the
+    /// spelling, so a contract that mentions `ret.Ok` anywhere gets the same
+    /// treatment.
+    pub ret_payload_guards: BTreeMap<String, (Var, u64)>,
     /// Indexed arguments (slices and arrays): name → (local, element width, the
     /// array's fixed length if it is one), so a contract's `xs.len()` and `xs[0]`
     /// can be bound without the IR's `Ty` in hand.
@@ -3322,12 +3332,72 @@ impl FieldEnv {
     /// that writes them on a non-enum return is refused, because the tag they would
     /// test does not exist.
     ///
-    /// A bare *payload* read (`ret.Ok <= n`) is not admitted here: it is meaningful
-    /// only on the paths whose tag is that variant, so it needs the postcondition
-    /// guarded on the discriminant. That is the remaining sub-item; until it lands a
-    /// contract naming `ret.Ok` is refused rather than read on the wrong path.
+    /// A bare *payload* read (`ret.Ok <= n`) is bound separately, by
+    /// [`bind_ret_payload`](Self::bind_ret_payload): it is meaningful only on the
+    /// paths whose tag is that variant, so the clause it appears in is guarded on
+    /// the discriminant rather than read on the wrong path.
     pub fn bind_ret_enum(&mut self, tag: Var, success: u64, failure: u64) {
         self.ret_enum_tags = Some((tag, success, failure));
+    }
+
+    /// Bind a *payload* of an enum return to a variable, so a contract can write
+    /// `ret.Ok <= n` / `ret.Some <= n`.
+    ///
+    /// A payload is meaningful only on the paths whose tag is that variant, so the
+    /// binding records the guard (`tag == discriminant`) beside the variable: the
+    /// postcondition is then required only where the payload exists, and a path
+    /// that returns the *other* variant makes the clause vacuous rather than
+    /// checking the payload against a value it does not have. Binding the payload
+    /// with no guard would compare it on every path -- a wrong value, not a weaker
+    /// proof.
+    ///
+    /// The variable is the executor's, not a fresh one, so the contract's
+    /// `ret.Ok` and the body's `((_0 as Ok).0)` name one value.
+    pub fn bind_ret_payload(&mut self, vname: &str, var: Var, tag: Var, disc: u64, signed: bool) {
+        let mangled = format!("ret__v_{vname}");
+        self.vars.insert(mangled.clone(), var);
+        // `ret.Ok` and its alias `result.Ok` name the same value, so both rewrite
+        // targets are recorded; the parser accepts either spelling of the return.
+        self.paths.insert(format!("ret.{vname}"), mangled.clone());
+        self.paths.insert(format!("result.{vname}"), mangled.clone());
+        if signed {
+            self.signed.insert(mangled.clone());
+        }
+        self.ret_payload_guards.insert(mangled, (tag, disc));
+    }
+
+    /// Bind the return payloads a contract *names*, for the parse probe.
+    ///
+    /// Only the named variants are bound, so a contract that never mentions a
+    /// payload does not pay for one, and a payload whose type has no bit-vector
+    /// width (`Ok(&u8)`) is refused only when a contract actually asks for it. The
+    /// variable is throwaway (the probe discards its result); it only has to be the
+    /// right width for the comparison to be well-formed.
+    pub fn probe_ret_payloads(
+        &mut self,
+        ret_ty: &Ty,
+        enums: &BTreeMap<String, EnumDef>,
+        tag: Var,
+        ensures: &[String],
+    ) {
+        let Some(def) = ret_enum_def(ret_ty, enums) else { return };
+        for (vname, payload, disc) in &def.variants {
+            let Some(first) = payload.first() else { continue };
+            let Some(w) = first.width() else { continue };
+            let named = ensures
+                .iter()
+                .any(|e| names_ret_variant(e, vname));
+            if !named {
+                continue;
+            }
+            let slot = self.base + self.next_slot + self.next_ret_slot;
+            if slot as usize >= crate::smt::MAX_VARS {
+                continue;
+            }
+            self.next_ret_slot += 1;
+            let v = smt::var_named(slot, w);
+            self.bind_ret_payload(vname, v, tag, *disc, first.is_signed());
+        }
     }
 
     /// A fresh variable for an enum return's *tag*, for the parse probe only.
@@ -4132,6 +4202,7 @@ pub fn eval_ensures(
     p.consts = fields.consts.clone();
     p.old_args = old_args.clone();
     p.ret_enum_tags = fields.ret_enum_tags;
+    p.ret_payload_guards = fields.ret_payload_guards.clone();
     let pred = p.parse_or().map_err(|e| e.about(orig))?;
     p.expect_end().map_err(|e| e.about(orig))?;
     Ok(pred)
@@ -4370,6 +4441,11 @@ struct Parser<'a> {
     /// is not an enum, in which case the methods are refused rather than answered
     /// from a tag that does not exist.
     ret_enum_tags: Option<(Var, u64, u64)>,
+    /// The `ret.<Variant>` payload bindings, mangled name → `(tag, discriminant)`.
+    /// A clause that mentions one of these is guarded on the tag, because the
+    /// payload exists only on that variant's paths. See
+    /// [`FieldEnv::ret_payload_guards`].
+    ret_payload_guards: BTreeMap<String, (Var, u64)>,
     /// The `(min, max)` envelope, as `i128`, of the *literals and folded
     /// intermediate values* in the term a `Var` holds. Rust range-checks every
     /// literal and every constant `+ - *` intermediate against the type the
@@ -4593,6 +4669,7 @@ impl<'a> Parser<'a> {
             consts: BTreeMap::new(),
             old_args: BTreeMap::new(),
             ret_enum_tags: None,
+            ret_payload_guards: BTreeMap::new(),
             range: BTreeMap::new(),
             bare_literals: BTreeSet::new(),
             amount_floor: 0,
@@ -4829,12 +4906,52 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_and(&mut self) -> Result<Pred, SpecError> {
-        let mut left = self.parse_cmp()?;
+        let start = self.pos;
+        let left = self.parse_cmp()?;
+        let mut left = self.guard_ret_payloads(start, self.pos, left);
         while self.eat_op("&&") {
+            let start = self.pos;
             let right = self.parse_cmp()?;
+            let right = self.guard_ret_payloads(start, self.pos, right);
             left = smt::and(left, right);
         }
         Ok(left)
+    }
+
+    /// Guard a clause on the discriminant of any `ret.<Variant>` payload it names.
+    ///
+    /// A payload exists only on the paths whose tag is that variant, so a clause
+    /// naming one is checked as `tag == disc => clause`: on the other variant's
+    /// paths it is vacuously true, which is the only meaningful reading. Without
+    /// the guard the payload would be compared on *every* path, against a value it
+    /// does not have -- a wrong value, not a weaker proof. The guard is applied per
+    /// top-level `&&` conjunct (`parse_and`), so `ret.Ok <= n && ret.Err <= m`
+    /// checks each payload only on its own variant's paths.
+    ///
+    /// The names are the *mangled* ones `rewrite_fields` emits (`ret__v_Ok`), and
+    /// the scan is over the tokens the conjunct consumed, so the guard is found
+    /// wherever in the clause the payload appears -- under a comparison, a cast, or
+    /// a nested `+`.
+    fn guard_ret_payloads(&self, from: usize, to: usize, p: Pred) -> Pred {
+        if self.ret_payload_guards.is_empty() {
+            return p;
+        }
+        let mut guard: Option<Pred> = None;
+        for t in &self.toks[from..to.min(self.toks.len())] {
+            if let Tok::Ident(name) = t {
+                if let Some((tag, disc)) = self.ret_payload_guards.get(name) {
+                    let g = smt::eq_const(*tag, *disc);
+                    guard = Some(match guard {
+                        None => g,
+                        Some(prev) => smt::and(prev, g),
+                    });
+                }
+            }
+        }
+        match guard {
+            None => p,
+            Some(g) => smt::implies(g, p),
+        }
     }
 
     /// The value of a term that has no free variable, if it is constant.
@@ -6490,6 +6607,22 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 if name == "ret" || name == "result" {
                     let v = self.ret.ok_or_else(|| self.err(self.ret_absent))?;
+                    // A trailing `.field` here means the field was not bound: the
+                    // return has no such component or variant payload. `rewrite_fields`
+                    // binds the ones that exist, so reaching this point with a `.`
+                    // left over is a name that does not exist on the return type --
+                    // report *that*, rather than the parser's "expected a comparison
+                    // operator" for the stray dot.
+                    if matches!(self.peek(), Some(Tok::Op(o)) if o == ".") {
+                        let field = match self.toks.get(self.pos + 1) {
+                            Some(Tok::Ident(f)) => f.clone(),
+                            Some(Tok::Num(n, _)) => n.to_string(),
+                            _ => String::new(),
+                        };
+                        return Err(self.err(format!(
+                            "the return type has no component or variant `{field}` to read"
+                        )));
+                    }
                     return Ok((v, Sign::from_bool(self.ret_signed)));
                 }
                 if name == "true" || name == "false" {
@@ -7200,28 +7333,97 @@ pub fn enum_ret_discriminants(
     ret_ty: &Ty,
     enums: &BTreeMap<String, EnumDef>,
 ) -> Option<(u64, u64)> {
+    let def = ret_enum_def(ret_ty, enums)?;
+    let find = |n: &str| def.variants.iter().find(|(vn, _, _)| vn == n).map(|(_, _, d)| *d);
+    let ok = find("Ok").or_else(|| find("Some"))?;
+    let err = find("Err").or_else(|| find("None"))?;
+    Some((ok, err))
+}
+
+/// The [`EnumDef`] an enum-returning function's type names, whether the enum is
+/// declared in the source or is one of the two standard ones.
+///
+/// This is the layout `enum_ret_discriminants` reads its tag pair from and that
+/// [`bind_ret_payloads`] reads its payload types from, so `ret.is_ok()` and
+/// `ret.Ok` agree about the numbering and the payload width by construction: there
+/// is one lookup.
+pub fn ret_enum_def(ret_ty: &Ty, enums: &BTreeMap<String, EnumDef>) -> Option<EnumDef> {
     let Ty::Other(name) = ret_ty else { return None };
     let bare = strip_generics(name);
     let segs: Vec<&str> = bare.split("::").filter(|s| !s.is_empty()).collect();
     let short = segs.last().copied().unwrap_or(&bare);
     if let Some(def) = enums.get(short).or_else(|| enums.get(&bare)) {
-        // A declared enum: success is a variant named `Ok`/`Some` if it has one,
-        // else the *first* variant. A user enum with neither name still has a
-        // discriminant for each variant, but "which one is success" is not a
-        // property of the type, so `is_ok` on it is refused by leaving this `None`
-        // -- a contract must name the variant (`ret == E::Variant`) instead.
-        let find = |n: &str| def.variants.iter().find(|(vn, _, _)| vn == n).map(|(_, _, d)| *d);
-        let (Some(ok), Some(err)) =
-            (find("Ok").or_else(|| find("Some")), find("Err").or_else(|| find("None")))
-        else {
-            return None;
-        };
-        return Some((ok, err));
+        return Some(def.clone());
     }
-    match short {
-        "Option" => Some((1, 0)),
-        "Result" => Some((0, 1)),
-        _ => None,
+    // A standard enum is recognised from the *full* type, because its payloads are
+    // its generic arguments: `Option<u8>` gives `Some: u8`, and the stripped `short`
+    // has no arguments left to read. The declared-layout lookup above keeps a user
+    // `enum Option { .. }` winning over the built-in numbering. A turbofished
+    // spelling (`Option::<u8>`) is the same type, so the `::` before `<` is dropped.
+    std_enum_def(&name.trim().replace("::<", "<"))
+}
+
+/// Whether a contract clause names `ret.<vname>` (or `result.<vname>`).
+///
+/// The same textual scan `named_ret_components` uses for `ret.N`, but matching a
+/// variant *name* rather than a component index. It decides which payloads the
+/// probe binds; a name that is not a variant is left for the parser to refuse.
+fn names_ret_variant(text: &str, vname: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_alphabetic() || chars[i] == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let ident: String = chars[start..i].iter().collect();
+            if (ident == "ret" || ident == "result") && chars.get(i) == Some(&'.') {
+                let j = i + 1;
+                let mut k = j;
+                while k < chars.len() && (chars[k].is_alphanumeric() || chars[k] == '_') {
+                    k += 1;
+                }
+                let field: String = chars[j..k].iter().collect();
+                if field == vname {
+                    return true;
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Bind the return payloads a contract names, for the *run*.
+///
+/// `projs` is the executor's return-payload list, keyed by discriminant; the
+/// payload's own type comes from the enum's layout, so the contract's `ret.Ok`
+/// and the body's `((_0 as Ok).0)` name the same variable. A variant the contract
+/// names but no path produced stays unbound, so a postcondition about it is
+/// refused rather than checked against a fabricated value -- the same rule
+/// `ret.N` follows.
+pub fn bind_ret_payloads(
+    fields: &mut FieldEnv,
+    ret_ty: &Ty,
+    enums: &BTreeMap<String, EnumDef>,
+    tag: Var,
+    projs: &[(u64, Var)],
+    ensures: &[String],
+) {
+    let Some(def) = ret_enum_def(ret_ty, enums) else { return };
+    for (vname, payload, disc) in &def.variants {
+        let Some(first) = payload.first() else { continue };
+        if first.width().is_none() {
+            continue;
+        }
+        if !ensures.iter().any(|e| names_ret_variant(e, vname)) {
+            continue;
+        }
+        if let Some((_, v)) = projs.iter().find(|(k, _)| k == disc) {
+            fields.bind_ret_payload(vname, *v, tag, *disc, first.is_signed());
+        }
     }
 }
 
@@ -7739,6 +7941,47 @@ mod tests {
             &old,
         );
         assert!(err.is_err(), "`ret.is_ok()` on a non-enum return must be refused");
+    }
+
+    /// A bare payload read on an enum return (`ret.Ok`, `ret.Some`) is *guarded on
+    /// the discriminant*: the clause is `tag == disc => clause`, so it is vacuous on
+    /// the other variant.
+    ///
+    /// The guard is the whole content: a payload exists only on the variant's paths.
+    /// Evaluated at the payload's own tag the clause is checked, and at the *other*
+    /// tag it is vacuously true -- which a model that bound the payload with no
+    /// guard would get wrong (it would check the clause on every path).
+    #[test]
+    fn an_enum_return_reads_a_payload_guarded_on_the_discriminant() {
+        let tag = smt::var_named(1, 1);
+        let ok = smt::var_named(2, 8);
+        let mut fields = FieldEnv::default();
+        fields.bind_ret_enum(tag, 0, 1);
+        fields.bind_ret_payload("Ok", ok, tag, 0, false);
+        let args = BTreeMap::new();
+        let signed = BTreeSet::new();
+        let old = BTreeMap::new();
+        // `Ok` is the success discriminant (0), so the guard is `tag == 0`.
+        let at = |t: u64, o: u64| move |i: u32| match i {
+            1 => Some(t),
+            2 => Some(o),
+            _ => None,
+        };
+        let read = |text: &str| {
+            eval_ensures(text, &args, Some(tag), RET_IS_UNKNOWN, &signed, false, &fields, &old)
+                .unwrap_or_else(|e| panic!("`{text}` must parse: {e}"))
+        };
+        let p = read("ret.Ok <= 9");
+        // On the `Ok` path the clause is checked: the payload's own bound decides.
+        assert_eq!(smt::evaluate_pred(p, at(0, 9)), Some(true), "Ok tag, payload 9");
+        assert_eq!(smt::evaluate_pred(p, at(0, 10)), Some(false), "Ok tag, payload 10");
+        // On the `Err` path there is no `Ok` payload, so the clause is *vacuously*
+        // true whatever the (unconstrained) payload variable holds -- which is the
+        // whole reason for the guard.
+        assert_eq!(smt::evaluate_pred(p, at(1, 10)), Some(true), "Err tag is vacuous");
+        // An unguarded reading would refute the clause on the Err path, so this is
+        // the evidence the guard is load-bearing rather than decorative.
+        assert_ne!(smt::evaluate_pred(p, at(1, 10)), Some(false), "must not check on Err");
     }
 
     /// The same discriminant methods on an enum-typed *argument*: `r.is_ok()` reads

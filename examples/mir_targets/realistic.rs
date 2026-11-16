@@ -2418,8 +2418,15 @@ pub fn result_unwrap_unguarded(r: Result<u8, u16>) -> u8 {
 // is a payload plus a tag -- so a bare `ret <= n` is refused. The four methods are
 // the *discriminant* predicates: they read the return place's tag, which the
 // executor passes as the return word. The tag is a value on every path, so the
-// four are total, unlike `ret.Ok`, which names a payload that exists on only one
-// variant.
+// four are total.
+//
+// A bare *payload* read -- `ret.Ok`, `ret.Some`, `ret.Err`, `ret.Run` -- is
+// modelled too, and it is *guarded on the discriminant*: a payload exists only on
+// the variant's paths, so a clause naming one is checked as `tag == disc => clause`
+// and is vacuous on the other variant. Binding it with no guard would compare it on
+// every path, against a value it does not have -- a wrong value, not a weaker
+// proof. The pairs below pin that: the true one holds on the variant it names, and
+// the tripwire claims a value the payload cannot be.
 //
 // Each pair pins the method against the *right* discriminant: `is_ok`/`is_some`
 // test the success tag (`Ok` is 0, `Some` is 1) and `is_err`/`is_none` the failure
@@ -2543,6 +2550,113 @@ pub fn enum_ret_from_match_tripwire(r: Result<u8, u8>) -> Result<u8, u8> {
         Ok(v) => Ok(v),
         Err(e) => Err(e),
     }
+}
+
+// A bare payload read on the return: `ret.Ok`, `ret.Some`, `ret.Err`, `ret.Run`.
+// Each is *guarded on the discriminant* (see the section header), so the pair
+// below is a true clause on the variant it names and a tripwire claiming a value
+// the payload cannot be.
+
+/// `ret.Ok` on a `Result` pass-through under `r.Ok == 9`: the result is `r`, so
+/// the `Ok` payload is `9` on the `Ok` path. The body's `((_0 as Ok).0)` and the
+/// contract's `ret.Ok` are one variable, which is what makes this verify.
+/// requires: r.is_ok() && r.Ok == 9
+/// ensures: ret.Ok == 9
+pub fn ret_ok_payload(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The tripwire: the payload is `9`, so `ret.Ok == 8` is refutable. A model that
+/// bound the payload to a fresh unconstrained variable would prove this, and one
+/// that bound it with no discriminant guard would refute the true entry above.
+/// requires: r.is_ok() && r.Ok == 9
+/// ensures: ret.Ok == 8
+pub fn ret_ok_payload_tripwire(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// `ret.Some` on an `Option` pass-through under `x.Some == 9`.
+/// requires: x.is_some() && x.Some == 9
+/// ensures: ret.Some == 9
+pub fn ret_some_payload(x: Option<u8>) -> Option<u8> {
+    x
+}
+
+/// The tripwire for `ret.Some`.
+/// requires: x.is_some() && x.Some == 9
+/// ensures: ret.Some == 8
+pub fn ret_some_payload_tripwire(x: Option<u8>) -> Option<u8> {
+    x
+}
+
+/// `ret.Err`: the failure payload of a `Result`. The guard is on the `Err`
+/// discriminant, so under `r.Err == 7` the clause is checked on the `Err` path.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: ret.Err == 7
+pub fn ret_err_payload(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The tripwire for `ret.Err`: a model that tested the wrong discriminant, or
+/// bound the payload with no guard, would prove this.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: ret.Err == 8
+pub fn ret_err_payload_tripwire(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The guard is *load-bearing* here, and this is the fixture that shows it: the
+/// body reaches `Ok(9)` on one branch and `Err(5)` on the other, so the `Err` path
+/// has no `Ok` payload. The clause `ret.Ok == 9` is checked on the `Ok` path and is
+/// *vacuously* true on the `Err` path -- which is what verifies it. Drop the guard
+/// and the `Ok` payload is compared on the `Err` path too, against a value the
+/// variant does not have, and this is refuted.
+/// requires: true
+/// ensures: ret.Ok == 9
+pub fn ret_payload_guarded_vacuous(c: bool) -> Result<u8, u8> {
+    if c { Ok(9) } else { Err(5) }
+}
+
+/// The tripwire: the `Ok` payload is `9` on the `Ok` path, so `ret.Ok == 200` is
+/// refuted -- a model that bound the payload to a constant, or dropped the guard,
+/// would prove it.
+/// requires: true
+/// ensures: ret.Ok == 200
+pub fn ret_payload_guarded_vacuous_tripwire(c: bool) -> Result<u8, u8> {
+    if c { Ok(9) } else { Err(5) }
+}
+
+/// A *user* enum's payload is readable too: `ret.Data` on a `Msg` pass-through.
+/// The binding is gated on the layout, not on a success/failure pair, so an enum
+/// with neither `Ok` nor `Some` still has readable payloads.
+/// requires: m == Msg::Data && m.Data == 9
+/// ensures: ret.Data == 9
+pub fn ret_user_enum_payload(m: Msg) -> Msg {
+    m
+}
+
+/// The tripwire for a user enum's payload.
+/// requires: m == Msg::Data && m.Data == 9
+/// ensures: ret.Data == 8
+pub fn ret_user_enum_payload_tripwire(m: Msg) -> Msg {
+    m
+}
+
+/// A payload read on a *non-enum* return must refuse: `ret.Ok` on a `u8` names a
+/// variant the return type does not have. The contract is unreadable, so the
+/// function is skipped rather than checked against a fabricated payload.
+/// requires: true
+/// ensures: ret.Ok == 5
+pub fn ret_payload_on_non_enum(x: u8) -> u8 {
+    x
+}
+
+/// A *unit* variant has no payload to read, so `ret.None` is refused rather than
+/// bound to a fabricated value.
+/// requires: true
+/// ensures: ret.None == 5
+pub fn ret_payload_on_unit_variant(x: Option<u8>) -> Option<u8> {
+    x
 }
 
 /// A *non-enum* return must refuse the methods: `ret.is_ok()` on a `u8` names a

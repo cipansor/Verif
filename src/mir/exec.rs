@@ -2582,7 +2582,7 @@ pub fn verify_fn<F>(
     rec: Option<Recursion>,
 ) -> MirReport
 where
-    F: Fn(Option<Var>, &[(u32, Var)], &[(u32, Var)]) -> Result<Pred, String>,
+    F: Fn(Option<Var>, &[(u32, Var)], &[(u64, Var)], &[(u32, Var)]) -> Result<Pred, String>,
 {
     let mut report = MirReport { function: f.name.clone(), ..Default::default() };
 
@@ -5554,7 +5554,7 @@ fn run_state<F>(
     unwind_declared: bool,
 )
 where
-    F: Fn(Option<Var>, &[(u32, Var)], &[(u32, Var)]) -> Result<Pred, String>,
+    F: Fn(Option<Var>, &[(u32, Var)], &[(u64, Var)], &[(u32, Var)]) -> Result<Pred, String>,
 {
     let cur = &prog.fns[st.frame.func];
     // A path that cannot be taken is not a path. Pruning it is what lets
@@ -5830,6 +5830,40 @@ where
                         // entry at all. Reading it here is what makes the method
                         // read the discriminant the body's `switchInt` compares.
                         let rv = st.env.tag_value(0).or(rv);
+                        // An enum return's payloads, keyed by their *discriminant*,
+                        // so a contract can name `ret.Ok` / `ret.Some`. A payload is
+                        // stored by a variant construction or a modelled call under
+                        // the variant's discriminant, and a payload *read* through a
+                        // downcast lands in `fields` keyed by the same number. A
+                        // `bool` payload is widened to a one-bit word, like any
+                        // other boolean value handed to the postcondition.
+                        let ret_payloads: Vec<(u64, Var)> = st
+                            .env
+                            .payloads
+                            .iter()
+                            .filter(|((l, _), _)| *l == 0)
+                            .filter_map(|((_, k), (v, _))| match v {
+                                Val::Sym(x, _) => Some((*k, *x)),
+                                Val::Bool(p) => {
+                                    Some((*k, smt::ite(*p, smt::word(1, 1), smt::word(0, 1))))
+                                }
+                                _ => None,
+                            })
+                            .chain(
+                                st.env
+                                    .fields
+                                    .iter()
+                                    .filter(|((l, _), _)| *l == 0)
+                                    .filter_map(|((_, k), v)| match v {
+                                        Val::Sym(x, _) => Some((*k as u64, *x)),
+                                        Val::Bool(p) => Some((
+                                            *k as u64,
+                                            smt::ite(*p, smt::word(1, 1), smt::word(0, 1)),
+                                        )),
+                                        _ => None,
+                                    }),
+                            )
+                            .collect();
                         // The *final* value of each reference argument, so an
                         // `ensures` that names one means what the body left there
                         // and `old(name)` reaches the entry value. A reference
@@ -5859,7 +5893,7 @@ where
                                 _ => {}
                             }
                         }
-                        match post(rv, &projs, &ref_final) {
+                        match post(rv, &projs, &ret_payloads, &ref_final) {
                             Ok(p) => {
                                 report.obligations.push(Obligation {
                                     kind: ObligationKind::Postcondition,
