@@ -150,6 +150,26 @@ with no new false proof while the independent corpus keeps growing.
   - Exit: `tri` verified with an `invariant:`; a missing invariant reported as *a
     missing invariant*, not "unmodelled".
   - Move: **build**.
+  - Progress: the desugaring is **built**. `RangeInclusive::new`/`Range::new`,
+    `IntoIterator::into_iter` and `Iterator::next` are modelled
+    (`intrinsics::Range`/`RangeMethod`, answered by `range_method` from the
+    range's struct fields, with `core`'s `forward_overflowing` boundary
+    reproduced exactly), and a `for` loop now decides through the existing
+    `unwind:` machinery — `for i in 0..=n { s += i }` verifies with `unwind: 4`
+    and its false twin is refuted (`the_for_loop_range_desugaring_is_modelled`).
+    What remains for the exit criterion is the *invariant* form: an `invariant:`
+    that names the loop variable (`s <= i`) is refused as `unknown name i`,
+    because `i` is a `debug` binding inside a nested `scope` block
+    (`debug i => _9;` at `scope 3`) that `invariant_names` does not resolve.
+    Until that is closed, a `for` loop is decided by `unwind:` (reported) rather
+    than by an invariant, and `tri` in `everyday.rs` stays `incomplete` with the
+    honest `loop unwound past 9` reason rather than a missing-invariant one.
+  - Follow-up: `invariant_names` must resolve the desugaring's scoped `debug`
+    bindings (the iterator element `i` and the `iter`/`s` locals) so an invariant
+    can name the loop variable. The soundness of the resolution is the same
+    question the alias work already answered: a name resolves only to a local
+    that is an argument or a loop-carried value the body has written, and only
+    when it is not shadowed.
 - **C4. Loops without path explosion.** · P0 · done · Kani (unwinding),
   Verus, Creusot, Prusti, SPARK (`Loop_Invariant`/`Loop_Variant`), Flux
   - Gap: a 4-iteration loop over an array exhausts the 64-path budget. Evidence:

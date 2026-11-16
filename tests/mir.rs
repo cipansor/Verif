@@ -1068,16 +1068,32 @@ fn the_independent_corpus_does_not_regress() {
         Ok(r) => r,
         Err(e) => panic!("frontend failed: {e}"),
     };
+    // A `Failed` is a *contract* failure only when the obligation that failed is a
+    // claim the source made: a postcondition, a vacuous precondition, a loop
+    // invariant. A `Failed` on a **panic** (or `unreachable`) obligation is not a
+    // bug in the frontend -- it is the tool correctly reporting that the body can
+    // panic. `sum_iter` (`v.iter().sum()`) is ordinary Rust whose unguarded
+    // addition *does* overflow for `[u32::MAX, 1]`, and `everyday.rs` documents it
+    // as "may overflow": rejecting every `Failed` would fail a correct panic
+    // finding the moment iterator support lands. So the assertion is per kind, not
+    // per outcome -- the panic family is allowed, the contract family is not.
     let refuted: Vec<&str> = report
         .outcomes
         .iter()
-        .filter(|(_, o)| matches!(o, FnOutcome::Failed { .. }))
+        .filter(|(_, o)| match o {
+            FnOutcome::Failed { kind, .. } => {
+                !(kind.starts_with("panic:") || kind.starts_with("reachable"))
+            }
+            _ => false,
+        })
         .map(|(n, _)| n.as_str())
         .collect();
     assert!(
         refuted.is_empty(),
-        "everyday.rs is ordinary Rust that must hold, so a refutation is a bug: {refuted:?}. \
-         A corpus function that is genuinely false belongs in a tripwire fixture, not here"
+        "everyday.rs is ordinary Rust whose *contracts* must hold, so a contract \
+         refutation is a bug: {refuted:?}. A corpus function that is genuinely false \
+         belongs in a tripwire fixture, not here. (A panic or unreachable failure is a \
+         legitimate finding and is allowed.)"
     );
     let verified = report
         .outcomes
@@ -9878,5 +9894,285 @@ fn the_drop_fixtures_decide_and_the_false_ones_are_refuted() {
     match outcome(&report, "string_drop_is_refused") {
         FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. } => {}
         other => panic!("a `String` drop must be refused, got: {other}"),
+    }
+}
+
+/// Review round: field drop glue, `unwrap_or`, unwind accounting, edition
+/// resolution, and rotate widths.
+///
+/// Nine findings from an adversarial review, each reproduced before being fixed.
+/// They fall into four families: drop glue (F1/F2/F3), unwinding (F4/F5), edition
+/// resolution (F6/F7), and width/precision (F8/F9).
+mod review_round {
+    use super::*;
+
+    /// F1/F3: a struct whose field has its own destructor must not be treated as
+    /// fully dropped after the outer user destructor.
+    ///
+    /// `Outer { inner: Inner }` with `impl Drop for Outer` and `impl Drop for
+    /// Inner` destroys *both*: the user body runs, then each field's glue. The
+    /// model ran the user body and stopped, so a panicking `Inner::drop` was never
+    /// seen and the function was a false `Verified`. The fix refuses the shape --
+    /// a field whose type has glue this tool cannot execute -- which is the honest
+    /// answer: the drop is unmodelled, not proved safe.
+    #[test]
+    fn a_field_with_its_own_destructor_is_refused_not_assumed_safe() {
+        let src = r#"
+pub struct Inner { pub v: u8 }
+impl Drop for Inner {
+    fn drop(&mut self) { assert!(self.v < 10); }
+}
+pub struct Outer { pub inner: Inner }
+impl Drop for Outer {
+    fn drop(&mut self) {}
+}
+
+/// requires: true
+/// ensures: ret == 1
+pub fn outer_with_panicking_field(x: u8) -> u8 {
+    let _o = Outer { inner: Inner { v: x } };
+    1
+}
+
+/// requires: x < 10
+/// ensures: ret == 1
+pub fn outer_guarded(x: u8) -> u8 {
+    let _o = Outer { inner: Inner { v: x } };
+    1
+}
+"#;
+        // The unguarded one must NOT be `Verified`: the field's destructor panics
+        // for `x >= 10`, and the model cannot run it, so it is a refusal.
+        let Some(u) = verify_src("outer_with_panicking_field", src) else { return };
+        assert!(
+            !u.is_verified(),
+            "a struct whose field has a panicking destructor must not be `Verified`, got: {u}"
+        );
+        // The guarded companion is refused too (same shape), which is the point:
+        // the refusal is about the *shape*, not about whether the panic is
+        // reachable. It must not be a false `Verified`.
+        let Some(g) = verify_src("outer_guarded", src) else { return };
+        assert!(
+            !g.is_verified(),
+            "the guarded companion is the same unmodelled shape and must not verify, got: {g}"
+        );
+    }
+
+    /// F2: `Result::unwrap_or` destroys the error value on the `Err` branch, so a
+    /// panicking error destructor must not be assumed away.
+    ///
+    /// `r.unwrap_or(0)` on `Result<u8, E>` with `impl Drop for E { panic }` panics
+    /// on the `Err` branch, but the model treated `unwrap_or` as total (it has no
+    /// panic obligation for the *tag*). The fix reads the error type from the
+    /// receiver and refuses when its glue is unmodelled; a scalar error type still
+    /// decides, which is the positive control that the refusal is not blanket.
+    #[test]
+    fn unwrap_or_refuses_an_error_type_whose_drop_is_unmodelled() {
+        let src = r#"
+pub struct Boom;
+impl Drop for Boom {
+    fn drop(&mut self) { assert!(false); }
+}
+
+/// requires: true
+/// ensures: ret <= 255
+pub fn unwrap_or_dropping_error(r: Result<u8, Boom>) -> u8 {
+    r.unwrap_or(0)
+}
+
+/// requires: true
+/// ensures: ret <= 255
+pub fn unwrap_or_scalar_error(r: Result<u8, u8>) -> u8 {
+    r.unwrap_or(0)
+}
+"#;
+        let Some(d) = verify_src("unwrap_or_dropping_error", src) else { return };
+        assert!(
+            !d.is_verified(),
+            "`unwrap_or` on an error type with a panicking destructor must not verify, got: {d}"
+        );
+        let Some(s) = verify_src("unwrap_or_scalar_error", src) else { return };
+        assert!(
+            s.is_verified(),
+            "`unwrap_or` on a scalar error type must still verify (positive control), got: {s}"
+        );
+    }
+
+    /// F4/F5: the unwind bound counts *latch traversals*, not raw block entries.
+    ///
+    /// A loop that runs exactly `N` iterations needs `N + 1` entries to its header
+    /// (the last evaluates the guard and exits), so `unwind: N` rejected it. A
+    /// loop-free helper called more than once from one function also tripped the
+    /// bound, because the counter was keyed by block without regard to *which*
+    /// invocation. Both are fixed by counting back-edge traversals; the bound is
+    /// now the number of iterations, which is what a caller means.
+    #[test]
+    fn the_unwind_bound_counts_iterations_not_header_entries() {
+        let src = r#"
+/// requires: true
+/// unwind: 3
+/// ensures: ret == 3
+pub fn while_exact() -> u32 {
+    let mut i = 0u32;
+    let mut s = 0u32;
+    while i < 3 { s += 1; i += 1; }
+    s
+}
+
+/// requires: true
+/// unwind: 3
+/// ensures: ret == 3
+pub fn for_exact() -> u32 {
+    let mut s = 0u32;
+    for _i in 0..3u32 { s += 1; }
+    s
+}
+
+fn helper(x: u8) -> u8 { if x == 0 { 0 } else { 1 } }
+
+/// requires: x == 0
+/// unwind: 1
+/// ensures: ret == 0
+pub fn loop_free_helper_calls(x: u8) -> u8 {
+    let a = helper(x);
+    let b = helper(0);
+    a + b
+}
+"#;
+        for name in ["while_exact", "for_exact", "loop_free_helper_calls"] {
+            let Some(o) = verify_src(name, src) else { return };
+            assert!(
+                o.is_verified(),
+                "`{name}` must verify: the bound counts iterations, so `unwind: N` \
+                 admits a loop that runs `N` times, and helper calls do not consume it; got: {o}"
+            );
+        }
+    }
+
+    /// F4: a bound one short of the iterations must still fail.
+    ///
+    /// The fix must not simply relax the bound: `unwind: 2` on a three-iteration
+    /// loop is a claim the loop violates, and it has to be refuted. Without this
+    /// the latch fix could pass by accepting every bound.
+    #[test]
+    fn an_unwind_bound_below_the_iterations_still_fails() {
+        let src = r#"
+/// requires: true
+/// unwind: 2
+/// ensures: ret == 3
+pub fn for_too_few() -> u32 {
+    let mut s = 0u32;
+    for _i in 0..3u32 { s += 1; }
+    s
+}
+"#;
+        let Some(o) = verify_src("for_too_few", src) else { return };
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("unwind"),
+                "a too-small bound must fail on the unwind obligation, got `{kind}`"
+            ),
+            other => panic!("`unwind: 2` on a 3-iteration loop must be refuted, got: {other}"),
+        }
+    }
+
+    /// F6/F7: edition resolution reads a quoted key and an explicit workspace path.
+    ///
+    /// Two spellings Cargo accepts and the reader did not: a quoted key
+    /// (`"edition" = "2021"`) read as *no* edition, so the 2015 default applied;
+    /// and `package.workspace = "../ws"` pointing at a root that is not an
+    /// ancestor, which the ancestor search could not find. Both are resolved from
+    /// the manifest text, so they are unit-tested here rather than end to end.
+    #[test]
+    fn a_quoted_edition_key_and_an_explicit_workspace_path_are_resolved() {
+        let dir = std::env::temp_dir().join(format!("verif-edition-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("member")).unwrap();
+        std::fs::create_dir_all(dir.join("ws")).unwrap();
+        std::fs::write(dir.join("ws/Cargo.toml"), "[workspace]\n[workspace.package]\nedition = \"2021\"\n").unwrap();
+        std::fs::write(
+            dir.join("member/Cargo.toml"),
+            "[package]\nname = \"m\"\n\"edition\" = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("member/src.rs"), "").unwrap();
+        let member = dir.join("member/src.rs");
+        assert_eq!(
+            verify::edition_from_manifest(&member),
+            Some(verify::Edition::Rust2024),
+            "a quoted `\"edition\"` key must be read, not defaulted to 2015"
+        );
+
+        std::fs::write(
+            dir.join("member/Cargo.toml"),
+            "[package]\nname = \"m\"\nworkspace = \"../ws\"\nedition.workspace = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            verify::edition_from_manifest(&member),
+            Some(verify::Edition::Rust2021),
+            "`package.workspace = \"../ws\"` must resolve to that root's edition"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C3: the `for`-loop desugaring over a range is modelled, both directions.
+    ///
+    /// A `for i in a..b` lowers to `Range::new`/`RangeInclusive::new`, an
+    /// `IntoIterator::into_iter` identity and a `next(&mut range)` loop, and all
+    /// three are answered from the range's struct fields. The `unwind:` bound
+    /// decides the loop without an invariant (the invariant form is blocked on the
+    /// loop-variable name resolution recorded in the ROADMAP). The false twin is
+    /// the evidence the range state is *read*: a model that returned a constant
+    /// would prove it.
+    #[test]
+    fn the_for_loop_range_desugaring_is_modelled() {
+        let src = r#"
+/// requires: n <= 3
+/// unwind: 4
+/// ensures: ret <= 6
+pub fn for_inclusive_sum(n: u32) -> u32 {
+    let mut s = 0;
+    for i in 0..=n { s += i; }
+    s
+}
+
+/// requires: n <= 3
+/// unwind: 4
+/// ensures: ret <= 5
+pub fn for_inclusive_sum_cannot_prove_this(n: u32) -> u32 {
+    let mut s = 0;
+    for i in 0..=n { s += i; }
+    s
+}
+
+/// requires: true
+/// unwind: 3
+/// ensures: ret == 3
+pub fn for_exclusive_counts() -> u32 {
+    let mut s = 0;
+    for _i in 0..3u32 { s += 1; }
+    s
+}
+"#;
+        for name in ["for_inclusive_sum", "for_exclusive_counts"] {
+            let Some(o) = verify_src(name, src) else { return };
+            assert!(
+                o.is_verified(),
+                "`{name}` must verify: the range desugaring is modelled and `unwind:` \
+                 decides the loop, got: {o}"
+            );
+        }
+        let Some(f) = verify_src("for_inclusive_sum_cannot_prove_this", src) else { return };
+        match f {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "the false twin must fail on its postcondition, got `{kind}`"
+            ),
+            other => panic!(
+                "the false twin claims `ret <= 5` for a sum that reaches 6 and must be \
+                 refuted; a model that ignored the range state would prove it, got: {other}"
+            ),
+        }
     }
 }

@@ -312,6 +312,42 @@ pub enum Intrinsic {
     /// library's `Option`/`Result` (see [`names_option_impl`] and
     /// [`names_result_impl`]); a same-dump body always wins the lookup first.
     OptionMethod(OptionMethod),
+    /// A `for`-loop range: the `RangeInclusive`/`Range` shapes and the
+    /// `IntoIterator`/`Iterator` methods the desugaring calls on them.
+    ///
+    /// These are the first modelled methods whose receiver is a *struct* rather
+    /// than an integer, an enum or a slice, so they are answered by the executor
+    /// from its field store: the `start`/`end`/`exhausted` words a `new` wrote and
+    /// a `next` advances. `eval` returns `None` for all of them. The struct is the
+    /// standard library's own, so the *type path* is checked (see [`names_range`]);
+    /// a same-dump body always wins the lookup first.
+    Range(RangeMethod),
+}
+
+/// A method on a `for`-loop range.
+///
+/// The `for` desugaring lowers to a fixed set of calls, and this is exactly that
+/// set: `RangeInclusive::new` / `Range::new` construct, `into_iter` is the
+/// identity the desugaring wraps, and `next` yields the next element or `None`.
+/// Modelling them makes the commonest loop in Rust reachable through the existing
+/// loop machinery (an `invariant:` decides it; without one it is unwound like any
+/// other loop).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeMethod {
+    /// `RangeInclusive::new(start, end)` -> `RangeInclusive { start, end, exhausted: false }`.
+    /// `Range::new(start, end)` -> `Range { start, end }`.
+    New,
+    /// `IntoIterator::into_iter(range)` -> the range itself. The desugaring calls
+    /// this once before the loop; it copies the range and returns it unchanged.
+    IntoIter,
+    /// `Iterator::next(&mut range) -> Option<Idx>`.
+    ///
+    /// The exclusive `Range` yields `start` while `start < end` and then `None`.
+    /// The inclusive `RangeInclusive` yields `start` while it is not exhausted and
+    /// then `None`, marking itself exhausted once `start` reaches the end -- see
+    /// [`RangeMethod::Next`]'s evaluator for the exact predicate, which has to
+    /// reproduce `core`'s `forward_overflowing` at the type's boundary.
+    Next,
 }
 
 /// Which family of a `core::num` method name a call belongs to.
@@ -738,6 +774,20 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             _ => {}
         }
     }
+    // The `for`-loop ranges: `RangeInclusive`/`Range` and the `IntoIterator` /
+    // `Iterator` methods the desugaring calls on them. Like the `Option` shapes
+    // these are inherent/standard-library methods answered from the executor's
+    // stores rather than from a bit-vector operand, and the *path* is checked
+    // (see `names_range`) so a user type spelled `RangeInclusive` is refused. The
+    // same-dump lookup still answers a real body first.
+    if names_range(name) {
+        match short {
+            "new" => return Some(Intrinsic::Range(RangeMethod::New)),
+            "into_iter" => return Some(Intrinsic::Range(RangeMethod::IntoIter)),
+            "next" => return Some(Intrinsic::Range(RangeMethod::Next)),
+            _ => {}
+        }
+    }
     // `Ord::min`/`Ord::max`. These are *trait* methods, so the name is matched on
     // the trait path rather than a `core::num::<impl …>` path: the dump spells the
     // call `<u8 as Ord>::min`, naming the trait itself. `min`/`max` are matched
@@ -910,6 +960,33 @@ pub fn names_result_impl(name: &str) -> bool {
     name.contains("result::Result") || name.starts_with("Result::")
 }
 
+/// Whether a name is a `for`-loop range method, and the standard library's alone.
+///
+/// The desugaring spells the calls as `std::ops::RangeInclusive::<u32>::new`,
+/// `<std::ops::RangeInclusive<u32> as IntoIterator>::into_iter` and
+/// `<std::ops::RangeInclusive<u32> as Iterator>::next`, so the *type* segment is
+/// `ops::RangeInclusive`/`ops::Range` (or the `core::ops` spelling). A user type
+/// spelled `RangeInclusive` in a local module is `m::RangeInclusive::<…>::new`,
+/// which has no `ops::` segment and is refused. `Range::new` is the *exclusive*
+/// range's constructor; `Range` itself has no `next` (only `RangeInclusive` does),
+/// but the desugaring never calls one, so the shared `new` spelling is enough.
+pub fn names_range(name: &str) -> bool {
+    // `ops::RangeInclusive` or `ops::Range` followed by a segment boundary, so
+    // `ops::RangeFrom`/`ops::RangeTo` -- which are not `Iterator`s and so never
+    // drive a `for` loop -- are not matched. A path printed with generics puts a
+    // `<`, `>` or `::` right after the type segment; a bare `Range::new` starts
+    // with the type name.
+    let has_segment = |seg: &str| {
+        name.match_indices(seg).any(|(i, _)| {
+            matches!(name[i + seg.len()..].chars().next(), None | Some(':') | Some('<') | Some('>'))
+        })
+    };
+    has_segment("ops::RangeInclusive")
+        || has_segment("ops::Range")
+        || name.starts_with("RangeInclusive::")
+        || name.starts_with("Range::")
+}
+
 /// Whether a `from`/`into` name is `core`'s own `From`/`Into`, and theirs alone.
 ///
 /// The dump spells the call `<u16 as From<u8>>::from` or `<u8 as Into<u16>>::into`,
@@ -999,13 +1076,25 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // `Option` state it does not hold). Total here so a probe does not report
         // them unmodelled.
         Intrinsic::OptionMethod(_) => true,
+        // The `for`-loop range methods. Like the `Option` methods they read the
+        // receiver's struct fields -- which live in the executor's store rather
+        // than in an operand term -- so there is no width or sign to check here;
+        // `eval` never sees them and the executor answers them from the fields (or
+        // refuses a receiver whose range state it does not hold).
+        Intrinsic::Range(_) => true,
         // `abs_diff` computes at one bit of headroom, so it needs a width below the
         // engine's 64. It exists on both signednesses -- on an unsigned type it is
         // a plain magnitude -- so there is no membership fact to check.
         Intrinsic::AbsDiff => (1..64).contains(&w),
-        // The rotations exist on both signednesses and are total; the only width
-        // constraint is the engine's own.
-        Intrinsic::Rotate(_) => (1..=64).contains(&w),
+        // The rotations exist on both signednesses and are total. The width must
+        // be a *power of two*: the amount is reduced with the low `log2(w)` bits
+        // (one `and`, no divider), which is exactly `n mod w` only when `w` is a
+        // power of two. At `w == 12` the reduction is modulo 4, so
+        // `rotate_left(1, 4)` would model as `1` where Rust gives `16`. Every real
+        // integer type is a power-of-two width, so this costs no coverage; a
+        // non-power-of-two width is refused rather than answered with the wrong
+        // rotation.
+        Intrinsic::Rotate(_) => (1..=64).contains(&w) && w.is_power_of_two(),
         // The unary operators. Two membership facts decide whether a call can be
         // modelled at all, and both are about the *type*, not the width:
         //
@@ -1121,6 +1210,12 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
     if matches!(op, Intrinsic::OptionMethod(_)) {
         return None;
     }
+    // The `for`-loop range methods read the receiver's struct fields from the
+    // executor's store, not from an operand term, so `eval` has nothing to compute
+    // for them either. The executor answers them (see `range_method`).
+    if matches!(op, Intrinsic::Range(_)) {
+        return None;
+    }
     Some(match op {
         // Answered by `eval_slice` from the executor's length variable; the early
         // return above keeps them from reaching here.
@@ -1131,6 +1226,11 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         // stores; the early return above keeps them from reaching here.
         Intrinsic::OptionMethod(_) => {
             unreachable!("Option methods are answered from the tag and payload stores")
+        }
+        // Answered by the executor's `range_method` from the struct field store;
+        // the early return above keeps them from reaching here.
+        Intrinsic::Range(_) => {
+            unreachable!("range methods are answered from the struct field store")
         }
         // The bit counts, each built at the operand's width and widened to the
         // result type. A count cannot exceed the operand width, so `w` bits hold
@@ -4684,5 +4784,30 @@ mod tests {
                 "a same-width conversion is the identity `core` implements, not a refusal"
             );
         });
+    }
+
+    /// F9: a rotation is modelled only at a power-of-two width.
+    ///
+    /// The amount is reduced with the low `log2(w)` bits (one `and`, no divider),
+    /// which is `n mod w` only when `w` is a power of two. At `w == 12` the
+    /// reduction is modulo 4, so `rotate_left(1, 4)` would model as `1` where Rust
+    /// gives `16` -- a wrong value, not a weaker proof. Every real integer type is
+    /// a power-of-two width, so the restriction costs no coverage.
+    #[test]
+    fn a_rotation_needs_a_power_of_two_width() {
+        let rot = Intrinsic::Rotate(RotateKind::Left);
+        for w in [8u8, 16, 32, 64] {
+            assert!(is_modelled(rot, w, false), "a rotation at width {w} must be modelled");
+        }
+        for w in [12u8, 24, 48] {
+            assert!(
+                !is_modelled(rot, w, false),
+                "a rotation at the non-power-of-two width {w} must be refused"
+            );
+        }
+        // The engine's own width bound is unchanged.
+        for w in [0u8, 65] {
+            assert!(!is_modelled(Intrinsic::Rotate(RotateKind::Right), w, false));
+        }
     }
 }

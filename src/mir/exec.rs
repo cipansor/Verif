@@ -2318,12 +2318,43 @@ pub struct CalleeEnv<'a> {
     prog: &'a MirProgram,
     /// The contracts read from the source.
     specs: &'a spec::Specs,
+    /// For each function index, the blocks that hold a back edge (a jump to a
+    /// block that appears no later in layout order).
+    ///
+    /// The unwind bound counts *these* rather than raw block entries. Counting
+    /// entries to the loop header counts it once more than the loop runs (the last
+    /// entry evaluates the guard and exits), so `unwind: N` rejected a loop that
+    /// runs exactly `N` times. The latch is executed once per iteration, which is
+    /// the quantity the bound is about. Precomputed because it is consulted on
+    /// every state and `is_latch` is a hot path.
+    latches: BTreeMap<usize, BTreeSet<usize>>,
 }
 
 impl<'a> CalleeEnv<'a> {
     /// Build for one program and its specs.
     pub fn new(prog: &'a MirProgram, specs: &'a spec::Specs) -> Self {
-        CalleeEnv { prog, specs }
+        let mut latches: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        for (i, f) in prog.fns.iter().enumerate() {
+            let position: BTreeMap<usize, usize> =
+                f.blocks.iter().enumerate().map(|(k, b)| (b.id, k)).collect();
+            let mut set = BTreeSet::new();
+            for b in &f.blocks {
+                let Some(&from) = position.get(&b.id) else { continue };
+                if successors(&b.term)
+                    .iter()
+                    .any(|t| position.get(t).is_some_and(|&to| to <= from))
+                {
+                    set.insert(b.id);
+                }
+            }
+            latches.insert(i, set);
+        }
+        CalleeEnv { prog, specs, latches }
+    }
+
+    /// Whether `block` of function `func` holds a back edge.
+    fn is_latch(&self, func: usize, block: usize) -> bool {
+        self.latches.get(&func).is_some_and(|s| s.contains(&block))
     }
 
     /// The contract for a call, or `None` when there is none to assume.
@@ -2350,6 +2381,16 @@ impl<'a> CalleeEnv<'a> {
                 .collect(),
             ret_signed: c.ret.as_ref().map(|t| t.is_signed()).unwrap_or(false),
         })
+    }
+
+    /// The declared struct layouts, read from the same source as the contracts.
+    ///
+    /// The `drop` handler needs these to decide whether an aggregate has drop glue
+    /// in a field: the MIR carries no field types for a `drop` terminator, so the
+    /// layout has to come from the source, exactly as a contract's field access
+    /// does.
+    pub fn structs(&self) -> &BTreeMap<String, spec::StructDef> {
+        &self.specs.structs
     }
 }
 
@@ -4320,6 +4361,189 @@ fn try_fmt_call(
     None
 }
 
+/// Answer a modelled `for`-loop range method from the receiver's struct fields.
+///
+/// The `for` desugaring lowers to `RangeInclusive::new(start, end)` (or
+/// `Range::new`), an `IntoIterator::into_iter` identity, and a loop that calls
+/// `<Range as Iterator>::next(&mut range)` until it yields `None`. Those three are
+/// the whole of it, and modelling them makes the commonest loop in Rust reachable
+/// through the existing loop machinery: an `invariant:` decides the loop, and
+/// without one it is unwound like any other.
+///
+/// # Where the state lives
+///
+/// A range is a struct, so its fields are in the environment's `fields` store, keyed
+/// by `(local, field index)`, exactly as any struct literal's are. `new` writes
+/// `start` (0), `end` (1) and, for `RangeInclusive`, `exhausted` (2); `next` reads
+/// and advances them. The field *index* is the declaration order, which is the order
+/// the dump's `_1.0`/`_1.1`/`_1.2` projections count in -- `RangeInclusive { start,
+/// end, exhausted }` and `Range { start, end }`.
+///
+/// # The receiver is `&mut`
+///
+/// `next` takes `&mut self`, so the dump prints `_6 = &mut _3; next(copy _7)`. The
+/// reference is followed with `pointee`, so the fields read and written are `_3`'s,
+/// the same ones the loop's own `_3.0` reads would name.
+///
+/// # What is refused
+///
+/// A receiver whose range state is not in the store -- one the frontend never
+/// modelled -- is refused rather than guessed, and so is a `next` whose element
+/// width or sign cannot be read from the destination's `Option<Idx>`. Reading a
+/// fresh variable would be a wrong value, not a weaker proof.
+fn range_method(
+    name: &str,
+    kind: intrinsics::RangeMethod,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+) -> Result<Vec<Obligation>, String> {
+    use intrinsics::RangeMethod;
+    // The exclusive `Range` has no `exhausted` field and yields `None` at
+    // `start >= end`; the inclusive `RangeInclusive` has the field and yields
+    // `None` once it is exhausted. The `name` says which: only `RangeInclusive`
+    // carries `RangeInclusive` in its path.
+    let inclusive = name.contains("RangeInclusive");
+    // The element width and sign, from the destination's `Option<Idx>` (for
+    // `next`) or the range's own type. `next`'s destination is the `Option<Idx>`
+    // the loop matches on, and `Idx`'s width is what the `start`/`end` words were
+    // built at.
+    match kind {
+        RangeMethod::New => {
+            // `new(start, end)` writes the two bounds and, for the inclusive
+            // range, `exhausted = false`.
+            let start = match args.first().map(|a| operand(env, a)) {
+                Some(Val::Sym(v, s)) => (v, s),
+                _ => return Err(format!("unmodelled argument to `{name}`")),
+            };
+            let end = match args.get(1).map(|a| operand(env, a)) {
+                Some(Val::Sym(v, s)) => (v, s),
+                _ => return Err(format!("unmodelled argument to `{name}`")),
+            };
+            let field = |i: u32| Place { local: dest.local, proj: vec![Proj::Field(i)] };
+            env.set(&field(0), Val::Sym(start.0, start.1));
+            env.set(&field(1), Val::Sym(end.0, end.1));
+            if inclusive {
+                // `exhausted: false`. A one-bit word, so it is a plain `Val::Sym`
+                // at width 1 rather than a `Val::Bool`: the body compares it with
+                // `!=`/`==` in `next`, and a predicate would not fit that store.
+                env.set(&field(2), Val::Sym(smt::word(0, 1), Sign::Unsigned));
+            }
+            Ok(Vec::new())
+        }
+        RangeMethod::IntoIter => {
+            // `into_iter` is the identity the desugaring wraps the range in: it
+            // copies the receiver and returns it. Every field the source holds is
+            // copied to the destination, so the loop's `next` reads the same state
+            // `new` wrote.
+            let src = match args.first() {
+                Some(Operand::Copy(p)) | Some(Operand::Move(p)) => p.clone(),
+                _ => return Err(format!("unmodelled receiver for `{name}`")),
+            };
+            let src = env.pointee(&src);
+            // The fields present: `RangeInclusive` has three, `Range` two.
+            let n = if inclusive { 3 } else { 2 };
+            let mut vals = Vec::new();
+            for i in 0..n {
+                let p = Place { local: src.local, proj: vec![Proj::Field(i as u32)] };
+                vals.push(env.get(&p));
+            }
+            for (i, v) in vals.into_iter().enumerate() {
+                let p = Place { local: dest.local, proj: vec![Proj::Field(i as u32)] };
+                env.set(&p, v);
+            }
+            Ok(Vec::new())
+        }
+        RangeMethod::Next => {
+            // `next(&mut range) -> Option<Idx>`. The receiver is the `&mut` the
+            // desugaring passes, so `pointee` follows it to the range local the
+            // fields live on. The element width and sign come from the destination's
+            // `Option<Idx>`, which is the type the `switchInt` reads.
+            let recv = match args.first() {
+                Some(Operand::Copy(p)) | Some(Operand::Move(p)) => p.clone(),
+                _ => return Err(format!("unmodelled receiver for `{name}`")),
+            };
+            let range = env.pointee(&recv);
+            let start_p = Place { local: range.local, proj: vec![Proj::Field(0)] };
+            let end_p = Place { local: range.local, proj: vec![Proj::Field(1)] };
+            let (start, start_sign) = match env.get(&start_p) {
+                Val::Sym(v, s) => (v, s),
+                _ => return Err(format!("`{name}` on a range whose start is not modelled")),
+            };
+            let (end, end_sign) = match env.get(&end_p) {
+                Val::Sym(v, s) => (v, s),
+                _ => return Err(format!("`{name}` on a range whose end is not modelled")),
+            };
+            let w = smt::bits(start);
+            // The `exhausted` flag, for the inclusive range. A range whose field is
+            // not modelled is refused rather than treated as not-exhausted.
+            let exhausted = if inclusive {
+                let ex_p = Place { local: range.local, proj: vec![Proj::Field(2)] };
+                match env.get(&ex_p) {
+                    Val::Sym(v, _) => Some(v),
+                    _ => return Err(format!("`{name}` on a range whose exhausted flag is not modelled")),
+                }
+            } else {
+                None
+            };
+            // The predicate for "the range is empty" (`is_empty`):
+            //
+            // * exclusive `Range`: `start >= end`;
+            // * inclusive `RangeInclusive`: `exhausted || start > end`.
+            //
+            // The comparison is the element type's own, so a signed range reads
+            // `i8::MIN` as below `0`. A mismatch between the two bounds' signs is a
+            // dump shape the model does not hold, so it is refused rather than read
+            // as either one.
+            let Some(signed) = start_sign.known().or(end_sign.known()) else {
+                return Err(format!("`{name}` on a range whose element sign is not modelled"));
+            };
+            if let (Some(a), Some(b)) = (start_sign.known(), end_sign.known()) {
+                if a != b {
+                    return Err(format!("`{name}` on a range whose bounds have different signs"));
+                }
+            }
+            let empty = match (signed, exhausted) {
+                (true, Some(ex)) => {
+                    smt::or(smt::eq_const(ex, 1), smt::slt(end, start))
+                }
+                (false, Some(ex)) => {
+                    smt::or(smt::eq_const(ex, 1), smt::ult(end, start))
+                }
+                (true, None) => smt::sle(end, start),
+                (false, None) => smt::ule(end, start),
+            };
+            // `start + 1`, and whether it overflowed. `forward_overflowing(start, 1)`
+            // is `overflowing_add(start, 1)`, so the successor is `start + 1` and the
+            // overflow flag is "the result is `MIN`". The inclusive range marks
+            // itself exhausted exactly when the successor overflows, and the last
+            // element (the `end` value) is yielded on the pass where `start == end`
+            // before that flag is set.
+            let one = smt::word(1, w);
+            let succ = smt::add(start, one);
+            let overflowed = smt::eq_const(succ, 0);
+            // The yielded value is `start` (both ranges yield `start`), the tag is
+            // `Some` unless the range is empty. The tag is a term at width 1: the
+            // loop's `switchInt` on the `Option<Idx>` discriminant compares it
+            // against `SOME_TAG`/`NONE_TAG`, so it must be a value the discriminant
+            // store can hold and the switch can read.
+            let tag = smt::ite(empty, smt::word(0, 1), smt::word(1, 1));
+            env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+            env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(start, start_sign), w);
+            // Advance the range *in place*: `start := start + 1`, and for the
+            // inclusive range `exhausted := overflowed`. This is the mutation the
+            // `&mut self` performs, and it is what makes the loop progress -- and
+            // what a `variant:` can be proved against.
+            env.set(&start_p, Val::Sym(succ, start_sign));
+            if inclusive {
+                let ex_p = Place { local: range.local, proj: vec![Proj::Field(2)] };
+                env.set(&ex_p, Val::Sym(smt::ite(overflowed, smt::word(1, 1), smt::word(0, 1)), Sign::Unsigned));
+            }
+            Ok(Vec::new())
+        }
+    }
+}
+
 /// Answer a modelled `Option`/`Result` method from the receiver's tag and payload.
 ///
 /// These are the first modelled calls that read an *enum* rather than a bit-vector
@@ -4357,6 +4581,7 @@ fn try_fmt_call(
 /// `isize` would widen a two-bit tag to 64 and the `switchInt` would compare the
 /// wrong word. This is the same width rule `Rvalue::Discriminant` uses, and it is
 /// deliberately read the same way so the two cannot disagree.
+#[allow(clippy::too_many_arguments)]
 fn enum_method(
     name: &str,
     kind: intrinsics::OptionMethod,
@@ -4365,6 +4590,9 @@ fn enum_method(
     env: &mut Env,
     path: Pred,
     pins: &[(u32, u64)],
+    cur: &MirFn,
+    prog: &MirProgram,
+    callees: &CalleeEnv<'_>,
 ) -> Result<Vec<Obligation>, String> {
     use intrinsics::OptionMethod;
     let receiver = args
@@ -4389,6 +4617,28 @@ fn enum_method(
     } else {
         intrinsics::SOME_TAG
     };
+    // `unwrap_or` on a `Result` is *total* only if destroying the error value on
+    // the `Err` branch cannot be observed. The model checks only that the payload
+    // and the default are scalar values, and Rust destroys `E` inside `unwrap_or`,
+    // so an error type with a panicking destructor would make the call panic while
+    // the model reports no obligation -- a false proof. The error type is read from
+    // the receiver's own type (`Result<T, E>`), and a type whose glue this tool
+    // cannot establish is refused rather than assumed harmless.
+    if let OptionMethod::UnwrapOr = kind {
+        if intrinsics::names_result_impl(name) {
+            if let Some(err) = receiver_error_type(cur, &opt) {
+                match has_drop_glue(prog, callees.structs(), &err) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        return Err(format!(
+                            "`{name}` destroys an error value whose destructor is not modelled"
+                        ));
+                    }
+                    Err(e) => return Err(format!("`{name}`: {e}")),
+                }
+            }
+        }
+    }
     // The tag's width: the seeded/enum width where there is one, else the
     // payload's, exactly as `Rvalue::Discriminant` reads it.
     let tag_w = env.tag_width(opt.local).or_else(|| env.option_width(opt.local)).unwrap_or(64);
@@ -4478,6 +4728,7 @@ fn try_intrinsic(
     env: &mut Env,
     path: Pred,
     pins: &[(u32, u64)],
+    callees: &CalleeEnv<'_>,
 ) -> Option<Result<Vec<Obligation>, String>> {
     let op = intrinsics::classify(name)?;
     // A modelled method is only ever `core`'s own, and rustc prints a `core`
@@ -4522,7 +4773,9 @@ fn try_intrinsic(
     let trait_method = is_ord_callee(name)
         || matches!(
             op,
-            intrinsics::Intrinsic::Conversion(_) | intrinsics::Intrinsic::OptionMethod(_)
+            intrinsics::Intrinsic::Conversion(_)
+                | intrinsics::Intrinsic::OptionMethod(_)
+                | intrinsics::Intrinsic::Range(_)
         );
     if !name.contains("<impl") && !trait_method {
         return None;
@@ -4606,7 +4859,16 @@ fn try_intrinsic(
     // through a reference the same way the ASCII tests are -- `_2 = &_1;
     // is_some(move _2)` reads `_1`.
     if let intrinsics::Intrinsic::OptionMethod(kind) = op {
-        return Some(enum_method(name, kind, args, dest, env, path, pins));
+        return Some(enum_method(name, kind, args, dest, env, path, pins, &prog.fns[func], prog, callees));
+    }
+    // The `for`-loop range methods. Their receiver is a `RangeInclusive`/`Range`
+    // struct whose `start`/`end`/`exhausted` fields the executor holds, so they are
+    // answered from that store rather than from an operand term. This is what makes
+    // the commonest loop in Rust reachable: the desugaring's `new`/`into_iter`/`next`
+    // are modelled, and the loop then decides by its `invariant:` (or is unwound
+    // like any other loop).
+    if let intrinsics::Intrinsic::Range(kind) = op {
+        return Some(range_method(name, kind, args, dest, env));
     }
     // The ASCII class tests take `&self`, so the operand is a reference whose
     // *referent* is the byte. rustc prints `_3 = &_1; is_ascii_digit(move _3)`,
@@ -5129,39 +5391,51 @@ where
         }
     };
 
-    // Unwind bound: count visits, and stop the path rather than assume exit.
+    // Unwind bound: count *back-edge traversals*, and stop the path rather than
+    // assume exit.
+    //
+    // Counting entries to a block counts the loop header once more than the loop
+    // runs -- the last entry evaluates the guard and takes the exit -- so a loop
+    // that runs exactly `N` iterations needs `N + 1` header entries, and
+    // `unwind: N` was rejected: `for i in 0..3` under `unwind: 3` came back
+    // `FAILED` (the `while` spelling only passed by accident, because its header
+    // ends in a `switchInt` that zeroes its own count). The *latch* -- the block
+    // holding the edge back to the header -- is executed exactly once per
+    // iteration, so it is the quantity the bound is about.
     let key = (st.frame.func, st.block);
-    let n = st.visits.entry(key).or_insert(0);
-    *n += 1;
-    if *n > unwind {
-        if unwind_declared {
-            // A *declared* bound is a claim ("this loop finishes within N
-            // iterations"), so running off the end of it is Kani's *unwinding
-            // assertion*: a failure, not an incompleteness. Recording it as a
-            // failure rather than an `unknown_paths` entry is what stops a
-            // too-small bound from turning into a weaker proof: `verified` under
-            // `unwind: 3` would be a statement about the first three iterations
-            // only, which is exactly the soundness hole the clause exists to
-            // avoid. The verdict is the reachability of the cutoff -- the same
-            // query shape as a diverging call, and for the same reason -- so a
-            // reachable cutoff comes back as a `Counterexample` naming an input
-            // that runs off the bound, and one reached on every input as `Valid`.
-            // `Unsat` would be a discharge, but the path was already pruned when
-            // unsatisfiable, so the cutoff is a failure on every input that reaches
-            // it.
-            report.obligations.push(Obligation {
-                kind: ObligationKind::UnwindBound { bound: unwind },
-                verdict: find_obligation(st.path, pins),
-            });
-        } else {
-            // No bound was declared, so the cutoff is the default, which is not a
-            // claim anyone made. It stays an honest incompleteness.
-            report.unknown_paths.push(format!(
-                "loop unwound past {unwind} at bb{} of {}; assuming it exited would be unsound",
-                st.block, cur.name
-            ));
+    if callees.is_latch(st.frame.func, st.block) {
+        let n = st.visits.entry(key).or_insert(0);
+        *n += 1;
+        if *n > unwind {
+            if unwind_declared {
+                // A *declared* bound is a claim ("this loop finishes within N
+                // iterations"), so running off the end of it is Kani's *unwinding
+                // assertion*: a failure, not an incompleteness. Recording it as a
+                // failure rather than an `unknown_paths` entry is what stops a
+                // too-small bound from turning into a weaker proof: `verified` under
+                // `unwind: 3` would be a statement about the first three iterations
+                // only, which is exactly the soundness hole the clause exists to
+                // avoid. The verdict is the reachability of the cutoff -- the same
+                // query shape as a diverging call, and for the same reason -- so a
+                // reachable cutoff comes back as a `Counterexample` naming an input
+                // that runs off the bound, and one reached on every input as `Valid`.
+                // `Unsat` would be a discharge, but the path was already pruned when
+                // unsatisfiable, so the cutoff is a failure on every input that reaches
+                // it.
+                report.obligations.push(Obligation {
+                    kind: ObligationKind::UnwindBound { bound: unwind },
+                    verdict: find_obligation(st.path, pins),
+                });
+            } else {
+                // No bound was declared, so the cutoff is the default, which is not a
+                // claim anyone made. It stays an honest incompleteness.
+                report.unknown_paths.push(format!(
+                    "loop unwound past {unwind} at bb{} of {}; assuming it exited would be unsound",
+                    st.block, cur.name
+                ));
+            }
+            return;
         }
-        return;
     }
 
     // Statements.
@@ -5852,6 +6126,26 @@ where
                 advance(prog, next, *target, report, work, pins);
                 return;
             }
+            // rustc's `drop` destroys the *whole* value: the user destructor, then
+            // the fields. Running only the user destructor skips a field's, and an
+            // empty outer destructor then hides a panicking inner one -- a false
+            // proof. A field that itself has glue (its own `Drop`, or a field of
+            // one) is refused unless it can be destroyed; only an all-glue-free
+            // field set is continued as a no-op.
+            match has_field_glue(prog, callees.structs(), &ty) {
+                Ok(true) => {
+                    report.unknown_paths.push(format!(
+                        "drop of `{}` destroys a field with its own destructor, which is not modelled",
+                        ty_label(&ty)
+                    ));
+                    return;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    report.unknown_paths.push(format!("drop of `{}`: {e}", ty_label(&ty)));
+                    return;
+                }
+            }
             let Some(idx) = (if place.proj.is_empty() { drop_destructor(prog, &ty) } else { None })
             else {
                 report
@@ -6098,6 +6392,7 @@ where
                     &mut st.env,
                     st.path,
                     pins,
+                    callees,
                 ) {
                     let next = match done {
                         // A modelled call can contribute obligations of its own:
@@ -6323,6 +6618,18 @@ fn drop_destructor(prog: &MirProgram, ty: &Ty) -> Option<usize> {
             continue;
         }
         let Some(loc) = f.impl_loc else { continue };
+        // The *trait* has to be `Drop`. A method named `drop` on any other trait
+        // (`trait NotDrop { fn drop(&mut self); }`) is not Rust's destruction hook,
+        // and executing it as though it were hides the real field destruction --
+        // a false proof (`Outer { inner: Inner }` with an empty `NotDrop::drop` on
+        // `Outer` and a panicking `Inner::drop` came back `Verified`). The trait
+        // path rustc prints for the standard library's `Drop` is the bare `Drop`
+        // (a local trait is qualified with its own module, `m::NotDrop`), so the
+        // last `::` segment is what is compared, exactly as the owner is.
+        match prog.impl_traits.get(&loc) {
+            Some(t) if t.rsplit("::").next() == Some("Drop") => {}
+            _ => continue,
+        }
         let Some(owner) = prog.impl_owners.get(&loc) else { continue };
         let owner_bare = owner.split('<').next().unwrap_or(owner);
         if owner_bare == bare {
@@ -6333,6 +6640,156 @@ fn drop_destructor(prog: &MirProgram, ty: &Ty) -> Option<usize> {
         }
     }
     hit
+}
+
+/// Whether a type has *any* drop glue -- a user `Drop` impl, or a field (at any
+/// depth) that does.
+///
+/// This is what makes the `drop` handler sound for an aggregate. rustc's `drop`
+/// terminator destroys the *whole* value, not only the user-written destructor:
+/// after `Outer::drop` returns, Rust also destroys `Outer`'s fields. A frontend
+/// that runs only the outer destructor therefore misses a field destructor that
+/// can panic, and an empty outer destructor *hides* it -- `Outer { inner: Inner }`
+/// with an empty `Outer::drop` and a panicking `Inner::drop` was reported
+/// `Verified`.
+///
+/// `Ok(false)` is "no glue anywhere"; `Ok(true)` is "some glue"; `Err` is a type
+/// this tool cannot decide (a container whose destructor it does not model), and
+/// the caller refuses rather than assuming. The layout comes from `structs`, read
+/// from the same source as the contracts; a type with no layout and no `Drop` impl
+/// is a container, which is the `Err` case.
+fn has_drop_glue(
+    prog: &MirProgram,
+    structs: &BTreeMap<String, spec::StructDef>,
+    ty: &Ty,
+) -> Result<bool, String> {
+    match ty {
+        Ty::Bool
+        | Ty::U8
+        | Ty::U16
+        | Ty::U32
+        | Ty::U64
+        | Ty::U128
+        | Ty::Usize
+        | Ty::I8
+        | Ty::I16
+        | Ty::I32
+        | Ty::I64
+        | Ty::I128
+        | Ty::Isize
+        | Ty::Unit
+        | Ty::Ref(_) => Ok(false),
+        Ty::Tuple(ts) => {
+            for t in ts {
+                if has_drop_glue(prog, structs, t)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Ty::Array(inner, _) | Ty::Slice(inner) => has_drop_glue(prog, structs, inner),
+        Ty::Other(name) => {
+            if drop_destructor(prog, ty).is_some() {
+                return Ok(true);
+            }
+            let bare = name.rsplit("::").next().unwrap_or(name);
+            let bare = bare.split('<').next().unwrap_or(bare);
+            match structs.get(bare).or_else(|| structs.get(name)) {
+                Some(def) => {
+                    for (_, fty) in &def.fields {
+                        if has_drop_glue(prog, structs, fty)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                // No layout and no `Drop` impl: a container (`Vec`, `String`, a
+                // guard) whose destructor this tool does not model. Whether it has
+                // observable glue is unknown, so the caller must refuse.
+                None => Err(format!("the drop glue of `{}` is not modelled", ty_label(ty))),
+            }
+        }
+    }
+}
+
+/// Whether destroying a value of `ty` also destroys a *field* (at any depth)
+/// whose own destructor would have to run.
+///
+/// The `drop` handler runs one destructor body per terminator. When a value's
+/// destruction also destroys a field -- `Outer { inner: Inner }` with a `Drop`
+/// for `Outer` destroys `inner` too -- running only the user destructor skips the
+/// field's, and an empty outer destructor *hides* a panicking inner one: that was
+/// a false proof (`Outer` came back `Verified`).
+///
+/// The layout comes from the source, exactly as [`has_drop_glue`]'s does. A type
+/// with no layout is a container or a unit-like item; a container's fields are
+/// unknown, so it is refused rather than assumed field-free.
+fn has_field_glue(
+    prog: &MirProgram,
+    structs: &BTreeMap<String, spec::StructDef>,
+    ty: &Ty,
+) -> Result<bool, String> {
+    match ty {
+        Ty::Bool
+        | Ty::U8
+        | Ty::U16
+        | Ty::U32
+        | Ty::U64
+        | Ty::U128
+        | Ty::Usize
+        | Ty::I8
+        | Ty::I16
+        | Ty::I32
+        | Ty::I64
+        | Ty::I128
+        | Ty::Isize
+        | Ty::Unit
+        | Ty::Ref(_) => Ok(false),
+        Ty::Tuple(ts) => {
+            for t in ts {
+                if has_drop_glue(prog, structs, t)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Ty::Array(inner, _) | Ty::Slice(inner) => has_drop_glue(prog, structs, inner),
+        Ty::Other(name) => {
+            let bare = name.rsplit("::").next().unwrap_or(name);
+            let bare = bare.split('<').next().unwrap_or(bare);
+            match structs.get(bare).or_else(|| structs.get(name)) {
+                Some(def) => {
+                    for (_, fty) in &def.fields {
+                        if has_drop_glue(prog, structs, fty)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                None => Err(format!("the fields of `{}` are not modelled", ty_label(ty))),
+            }
+        }
+    }
+}
+
+/// The error type of a `Result<T, E>` receiver, for the drop-glue check.
+///
+/// The receiver's type is printed as `Result<u8, E>` (or with a path prefix), and
+/// the error is the second top-level generic argument. A type that is not a
+/// `Result`, or whose arguments cannot be split, yields `None` -- the caller then
+/// does no glue check, which is the *unsound* direction only if the type really
+/// were a `Result` with an unmodelled error, and the receiver reaching this arm is
+/// already known to be a modelled `Result` (its tag and payload are in the store).
+fn receiver_error_type(f: &MirFn, p: &Place) -> Option<Ty> {
+    let Ty::Other(name) = f.ty_of(p.local)? else {
+        return None;
+    };
+    if !name.starts_with("Result") && !name.contains("::Result") {
+        return None;
+    }
+    let inner = spec::angle_inner(name)?;
+    let args = crate::mir::parse::split_top_level(inner, ',');
+    args.get(1).map(|e| Ty::parse(e.trim()))
 }
 
 /// Resolve an operand to a symbolic value.

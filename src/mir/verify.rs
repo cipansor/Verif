@@ -132,14 +132,17 @@ pub fn resolve_edition(file: &Path, explicit: Option<Edition>) -> Result<Edition
 /// which is Cargo's default for a package that does not state one -- so a valid
 /// 2015 package is verified, not refused. A manifest the reader cannot parse
 /// yields `None`, so the caller reports "no edition" rather than a wrong one.
-fn edition_from_manifest(file: &Path) -> Option<Edition> {
+///
+/// Public because it is the manifest half of [`resolve_edition`]: a caller may
+/// want to ask what a manifest declares without the environment fallbacks.
+pub fn edition_from_manifest(file: &Path) -> Option<Edition> {
     let manifest = nearest_manifest(file)?;
     let text = std::fs::read_to_string(&manifest).ok()?;
     match manifest_value(&text, "package", "edition") {
         // `edition.workspace = true` / `edition = { workspace = true }`: the value
         // lives in the workspace root.
         Some(v) if v == "workspace" => {
-            let root = workspace_root(&manifest)?;
+            let root = workspace_root(&manifest, &text)?;
             let root_text = std::fs::read_to_string(&root).ok()?;
             Edition::parse(&manifest_value(&root_text, "workspace.package", "edition")?)
         }
@@ -180,8 +183,23 @@ fn nearest_manifest(file: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The nearest `Cargo.toml` at or above `manifest` that declares a `[workspace]`.
-fn workspace_root(manifest: &Path) -> Option<PathBuf> {
+/// The workspace root for a member manifest.
+///
+/// Cargo's `package.workspace` key names the root explicitly, and it may point
+/// *outside* the member's ancestor chain (`workspace = "../ws"`), so it is
+/// resolved first: searching ancestors only would fail a valid workspace member
+/// whose root is not above it. When the key is absent, the root is the nearest
+/// ancestor manifest that declares `[workspace]`.
+fn workspace_root(manifest: &Path, text: &str) -> Option<PathBuf> {
+    if let Some(rel) = manifest_value(text, "package", "workspace") {
+        if rel != "workspace" {
+            let dir = manifest.parent()?;
+            let candidate = dir.join(rel).join("Cargo.toml");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
     let mut dir = manifest.parent()?;
     loop {
         let candidate = dir.join("Cargo.toml");
@@ -217,7 +235,14 @@ fn manifest_value(text: &str, table: &str, key: &str) -> Option<String> {
             continue;
         }
         let Some((lhs, rhs)) = line.split_once('=') else { continue };
-        let (lhs, rhs) = (lhs.trim(), rhs.trim());
+        // TOML permits a *quoted* key (`"edition" = "2024"`), which Cargo accepts
+        // and treats exactly as the bare spelling. Comparing the raw left-hand side
+        // missed it, so a quoted edition key read as *no* edition and the 2015
+        // default was applied -- verification then compiled a different edition
+        // from Cargo. A dotted key (`edition.workspace`) is not quoted as a whole,
+        // so only the bare key is unquoted here.
+        let lhs = unquote_toml_key(lhs.trim());
+        let rhs = rhs.trim();
         if lhs == format!("{key}.workspace") {
             return Some(if rhs == "true" { "workspace".into() } else { rhs.into() });
         }
@@ -234,6 +259,15 @@ fn manifest_value(text: &str, table: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Strip surrounding double quotes from a TOML key, if present.
+///
+/// A TOML key may be quoted (`"edition" = "2024"`); Cargo reads it identically to
+/// the bare spelling. The reader compares keys as strings, so it has to normalise
+/// the spelling or a quoted key silently reads as absent.
+fn unquote_toml_key(k: &str) -> &str {
+    k.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(k)
 }
 
 /// Drop a trailing `#` comment, respecting string literals so a `#` inside one is
