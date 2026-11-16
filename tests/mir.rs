@@ -10188,4 +10188,42 @@ pub fn tri_invariant(n: u32) -> u32 {
             ),
         }
     }
+
+    /// C3 exit criterion, second half: a loop with no contract is reported as a
+    /// *missing loop contract*, not as an unmodelled construct.
+    ///
+    /// `tri` in `everyday.rs` declares no `invariant:` or `unwind:`, so its loop is
+    /// unwound to the default and the path stops. That is an honest incompleteness,
+    /// but the message has to point at the remedy -- the loop is understood, and the
+    /// tool is declining to guess an exit -- rather than reading as "the frontend
+    /// could not model this".
+    #[test]
+    fn a_loop_without_a_contract_names_the_missing_contract() {
+        let src = r#"
+/// requires: true
+/// ensures: true
+pub fn tri(n: u32) -> u32 {
+    let mut s = 0;
+    for i in 0..=n { s += i; }
+    s
+}
+"#;
+        let Some(o) = verify_src("tri", src) else { return };
+        match o {
+            FnOutcome::Incomplete { reasons, .. } => {
+                let joined = reasons.join(" | ");
+                assert!(
+                    joined.contains("missing loop contract")
+                        && joined.contains("invariant:")
+                        && joined.contains("unwind:"),
+                    "the reason must name the missing loop contract and the two ways to \
+                     supply it, got: {joined}"
+                );
+            }
+            other => panic!(
+                "`tri` declares no loop contract and must be an honest incompleteness, \
+                 got: {other}"
+            ),
+        }
+    }
 }

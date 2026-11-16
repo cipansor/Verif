@@ -5428,9 +5428,16 @@ where
                 });
             } else {
                 // No bound was declared, so the cutoff is the default, which is not a
-                // claim anyone made. It stays an honest incompleteness.
+                // claim anyone made. It stays an honest incompleteness -- but it is a
+                // *missing loop contract*, not an unmodelled construct, and the
+                // message says so: the loop is understood, and the tool is declining
+                // to unwind it past the default because assuming an exit would be
+                // unsound. A reader who wants a verdict here declares an `invariant:`
+                // (which cuts the loop at the header) or an `unwind:` bound.
                 report.unknown_paths.push(format!(
-                    "loop unwound past {unwind} at bb{} of {}; assuming it exited would be unsound",
+                    "loop unwound past {unwind} at bb{} of {}; assuming it exited would be \
+                     unsound -- this is a missing loop contract, not an unmodelled \
+                     construct: declare `invariant:` or `unwind:` to decide it",
                     st.block, cur.name
                 ));
             }
