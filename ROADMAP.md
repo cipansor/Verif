@@ -200,6 +200,39 @@ with no new false proof while the independent corpus keeps growing.
     `the_option_result_conversions_decide_and_move_the_payload` and by a
     toolchain-free `classify` unit test (including the turbofish).
     `realistic.rs` **448 of 832 -> 457 of 850**.
+  - Progress (PR #8 review round: three findings). Each was reproduced against
+    real rustc before being fixed, and each fix is pinned by a true/tripwire pair.
+    - **A `&mut bool` postcondition lost its value.** A `bool` target is a
+      `Val::Bool` *predicate*, not a `Val::Sym` word, and the reference-final
+      collection kept only the `Sym` arm -- so `ensures: c == true` after
+      `*c = true` was refused as an *unknown name*. The predicate is now widened to
+      a one-bit word, exactly as a `bool` `ret` is. Three fixtures
+      (`set_bool_ref`, `keep_bool_ref`, and the false `a_bool_ref_write_cannot_prove_this`),
+      pinned by `a_mutable_bool_reference_postcondition_reads_its_final_value`.
+    - **A conversion over a *constructed* variant was refused.** A locally
+      constructed `None`/`Err`/`Ok` records only the payload that variant carries,
+      so `None::<u8>.ok_or(e)` had no `Some` payload to move and the call was
+      reported "on a receiver whose payload is not modelled". The inactive
+      variant's payload is unreachable on such a path (the tag is a *known*
+      discriminant), so it is now left *unbound* rather than refused -- the same
+      treatment a `None` construction gets. A *symbolic* tag still refuses, so no
+      fabricated value is bound on a path that could reach the payload. Eight
+      fixtures (both constructed directions for each of the three, true and
+      tripwire), pinned by
+      `the_option_result_conversions_handle_constructed_variants_and_grouping`.
+    - **Grouping and negation of an enum predicate was unreadable.** `(ret.is_ok())`
+      and `!x.is_none()` carry no comparator, so `paren_is_predicate_from` and
+      `bang_is_predicate` routed them into arithmetic and the contract was skipped.
+      Both lookaheads now recognise the `base.method()` shape; whether the base
+      really names an enum is still decided when the predicate is parsed. Eight
+      fixtures plus a toolchain-free `spec` unit test
+      (`a_grouped_or_negated_enum_method_is_a_predicate`).
+    `realistic.rs` **457 of 850 -> 467 of 869** (11 verify, 11 refute).
+  - Remaining: `?` (the `Try` desugaring needs `From` on the error type),
+    `map`/`map_err`/`and_then`/`unwrap_or_else` (closures), and a bare payload read
+    on an enum *return* (`ret.Ok <= n` / `ret.Some <= n`). The last needs the
+    payload to cross the return boundary *guarded* on the discriminant (a payload
+    read is meaningful only on the variant's paths), which is the next sub-item.
 - **C3. Ranges and `for` loops.** · P0 · done · Kani, Verus, Prusti
   - Gap: `RangeInclusive::new`, `Range`, `Iterator::next` unmodelled, so the
     commonest loop in Rust is out of reach. Evidence: `tri` incomplete.

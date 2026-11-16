@@ -5734,6 +5734,89 @@ fn the_option_result_conversions_decide_and_move_the_payload() {
     }
 }
 
+/// The three findings of the PR #8 review round on the enum conversions.
+///
+/// * A *constructed* source variant (`None::<u8>.ok_or(e)`, `Err(e).ok()`,
+///   `Ok(x).err()`) records no payload for the variant that is absent, so the
+///   conversion must still produce a result. It is sound to leave the unreachable
+///   payload unbound when the tag is a *known* other discriminant; a symbolic tag
+///   still refuses. The tripwires refute the *tag*, which is what proves the
+///   conversion ran rather than the whole call being dropped.
+/// * The grouping and negation lookaheads recognise the `base.method()` enum
+///   predicate, so `(ret.is_ok())` and `!x.is_none()` read instead of being routed
+///   into arithmetic.
+#[test]
+fn the_option_result_conversions_handle_constructed_variants_and_grouping() {
+    let names = [
+        "constructed_none_ok_or_is_err",
+        "constructed_none_ok_or_is_err_tripwire",
+        "constructed_err_ok_is_none",
+        "constructed_err_ok_is_none_tripwire",
+        "constructed_ok_err_is_none",
+        "constructed_ok_err_is_none_tripwire",
+        "constructed_ok_ok_is_some",
+        "constructed_ok_ok_is_some_tripwire",
+        "grouped_enum_predicate",
+        "grouped_enum_predicate_tripwire",
+        "negated_enum_predicate",
+        "negated_enum_predicate_tripwire",
+        "grouped_enum_predicate_conjunction",
+        "grouped_enum_predicate_conjunction_tripwire",
+        "bare_negated_enum_predicate",
+        "bare_negated_enum_predicate_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "constructed_none_ok_or_is_err",
+        "constructed_err_ok_is_none",
+        "constructed_ok_err_is_none",
+        "constructed_ok_ok_is_some",
+        "grouped_enum_predicate",
+        "negated_enum_predicate",
+        "grouped_enum_predicate_conjunction",
+        "bare_negated_enum_predicate",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "constructed_none_ok_or_is_err_tripwire",
+        "constructed_err_ok_is_none_tripwire",
+        "constructed_ok_err_is_none_tripwire",
+        "constructed_ok_ok_is_some_tripwire",
+        "grouped_enum_predicate_tripwire",
+        "negated_enum_predicate_tripwire",
+        "grouped_enum_predicate_conjunction_tripwire",
+        "bare_negated_enum_predicate_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        assert!(!o.is_verified(), "`{name}` must be refuted, got: {o}");
+    }
+}
+
+/// A `&mut bool` argument's final value is a predicate, not a word.
+///
+/// The postcondition's bare `c` means the value the body left at the target. A
+/// `bool` target is a `Val::Bool`, so the word-only collection dropped it and the
+/// contract was refused as an unknown name. The predicate is widened to a one-bit
+/// word, exactly as a `bool` `ret` is. The false direction pins that the binding is
+/// the *final* value, not the entry value.
+#[test]
+fn a_mutable_bool_reference_postcondition_reads_its_final_value() {
+    let names = ["set_bool_ref", "a_bool_ref_write_cannot_prove_this", "keep_bool_ref"];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in ["set_bool_ref", "keep_bool_ref"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let o = outcome(&report, "a_bool_ref_write_cannot_prove_this");
+    assert!(!o.is_verified(), "the false direction must be refuted, got: {o}");
+}
+
 /// A trailing line comment on a variant line does not erase the enum layout.
 ///
 /// `B = 3, // special` keeps the comma *before* the comment, so the reader that

@@ -4764,22 +4764,41 @@ fn enum_method(
         // left unset -- the consuming `switchInt` only reads the payload in the
         // arm whose tag matched, so a read of the unset one never happens.
         OptionMethod::OkOr => {
-            // `Some`'s payload becomes the result's `Ok` payload (discriminant 0),
-            // and the error argument becomes the `Err` payload (discriminant 1).
-            let Some((Val::Sym(ok, ok_sign), ok_w)) =
-                env.payloads.get(&(opt.local, intrinsics::SOME_TAG)).copied()
-            else {
-                return Err(format!("`{name}` on a receiver whose payload is not modelled"));
-            };
+            // The error argument is always present and always needed: it becomes
+            // the result's `Err` payload (discriminant 1). `Some`'s payload
+            // becomes the result's `Ok` payload (discriminant 0).
             let (err, err_sign) = match args.get(1).map(|d| operand(env, d)) {
                 Some(Val::Sym(v, s)) => (v, s),
                 Some(_) => return Err(format!("unmodelled argument to `{name}`")),
                 None => return Err(format!("`{name}` has no error argument")),
             };
             let err_w = smt::bits(err);
+            // The `Ok` payload exists only on the `Some` path. A receiver whose
+            // tag is a *known* non-`Some` discriminant (`None::<u8>.ok_or(e)`)
+            // cannot reach the `Ok` result on this path, so the payload is left
+            // *unbound* rather than refused -- exactly as a `None` construction
+            // leaves it. A symbolic or `Some` tag still requires the payload:
+            // binding a fabricated value there would be a value the receiver never
+            // holds.
+            let ok_payload = match env.payloads.get(&(opt.local, intrinsics::SOME_TAG)).copied() {
+                Some((Val::Sym(ok, ok_sign), ok_w)) => Some((ok, ok_sign, ok_w)),
+                Some(_) => {
+                    return Err(format!("`{name}` on a receiver whose payload is not modelled"))
+                }
+                None => match smt::evaluate(tag, |_| None) {
+                    Some(v) if v != intrinsics::SOME_TAG => None,
+                    _ => {
+                        return Err(format!(
+                            "`{name}` on a receiver whose payload is not modelled"
+                        ))
+                    }
+                },
+            };
             let result_tag = smt::truncate(smt::sub(smt::word(1, tag_w), tag), tag_w);
             env.set_discriminant(dest.local, Val::Sym(result_tag, Sign::Unsigned));
-            env.set_payload(dest.local, intrinsics::OK_TAG, Val::Sym(ok, ok_sign), ok_w);
+            if let Some((ok, ok_sign, ok_w)) = ok_payload {
+                env.set_payload(dest.local, intrinsics::OK_TAG, Val::Sym(ok, ok_sign), ok_w);
+            }
             env.set_payload(dest.local, 1, Val::Sym(err, err_sign), err_w);
             Vec::new()
         }
@@ -4791,10 +4810,23 @@ fn enum_method(
                 OptionMethod::Ok => intrinsics::OK_TAG,
                 _ => 1 - intrinsics::OK_TAG,
             };
-            let Some((Val::Sym(payload, sign), pw)) =
-                env.payloads.get(&(opt.local, src)).copied()
-            else {
-                return Err(format!("`{name}` on a receiver whose payload is not modelled"));
+            // The source variant has no payload on this path (`Err::<u8,u8>(e).ok()`
+            // reaches the `Ok` result on no path). Sound to leave unbound only when
+            // the tag is a *known* other discriminant; a symbolic tag still requires
+            // the payload.
+            let payload = match env.payloads.get(&(opt.local, src)).copied() {
+                Some((Val::Sym(payload, sign), pw)) => Some((payload, sign, pw)),
+                Some(_) => {
+                    return Err(format!("`{name}` on a receiver whose payload is not modelled"))
+                }
+                None => match smt::evaluate(tag, |_| None) {
+                    Some(v) if v != src => None,
+                    _ => {
+                        return Err(format!(
+                            "`{name}` on a receiver whose payload is not modelled"
+                        ))
+                    }
+                },
             };
             let result_tag = match kind {
                 // `Ok`(0) -> `Some`(1), `Err`(1) -> `None`(0): `1 - tag`.
@@ -4803,7 +4835,9 @@ fn enum_method(
                 _ => tag,
             };
             env.set_discriminant(dest.local, Val::Sym(result_tag, Sign::Unsigned));
-            env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(payload, sign), pw);
+            if let Some((payload, sign, pw)) = payload {
+                env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(payload, sign), pw);
+            }
             Vec::new()
         }
         // `unwrap`/`unwrap_or` read the payload, which `checked_*` recorded
@@ -5812,8 +5846,17 @@ where
                             if cur.ty_of(l).and_then(|t| t.referent().width()).is_none() {
                                 continue;
                             }
-                            if let Val::Sym(v, _) = st.env.get(&Place::new(l)) {
-                                ref_final.push((l, v));
+                            // A `&mut bool` target is a `Val::Bool` predicate, not a
+                            // `Val::Sym` word. Dropping it left `c` unbound, so
+                            // `ensures: c == true` after `*c = true` was refused as an
+                            // unknown name -- the same final-value loss the `Sym` arm
+                            // exists to prevent. Widen the predicate to a one-bit
+                            // word, exactly as the return word does for a `bool` `ret`.
+                            match st.env.get(&Place::new(l)) {
+                                Val::Sym(v, _) => ref_final.push((l, v)),
+                                Val::Bool(p) => ref_final
+                                    .push((l, smt::ite(p, smt::word(1, 1), smt::word(0, 1)))),
+                                _ => {}
                             }
                         }
                         match post(rv, &projs, &ref_final) {

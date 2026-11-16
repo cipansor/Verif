@@ -2735,6 +2735,138 @@ pub fn err_moves_the_payload_tripwire(r: Result<u8, u8>) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Conversions whose source variant is *constructed*, not seeded. A locally
+// constructed `None`/`Err`/`Ok` records only the payload that variant carries,
+// so the inactive variant has no payload to move. The conversion must still
+// produce the result: the missing payload is unreachable on the path (the tag is
+// a known discriminant), so it is left unbound rather than refused. The tag is
+// what these fixtures pin -- a `None::<u8>.ok_or(e)` is a known `Err`, and a
+// model that refused it (or invented an `Ok` payload) would not decide.
+
+/// `None::<u8>.ok_or(7)` is an `Err` -- a known tag, no `Some` payload needed.
+/// requires: true
+/// ensures: ret.is_err()
+pub fn constructed_none_ok_or_is_err() -> Result<u8, u8> {
+    None::<u8>.ok_or(7u8)
+}
+
+/// The tripwire: `None.ok_or` never produces an `Ok`, so claiming one refutes.
+/// requires: true
+/// ensures: ret.is_ok()
+pub fn constructed_none_ok_or_is_err_tripwire() -> Result<u8, u8> {
+    None::<u8>.ok_or(7u8)
+}
+
+/// `Err(e).ok()` is a `None` -- a known tag, no `Ok` payload needed.
+/// requires: true
+/// ensures: ret.is_none()
+pub fn constructed_err_ok_is_none(e: u8) -> Option<u8> {
+    Err::<u8, u8>(e).ok()
+}
+
+/// The tripwire for the constructed `Err`.
+/// requires: true
+/// ensures: ret.is_some()
+pub fn constructed_err_ok_is_none_tripwire(e: u8) -> Option<u8> {
+    Err::<u8, u8>(e).ok()
+}
+
+/// `Ok(x).err()` is a `None` -- the other constructed direction.
+/// requires: true
+/// ensures: ret.is_none()
+pub fn constructed_ok_err_is_none(x: u8) -> Option<u8> {
+    Ok::<u8, u8>(x).err()
+}
+
+/// The tripwire for the constructed `Ok`.
+/// requires: true
+/// ensures: ret.is_some()
+pub fn constructed_ok_err_is_none_tripwire(x: u8) -> Option<u8> {
+    Ok::<u8, u8>(x).err()
+}
+
+/// The constructed *payload-carrying* variant still moves its payload: a known
+/// `Ok` needs no `Err` payload, and its `Ok` payload survives onto `Some`.
+/// requires: true
+/// ensures: ret.is_some()
+pub fn constructed_ok_ok_is_some(x: u8) -> Option<u8> {
+    Ok::<u8, u8>(x).ok()
+}
+
+/// The tripwire for the constructed `Ok` payload-carrying direction.
+/// requires: true
+/// ensures: ret.is_none()
+pub fn constructed_ok_ok_is_some_tripwire(x: u8) -> Option<u8> {
+    Ok::<u8, u8>(x).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Grouping and negation of the enum discriminant predicates. `ret.is_ok()`
+// parses as a whole predicate, but `(ret.is_ok())` and `!ret.is_none()` were
+// routed into arithmetic because the grouping/negation lookaheads recognised
+// only comparators and boolean literals, so the contract was skipped. The
+// lookaheads now know the `base.method()` shape; whether the base really names
+// an enum is still decided when the predicate is parsed.
+
+/// A parenthesised enum predicate reads.
+/// requires: true
+/// ensures: (ret.is_some())
+pub fn grouped_enum_predicate(x: u8) -> Option<u8> {
+    Some(x)
+}
+
+/// The tripwire: a parenthesised claim that the result is `None` is refutable
+/// (the body always returns `Some`).
+/// requires: true
+/// ensures: (ret.is_none())
+pub fn grouped_enum_predicate_tripwire(x: u8) -> Option<u8> {
+    Some(x)
+}
+
+/// A negated enum predicate on the *argument* reads.
+/// requires: !(x.is_none())
+/// ensures: true
+pub fn negated_enum_predicate(x: Option<u8>) -> u8 {
+    x.unwrap_or(0)
+}
+
+/// The tripwire: `!(x.is_none())` is `x.is_some()`, so it does not say the
+/// payload is `0` (a `Some(1)` argument refutes it).
+/// requires: !(x.is_none())
+/// ensures: x.is_some() && x.Some == 0
+pub fn negated_enum_predicate_tripwire(x: Option<u8>) -> u8 {
+    x.unwrap_or(0)
+}
+
+/// A parenthesised enum predicate combines with `&&`.
+/// requires: true
+/// ensures: (ret.is_ok()) && ret.is_ok()
+pub fn grouped_enum_predicate_conjunction(x: u8) -> Result<u8, u8> {
+    Ok(x)
+}
+
+/// The tripwire for the conjunction: no result is both `Ok` and `Err`.
+/// requires: true
+/// ensures: (ret.is_ok()) && ret.is_err()
+pub fn grouped_enum_predicate_conjunction_tripwire(x: u8) -> Result<u8, u8> {
+    Ok(x)
+}
+
+/// A negated enum predicate on the *argument*, without parentheses.
+/// requires: !x.is_none()
+/// ensures: true
+pub fn bare_negated_enum_predicate(x: Option<u8>) -> u8 {
+    x.unwrap_or(0)
+}
+
+/// The tripwire for the bare negation.
+/// requires: !x.is_none()
+/// ensures: x.Some == 0
+pub fn bare_negated_enum_predicate_tripwire(x: Option<u8>) -> u8 {
+    x.unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // A cast in a *contract*: `x as u32`. The body has modelled `as` for a while
 // (it is what lets a narrow argument meet a wide return), but the contract
 // language had no cast at all, so any contract that related the two was
@@ -10114,5 +10246,35 @@ pub fn a_scalar_ref_caller(x: u16) -> u16 {
 /// ensures: *c == old(*c) + 1
 pub fn bump_scalar_ref_star(c: &mut u16) {
     *c += 1;
+}
+
+// ---------------------------------------------------------------------------
+// A `&mut bool` argument: the final value is a *predicate* (`Val::Bool`), not a
+// word, so `ref_final` dropped it and the postcondition was refused as an unknown
+// name -- the same final-value loss the word case exists to prevent. The
+// predicate is widened to a one-bit word, exactly as a `bool` `ret` is.
+// ---------------------------------------------------------------------------
+
+/// A `&mut bool` written to a constant.
+/// requires: true
+/// ensures: c == true
+pub fn set_bool_ref(c: &mut bool) {
+    *c = true;
+}
+
+/// The false direction of [`set_bool_ref`]: the final value is `true`, so a claim
+/// of `false` is refutable. Dropping the binding would make the contract
+/// *unreadable* rather than refuted, which is the milder bug this pins shut.
+/// requires: true
+/// ensures: c == false
+pub fn a_bool_ref_write_cannot_prove_this(c: &mut bool) {
+    *c = true;
+}
+
+/// A `&mut bool` read but not written: the final value is the entry value.
+/// requires: c == true
+/// ensures: c == true
+pub fn keep_bool_ref(c: &mut bool) {
+    let _ = *c;
 }
 

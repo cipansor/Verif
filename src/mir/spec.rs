@@ -4734,9 +4734,19 @@ impl<'a> Parser<'a> {
     /// must ask about the `(` that follows the `!`, not the one at the cursor.
     fn paren_is_predicate_from(&self, start: usize) -> bool {
         let mut depth = 0usize;
-        for t in &self.toks[start..] {
+        for (off, t) in self.toks[start..].iter().enumerate() {
             match t {
-                Tok::Op(o) if o == "(" => depth += 1,
+                Tok::Op(o) if o == "(" => {
+                    // A group whose leading predicate is an enum method
+                    // (`(ret.is_ok())`, `!(x.is_none())`) is a predicate even though
+                    // it carries no comparator. Recognising it here is what makes
+                    // grouping and negation of the enum-method predicates parse
+                    // instead of falling through to arithmetic.
+                    if self.enum_method_is_predicate_from(start + off) {
+                        return true;
+                    }
+                    depth += 1;
+                }
                 Tok::Op(o) if o == ")" => {
                     depth -= 1;
                     if depth == 0 {
@@ -4755,6 +4765,37 @@ impl<'a> Parser<'a> {
         false
     }
 
+    /// Whether the `(` at `start` opens the `base.method()` shape of an enum
+    /// discriminant predicate (`ret.is_ok()`, `x.is_none()`).
+    ///
+    /// This is a *syntactic* lookahead only: whether `base` really names an enum is
+    /// decided when the predicate is parsed (and refused if it is not). It exists so
+    /// the grouping and negation lookaheads treat `(ret.is_ok())` as a predicate
+    /// rather than arithmetic; without it the method reached the arithmetic parser
+    /// and the contract was skipped.
+    fn enum_method_is_predicate_from(&self, start: usize) -> bool {
+        matches!(self.toks.get(start), Some(Tok::Op(o)) if o == "(")
+            && self.enum_method_shape(start + 1)
+    }
+
+    /// The bare `base.method()` shape of an enum discriminant predicate, with no
+    /// enclosing parenthesis: `Ident . is_ok|is_some|is_err|is_none ( )` at `start`.
+    /// Used for `!ret.is_some()`, where the `!` is followed by the method directly.
+    fn enum_method_shape(&self, start: usize) -> bool {
+        if !matches!(self.toks.get(start), Some(Tok::Ident(_))) {
+            return false;
+        }
+        if !matches!(self.toks.get(start + 1), Some(Tok::Op(o)) if o == ".") {
+            return false;
+        }
+        let Some(Tok::Ident(m)) = self.toks.get(start + 2) else { return false };
+        if !matches!(m.as_str(), "is_ok" | "is_some" | "is_err" | "is_none") {
+            return false;
+        }
+        matches!(self.toks.get(start + 3), Some(Tok::Op(o)) if o == "(")
+            && matches!(self.toks.get(start + 4), Some(Tok::Op(o)) if o == ")")
+    }
+
     /// Whether the `!` at the cursor applies to a *predicate* rather than a value.
     ///
     /// True for `!(a == b)` (a parenthesized predicate) and `!true`/`!false`; false
@@ -4763,6 +4804,9 @@ impl<'a> Parser<'a> {
         match self.toks.get(self.pos + 1) {
             Some(Tok::Op(o)) if o == "(" => self.paren_is_predicate_from(self.pos + 1),
             Some(Tok::Ident(n)) if n == "true" || n == "false" => true,
+            // `!ret.is_some()`: the `!` is followed by the enum method directly, so
+            // the predicate shape is the bare `base.method()` rather than a group.
+            Some(Tok::Ident(_)) => self.enum_method_shape(self.pos + 1),
             _ => false,
         }
     }
@@ -7727,6 +7771,57 @@ mod tests {
             Some(false),
             "the conjunction is refutable"
         );
+    }
+
+    /// Grouping and negation of the enum discriminant methods parse and read the
+    /// same predicate.
+    ///
+    /// `(ret.is_ok())` and `!r.is_err()` carry no comparator, so the grouping and
+    /// negation lookaheads -- which recognised only comparators and boolean
+    /// literals -- routed them into arithmetic and the contract was skipped. The
+    /// lookaheads now know the `base.method()` shape. Evaluated at both
+    /// discriminants, so a wrong tree is a wrong boolean rather than a parse error.
+    #[test]
+    fn a_grouped_or_negated_enum_method_is_a_predicate() {
+        let tag = smt::var_named(1, 64);
+        let mut fields = FieldEnv::default();
+        fields.bind_ret_enum(tag, 0, 1);
+        let args = BTreeMap::new();
+        let signed = BTreeSet::new();
+        let old = BTreeMap::new();
+        let at = |k: u64| move |i: u32| if i == 1 { Some(k) } else { None };
+        let read = |text: &str| {
+            eval_ensures(
+                text,
+                &args,
+                Some(tag),
+                RET_IS_UNKNOWN,
+                &signed,
+                false,
+                &fields,
+                &old,
+            )
+            .unwrap_or_else(|e| panic!("`{text}` must parse: {e}"))
+        };
+        for (text, on_ok, on_err) in [
+            ("(ret.is_ok())", true, false),
+            ("!(ret.is_ok())", false, true),
+            ("!ret.is_ok()", false, true),
+            ("((ret.is_err()))", false, true),
+            ("!(ret.is_ok() && ret.is_err())", true, true),
+        ] {
+            let p = read(text);
+            assert_eq!(
+                smt::evaluate_pred(p, at(0)),
+                Some(on_ok),
+                "`{text}` at the Ok tag (0)"
+            );
+            assert_eq!(
+                smt::evaluate_pred(p, at(1)),
+                Some(on_err),
+                "`{text}` at the Err tag (1)"
+            );
+        }
     }
 
     /// A contract cast sets the target's width *and* sign, and a chain applies
