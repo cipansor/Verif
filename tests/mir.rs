@@ -121,6 +121,22 @@ fn outcome<'a>(report: &'a verify::FileReport, name: &str) -> &'a FnOutcome {
         .unwrap_or_else(|| panic!("{name} missing from the report"))
 }
 
+/// Assert a function is *refuted* -- `Failed`, with a counterexample.
+///
+/// `!o.is_verified()` accepts `Skipped` and `Incomplete` too, so it does not
+/// establish that a false postcondition produced a counterexample, which is the
+/// only thing a tripwire is for: a tripwire that "passes" because the function
+/// was skipped has never been pulled. This requires the refutation itself. A
+/// shape that is *honestly* undecided must be asserted `!is_verified()` on
+/// purpose, with a comment saying so.
+fn assert_refuted(report: &verify::FileReport, name: &str) {
+    let o = outcome(report, name);
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`{name}` must be refuted with a counterexample, got: {o}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The contract scanner
 // ---------------------------------------------------------------------------
@@ -4726,26 +4742,45 @@ fn a_local_const_is_not_in_scope_in_another_function() {
 }
 
 /// The whole-corpus direction invariant: a function whose *name* says it must not be
-/// provable may never come back `verified`.
+/// provable must come back `Failed` -- a real refutation with a counterexample.
 ///
 /// The corpus pairs each contract with its false twin, spelled `..._cannot_prove_this`:
 /// the same body, or one differing only in the direction of the claim, so a twin that
-/// verifies is a false proof by construction. Checking the naming convention
-/// over the whole file means a new false proof of any *known* shape fails this test the
-/// moment it is introduced, instead of waiting for someone to remember to assert the
-/// twin in the same commit that adds the shape. It is the corpus-wide version of the
-/// per-shape `Failed` assertions below, and it is deliberately weaker than they are --
-/// a twin may be `Failed`, `Incomplete` or `Skipped` and this passes, because all three
-/// are honest answers and only `verified` is a lie.
+/// verifies is a false proof by construction. Checking the naming convention over the
+/// whole file means a new false proof of any *known* shape fails this test the moment
+/// it is introduced, instead of waiting for someone to remember to assert the twin in
+/// the same commit that adds the shape.
+///
+/// The assertion is on `Failed`, not on `!is_verified()`. `!is_verified()` also accepts
+/// `Skipped` and `Incomplete`, so a tripwire that "passed" that way would never have
+/// been pulled -- a false contract that was never checked is not evidence the checker
+/// works. Two entries are `Incomplete` on purpose, and they are named here with the
+/// reason: a tripwire may be undecided only when it is *listed* as such, so a
+/// regression that turns a refutation into a skip fails this test rather than slipping
+/// through.
 #[test]
 fn no_cannot_prove_entry_is_ever_verified() {
     let Some(report) = verify_realistic(&[]) else { return };
+    // Tripwires that are honestly undecided, with the reason they cannot be refuted
+    // today. Each is a *lost* proof (a skip), never a false one, and each is a
+    // documented coverage gap rather than a regression. Anything else that is not
+    // `Failed` fails this test.
+    let undecided_on_purpose: &[(&str, &str)] = &[
+        (
+            "a_shifted_symbolic_element_cannot_prove_this",
+            "a symbolic shift of an array element is not modelled, so the contract is \
+             unreadable -- the read never reaches the refutation",
+        ),
+        (
+            "default_body_self_call_is_not_the_default_cannot_prove_this",
+            "the self-call to a trait default body is unmodelled, so the path is cut \
+             before the false claim is checked",
+        ),
+    ];
     let mut checked = 0usize;
     let mut liars = Vec::new();
+    let mut wrongly_undecided = Vec::new();
     for (name, o) in &report.outcomes {
-        // The suffix is the whole convention: all 49 probes in the corpus use it, and
-        // none uses a prefix. A name that does not end this way is not a
-        // false-direction probe, whatever else it looks like.
         let false_direction = name.ends_with("_cannot_prove_this");
         if !false_direction {
             continue;
@@ -4753,11 +4788,20 @@ fn no_cannot_prove_entry_is_ever_verified() {
         checked += 1;
         if o.is_verified() {
             liars.push(name.clone());
+        } else if !matches!(o, FnOutcome::Failed { .. })
+            && !undecided_on_purpose.iter().any(|(n, _)| n == name)
+        {
+            wrongly_undecided.push(format!("{name}: {o}"));
         }
     }
     assert!(
         liars.is_empty(),
         "these entries claim a false contract and were `verified` -- a false proof: {liars:?}"
+    );
+    assert!(
+        wrongly_undecided.is_empty(),
+        "these tripwires were neither refuted nor on the documented undecided list -- a \
+         tripwire that was not pulled is not evidence: {wrongly_undecided:#?}"
     );
     // A silent zero would make this test vacuous if the naming convention ever drifts,
     // so the count is asserted rather than merely reported.
@@ -4767,6 +4811,7 @@ fn no_cannot_prove_entry_is_ever_verified() {
          has the naming convention changed?"
     );
 }
+
 /// A deep term is refused, not allowed to overflow the stack.
 ///
 /// The engine's contract is that a query it cannot decide is *reported*: `Unknown`,
@@ -5729,8 +5774,9 @@ fn the_option_result_conversions_decide_and_move_the_payload() {
         "err_ok_is_none_tripwire",
         "err_moves_the_payload_tripwire",
     ] {
-        let o = outcome(&report, name);
-        assert!(!o.is_verified(), "`{name}` must be refuted, got: {o}");
+        // A *refutation*: the conversion is only pinned if the false contract
+        // produced a counterexample. `!is_verified()` would also accept a skip.
+        assert_refuted(&report, name);
     }
 }
 
@@ -5791,8 +5837,10 @@ fn the_option_result_conversions_handle_constructed_variants_and_grouping() {
         "grouped_enum_predicate_conjunction_tripwire",
         "bare_negated_enum_predicate_tripwire",
     ] {
-        let o = outcome(&report, name);
-        assert!(!o.is_verified(), "`{name}` must be refuted, got: {o}");
+        // A *refutation*, not merely "not verified": these tripwires are only
+        // evidence of the conversion/parser if the false contract produced a
+        // counterexample. `!is_verified()` would also accept a skip.
+        assert_refuted(&report, name);
     }
 }
 
@@ -5813,8 +5861,8 @@ fn a_mutable_bool_reference_postcondition_reads_its_final_value() {
         let o = outcome(&report, name);
         assert!(o.is_verified(), "`{name}` must verify, got: {o}");
     }
-    let o = outcome(&report, "a_bool_ref_write_cannot_prove_this");
-    assert!(!o.is_verified(), "the false direction must be refuted, got: {o}");
+    // A real refutation, so the false direction is a counterexample and not a skip.
+    assert_refuted(&report, "a_bool_ref_write_cannot_prove_this");
 }
 
 /// A trailing line comment on a variant line does not erase the enum layout.
