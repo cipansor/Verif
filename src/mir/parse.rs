@@ -2518,7 +2518,7 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
     // hands the whole string to `parse_const`, which reads `i32 as u32 (IntToInt)`
     // as a type name and produces a constant with no width -- an `Unknown` that
     // then makes every guard written against it unmodelled.
-    if let Some(i) = t.find(" as ") {
+    if let Some(i) = find_top_level_as(t) {
         let (src, dst) = (t[..i].trim(), t[i + 4..].trim());
         let ty_text = dst.split_whitespace().next().unwrap_or(dst);
         return Rvalue::Cast(parse_operand(src, enums), Ty::parse(ty_text));
@@ -2672,6 +2672,39 @@ fn has_top_level_space(s: &str) -> bool {
         }
     }
     false
+}
+
+/// The byte offset of the first ` as ` that is not inside `<...>` or `(...)`.
+///
+/// The cast arm needs the *cast's* ` as `, but a promoted constant's use-site
+/// spelling contains one of its own inside the `<T as Trait>` projection
+/// (`const <Self as range_shim::a::Custom>::into_iter::promoted[0]`). A plain
+/// `find(" as ")` matched that one, so the whole operand was read as a cast of the
+/// string `const <Self` and the promoted constant was never recorded -- an
+/// MSRV-only failure, because current stable prints a plain `from_str` instead.
+/// The search skips `<>` and `()` nesting, so the projection's ` as ` is invisible
+/// and a real cast (`const 3_i32 as u32 (IntToInt)`) is still found.
+fn find_top_level_as(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut angle = 0i32;
+    let mut paren = 0i32;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'<' => angle += 1,
+            b'>' => angle -= 1,
+            b'(' => paren += 1,
+            b')' => paren -= 1,
+            b' ' if angle <= 0 && paren <= 0
+                && s[i..].starts_with(" as ") =>
+            {
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Parse one statement or terminator line.
@@ -3008,8 +3041,12 @@ fn parse_program_impl(
     // to the other `const` items, so the `Arguments` model can read the pieces back.
     for (li, line) in lines.iter().enumerate() {
         let Some(rest) = line.trim_end().strip_prefix("const ") else { continue };
-        let Some((name, body)) = rest.split_once(" = ") else { continue };
-        let Some(name) = name.split_once(": ").map(|(n, _)| n) else { continue };
+        let Some((name_ty, body)) = rest.split_once(" = ") else { continue };
+        // The name/type separator is the *last* `: ` before the type: a promoted
+        // constant inside an `impl` names the impl by location, and on the MSRV that
+        // marker contains a `: ` of its own (`<impl at FILE:L:C: L:C>::m::promoted[0]`),
+        // so the first `: ` would cut the name short and drop the item.
+        let Some((name, _ty)) = name_ty.rsplit_once(": ") else { continue };
         if !name.ends_with(']') || body.trim() != "{" {
             continue;
         }
@@ -3612,6 +3649,19 @@ fn add(_1: u32, _2: u32) -> u32 {
         // A real cast still parses as a cast: `_1 as u32` is not a place.
         let rv = parse_rvalue("move _1 as u32 (IntToInt)", &enums);
         assert!(matches!(rv, Rvalue::Cast(..)), "a cast must stay a cast, got {rv:?}");
+        // A promoted constant's use-site spelling carries an ` as ` of its own,
+        // inside the `<T as Trait>` projection. It must stay a `Use` of the
+        // constant, not become a cast of the string `const <Self` -- the MSRV
+        // prints a trait default body's `panic!` this way, and misreading it made
+        // the `Arguments::new_const` call unmodelled.
+        let rv = parse_rvalue(
+            "const <Self as range_shim::a::Custom>::into_iter::promoted[0]",
+            &enums,
+        );
+        let Rvalue::Use(Operand::Const(Const::Other(n))) = rv else {
+            panic!("a promoted constant must stay a Use, got {rv:?}")
+        };
+        assert_eq!(n, "<Self as range_shim::a::Custom>::into_iter::promoted[0]");
     }
 
     /// A *qualified* spelling of `Option`/`Result` resolves to the same numbering
@@ -3700,6 +3750,29 @@ fn add(_1: u32, _2: u32) -> u32 {
         assert!(!prog.consts.contains_key("UNUSED"), "a bare definition with no bare use is not kept");
         assert!(!prog.consts.contains_key("EXPR"), "an expression body is not a literal");
         assert!(!prog.consts.contains_key("ARR"), "a qualified name is not collected");
+    }
+
+    /// A promoted constant's *definition* is read even when its name carries the
+    /// `<impl at FILE:L:C: L:C>` marker, whose `: ` must not be mistaken for the
+    /// name/type separator.
+    ///
+    /// On the MSRV (1.85) a `panic!` inside a trait default body defines
+    /// `const a::Custom::into_iter::promoted[0]: &[&str; 1] = { … }`; the marker is
+    /// not there, but a promoted constant inside an `impl` block is named
+    /// `const NAME::<impl at FILE:L:C: L:C>::m::promoted[0]: …`, and a first-`: `
+    /// split cut the name at the marker's own `: `. The item was then dropped and
+    /// the `Arguments::new_const` call that reads it was unmodelled.
+    #[test]
+    fn a_promoted_const_definition_survives_an_impl_location() {
+        let dump = "const range_shim::<impl at /tmp/x.rs:4:5: 4:30>::m::promoted[0]: &[&str; 1] = {\n\
+                    \x20   let mut _0: &[&str; 1];\n    let mut _1: [&str; 1];\n\n    bb0: {\n        \
+                    _1 = [const \"boom\"];\n        _0 = &_1;\n        return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        assert_eq!(
+            prog.promoted_strs
+                .get("range_shim::<impl at /tmp/x.rs:4:5: 4:30>::m::promoted[0]"),
+            Some(&vec!["boom".to_string()])
+        );
     }
 
     /// A function-local `const`'s definition must not become a bare program-wide

@@ -9697,3 +9697,86 @@ enum-construction work, not with the `cmp` model. Adding `Ordering` to
 `variant_index` without also teaching the *contract* reader its variants would
 introduce a name the two sides disagree about, which is the false-proof direction,
 so the two must land together.
+
+## A test oracle must not call a method newer than the MSRV floor
+
+The C6 work modelled methods that are *unstable* on the 1.85 floor: `is_multiple_of`
+(`unsigned_is_multiple_of`), `cast_signed`/`cast_unsigned` (`integer_sign_cast`) and the
+signed `midpoint` (`num_midpoint_signed`). The *model* never calls them -- it is a term
+built from primitives -- but the exhaustive differential *oracles* did, and the MSRV gate
+(step 13, `cargo +1.85 check --all-targets`) compiles the test code too. So four
+`E0658: use of unstable library feature` errors landed in `src/mir/intrinsics.rs`'s
+`#[cfg(test)]` module, the `gates` job went red, and the failure was **invisible to a local
+`scripts/gate.sh` run** on a container whose toolchain is stable 1.99+ (the features are
+stable there).
+
+The fix is to write each oracle as the *definition* the method documents, which is stable at
+every toolchain:
+
+- `a.is_multiple_of(b)` → `if b == 0 { a == 0 } else { a % b == 0 }` (`core`'s own
+  definition of the `b == 0` corner);
+- `s.cast_unsigned() as u8` → `s as u8`, and `u.cast_signed() as u8` → `u as i8 as u8`
+  (a same-width reinterpretation *is* the `as` cast);
+- `(x as u8).midpoint(y as u8)` → `((x as u16 + y as u16) / 2) as u8`, and the signed form
+  → `((x as i32 + y as i32) / 2) as i8` (the truncating average computed in a wider type).
+
+The two lessons. First, **the oracle is test code the gate compiles**, so an oracle written
+against a newer toolchain's convenience method is a gate failure that no local run on a
+newer stable reproduces -- the MSRV job is the only thing that sees it, and only when CI runs
+it. Second, a replacement oracle must be *checked* against the method it replaces before it
+is trusted: the four substitutes were each walked over the whole `u8`/`i8` domain against the
+real method on stable 1.100, so the oracle did not silently change what it asserts. The
+`is_multiple_of` case is the one worth stating: the naive `a % b == 0` alone would *panic* at
+`b == 0`, so the `b == 0` guard is the definition, not a defensive extra.
+
+This is the same class the "gate that skips can hide a test that fails" note describes, in
+the other direction: a gate that *runs* on a newer toolchain than it claims to support hides
+a build break that the floor sees.
+
+## An MSRV-only lowering difference: the promoted `panic!` constant's name
+
+The `RUSTC_BOOTSTRAP` fix above let the corpus compile on 1.85, but one MSRV failure
+remained, and it was not a compile error -- it was a *verdict*: the tripwire
+`user_range_into_iter_is_not_the_model_cannot_prove_this` came back `incomplete` with
+`call to unmodelled function Arguments::<'_>::new_const::<1>`. The same entry refutes
+(`FAILED`) on current stable. Two independent differences between the toolchains caused it,
+and each is a general trap.
+
+**1. A `panic!("literal")` lowers through a *promoted* constant on 1.85.** Current stable
+prints `_3 = Arguments::<'_>::from_str(const "…")` -- one literal. 1.85 prints
+`_4 = const NAME::promoted[0]; _3 = Arguments::<'_>::new_const::<1>(copy _4)`, where the
+format pieces live in a `const NAME::promoted[0]: &[&str; 1] = { … }` item printed *outside*
+any function. The frontend already collected those items (that is what `promoted_strs` is
+for), so this half was a *lookup* problem, not a modelling one.
+
+**2. A promoted constant's *definition* and its *use* are spelled differently on 1.85.**
+Inside a trait default body, the definition is
+`const a::Custom::into_iter::promoted[0]: …`, but the use is
+`_4 = const <Self as range_shim::a::Custom>::into_iter::promoted[0]`. An exact-name lookup
+misses, so the pieces are never found and the `new_const` call is unmodelled. Two bugs hid in
+the use spelling, and both had to be fixed:
+
+* **`split_once(": ")` cut the *definition* name short** when the name carries an
+  `<impl at FILE:L:C: L:C>` marker -- the marker's own `: ` is the first one. The split is now
+  on the *last* `: ` before the type.
+* **`t.find(" as ")` misread the *use* as a cast.** The `<Self as Trait>` projection contains
+  ` as `, and the cast arm (which must run before the `const ` arm, for the
+  `const 3_i32 as u32 (IntToInt)` case) matched the projection's ` as ` and read the whole
+  operand as a cast of the string `const <Self`. The search is now `find_top_level_as`, which
+  skips `<…>`/`(…)` nesting, so a projection's ` as ` is invisible and a real cast is still
+  found.
+
+The reconciliation is `lookup_promoted`: after the exact match, a use whose tail is
+`promoted[N]` is matched to a definition with the same tail and an *owner* that is a
+`::`-aligned suffix of the use's owner (the `<T as Trait>` projection on the use side, the
+qualifier on the definition side). Comparing owners rather than the last segment is what keeps
+two sibling traits of the same method (`a::Custom` and `b::Custom`, each with its own
+`into_iter`) from answering for one another -- the corpus carries exactly that pair, and a
+last-segment match would let one trait's message resolve for the other.
+
+The lesson generalises past this printer change: **a toolchain that lowers the same source to
+a different *shape* is not a compile break, it is a coverage break.** The MSRV gate is the only
+place that sees it, and it sees it as a *verdict* difference, not an error -- which is why gate
+14 runs the frontend's own suite against the floor rather than merely compiling it. The
+`#![feature(…)]` header plus `RUSTC_BOOTSTRAP` is what makes the corpus *compile* on 1.85; the
+promoted-const reconciliation is what makes its *verdicts* agree across the floor.

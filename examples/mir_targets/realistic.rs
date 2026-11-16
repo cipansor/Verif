@@ -52,6 +52,13 @@
 //! function, so a change that adds it moves exactly one row from `incomplete`
 //! to `verified`.
 
+// Some modelled shapes (`cast_unsigned`/`cast_signed`, `is_multiple_of`, the signed
+// `midpoint`) are unstable library features on the MSRV floor (1.85), so this corpus
+// needs the feature gate to compile there. `rustc` only honours the gate on a
+// bootstrap or a nightly, so `mir::verify` sets `RUSTC_BOOTSTRAP=1` for a source
+// that declares one -- see `emit_mir_with_opts`. The gate is inert on current
+// stable, where those methods are already stable.
+#![feature(integer_sign_cast, unsigned_is_multiple_of, num_midpoint_signed)]
 #![allow(dead_code, clippy::all)]
 
 // ---------------------------------------------------------------------------

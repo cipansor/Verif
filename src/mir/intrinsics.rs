@@ -6253,7 +6253,12 @@ mod tests {
             8,
             false,
             unident,
-            |x, y| (x as u8).is_multiple_of(y as u8),
+            // The oracle is the *definition* (`b == 0` means `a == 0`), not
+            // `u8::is_multiple_of`, which is unstable on the MSRV floor.
+            |x, y| {
+                let (a, b) = (x as u8, y as u8);
+                if b == 0 { a == 0 } else { a % b == 0 }
+            },
             "u8::is_multiple_of",
         );
     }
@@ -6280,13 +6285,15 @@ mod tests {
     /// values (`-1` and `MIN`) this walk reaches.
     #[test]
     fn the_signedness_casts_agree_with_rust() {
-        // `i8::cast_unsigned` reinterprets the same bits as `u8`.
+        // `i8::cast_unsigned` reinterprets the same bits as `u8`. The oracle is
+        // the *reinterpretation* (`as u8`), not `cast_unsigned`, which is unstable
+        // on the MSRV floor.
         check_unary(
             Intrinsic::SignednessCast,
             8,
             8,
             true,
-            |xb| u64::from(signed_of(xb, 8).cast_unsigned() as u8),
+            |xb| u64::from(signed_of(xb, 8) as u8),
             "i8::cast_unsigned",
         );
         // `u8::cast_signed` reinterprets the same bits as `i8`.
@@ -6295,7 +6302,7 @@ mod tests {
             8,
             8,
             false,
-            |xb| (u8::try_from(xb).unwrap().cast_signed() as u8) as u64,
+            |xb| (u8::try_from(xb).unwrap() as i8 as u8) as u64,
             "u8::cast_signed",
         );
     }
@@ -6400,12 +6407,15 @@ mod tests {
     /// boundary cases (`MIN`, `MAX`, `MAX + MAX`) that a sampling test would miss.
     #[test]
     fn midpoint_agrees_with_rust() {
+        // The oracle is the *definition* -- the truncating average computed in a
+        // wider type -- not `u8::midpoint`/`i8::midpoint`, which are unstable on the
+        // MSRV floor. The truncation is toward zero, which `i32` division gives.
         check_unary_binary_value(
             Intrinsic::Midpoint,
             8,
             false,
             unident,
-            |x, y| i64::from((x as u8).midpoint(y as u8)),
+            |x, y| i64::from(((x as u16 + y as u16) / 2) as u8),
             "u8::midpoint",
         );
         check_unary_binary_value(
@@ -6413,7 +6423,7 @@ mod tests {
             8,
             true,
             |b| i8::from_ne_bytes([b as u8]) as i64,
-            |x, y| i64::from((x as i8).midpoint(y as i8)),
+            |x, y| i64::from(((x as i32 + y as i32) / 2) as i8),
             "i8::midpoint",
         );
     }

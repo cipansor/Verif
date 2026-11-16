@@ -302,6 +302,33 @@ pub enum MirSource {
     Inline(String),
 }
 
+/// The extra environment for `rustc` when the source declares a crate-level
+/// `#![feature(…)]`.
+///
+/// A modelled shape may name a library method that is *stable* on the toolchain the
+/// crate is built with but *unstable* on the MSRV floor -- the C6 corpus's
+/// `cast_unsigned`/`cast_signed` (`integer_sign_cast`), `is_multiple_of`
+/// (`unsigned_is_multiple_of`) and signed `midpoint` (`num_midpoint_signed`) are
+/// stable from 1.87 and gated on 1.85. The corpus must compile on the floor (gate 14
+/// runs the frontend's own suite against it), so it carries a `#![feature(…)]`
+/// header, and `rustc` refuses a feature gate on a stable channel unless
+/// `RUSTC_BOOTSTRAP` is set.
+///
+/// The bootstrap is scoped to a source that *declares* a feature, never set
+/// globally: a file with no gate is compiled exactly as before, so this cannot
+/// change the lowering of ordinary code. It is inert on current stable too, where
+/// the features are already stable and the gate is a no-op warning.
+fn bootstrap_env(file: &Path) -> Vec<(&'static str, &'static str)> {
+    let declares_feature = std::fs::read_to_string(file)
+        .map(|s| s.lines().any(|l| l.trim_start().starts_with("#![feature(")))
+        .unwrap_or(false);
+    if declares_feature {
+        vec![("RUSTC_BOOTSTRAP", "1")]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Get MIR text for a Rust file, or explain why not.
 ///
 /// `rustc --emit=mir` is a *stable* flag -- `-Zunpretty=mir` is the nightly-only
@@ -377,6 +404,7 @@ pub fn emit_mir_with_opts(
         .arg("-o")
         .arg(&out_path)
         .arg(file)
+        .envs(bootstrap_env(file))
         .output()
         .map_err(|e| format!("could not run rustc: {e}"))?;
     if !out.status.success() {

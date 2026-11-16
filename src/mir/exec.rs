@@ -3418,6 +3418,53 @@ fn call_trait_args(name: &str) -> Option<String> {
     (!inner.is_empty()).then(|| inner.to_string())
 }
 
+/// The string pieces of the promoted constant a `const <…>::promoted[N]` operand
+/// names, reconciling the use-site spelling with the definition's.
+///
+/// rustc prints a promoted constant's *definition* and its *use* with different
+/// paths on the MSRV (1.85): a `panic!` inside a trait default body defines
+/// `const a::Custom::into_iter::promoted[0]` but uses
+/// `const <Self as range_shim::a::Custom>::into_iter::promoted[0]`. An exact
+/// lookup misses, so the `Arguments::new_const` call is reported unmodelled and a
+/// function that only panics comes back `incomplete` instead of refuted -- an
+/// MSRV-only failure that current stable hides (it prints a plain `from_str`).
+///
+/// The two names share the `::promoted[N]` tail, and the owner before it is the
+/// same trait or item. A suffix match on the whole name is not enough
+/// (`a::Custom::into_iter::promoted[0]` is not a suffix of the use), so the tail
+/// is stripped and the *owner* paths compared: the use's owner is its `<T as
+/// Trait>` projection when it has one (`range_shim::a::Custom`), else the whole
+/// qualifier, and a definition whose owner is a `::`-aligned suffix of it
+/// (`a::Custom`) is the one the use names. Comparing owners rather than the last
+/// segment is what keeps two sibling traits of the same method (`a::Custom` and
+/// `b::Custom`, each with its own `into_iter`) from answering for one another.
+/// Only `promoted[…]` names are reconciled -- an ordinary `const NAME` keeps the
+/// exact-match rule, because a name that does not resolve exactly is a name this
+/// model does not hold.
+fn lookup_promoted(promoted: &BTreeMap<String, Vec<String>>, use_name: &str) -> Option<Vec<String>> {
+    if let Some(v) = promoted.get(use_name) {
+        return Some(v.clone());
+    }
+    // `qualifier::promoted[N]` -> `(qualifier, "promoted[N]")`.
+    let (use_qual, use_tail) = use_name.rsplit_once("::")?;
+    if !use_tail.starts_with("promoted[") {
+        return None;
+    }
+    let use_owner = call_trait_path(use_name).unwrap_or_else(|| use_qual.to_string());
+    for (def, pieces) in promoted {
+        let Some((def_qual, def_tail)) = def.rsplit_once("::") else { continue };
+        if def_tail != use_tail {
+            continue;
+        }
+        // The definition's owner is its qualifier minus the method/item segment.
+        let def_owner = def_qual.rsplit_once("::").map(|(o, _)| o).unwrap_or(def_qual);
+        if use_owner == def_owner || crate::mir::spec::is_path_suffix(&use_owner, def_owner) {
+            return Some(pieces.clone());
+        }
+    }
+    None
+}
+
 /// Whether a local method candidate may answer a *trait* call.
 ///
 /// `want` is the trait path the call names (`std::convert::From`); `have` is the
@@ -4401,7 +4448,7 @@ fn try_fmt_call(
     // them.
     let pieces_of = |env: &Env, o: &Operand| -> Option<Vec<String>> {
         match o {
-            Operand::Const(Const::Other(n)) => env.promoted.get(n).cloned(),
+            Operand::Const(Const::Other(n)) => lookup_promoted(&env.promoted, n),
             Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => {
                 env.piece_sets.get(&p.local).cloned()
             }
@@ -6180,7 +6227,7 @@ where
                 // them inside `eval_rvalue` would have them cleared by the very
                 // `set` that follows. The value itself is not a bit-vector.
                 if let Rvalue::Use(Operand::Const(Const::Other(n))) = rv {
-                    if let Some(pieces) = st.env.promoted.get(n).cloned() {
+                    if let Some(pieces) = lookup_promoted(&st.env.promoted, n) {
                         st.env.piece_sets.insert(dest.local, pieces);
                     }
                 }
@@ -9924,6 +9971,36 @@ fn count_via_helper(_1: u8) -> u8 {
         assert_eq!(generic_arg("Arguments::<'_>::new_const", 1), None);
         assert_eq!(generic_arg("Arguments::<'_>::new_v1::<2>", 1), None);
         assert_eq!(generic_arg("Arguments::<'_>::new_v1::<2, A>", 1), None);
+    }
+
+    /// A promoted constant's use-site spelling is reconciled with its definition's.
+    ///
+    /// On the MSRV rustc prints a trait default body's `panic!` promoted constant as
+    /// `const a::Custom::into_iter::promoted[0]` but uses it as
+    /// `const <Self as range_shim::a::Custom>::into_iter::promoted[0]`. An exact
+    /// lookup misses and the `new_const` call becomes unmodelled, so the function is
+    /// `incomplete` instead of refuted. The owner paths (the `<T as Trait>` projection
+    /// on the use side, the qualifier on the definition side) are what reconcile them,
+    /// and two sibling traits of the same method must not answer for each other.
+    #[test]
+    fn a_promoted_const_use_is_reconciled_with_its_definition() {
+        let mut m: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        m.insert("a::Custom::into_iter::promoted[0]".into(), vec!["from a".into()]);
+        m.insert("b::Custom::into_iter::promoted[0]".into(), vec!["from b".into()]);
+        m.insert("g::promoted[0]".into(), vec!["from g".into()]);
+        // The MSRV use spelling resolves to the trait it names, not its sibling.
+        assert_eq!(
+            lookup_promoted(&m, "<Self as range_shim::a::Custom>::into_iter::promoted[0]"),
+            Some(vec!["from a".to_string()])
+        );
+        assert_eq!(
+            lookup_promoted(&m, "<Self as range_shim::b::Custom>::into_iter::promoted[0]"),
+            Some(vec!["from b".to_string()])
+        );
+        // An exact match still wins, and an unrelated name resolves to nothing.
+        assert_eq!(lookup_promoted(&m, "g::promoted[0]"), Some(vec!["from g".to_string()]));
+        assert_eq!(lookup_promoted(&m, "z::promoted[0]"), None);
+        assert_eq!(lookup_promoted(&m, "SOME_CONST"), None);
     }
 
     /// A diverging call is labelled by *what* it does, not always `panic`.
