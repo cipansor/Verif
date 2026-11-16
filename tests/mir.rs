@@ -5662,6 +5662,78 @@ fn an_enum_return_contract_can_name_the_discriminant_methods() {
     );
 }
 
+/// The `Option`↔`Result` conversions -- `Option::ok_or`, `Result::ok`,
+/// `Result::err` -- decide, and both the *tag* and the *payload* cross.
+///
+/// Three things are pinned, and each is a way the model could be wrong:
+///
+/// * the tag: `ok_or`/`ok` reinterpret the receiver's tag (`Ok` and `Some` are
+///   discriminants 0 and 1, so `1 - tag`), while `err` *keeps* it (`Err` is
+///   already the payload-carrying variant). A model that inverted `err`'s tag, or
+///   read the result tag as a constant, proves a tripwire.
+/// * the payload: the moved payload is recorded under the discriminant the
+///   consuming `switchInt` selects, at the *payload's* width. The `_moves_the_payload`
+///   pair reads it back through `unwrap`; a model that recorded the wrong width (as
+///   the first cut did -- it stored the error argument as the `Ok` payload) refutes
+///   the true direction and cannot prove the false one.
+/// * the classifier: `ok_or` is printed with a *method* turbofish
+///   (`Option::<u8>::ok_or::<i32>`), so its name must be found past the `<…>`
+///   segment, or the call is reported unmodelled.
+#[test]
+fn the_option_result_conversions_decide_and_move_the_payload() {
+    let names = [
+        "ok_or_some_is_ok",
+        "ok_or_some_is_ok_tripwire",
+        "ok_or_none_is_err",
+        "ok_or_none_is_err_tripwire",
+        "ok_or_moves_the_payload",
+        "ok_or_moves_the_payload_tripwire",
+        "ok_ok_is_some",
+        "ok_ok_is_some_tripwire",
+        "ok_err_is_none",
+        "ok_err_is_none_tripwire",
+        "ok_moves_the_payload",
+        "ok_moves_the_payload_tripwire",
+        "err_err_is_some",
+        "err_err_is_some_tripwire",
+        "err_ok_is_none",
+        "err_ok_is_none_tripwire",
+        "err_moves_the_payload",
+        "err_moves_the_payload_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "ok_or_some_is_ok",
+        "ok_or_none_is_err",
+        "ok_or_moves_the_payload",
+        "ok_ok_is_some",
+        "ok_err_is_none",
+        "ok_moves_the_payload",
+        "err_err_is_some",
+        "err_ok_is_none",
+        "err_moves_the_payload",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "ok_or_some_is_ok_tripwire",
+        "ok_or_none_is_err_tripwire",
+        "ok_or_moves_the_payload_tripwire",
+        "ok_ok_is_some_tripwire",
+        "ok_err_is_none_tripwire",
+        "ok_moves_the_payload_tripwire",
+        "err_err_is_some_tripwire",
+        "err_ok_is_none_tripwire",
+        "err_moves_the_payload_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        assert!(!o.is_verified(), "`{name}` must be refuted, got: {o}");
+    }
+}
+
 /// A trailing line comment on a variant line does not erase the enum layout.
 ///
 /// `B = 3, // special` keeps the comma *before* the comment, so the reader that

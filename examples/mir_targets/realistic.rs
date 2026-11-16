@@ -2590,6 +2590,151 @@ pub fn enum_arg_is_ok_and_err_tripwire(r: Result<u8, u8>) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// `Option`↔`Result` conversions: `Option::ok_or`, `Result::ok`, `Result::err`.
+// Each is *total* for a scalar payload and moves one payload across the tag. The
+// result's tag is the receiver's reinterpreted (`Ok` and `Some` are discriminants
+// 0 and 1), and the moved payload is recorded under the discriminant the consuming
+// `switchInt` selects. `ok_or` is printed with a *method* turbofish
+// (`Option::<u8>::ok_or::<i32>`), so it also pins that the classifier finds the
+// method name past a `<…>` segment.
+
+/// `Option::ok_or`: `Some` becomes `Ok`, so the result is `Ok` exactly on the
+/// receiver's `Some`.
+/// requires: x.is_some()
+/// ensures: ret.is_ok()
+pub fn ok_or_some_is_ok(x: Option<u8>) -> Result<u8, u8> {
+    x.ok_or(0)
+}
+
+/// The tripwire: under `x.is_some()` the result is `Ok`, so `ret.is_err()` is
+/// refutable. A model that read the result tag as a constant, or tested the wrong
+/// discriminant, would prove it.
+/// requires: x.is_some()
+/// ensures: ret.is_err()
+pub fn ok_or_some_is_ok_tripwire(x: Option<u8>) -> Result<u8, u8> {
+    x.ok_or(0)
+}
+
+/// The other tag: under `x.is_none()` the result is `Err`.
+/// requires: x.is_none()
+/// ensures: ret.is_err()
+pub fn ok_or_none_is_err(x: Option<u8>) -> Result<u8, u8> {
+    x.ok_or(0)
+}
+
+/// The tripwire for the `None` branch.
+/// requires: x.is_none()
+/// ensures: ret.is_ok()
+pub fn ok_or_none_is_err_tripwire(x: Option<u8>) -> Result<u8, u8> {
+    x.ok_or(0)
+}
+
+/// `ok_or` *moves the payload*: under `x.Some == 9` the result's `Ok` payload is
+/// `9`. Reading it back through `unwrap` is the evidence the payload crossed the
+/// conversion, not just the tag.
+/// requires: x.is_some() && x.Some == 9
+/// ensures: ret == 9
+pub fn ok_or_moves_the_payload(x: Option<u8>) -> u8 {
+    x.ok_or(0).unwrap()
+}
+
+/// The tripwire: the payload is `9`, so a claim of `8` is refutable. A model that
+/// dropped the payload (leaving it unconstrained, or `0`) would prove this.
+/// requires: x.is_some() && x.Some == 9
+/// ensures: ret == 8
+pub fn ok_or_moves_the_payload_tripwire(x: Option<u8>) -> u8 {
+    x.ok_or(0).unwrap()
+}
+
+/// `Result::ok`: `Ok` becomes `Some`, so the result is `Some` exactly on the
+/// receiver's `Ok`.
+/// requires: r.is_ok()
+/// ensures: ret.is_some()
+pub fn ok_ok_is_some(r: Result<u8, u8>) -> Option<u8> {
+    r.ok()
+}
+
+/// The tripwire for the `Ok` branch.
+/// requires: r.is_ok()
+/// ensures: ret.is_none()
+pub fn ok_ok_is_some_tripwire(r: Result<u8, u8>) -> Option<u8> {
+    r.ok()
+}
+
+/// The other tag: under `r.is_err()` the result is `None`.
+/// requires: r.is_err()
+/// ensures: ret.is_none()
+pub fn ok_err_is_none(r: Result<u8, u8>) -> Option<u8> {
+    r.ok()
+}
+
+/// The tripwire for the `Err` branch.
+/// requires: r.is_err()
+/// ensures: ret.is_some()
+pub fn ok_err_is_none_tripwire(r: Result<u8, u8>) -> Option<u8> {
+    r.ok()
+}
+
+/// `ok` moves the `Ok` payload onto `Some`.
+/// requires: r.is_ok() && r.Ok == 9
+/// ensures: ret == 9
+pub fn ok_moves_the_payload(r: Result<u8, u8>) -> u8 {
+    r.ok().unwrap()
+}
+
+/// The tripwire: a model that dropped the payload would prove `8`.
+/// requires: r.is_ok() && r.Ok == 9
+/// ensures: ret == 8
+pub fn ok_moves_the_payload_tripwire(r: Result<u8, u8>) -> u8 {
+    r.ok().unwrap()
+}
+
+/// `Result::err`: `Err` becomes `Some`, so the result is `Some` exactly on the
+/// receiver's `Err` (the tag is *kept*, not inverted -- `err` is the mirror of
+/// `ok`, which inverts).
+/// requires: r.is_err()
+/// ensures: ret.is_some()
+pub fn err_err_is_some(r: Result<u8, u8>) -> Option<u8> {
+    r.err()
+}
+
+/// The tripwire for the `Err` branch of `err`: a model that inverted the tag (as
+/// `ok` does) would call `Err` `None` and prove this.
+/// requires: r.is_err()
+/// ensures: ret.is_none()
+pub fn err_err_is_some_tripwire(r: Result<u8, u8>) -> Option<u8> {
+    r.err()
+}
+
+/// The other tag: under `r.is_ok()` the result is `None`.
+/// requires: r.is_ok()
+/// ensures: ret.is_none()
+pub fn err_ok_is_none(r: Result<u8, u8>) -> Option<u8> {
+    r.err()
+}
+
+/// The tripwire for the `Ok` branch of `err`.
+/// requires: r.is_ok()
+/// ensures: ret.is_some()
+pub fn err_ok_is_none_tripwire(r: Result<u8, u8>) -> Option<u8> {
+    r.err()
+}
+
+/// `err` moves the `Err` payload onto `Some`.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: ret == 7
+pub fn err_moves_the_payload(r: Result<u8, u8>) -> u8 {
+    r.err().unwrap()
+}
+
+/// The tripwire: the payload is `7`, so a claim of `8` is refutable.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: ret == 8
+pub fn err_moves_the_payload_tripwire(r: Result<u8, u8>) -> u8 {
+    r.err().unwrap()
+}
+
+// ---------------------------------------------------------------------------
 // A cast in a *contract*: `x as u32`. The body has modelled `as` for a while
 // (it is what lets a narrow argument meet a wide return), but the contract
 // language had no cast at all, so any contract that related the two was

@@ -4714,6 +4714,30 @@ fn enum_method(
             }
         }
     }
+    // The `Option`↔`Result` conversions move one payload into the result and
+    // *drop* the other, so a type whose destructor this tool cannot establish is
+    // refused rather than assumed harmless -- the same reasoning as `unwrap_or`'s
+    // error check. Each reads the type that gets dropped: `ok_or`'s argument, the
+    // `Err` payload of `ok()`, the `Ok` payload of `err()`.
+    let dropped_ty = match kind {
+        OptionMethod::OkOr => args.get(1).and_then(|a| operand_ty(cur, a)),
+        OptionMethod::Ok => receiver_error_type(cur, &opt),
+        OptionMethod::Err => receiver_ok_type(cur, &opt),
+        _ => None,
+    };
+    if matches!(kind, OptionMethod::OkOr | OptionMethod::Ok | OptionMethod::Err) {
+        if let Some(ty) = dropped_ty {
+            match has_drop_glue(prog, callees.structs(), &ty) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(format!(
+                        "`{name}` destroys a value whose destructor is not modelled"
+                    ));
+                }
+                Err(e) => return Err(format!("`{name}`: {e}")),
+            }
+        }
+    }
     // The tag's width: the seeded/enum width where there is one, else the
     // payload's, exactly as `Rvalue::Discriminant` reads it.
     let tag_w = env.tag_width(opt.local).or_else(|| env.option_width(opt.local)).unwrap_or(64);
@@ -4729,6 +4753,57 @@ fn enum_method(
         }
         OptionMethod::IsFailure => {
             env.set(dest, Val::Bool(smt::eq_const(tag, 1 - payload_variant)));
+            Vec::new()
+        }
+        // `Option::ok_or(err)` and `Result::ok()`/`err()` convert between the two
+        // enums. `ok_or`/`ok` reinterpret the receiver's tag (`Ok` and `Some` are
+        // discriminants 0 and 1, so `1 - tag`); `err` keeps it, because `Err` is
+        // already the payload-carrying variant of a `Result` and `Some` of an
+        // `Option`. The payload a variant *carries* is recorded under the
+        // discriminant rustc's `switchInt` selects, and the other variant's is
+        // left unset -- the consuming `switchInt` only reads the payload in the
+        // arm whose tag matched, so a read of the unset one never happens.
+        OptionMethod::OkOr => {
+            // `Some`'s payload becomes the result's `Ok` payload (discriminant 0),
+            // and the error argument becomes the `Err` payload (discriminant 1).
+            let Some((Val::Sym(ok, ok_sign), ok_w)) =
+                env.payloads.get(&(opt.local, intrinsics::SOME_TAG)).copied()
+            else {
+                return Err(format!("`{name}` on a receiver whose payload is not modelled"));
+            };
+            let (err, err_sign) = match args.get(1).map(|d| operand(env, d)) {
+                Some(Val::Sym(v, s)) => (v, s),
+                Some(_) => return Err(format!("unmodelled argument to `{name}`")),
+                None => return Err(format!("`{name}` has no error argument")),
+            };
+            let err_w = smt::bits(err);
+            let result_tag = smt::truncate(smt::sub(smt::word(1, tag_w), tag), tag_w);
+            env.set_discriminant(dest.local, Val::Sym(result_tag, Sign::Unsigned));
+            env.set_payload(dest.local, intrinsics::OK_TAG, Val::Sym(ok, ok_sign), ok_w);
+            env.set_payload(dest.local, 1, Val::Sym(err, err_sign), err_w);
+            Vec::new()
+        }
+        OptionMethod::Ok | OptionMethod::Err => {
+            // `ok()` moves the `Ok` payload onto `Some`; `err()` moves the `Err`
+            // payload onto `Some`. Both results are `Option`s, whose payload
+            // variant is `Some`.
+            let src = match kind {
+                OptionMethod::Ok => intrinsics::OK_TAG,
+                _ => 1 - intrinsics::OK_TAG,
+            };
+            let Some((Val::Sym(payload, sign), pw)) =
+                env.payloads.get(&(opt.local, src)).copied()
+            else {
+                return Err(format!("`{name}` on a receiver whose payload is not modelled"));
+            };
+            let result_tag = match kind {
+                // `Ok`(0) -> `Some`(1), `Err`(1) -> `None`(0): `1 - tag`.
+                OptionMethod::Ok => smt::truncate(smt::sub(smt::word(1, tag_w), tag), tag_w),
+                // `err()` keeps the tag: `Err` is the `Option::Some` result.
+                _ => tag,
+            };
+            env.set_discriminant(dest.local, Val::Sym(result_tag, Sign::Unsigned));
+            env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(payload, sign), pw);
             Vec::new()
         }
         // `unwrap`/`unwrap_or` read the payload, which `checked_*` recorded
@@ -6903,6 +6978,29 @@ fn receiver_error_type(f: &MirFn, p: &Place) -> Option<Ty> {
     let inner = spec::angle_inner(name)?;
     let args = crate::mir::parse::split_top_level(inner, ',');
     args.get(1).map(|e| Ty::parse(e.trim()))
+}
+
+/// The `T` of a `Result<T, E>` receiver's declared type, for the drop-glue check
+/// on `Result::err()` (which drops the `Ok` payload).
+fn receiver_ok_type(f: &MirFn, p: &Place) -> Option<Ty> {
+    let Ty::Other(name) = f.ty_of(p.local)? else {
+        return None;
+    };
+    if !name.starts_with("Result") && !name.contains("::Result") {
+        return None;
+    }
+    let inner = spec::angle_inner(name)?;
+    let args = crate::mir::parse::split_top_level(inner, ',');
+    args.first().map(|t| Ty::parse(t.trim()))
+}
+
+/// The declared type of an operand, for the enum-method glue checks.
+fn operand_ty(f: &MirFn, o: &Operand) -> Option<Ty> {
+    match o {
+        Operand::Copy(p) | Operand::Move(p) => type_of_place(f, p),
+        Operand::Const(Const::UInt(_, Some(t))) => Some(t.clone()),
+        Operand::Const(_) => None,
+    }
 }
 
 /// Resolve an operand to a symbolic value.

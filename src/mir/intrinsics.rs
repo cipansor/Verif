@@ -510,6 +510,18 @@ pub enum OptionMethod {
     /// and the model tests the tag against the failure constant so the two cannot
     /// disagree.
     IsFailure,
+    /// `Option::ok_or(err)`: `Ok(payload)` on `Some`, `Err(err)` on `None`. Total
+    /// for a scalar payload and a scalar error. The error argument is moved into
+    /// the result on the `None` path and dropped on the `Some` path, so its
+    /// destructor is the reason this is not unconditionally total (see the
+    /// executor's glue check).
+    OkOr,
+    /// `Result::ok()`: `Some(payload)` on `Ok`, `None` on `Err`. The `Err` payload
+    /// is dropped, so its destructor is the glue the executor checks.
+    Ok,
+    /// `Result::err()`: `Some(payload)` on `Err`, `None` on `Ok`. The `Ok` payload
+    /// is dropped, so its destructor is the glue the executor checks.
+    Err,
 }
 
 /// A widening integer conversion: `u16::from(x)` where `x: u8`, `x.into()`.
@@ -726,7 +738,7 @@ pub enum Outcome {
 /// keeps the split honest -- it only ever sees a name it could actually have
 /// prefixed.
 pub fn classify(name: &str) -> Option<Intrinsic> {
-    let short = name.rsplit("::").next().unwrap_or(name);
+    let short = name.rsplit("::").find(|s| !s.starts_with('<')).unwrap_or(name);
     match short {
         "count_ones" => return Some(Intrinsic::Bits(BitKind::Ones)),
         "count_zeros" => return Some(Intrinsic::Bits(BitKind::CountZeros)),
@@ -785,6 +797,7 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             "expect" => return Some(Intrinsic::OptionMethod(OptionMethod::Expect)),
             "is_some" => return Some(Intrinsic::OptionMethod(OptionMethod::IsSuccess)),
             "is_none" => return Some(Intrinsic::OptionMethod(OptionMethod::IsFailure)),
+            "ok_or" => return Some(Intrinsic::OptionMethod(OptionMethod::OkOr)),
             _ => {}
         }
     }
@@ -795,6 +808,8 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             "expect" => return Some(Intrinsic::OptionMethod(OptionMethod::Expect)),
             "is_ok" => return Some(Intrinsic::OptionMethod(OptionMethod::IsSuccess)),
             "is_err" => return Some(Intrinsic::OptionMethod(OptionMethod::IsFailure)),
+            "ok" => return Some(Intrinsic::OptionMethod(OptionMethod::Ok)),
+            "err" => return Some(Intrinsic::OptionMethod(OptionMethod::Err)),
             _ => {}
         }
     }
@@ -2868,13 +2883,57 @@ mod tests {
             classify("core::result::Result::<u8, u16>::unwrap_or"),
             Some(Intrinsic::OptionMethod(OptionMethod::UnwrapOr))
         );
+        // The `Option`↔`Result` conversions: `ok_or` on `Option`, `ok`/`err` on
+        // `Result`. `ok_or` is printed with a *method* turbofish
+        // (`Option::<u8>::ok_or::<i32>`), so the classifier's last-segment read has
+        // to skip a `<…>` segment to find `ok_or`.
+        assert_eq!(
+            classify("core::option::Option::<u8>::ok_or::<i32>"),
+            Some(Intrinsic::OptionMethod(OptionMethod::OkOr))
+        );
+        assert_eq!(
+            classify("Option::<u32>::ok_or::<u32>"),
+            Some(Intrinsic::OptionMethod(OptionMethod::OkOr))
+        );
+        assert_eq!(
+            classify("core::result::Result::<u8, u16>::ok"),
+            Some(Intrinsic::OptionMethod(OptionMethod::Ok))
+        );
+        assert_eq!(
+            classify("core::result::Result::<u8, u16>::err"),
+            Some(Intrinsic::OptionMethod(OptionMethod::Err))
+        );
         // A local type spelled `Option`/`Result` in a module is not the standard
         // library's.
         assert_eq!(classify("m::Option::<u8>::unwrap"), None);
         assert_eq!(classify("m::Result::<u8, u16>::is_ok"), None);
+        assert_eq!(classify("m::Option::<u8>::ok_or::<u8>"), None);
         // A different method the model does not know stays unmodelled.
         assert_eq!(classify("core::option::Option::<u8>::map"), None);
         assert_eq!(classify("core::result::Result::<u8, u16>::map"), None);
+    }
+
+    /// A *method* turbofish puts a `<…>` segment where the method name would be,
+    /// so the classifier's last-segment read must skip it -- or `ok_or` is never
+    /// classified and the call is reported unmodelled. A plain path segment that
+    /// merely contains a `<` (a generic type) is skipped too, and a method name
+    /// never begins with `<`.
+    #[test]
+    fn a_method_turbofish_does_not_hide_the_method_name() {
+        assert_eq!(
+            classify("Option::<u8>::ok_or::<i32>"),
+            Some(Intrinsic::OptionMethod(OptionMethod::OkOr))
+        );
+        // The ordinary spelling (no method turbofish) still classifies.
+        assert_eq!(
+            classify("core::option::Option::<u8>::is_some"),
+            Some(Intrinsic::OptionMethod(OptionMethod::IsSuccess))
+        );
+        // A generic *argument* segment is skipped for an inherent method too.
+        assert_eq!(
+            classify("core::num::<impl u8>::wrapping_add"),
+            Some(Intrinsic::Wrapping(BinOp::Add))
+        );
     }
 
     /// The `for`-loop range names classify, in the spelling every toolchain prints.

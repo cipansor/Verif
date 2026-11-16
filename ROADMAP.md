@@ -151,11 +151,9 @@ with no new false proof while the independent corpus keeps growing.
     is the *divider* wall (`n / d <= n` at `u32`), not the `Option`; the same body
     decides at `u8`. Sixteen fixtures (true/tripwire/panic pairs, both families) in
     `realistic.rs` (**424 of 789**).
-  - Remaining: `?` (the `Try` desugaring needs `From` on the error type), `ok_or`,
-    `map`/`map_err`/`and_then` (closures), and the `Option`/`Result` *result* of a
-    function whose contract names the payload (the `qmark_probe` gap: a contract
-    reading `ret <= n` on an `Option<u32>` return is refused because the return has
-    no single word).
+  - Remaining: `?` (the `Try` desugaring needs `From` on the error type), and
+    `map`/`map_err`/`and_then` (closures). `ok_or`/`ok`/`err` are now modelled (see
+    below), so they are off this list.
   - Progress (enum-return contract): a contract on an `Option`/`Result`-returning
     function can now name the **discriminant** methods — `ret.is_ok()`,
     `ret.is_some()`, `ret.is_err()`, `ret.is_none()`. A function returning an enum
@@ -176,8 +174,32 @@ with no new false proof while the independent corpus keeps growing.
     argument, a pass-through, a `match`, and the non-enum refusal), pinned by
     `an_enum_return_contract_can_name_the_discriminant_methods` and by two
     toolchain-free `spec` unit tests. `realistic.rs` **439 of 813 -> 448 of 832**.
-  - Remaining (same item): `ret.Ok <= n` / `ret.Some <= n` (a payload read, which
-    needs the postcondition guarded on the discriminant), and `?`.
+  - Progress (the `Option`↔`Result` conversions): `Option::ok_or`,
+    `Result::ok` and `Result::err` are modelled. Each is *total* for a scalar
+    payload and moves one payload across the tag: the result's tag is the
+    receiver's reinterpreted (`Ok` and `Some` are discriminants 0 and 1, so
+    `1 - tag` for `ok_or`/`ok`), while `err` *keeps* the tag (`Err` is already the
+    payload-carrying variant of a `Result`, and the result is an `Option` whose
+    `Some` is that discriminant). The moved payload is recorded under the
+    discriminant the consuming `switchInt` selects -- `ok_or` writes *both*
+    payloads, `Some`'s onto `Ok` and the error argument onto `Err`, because
+    `ok_or` is the one conversion with two inputs. Each reads the type it *drops*
+    (the `ok_or` argument, `ok`'s `Err` payload, `err`'s `Ok` payload) through the
+    same `has_drop_glue` check `unwrap_or` uses, so a type with an unmodelled
+    destructor is refused rather than assumed harmless. One parser-side finding:
+    `ok_or` is printed with a *method* turbofish (`Option::<u8>::ok_or::<i32>`), so
+    the classifier's last-segment read had to skip a `<…>` segment to find the
+    method name -- without that the call was reported unmodelled, and the fix is
+    strictly safer because a method name never begins with `<`. The first cut of
+    the executor also stored the *error argument* as the `Ok` payload (it read the
+    single "moved" operand), which made the payload's width 32 for a `u8` receiver
+    and refuted every true payload contract; the fixtures' `_moves_the_payload`
+    pairs are what caught it. Eighteen fixtures in `realistic.rs` (true/tripwire
+    pairs on both tags for each of the three, and a payload round-trip through
+    `unwrap` for each), pinned by
+    `the_option_result_conversions_decide_and_move_the_payload` and by a
+    toolchain-free `classify` unit test (including the turbofish).
+    `realistic.rs` **448 of 832 -> 457 of 850**.
 - **C3. Ranges and `for` loops.** · P0 · done · Kani, Verus, Prusti
   - Gap: `RangeInclusive::new`, `Range`, `Iterator::next` unmodelled, so the
     commonest loop in Rust is out of reach. Evidence: `tri` incomplete.
