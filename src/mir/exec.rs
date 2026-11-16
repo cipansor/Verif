@@ -2045,6 +2045,20 @@ impl Env {
         self.tag_widths.get(&local).copied()
     }
 
+    /// The symbolic discriminant of a modelled enum local, when its tag is a
+    /// symbol (a seeded argument's, or one a variant construction wrote).
+    ///
+    /// This is what an enum-returning function's `ret` is: the return place's tag,
+    /// which `ret.is_ok()` and friends read. A tag that is not a `Val::Sym` -- an
+    /// unmodelled enum -- yields `None`, so the postcondition refuses the method
+    /// rather than testing a value it does not have.
+    fn tag_value(&self, local: u32) -> Option<Var> {
+        match self.discriminants.get(&local) {
+            Some(Val::Sym(v, _)) => Some(*v),
+            _ => None,
+        }
+    }
+
     /// The width of a modelled `Option` local, from its payload.
     fn option_width(&self, local: u32) -> Option<u8> {
         self.payloads
@@ -5699,6 +5713,14 @@ where
                             Val::Bool(rp) => Some(smt::ite(rp, smt::word(1, 1), smt::word(0, 1))),
                             _ => None,
                         };
+                        // An enum return: the *tag* is what `ret.is_ok()` and
+                        // friends read, so it is passed as the return word. The
+                        // tag lives in the discriminant store (written by a variant
+                        // construction, or seeded for an enum argument), not in the
+                        // local's value -- `_0` for `Some(x)` has no whole-local
+                        // entry at all. Reading it here is what makes the method
+                        // read the discriminant the body's `switchInt` compares.
+                        let rv = st.env.tag_value(0).or(rv);
                         // The *final* value of each reference argument, so an
                         // `ensures` that names one means what the body left there
                         // and `old(name)` reaches the entry value. A reference

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::mir::exec;
-use crate::mir::parse::{self, MirFn, MirProgram, Ty};
+use crate::mir::parse::{self, MirFn, MirProgram, Ty, USIZE_WIDTH};
 
 // The report types are part of the public verdict surface -- `FnOutcome`
 // carries a `MirReport` -- so they are re-exported here rather than leaving a
@@ -757,6 +757,20 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         // word, so the aggregate message is the honest one here.
         let probe_absent =
             if probe_ret.is_some() { spec::RET_IS_UNKNOWN } else { spec::RET_IS_AGGREGATE };
+        // An enum return: bind the discriminant so `ret.is_ok()` and friends parse
+        // in the probe exactly as they will in the run. The tag is a `usize`-wide
+        // word (the enum's discriminant type), which is the width the run passes.
+        // The probe discards its result, so a throwaway variable is enough; it must
+        // only be the right *width* for `eq_const` to be well-formed.
+        if let Some((ok, err)) = spec::enum_ret_discriminants(&f.ret_ty, &specs.enums) {
+            // A throwaway tag, above every slot the run will use so it cannot
+            // collide with a live variable (see `probe_ret_enum_slot`). The probe
+            // discards its result; it only has to be the right *width* for
+            // `eq_const` to be well-formed.
+            if let Some(tag) = probe_fields.probe_ret_enum_slot(USIZE_WIDTH) {
+                probe_fields.bind_ret_enum(tag, ok, err);
+            }
+        }
         if let Some(err) = ensures.iter().find_map(|e| {
             spec::eval_ensures(
                 e,
@@ -833,6 +847,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     let post = if ensures.is_empty() {
         None
     } else {
+        let enum_ret = spec::enum_ret_discriminants(&f.ret_ty, &specs.enums);
         Some(move |ret: Option<smt::Var>,
                    projs: &[(u32, smt::Var)],
                    ref_final: &[(u32, smt::Var)]| {
@@ -868,6 +883,13 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
                 if let Some((_, v)) = projs.iter().find(|(k, _)| *k == i) {
                     fields.bind_ret(i, ty, *v);
                 }
+            }
+            // An enum return: bind the discriminant, so `ret.is_ok()` and friends
+            // read the tag the body produced. `ret` here is the tag variable the
+            // executor passed (the return word for an enum-returning function), and
+            // the discriminants are the same ones the body's `switchInt` compares.
+            if let (Some((ok, err)), Some(tag)) = (enum_ret, ret) {
+                fields.bind_ret_enum(tag, ok, err);
             }
             // `ret` is `None` when the return value is an aggregate: there is no
             // single word to stand for it, and the parser refuses a bare `ret`

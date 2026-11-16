@@ -5584,6 +5584,84 @@ fn the_option_methods_read_the_receivers_tag_and_payload() {
     );
 }
 
+/// An enum-returning function's contract can name the *discriminant* methods:
+/// `ret.is_ok()`, `ret.is_some()`, `ret.is_err()`, `ret.is_none()`.
+///
+/// A function returning `Option`/`Result` has no single return word, so a bare
+/// `ret <= n` is refused. The four methods read the return place's tag, which the
+/// executor passes as the return word. Each is total over the tag -- unlike
+/// `ret.Ok`, which names a payload that exists on only one variant -- so they are
+/// admitted without a payload guard.
+///
+/// The pairs are the teeth: a body that always returns `Some`/`Ok` must *verify*
+/// `ret.is_some()`/`ret.is_ok()` and *refute* `ret.is_none()`/`ret.is_err()`, and
+/// the `None`/`Err` bodies the other way round. A model that read the tag as a
+/// constant, or swapped the two discriminants, would prove the tripwires.
+#[test]
+fn an_enum_return_contract_can_name_the_discriminant_methods() {
+    let names = [
+        "enum_ret_is_some",
+        "enum_ret_is_some_tripwire",
+        "enum_ret_is_none",
+        "enum_ret_is_none_tripwire",
+        "enum_ret_is_ok",
+        "enum_ret_is_ok_tripwire",
+        "enum_ret_is_err",
+        "enum_ret_is_err_tripwire",
+        "enum_ret_is_ok_or_err",
+        "enum_ret_is_ok_and_err_tripwire",
+        "enum_ret_passthrough",
+        "enum_ret_passthrough_tripwire",
+        "enum_ret_from_match",
+        "enum_ret_from_match_tripwire",
+        "enum_ret_method_on_non_enum",
+        "enum_arg_is_ok_guarded",
+        "enum_arg_is_ok_guarded_tripwire",
+        "enum_arg_is_ok_or_err",
+        "enum_arg_is_ok_and_err_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    // The true directions: the success/failure tag matches the method.
+    for name in [
+        "enum_ret_is_some",
+        "enum_ret_is_none",
+        "enum_ret_is_ok",
+        "enum_ret_is_err",
+        "enum_ret_is_ok_or_err",
+        "enum_ret_passthrough",
+        "enum_ret_from_match",
+        "enum_arg_is_ok_guarded",
+        "enum_arg_is_ok_or_err",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    // The tripwires: refuted, so the method read the *right* discriminant.
+    for name in [
+        "enum_ret_is_some_tripwire",
+        "enum_ret_is_none_tripwire",
+        "enum_ret_is_ok_tripwire",
+        "enum_ret_is_err_tripwire",
+        "enum_ret_is_ok_and_err_tripwire",
+        "enum_ret_passthrough_tripwire",
+        "enum_ret_from_match_tripwire",
+        "enum_arg_is_ok_guarded_tripwire",
+        "enum_arg_is_ok_and_err_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        assert!(!o.is_verified(), "`{name}` must be refuted, got: {o}");
+    }
+    // The refusal: a non-enum return names a tag that does not exist, so the
+    // method is unreadable -- a skip, never a verdict against a fabricated tag.
+    let o = outcome(&report, "enum_ret_method_on_non_enum");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "`ret.is_ok()` on a non-enum return must be refused, got: {o}"
+    );
+}
+
 /// A trailing line comment on a variant line does not erase the enum layout.
 ///
 /// `B = 3, // special` keeps the comma *before* the comment, so the reader that

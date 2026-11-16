@@ -2411,6 +2411,185 @@ pub fn result_unwrap_unguarded(r: Result<u8, u16>) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// An enum-returning function's contract: `ret.is_ok()` / `ret.is_some()` /
+// `ret.is_err()` / `ret.is_none()`.
+//
+// A function returning `Option`/`Result` has no single return *word* -- the value
+// is a payload plus a tag -- so a bare `ret <= n` is refused. The four methods are
+// the *discriminant* predicates: they read the return place's tag, which the
+// executor passes as the return word. The tag is a value on every path, so the
+// four are total, unlike `ret.Ok`, which names a payload that exists on only one
+// variant.
+//
+// Each pair pins the method against the *right* discriminant: `is_ok`/`is_some`
+// test the success tag (`Ok` is 0, `Some` is 1) and `is_err`/`is_none` the failure
+// tag, so a model that swapped the two tags would prove the tripwires.
+
+/// `ret.is_some()` on a body that always returns `Some`, so the contract is true.
+/// The body reads the tag the executor passed, and the pair with the tripwire is
+/// what pins the success tag.
+/// requires: true
+/// ensures: ret.is_some()
+pub fn enum_ret_is_some(x: u8) -> Option<u8> {
+    Some(x)
+}
+
+/// The tripwire: the body is always `Some`, so `ret.is_none()` is refutable. A
+/// model that read `is_none` as the success tag (or the tag as a constant) would
+/// prove this.
+/// requires: true
+/// ensures: ret.is_none()
+pub fn enum_ret_is_some_tripwire(x: u8) -> Option<u8> {
+    Some(x)
+}
+
+/// `ret.is_none()` on a body that always returns `None`: the failure tag.
+/// requires: true
+/// ensures: ret.is_none()
+pub fn enum_ret_is_none() -> Option<u8> {
+    None
+}
+
+/// The tripwire: the body is always `None`, so `ret.is_some()` is refutable.
+/// requires: true
+/// ensures: ret.is_some()
+pub fn enum_ret_is_none_tripwire() -> Option<u8> {
+    None
+}
+
+/// `ret.is_ok()` on a body that always returns `Ok`: the `Ok` tag is 0, so a
+/// model that tested against `Some`'s tag 1 would refute this.
+/// requires: true
+/// ensures: ret.is_ok()
+pub fn enum_ret_is_ok(x: u8) -> Result<u8, u8> {
+    Ok(x)
+}
+
+/// The tripwire: the body is always `Ok`, so `ret.is_err()` is refutable.
+/// requires: true
+/// ensures: ret.is_err()
+pub fn enum_ret_is_ok_tripwire(x: u8) -> Result<u8, u8> {
+    Ok(x)
+}
+
+/// `ret.is_err()` on a body that always returns `Err`: the failure tag.
+/// requires: true
+/// ensures: ret.is_err()
+pub fn enum_ret_is_err(x: u8) -> Result<u8, u8> {
+    Err(x)
+}
+
+/// The tripwire: the body is always `Err`, so `ret.is_ok()` is refutable. This is
+/// the pair that separates the `Ok` tag (0) from the `Err` tag (1) on a *return*,
+/// exactly as `result_is_ok`/`result_is_err` do for an argument.
+/// requires: true
+/// ensures: ret.is_ok()
+pub fn enum_ret_is_err_tripwire(x: u8) -> Result<u8, u8> {
+    Err(x)
+}
+
+/// A contract that names *both* methods: `ret.is_ok() || ret.is_err()` is a
+/// tautology over the two tags, so it must verify. This is the evidence the two
+/// read the same tag at the two discriminants rather than one being constant.
+/// requires: true
+/// ensures: ret.is_ok() || ret.is_err()
+pub fn enum_ret_is_ok_or_err(x: u8) -> Result<u8, u8> {
+    Ok(x)
+}
+
+/// The tripwire: the body is always `Ok`, so `ret.is_ok() && ret.is_err()` is
+/// refutable -- the two methods are not the same predicate.
+/// requires: true
+/// ensures: ret.is_ok() && ret.is_err()
+pub fn enum_ret_is_ok_and_err_tripwire(x: u8) -> Result<u8, u8> {
+    Ok(x)
+}
+
+/// A *pass-through* return: the tag comes from an enum *argument*, so the contract
+/// reads the argument's tag, which the executor seeds. This is the shape a real
+/// function has when it forwards a `Result`.
+/// requires: true
+/// ensures: ret.is_ok() || ret.is_err()
+pub fn enum_ret_passthrough(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The tripwire for the pass-through: the tag is the argument's, so `ret.is_ok()`
+/// is refutable with an `Err` receiver -- a model that read the return tag as a
+/// constant would prove it.
+/// requires: true
+/// ensures: ret.is_ok()
+pub fn enum_ret_passthrough_tripwire(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// A `match` on the returned enum, so the body's own `switchInt` reads the same
+/// tag the contract does. The contract must hold on both arms.
+/// requires: true
+/// ensures: ret.is_ok() || ret.is_err()
+pub fn enum_ret_from_match(r: Result<u8, u8>) -> Result<u8, u8> {
+    match r {
+        Ok(v) => Ok(v),
+        Err(e) => Err(e),
+    }
+}
+
+/// The tripwire: the body preserves the argument's tag, so `ret.is_err()` alone is
+/// refutable with an `Ok` receiver.
+/// requires: true
+/// ensures: ret.is_err()
+pub fn enum_ret_from_match_tripwire(r: Result<u8, u8>) -> Result<u8, u8> {
+    match r {
+        Ok(v) => Ok(v),
+        Err(e) => Err(e),
+    }
+}
+
+/// A *non-enum* return must refuse the methods: `ret.is_ok()` on a `u8` names a
+/// tag that does not exist. This is the refusal, not a verdict -- the contract is
+/// unreadable, so the function is skipped rather than checked against a
+/// fabricated tag.
+/// requires: true
+/// ensures: ret.is_ok()
+pub fn enum_ret_method_on_non_enum(x: u8) -> u8 {
+    x
+}
+
+/// The same methods on an enum-typed *argument*: `r.is_ok()` in a `requires` reads
+/// the argument's tag, which the executor seeds. A precondition that names the tag
+/// is the shape a real function has when it dispatches on a `Result` before
+/// returning a value.
+/// requires: r.is_ok()
+/// ensures: ret == true
+pub fn enum_arg_is_ok_guarded(r: Result<u8, u8>) -> bool {
+    r.is_ok()
+}
+
+/// The tripwire: the precondition admits only `Ok`, so `r.is_ok()` is `true` and
+/// `ret == false` is refutable. A model that read the argument's tag as a constant,
+/// or tested the wrong discriminant, would prove this.
+/// requires: r.is_ok()
+/// ensures: ret == false
+pub fn enum_arg_is_ok_guarded_tripwire(r: Result<u8, u8>) -> bool {
+    r.is_ok()
+}
+
+/// `is_ok`/`is_err` on an argument read the two discriminants, so their disjunction
+/// is a tautology and must verify.
+/// requires: true
+/// ensures: r.is_ok() || r.is_err()
+pub fn enum_arg_is_ok_or_err(r: Result<u8, u8>) -> bool {
+    r.is_ok()
+}
+
+/// The tripwire: the conjunction is refutable, so the two read *different* tags.
+/// requires: true
+/// ensures: r.is_ok() && r.is_err()
+pub fn enum_arg_is_ok_and_err_tripwire(r: Result<u8, u8>) -> bool {
+    r.is_ok()
+}
+
+// ---------------------------------------------------------------------------
 // A cast in a *contract*: `x as u32`. The body has modelled `as` for a while
 // (it is what lets a narrow argument meet a wide return), but the contract
 // language had no cast at all, so any contract that related the two was

@@ -2869,6 +2869,16 @@ pub struct FieldEnv {
     /// The names of enum-typed arguments, for diagnostics: a contract naming
     /// `m.Nope` where `Nope` is not a variant gets a message about the variant.
     pub enum_args: BTreeSet<String>,
+    /// `(tag variable, success discriminant, failure discriminant)` for an
+    /// enum-returning function, so a contract can write `ret.is_ok()` /
+    /// `ret.is_some()` / `ret.is_err()` / `ret.is_none()`.
+    ///
+    /// Kept apart from the bare `ret` binding on purpose: the *tag* is a value, but
+    /// it is not the enum's value, so a bare `ret <= n` on an enum return stays a
+    /// refusal (the return has no single word) rather than silently comparing the
+    /// discriminant. Only the four methods -- which say what they test -- read the
+    /// tag.
+    pub ret_enum_tags: Option<(Var, u64, u64)>,
     /// Indexed arguments (slices and arrays): name → (local, element width, the
     /// array's fixed length if it is one), so a contract's `xs.len()` and `xs[0]`
     /// can be bound without the IR's `Ty` in hand.
@@ -3301,6 +3311,40 @@ impl FieldEnv {
         }
         self.paths.insert(format!("ret.{index}"), mangled);
         Some(())
+    }
+
+    /// Record an enum return's tag and discriminants, so a contract can write
+    /// `ret.is_ok()` / `ret.is_some()` / `ret.is_err()` / `ret.is_none()`.
+    ///
+    /// `is_ok`/`is_some` test the *success* variant (`Ok` is 0, `Some` is 1) and
+    /// `is_err`/`is_none` the *failure* one. The tag is a value on every path (the
+    /// executor passes it as the return word), so the four are total; a contract
+    /// that writes them on a non-enum return is refused, because the tag they would
+    /// test does not exist.
+    ///
+    /// A bare *payload* read (`ret.Ok <= n`) is not admitted here: it is meaningful
+    /// only on the paths whose tag is that variant, so it needs the postcondition
+    /// guarded on the discriminant. That is the remaining sub-item; until it lands a
+    /// contract naming `ret.Ok` is refused rather than read on the wrong path.
+    pub fn bind_ret_enum(&mut self, tag: Var, success: u64, failure: u64) {
+        self.ret_enum_tags = Some((tag, success, failure));
+    }
+
+    /// A fresh variable for an enum return's *tag*, for the parse probe only.
+    ///
+    /// Allocated above every slot the run will use -- the locals (`0..base`) and
+    /// the argument field/tag slots (`base..base+next_slot`) -- so the probe's
+    /// throwaway tag can never collide with a variable the run declares. A
+    /// collision at a *different width* is what `var_named` refuses, and it would
+    /// poison the whole arena and turn every obligation `Unknown`; a slot past the
+    /// run's own allocation is what makes the probe free rather than harmful.
+    pub fn probe_ret_enum_slot(&mut self, width: u8) -> Option<Var> {
+        let slot = self.base + self.next_slot + self.next_ret_slot;
+        if slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        self.next_ret_slot += 1;
+        Some(smt::var_named(slot, width.clamp(1, 64)))
     }
 
     /// A fresh variable for the `index`-th return projection, for the parse probe.
@@ -4087,6 +4131,7 @@ pub fn eval_ensures(
     p.enum_args = fields.enum_args.clone();
     p.consts = fields.consts.clone();
     p.old_args = old_args.clone();
+    p.ret_enum_tags = fields.ret_enum_tags;
     let pred = p.parse_or().map_err(|e| e.about(orig))?;
     p.expect_end().map_err(|e| e.about(orig))?;
     Ok(pred)
@@ -4320,6 +4365,11 @@ struct Parser<'a> {
     /// where `old` is refused rather than guessed -- the same discipline as
     /// `ret_absent`.
     old_args: BTreeMap<String, Var>,
+    /// `(tag, success discriminant, failure discriminant)` for an enum-returning
+    /// function, so `ret.is_ok()` and friends read the tag. `None` when the return
+    /// is not an enum, in which case the methods are refused rather than answered
+    /// from a tag that does not exist.
+    ret_enum_tags: Option<(Var, u64, u64)>,
     /// The `(min, max)` envelope, as `i128`, of the *literals and folded
     /// intermediate values* in the term a `Var` holds. Rust range-checks every
     /// literal and every constant `+ - *` intermediate against the type the
@@ -4542,6 +4592,7 @@ impl<'a> Parser<'a> {
             enum_args: BTreeSet::new(),
             consts: BTreeMap::new(),
             old_args: BTreeMap::new(),
+            ret_enum_tags: None,
             range: BTreeMap::new(),
             bare_literals: BTreeSet::new(),
             amount_floor: 0,
@@ -4555,6 +4606,89 @@ impl<'a> Parser<'a> {
             return self.ret_signed;
         }
         self.signed.contains(name)
+    }
+
+    /// Recognize `<name>.is_ok()` / `.is_some()` / `.is_err()` / `.is_none()` as
+    /// a whole predicate, where `<name>` is `ret` (an enum-returning function) or
+    /// an enum-typed *argument*.
+    ///
+    /// The four are the *discriminant* predicates: `is_ok`/`is_some` test the
+    /// success variant's tag (`Ok` is 0, `Some` is 1) and `is_err`/`is_none` the
+    /// failure one. They are total over the tag, so they need no payload guard --
+    /// unlike `ret.Ok`, which names a payload that exists on only one variant.
+    ///
+    /// An argument's tag is bound under `arg__tag`, and the *discriminants* are not
+    /// recorded per argument (only `ret`'s are), so for an argument the method is
+    /// read against the tag's own domain: `is_ok`/`is_some` test the *success*
+    /// discriminant from the enum's layout, which the parser looks up. That lookup
+    /// is the one the return case avoids by recording the pair up front; the
+    /// argument case resolves it here so the two agree on what `Ok`/`Some` mean.
+    ///
+    /// Returns `Ok(None)` when the tokens are not this shape (so the caller
+    /// continues with the ordinary grammar) and `Err` when they *are* the shape but
+    /// the name is not an enum, which is a refusal rather than a silent
+    /// fall-through: `ret.is_ok()` on a `u8` return must not be read as some other
+    /// comparison.
+    fn try_ret_variant_method(&mut self) -> Result<Option<Pred>, SpecError> {
+        let Some(Tok::Ident(base)) = self.peek() else { return Ok(None) };
+        // `ret . method (` -- four tokens. A bare `ret` (no `.`) is left for the
+        // ordinary grammar, which resolves it to the return value.
+        if !matches!(self.toks.get(self.pos + 1), Some(Tok::Op(o)) if o == ".") {
+            return Ok(None);
+        }
+        let Some(Tok::Ident(method)) = self.toks.get(self.pos + 2) else { return Ok(None) };
+        if !matches!(self.toks.get(self.pos + 3), Some(Tok::Op(o)) if o == "(") {
+            return Ok(None);
+        }
+        if !matches!(self.toks.get(self.pos + 4), Some(Tok::Op(o)) if o == ")") {
+            return Ok(None);
+        }
+        let base = base.clone();
+        let method = method.clone();
+        // An enum-typed *argument* binds its tag under `arg__tag`, and that is
+        // checked first: an argument's own name wins over the `ret`/`result` alias,
+        // so a function with an argument called `result` reads the argument rather
+        // than the return.
+        let arg_tag = self.args.get(&format!("{base}__tag")).copied();
+        let (tag, success, failure) = if let Some(tag) = arg_tag {
+            let Some(sf) = self.arg_enum_discriminants(&base) else { return Ok(None) };
+            (tag, sf.0, sf.1)
+        } else if base == "ret" || base == "result" {
+            match self.ret_enum_tags {
+                Some(t) => t,
+                None => {
+                    return Err(self.err(
+                        "`is_ok`/`is_some`/`is_err`/`is_none` is only meaningful on an enum return",
+                    ))
+                }
+            }
+        } else {
+            // Not an enum argument and not `ret`: not this shape, so the caller's
+            // ordinary grammar reports the `.`.
+            return Ok(None);
+        };
+        let d = match method.as_str() {
+            "is_ok" | "is_some" => success,
+            "is_err" | "is_none" => failure,
+            _ => return Ok(None),
+        };
+        let p = smt::eq_const(tag, d);
+        self.pos += 5;
+        Ok(Some(p))
+    }
+
+    /// The `(success, failure)` discriminants of an enum-typed *argument*, from the
+    /// variant constants the binder recorded (`<arg>::Ok`, `<arg>::Some`, …).
+    ///
+    /// Returns `None` when the argument is not an enum (no `__tag` binding) or has
+    /// neither a success nor a failure variant -- a user enum with neither `Ok` nor
+    /// `Some` has no "success" that the type alone names, so `is_ok` on it is
+    /// refused rather than guessed.
+    fn arg_enum_discriminants(&self, arg: &str) -> Option<(u64, u64)> {
+        let find = |v: &str| self.variant_consts.get(&format!("{arg}::{v}")).map(|(d, _)| *d);
+        let success = find("Ok").or_else(|| find("Some"))?;
+        let failure = find("Err").or_else(|| find("None"))?;
+        Some((success, failure))
     }
 
     fn peek(&self) -> Option<&Tok> {
@@ -5390,6 +5524,16 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 return Ok(smt::truth(v));
             }
+        }
+        // `ret.is_ok()` / `ret.is_some()` / `ret.is_err()` / `ret.is_none()` as a
+        // whole predicate. These are the *discriminant* predicates of an
+        // enum-returning function, and they are total over the tag -- there is no
+        // path on which they are unreadable -- so they are admitted here rather
+        // than through the payload guard a bare `ret.Ok` needs. A contract that
+        // writes them on a function whose return is *not* an enum is refused: the
+        // tag it would test does not exist.
+        if let Some(p) = self.try_ret_variant_method()? {
+            return Ok(p);
         }
         if self.bang_is_predicate() && self.eat_op("!") {
             let inner = self.parse_cmp()?;
@@ -6999,6 +7143,50 @@ pub fn std_enum_def(name: &str) -> Option<EnumDef> {
     None
 }
 
+/// The `(success discriminant, failure discriminant)` of an enum-returning
+/// function's type, for `ret.is_ok()` and friends.
+///
+/// `Option` and `Result` are the two standard enums with a fixed numbering
+/// (`Some`/`Err` are the success variant at 1, `Ok`/`None` at 0). A *declared* enum
+/// resolves through its own layout, which is the map the caller passes in; a
+/// standard enum has no declared layout, so it is recognised by name. A return type
+/// that is neither is `None`, and the parser refuses the methods rather than testing
+/// a tag that does not exist.
+pub fn enum_ret_discriminants(
+    ret_ty: &Ty,
+    enums: &BTreeMap<String, EnumDef>,
+) -> Option<(u64, u64)> {
+    let Ty::Other(name) = ret_ty else { return None };
+    let bare = strip_generics(name);
+    let segs: Vec<&str> = bare.split("::").filter(|s| !s.is_empty()).collect();
+    let short = segs.last().copied().unwrap_or(&bare);
+    if let Some(def) = enums.get(short).or_else(|| enums.get(&bare)) {
+        // A declared enum: success is a variant named `Ok`/`Some` if it has one,
+        // else the *first* variant. A user enum with neither name still has a
+        // discriminant for each variant, but "which one is success" is not a
+        // property of the type, so `is_ok` on it is refused by leaving this `None`
+        // -- a contract must name the variant (`ret == E::Variant`) instead.
+        let find = |n: &str| def.variants.iter().find(|(vn, _, _)| vn == n).map(|(_, _, d)| *d);
+        let (Some(ok), Some(err)) =
+            (find("Ok").or_else(|| find("Some")), find("Err").or_else(|| find("None")))
+        else {
+            return None;
+        };
+        return Some((ok, err));
+    }
+    match short {
+        "Option" => Some((1, 0)),
+        "Result" => Some((0, 1)),
+        _ => None,
+    }
+}
+
+/// The generics-stripped head of a type name, so `Option::<u8>` and `Option<u8>`
+/// both read as `Option`.
+fn strip_generics(s: &str) -> String {
+    crate::mir::parse::strip_generics(s)
+}
+
 /// Bind every field of every struct-typed argument to a symbolic variable.
 ///
 /// A struct argument has no width of its own (`Ty::Other("Config")`), so it gets
@@ -7406,6 +7594,139 @@ mod tests {
         assert!(std_enum_def("Option").is_none(), "no type argument is not Option<T>");
         assert!(std_enum_def("Option<u8>X").is_none(), "trailing text is not Option<u8>");
         assert!(std_enum_def("Result<u8>").is_none(), "Result needs two arguments");
+    }
+
+    /// The two standard enums' return discriminants: `Ok` is 0 and `Err` is 1 for
+    /// `Result`, `Some` is 1 and `None` is 0 for `Option`. A declared enum resolves
+    /// through its own layout; a non-enum return is `None`, so the methods are
+    /// refused rather than tested against a tag that does not exist.
+    #[test]
+    fn an_enum_return_type_gives_its_discriminants() {
+        let none = BTreeMap::new();
+        assert_eq!(
+            enum_ret_discriminants(&Ty::Other("Result<u8, u8>".into()), &none),
+            Some((0, 1)),
+            "Result: Ok is 0, Err is 1"
+        );
+        assert_eq!(
+            enum_ret_discriminants(&Ty::Other("Option<u8>".into()), &none),
+            Some((1, 0)),
+            "Option: Some is 1, None is 0"
+        );
+        assert_eq!(
+            enum_ret_discriminants(&Ty::Other("Option::<u8>".into()), &none),
+            Some((1, 0)),
+            "a turbofished spelling is the same type"
+        );
+        assert_eq!(enum_ret_discriminants(&Ty::U8, &none), None, "a scalar has no tag");
+        assert_eq!(
+            enum_ret_discriminants(&Ty::Other("Mode".into()), &none),
+            None,
+            "a non-standard name is not a tag"
+        );
+        // A *declared* enum resolves through its layout, keyed by the short name.
+        let mut enums = BTreeMap::new();
+        enums.insert("E".to_string(), def("pub enum E { Ok(u8), Err }"));
+        assert_eq!(
+            enum_ret_discriminants(&Ty::Other("E".into()), &enums),
+            Some((0, 1)),
+            "a declared enum uses its own discriminants"
+        );
+    }
+
+    /// `ret.is_ok()` / `ret.is_some()` / `ret.is_err()` / `ret.is_none()` read the
+    /// return place's *tag*, and a non-enum return refuses them.
+    ///
+    /// The values are evaluated on the engine at both discriminants, so a method
+    /// that tested the wrong tag (or read the tag as a constant) shows up as a
+    /// wrong boolean, not a compile error.
+    #[test]
+    fn an_enum_return_reads_the_discriminant_methods() {
+        let tag = smt::var_named(1, 64);
+        let mut fields = FieldEnv::default();
+        // Result: Ok is 0, Err is 1.
+        fields.bind_ret_enum(tag, 0, 1);
+        let args = BTreeMap::new();
+        let signed = BTreeSet::new();
+        let old = BTreeMap::new();
+        let at = |k: u64| move |i: u32| if i == 1 { Some(k) } else { None };
+        let read = |text: &str| {
+            eval_ensures(
+                text,
+                &args,
+                Some(tag),
+                RET_IS_UNKNOWN,
+                &signed,
+                false,
+                &fields,
+                &old,
+            )
+            .unwrap_or_else(|e| panic!("`{text}` must parse: {e}"))
+        };
+        for (text, on_ok, on_err) in [
+            ("ret.is_ok()", true, false),
+            ("ret.is_err()", false, true),
+            ("ret.is_ok() || ret.is_err()", true, true),
+            ("ret.is_ok() && ret.is_err()", false, false),
+        ] {
+            let p = read(text);
+            assert_eq!(
+                smt::evaluate_pred(p, at(0)),
+                Some(on_ok),
+                "`{text}` at the Ok tag (0)"
+            );
+            assert_eq!(
+                smt::evaluate_pred(p, at(1)),
+                Some(on_err),
+                "`{text}` at the Err tag (1)"
+            );
+        }
+        // A non-enum return: the method names a tag that does not exist, so the
+        // contract is refused rather than read against a fabricated value.
+        let plain = FieldEnv::default();
+        let err = eval_ensures(
+            "ret.is_ok()",
+            &args,
+            Some(tag),
+            RET_IS_UNKNOWN,
+            &signed,
+            false,
+            &plain,
+            &old,
+        );
+        assert!(err.is_err(), "`ret.is_ok()` on a non-enum return must be refused");
+    }
+
+    /// The same discriminant methods on an enum-typed *argument*: `r.is_ok()` reads
+    /// the argument's tag, which the binder records under `r__tag`, and the
+    /// discriminants come from the variant constants it recorded.
+    #[test]
+    fn an_enum_argument_reads_the_discriminant_methods() {
+        let tag = smt::var_named(7, 1);
+        let mut args = BTreeMap::new();
+        args.insert("r__tag".to_string(), tag);
+        let mut fields = FieldEnv::default();
+        fields.variant_consts.insert("r::Ok".to_string(), (0, 1));
+        fields.variant_consts.insert("r::Err".to_string(), (1, 1));
+        let signed = BTreeSet::new();
+        let at = |k: u64| move |i: u32| if i == 7 { Some(k) } else { None };
+        let read = |text: &str| {
+            eval_requires(text, &args, &signed, &fields)
+                .unwrap_or_else(|e| panic!("`{text}` must parse: {e}"))
+        };
+        assert_eq!(smt::evaluate_pred(read("r.is_ok()"), at(0)), Some(true), "Ok tag");
+        assert_eq!(smt::evaluate_pred(read("r.is_ok()"), at(1)), Some(false), "Err tag");
+        assert_eq!(smt::evaluate_pred(read("r.is_err()"), at(1)), Some(true), "Err tag");
+        assert_eq!(
+            smt::evaluate_pred(read("r.is_ok() || r.is_err()"), at(1)),
+            Some(true),
+            "the disjunction is a tautology"
+        );
+        assert_eq!(
+            smt::evaluate_pred(read("r.is_ok() && r.is_err()"), at(0)),
+            Some(false),
+            "the conjunction is refutable"
+        );
     }
 
     /// A contract cast sets the target's width *and* sign, and a chain applies

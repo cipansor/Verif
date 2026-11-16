@@ -945,7 +945,7 @@ pub fn variant_index(name: &str, enums: &BTreeMap<String, EnumLayout>) -> Option
 
 /// Drop balanced `<…>` generic arguments from a path, so `Option::<u8>::Some`
 /// reads as `Option::::Some` (empty segments are filtered by the caller).
-fn strip_generics(s: &str) -> String {
+pub(crate) fn strip_generics(s: &str) -> String {
     let mut out = String::new();
     let mut depth = 0i32;
     for c in s.chars() {
@@ -2607,7 +2607,13 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
             // separates it from a plain call; the executor resolves the variant
             // against the program's enum layouts, which is the only place the
             // declaration order is known.
-            if name.contains("::") && !name.contains(' ') {
+            //
+            // The space check ignores spaces *inside* a generic list, so
+            // `Result::<u8, u8>::Ok(x)` -- which rustc prints with a space after
+            // the comma -- is recognised. A top-level space would mean something
+            // else (a call expression this parser does not produce), so it still
+            // refuses.
+            if name.contains("::") && !has_top_level_space(name) {
                 return Rvalue::Variant(name.to_string(), args);
             }
         }
@@ -2636,11 +2642,31 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
     // even once a tag read from an argument worked. A `::` with no spaces or
     // parens is the shape; the discriminant is resolved by the executor, which
     // is the only place the enum's layout is known.
-    if t.contains("::") && !t.contains(' ') && !t.contains('(') {
+    if t.contains("::") && !has_top_level_space(t) && !t.contains('(') {
         return Rvalue::Use(Operand::Const(Const::Other(t.to_string())));
     }
     Rvalue::Unknown(t.to_string())
 }
+
+/// Whether `s` has a space that is not inside a `<...>` generic list.
+///
+/// rustc prints a generic argument list with a space after the comma
+/// (`Result::<u8, u8>::Ok`), so a plain `contains(' ')` rejects a variant
+/// construction this parser can read. A space *outside* the angle brackets is a
+/// different shape (a call expression), so it is still refused.
+fn has_top_level_space(s: &str) -> bool {
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ' ' if depth <= 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Parse one statement or terminator line.
 fn parse_stmt_or_term(line: &str, enums: &BTreeMap<String, EnumLayout>) -> Result<Stmt, Term> {
     let t = line.trim().trim_end_matches(';').trim();

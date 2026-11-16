@@ -156,6 +156,28 @@ with no new false proof while the independent corpus keeps growing.
     function whose contract names the payload (the `qmark_probe` gap: a contract
     reading `ret <= n` on an `Option<u32>` return is refused because the return has
     no single word).
+  - Progress (enum-return contract): a contract on an `Option`/`Result`-returning
+    function can now name the **discriminant** methods — `ret.is_ok()`,
+    `ret.is_some()`, `ret.is_err()`, `ret.is_none()`. A function returning an enum
+    has no single return *word*, so a bare `ret <= n` is refused; the four methods
+    read the return place's **tag**, which the executor now passes as the return
+    word (`Env::tag_value(0)`), and the discriminants come from the type
+    (`spec::enum_ret_discriminants`: `Ok` is 0 / `Err` is 1, `Some` is 1 / `None` is
+    0, or a declared enum's own layout). They are *total* over the tag, so unlike
+    `ret.Ok` — which names a payload that exists on only one variant, and so needs
+    the postcondition guarded on the discriminant — they are admitted without a
+    payload guard. A non-enum return refuses them (a skip, never a verdict against
+    a fabricated tag). This also needed the parser to accept a variant name with a
+    generic list containing a space (`Result::<u8, u8>::Ok`, which rustc prints with
+    a space after the comma). The same four methods also read an enum-typed
+    **argument** (`requires: r.is_ok()`), from the tag the binder records under
+    `r__tag` and the discriminants it records as variant constants. Nineteen
+    fixtures in `realistic.rs` (true/tripwire pairs on both tags for `ret` and for an
+    argument, a pass-through, a `match`, and the non-enum refusal), pinned by
+    `an_enum_return_contract_can_name_the_discriminant_methods` and by two
+    toolchain-free `spec` unit tests. `realistic.rs` **439 of 813 -> 448 of 832**.
+  - Remaining (same item): `ret.Ok <= n` / `ret.Some <= n` (a payload read, which
+    needs the postcondition guarded on the discriminant), and `?`.
 - **C3. Ranges and `for` loops.** · P0 · done · Kani, Verus, Prusti
   - Gap: `RangeInclusive::new`, `Range`, `Iterator::next` unmodelled, so the
     commonest loop in Rust is out of reach. Evidence: `tri` incomplete.
