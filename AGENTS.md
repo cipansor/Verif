@@ -4148,7 +4148,14 @@ executor builds for a `Not` rvalue, so a bit count of a written `!x` and a bit c
 of the complement cannot disagree. `is_power_of_two` is modelled too, and it is the
 one shape whose *return type* is `bool`: the model produces a `Pred` and the executor
 writes a `Val::Bool`, which is what the `if` that consumes it branches on. It is
-unsigned-only, because `core` has no such method on the signed types. The
+unsigned-only, because `core` has no such method on the signed types. The sign
+predicates `is_negative`/`is_positive` are modelled the same way and are `core`'s
+own definition read *signed* (`x < 0`, `x > 0`); they exist only on the signed
+types, and the signedness is the whole content, because `i8::MIN` (`0x80`) is the
+largest unsigned byte, so an unsigned reading of the top bit would call it positive.
+Each is checked exhaustively over `i8`/`i16` against Rust's own methods
+(`the_sign_predicates_agree_with_rust`), with `i8::MIN` named as the point an
+unsigned reading gets wrong. The
 mixed-signedness additions — `wrapping_add_signed`, `saturating_add_signed`,
 `checked_add_signed`, `overflowing_add_signed` and their `_unsigned` counterparts —
 are modelled too, as `Intrinsic::MixedAdd(Family)`: their two operands have
