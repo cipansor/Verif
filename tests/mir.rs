@@ -5912,6 +5912,10 @@ fn the_try_operator_decides_on_both_paths() {
         "result_try_of_a_known_err_cannot_prove_this",
         "option_try_of_a_known_none",
         "option_try_of_a_known_none_cannot_prove_this",
+        "result_try_chained",
+        "result_try_chained_cannot_prove_this",
+        "result_try_in_either_branch",
+        "result_try_in_either_branch_cannot_prove_this",
     ];
     let Some(report) = verify_realistic(&names) else {
         return;
@@ -5925,6 +5929,8 @@ fn the_try_operator_decides_on_both_paths() {
         "result_try_of_a_known_ok",
         "result_try_of_a_known_err",
         "option_try_of_a_known_none",
+        "result_try_chained",
+        "result_try_in_either_branch",
     ] {
         let o = outcome(&report, name);
         assert!(o.is_verified(), "`{name}` must verify, got: {o}");
@@ -5937,6 +5943,8 @@ fn the_try_operator_decides_on_both_paths() {
         "option_try_none_propagates_cannot_prove_this",
         "result_try_of_a_known_err_cannot_prove_this",
         "option_try_of_a_known_none_cannot_prove_this",
+        "result_try_chained_cannot_prove_this",
+        "result_try_in_either_branch_cannot_prove_this",
     ] {
         assert_refuted(&report, name);
     }

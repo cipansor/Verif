@@ -10696,3 +10696,56 @@ pub fn option_try_of_a_known_none_cannot_prove_this() -> Option<u8> {
     let v = r?;
     Some(v)
 }
+
+/// Two `?` in sequence: each propagates independently, so the result is `Err`
+/// whenever *either* input is, and the second `?` is only reached on the first's
+/// success path.
+/// requires: r.is_ok() && s.is_ok()
+/// ensures: ret.is_ok()
+pub fn result_try_chained(r: Result<u8, u8>, s: Result<u8, u8>) -> Result<u8, u8> {
+    let a = r?;
+    let b = s?;
+    Ok(a.wrapping_add(b))
+}
+
+/// The false direction of [`result_try_chained`]: both inputs are `Ok`, so the
+/// result is `Ok`; a claim of `Err` is refutable.
+/// requires: r.is_ok() && s.is_ok()
+/// ensures: ret.is_err()
+pub fn result_try_chained_cannot_prove_this(r: Result<u8, u8>, s: Result<u8, u8>) -> Result<u8, u8> {
+    let a = r?;
+    let b = s?;
+    Ok(a.wrapping_add(b))
+}
+
+/// `?` on one of *two* branches: the propagation must be path-sensitive, so under
+/// "both inputs are `Err`" every path returns `Err`.
+/// requires: r.is_err() && s.is_err()
+/// ensures: ret.is_err()
+pub fn result_try_in_either_branch(c: bool, r: Result<u8, u8>, s: Result<u8, u8>) -> Result<u8, u8> {
+    if c {
+        let v = r?;
+        Ok(v)
+    } else {
+        let v = s?;
+        Ok(v)
+    }
+}
+
+/// The false direction of [`result_try_in_either_branch`]: both inputs are `Ok`,
+/// so no branch can produce an `Err`.
+/// requires: r.is_ok() && s.is_ok()
+/// ensures: ret.is_err()
+pub fn result_try_in_either_branch_cannot_prove_this(
+    c: bool,
+    r: Result<u8, u8>,
+    s: Result<u8, u8>,
+) -> Result<u8, u8> {
+    if c {
+        let v = r?;
+        Ok(v)
+    } else {
+        let v = s?;
+        Ok(v)
+    }
+}

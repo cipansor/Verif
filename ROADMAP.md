@@ -173,10 +173,11 @@ with no new false proof while the independent corpus keeps growing.
     re-numbers it for the *return* enum (read from the call's self type) and moves
     the error value onto the `Err` payload. A locally constructed `Ok`/`Err`/`None`
     receiver has a *known* tag, so the branch is decided statically (the
-    `smt::evaluate` known-tag arm). Fifteen fixtures in `realistic.rs`
-    (verify/tripwire pairs on both paths for both families, plus the three
-    known-tag receivers), pinned by `the_try_operator_decides_on_both_paths`.
-    `realistic.rs` **472 of 881 -> 488 of 912**.
+    `smt::evaluate` known-tag arm). Nineteen fixtures in `realistic.rs`
+    (verify/tripwire pairs on both paths for both families, the three known-tag
+    receivers, a chained pair and a two-branch pair), pinned by
+    `the_try_operator_decides_on_both_paths`. `realistic.rs` **472 of 881 ->
+    490 of 916**.
   - Progress (enum-return contract): a contract on an `Option`/`Result`-returning
     function can now name the **discriminant** methods — `ret.is_ok()`,
     `ret.is_some()`, `ret.is_err()`, `ret.is_none()`. A function returning an enum
