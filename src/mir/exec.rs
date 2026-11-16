@@ -5540,7 +5540,7 @@ fn try_intrinsic(
     // and the fold is handed the two separately. Reading it as a second operand at
     // `w` bits would read an `i8` exponent for a `u8` base, or a `u8` exponent for
     // a `u32` one, and fold the wrong number of bits.
-    if let intrinsics::Intrinsic::Pow(_) = op {
+    if matches!(op, intrinsics::Intrinsic::Pow(_) | intrinsics::Intrinsic::PowPanic) {
         let Some(exp_arg) = args.get(1) else {
             return Some(Err(format!("unmodelled arity for `{name}`")));
         };
@@ -5579,10 +5579,18 @@ fn try_intrinsic(
             // A `bool` predicate is unary (`is_power_of_two` is the only one),
             // so it never reaches the `pow` path.
             Outcome::Bool(_) => unreachable!("a bool predicate is unary"),
-            // A value-or-panic outcome is the unary `abs` or the three-operand
-            // `clamp`, neither of which is a `pow`; those are handled before this
-            // path.
-            Outcome::ValueOrPanic { .. } => unreachable!("a value-or-panic outcome is not a pow"),
+            // The plain inherent `pow` panics on overflow, so its outcome is a
+            // value-or-panic. The value is written unconditionally -- a path where
+            // it panics is reported by the obligation below -- and the panic is the
+            // same reachable-failure obligation a family's `pow` debug-`assert!`
+            // would raise.
+            Outcome::ValueOrPanic { value, fails } => {
+                env.set(dest, Val::Sym(value, sign));
+                return Some(Ok(vec![Obligation {
+                    kind: ObligationKind::Panic { message: format!("`{name}` overflows") },
+                    verdict: find_obligation(smt::and(path, fails), pins),
+                }]));
+            }
         });
     }
     let y = match args.get(1) {

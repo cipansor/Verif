@@ -551,6 +551,22 @@ with no new false proof while the independent corpus keeps growing.
     `the_next_core_value_methods_are_modelled_with_their_tripwires`; the value is
     checked exhaustively against Rust's own methods over the whole `u8`/`i8`
     domain (`the_signedness_casts_agree_with_rust`).
+  - Progress (cont.): the inherent `iN::pow` is modelled as `Intrinsic::PowPanic`.
+    The four *families* (`wrapping_pow`/`saturating_pow`/`checked_pow`/
+    `overflowing_pow`) express overflow as a value, but the plain `pow` **panics**
+    (`assert!` on overflow) and has no family-prefixed spelling to fall back on, so
+    it is its own shape yielding a reachable-panic obligation. A model that wrapped
+    or clamped would *hide the panic* — the one thing this frontend must never do —
+    so the fixtures pin the polarity: two verify (in-range and exact boundary), two
+    must fail on the `pow` overflow panic. Checked exhaustively against Rust's own
+    `checked_pow` over the whole `u8`/`i8` base domain (`the_plain_pow_agrees_with_rust`),
+    and pinned end to end by `the_plain_pow_panics_where_it_overflows`.
+  - Progress (cont.): `iN::from_be`/`iN::from_le` are modelled — the associated
+    functions that invert `to_be`/`to_le` on the same target, so they classify to
+    the same byte-order shapes (`from_be` on a little-endian target is the same
+    swap as `to_be`, and the `to_be`/`from_be` round trip is the identity). Six
+    fixtures (three true, three tripwires) in `realistic.rs` (**551 of 1015**),
+    pinned by `the_next_core_value_methods_are_modelled_with_their_tripwires`.
   - Remaining: the *generic* `<[T]>::first/get/len/is_empty` (`first_or<T>`) need
     monomorphisation, which is C10: `first_or`'s element type has no width and its
     slice length is never seeded (the frontend refuses a receiver whose length it

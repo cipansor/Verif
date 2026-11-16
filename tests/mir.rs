@@ -7069,6 +7069,51 @@ fn the_pow_families_are_modelled_with_a_wide_exponent() {
     }
 }
 
+/// The plain inherent `pow` is modelled, and its failure is a *panic* obligation
+/// rather than a wrapped value.
+///
+/// This is the polarity the shape exists to pin: the families' `pow` expresses
+/// overflow as a value (wrap, clamp, `None`, flag), but the plain `pow` panics, so
+/// a model that treated it as total would discharge `plain_pow_panic_is_reachable`
+/// as panic-free -- a false proof that an overflowing `pow` is safe. The two
+/// verifying entries are the in-range case and the exact-boundary case; the two
+/// failing entries must fail on the *panic* obligation, not on a postcondition, so
+/// a model that wrapped instead of panicking is caught by the kind rather than by
+/// a value that happens to differ.
+#[test]
+fn the_plain_pow_panics_where_it_overflows() {
+    let Some(report) = verify_realistic(&[
+        "plain_pow_three_to_five_is_243",
+        "plain_pow_two_to_seven_does_not_panic",
+    ]) else {
+        return;
+    };
+    for name in ["plain_pow_three_to_five_is_243", "plain_pow_two_to_seven_does_not_panic"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    let Some(report) = verify_realistic(&[
+        "plain_pow_panic_is_reachable",
+        "plain_pow_two_to_eight_would_panic_tripwire",
+    ]) else {
+        return;
+    };
+    for name in ["plain_pow_panic_is_reachable", "plain_pow_two_to_eight_would_panic_tripwire"] {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` must FAIL on a panic, got: {o}");
+        };
+        // The panic must be *`pow`'s overflow*, not merely any panic: a model that
+        // wrapped and then tripped a later shift, or a divide, would pass a bare
+        // `starts_with("panic")`. The message names the method, so pin both.
+        assert!(
+            kind.starts_with("panic") && kind.contains("pow"),
+            "`{name}` must fail on the `pow` overflow panic, got: {o}"
+        );
+    }
+}
+
 /// The four unary `neg`/`abs` families are modelled, and they disagree about
 /// `MIN` -- which is what proves each is the right one and not a shared stand-in.
 ///
@@ -10797,6 +10842,11 @@ fn the_next_core_value_methods_are_modelled_with_their_tripwires() {
         "to_be_on_a_little_endian_target_swaps",
         "to_be_is_not_the_identity_here_cannot_prove_this",
         "to_le_on_a_little_endian_target_is_the_identity",
+        "from_be_on_a_little_endian_target_swaps",
+        "from_be_is_not_the_identity_here_cannot_prove_this",
+        "from_le_on_a_little_endian_target_is_the_identity",
+        "to_be_then_from_be_is_the_identity",
+        "to_le_then_from_be_is_not_the_identity_cannot_prove_this",
         "to_ascii_uppercase_of_a_lowercase_letter",
         "to_ascii_uppercase_leaves_uppercase_cannot_prove_this",
         "to_ascii_lowercase_of_an_uppercase_letter",
@@ -10819,6 +10869,9 @@ fn the_next_core_value_methods_are_modelled_with_their_tripwires() {
         "swap_bytes_reverses_the_bytes",
         "to_be_on_a_little_endian_target_swaps",
         "to_le_on_a_little_endian_target_is_the_identity",
+        "from_be_on_a_little_endian_target_swaps",
+        "from_le_on_a_little_endian_target_is_the_identity",
+        "to_be_then_from_be_is_the_identity",
         "to_ascii_uppercase_of_a_lowercase_letter",
         "to_ascii_lowercase_of_an_uppercase_letter",
         "is_multiple_of_six_by_three",
@@ -10839,6 +10892,8 @@ fn the_next_core_value_methods_are_modelled_with_their_tripwires() {
         "reverse_bits_is_not_the_identity_cannot_prove_this",
         "swap_bytes_is_not_the_identity_cannot_prove_this",
         "to_be_is_not_the_identity_here_cannot_prove_this",
+        "from_be_is_not_the_identity_here_cannot_prove_this",
+        "to_le_then_from_be_is_not_the_identity_cannot_prove_this",
         "to_ascii_uppercase_leaves_uppercase_cannot_prove_this",
         "is_multiple_of_seven_by_three_cannot_prove_this",
     ] {

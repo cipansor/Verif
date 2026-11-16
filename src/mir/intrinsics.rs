@@ -407,13 +407,17 @@ pub enum Intrinsic {
     /// travels half the *width*, i.e. `w/2` bits (a `u16` rotates by `8`, a `u32`
     /// by `16`).
     ByteSwap,
-    /// `iN::to_be`/`to_le`: a byte-order conversion.
+    /// `iN::to_be`/`to_le` and the associated `iN::from_be`/`iN::from_le`: a
+    /// byte-order conversion.
     ///
     /// `to_be` on a little-endian target is `swap_bytes`, and on a big-endian one
     /// it is the identity; `to_le` is the reverse. The *target* endianness is not
     /// something the dump states, so the model reads it from the compilation and
-    /// applies the matching of the two. Total, both signednesses. The `_bytes`
-    /// forms are not modelled (they return an array, not an integer).
+    /// applies the matching of the two. `from_be`/`from_le` are the involutions of
+    /// `to_be`/`to_le` on the same target -- a conversion *from* a byte order is
+    /// the same permutation as a conversion *to* it -- so one model serves both.
+    /// Total, both signednesses. The `_bytes` forms are not modelled (they return
+    /// an array, not an integer).
     ByteOrder(ByteOrderKind),
     /// `iN::to_ascii_uppercase`/`to_ascii_lowercase`: the ASCII case of a `u8`.
     ///
@@ -473,6 +477,16 @@ pub enum Intrinsic {
     /// the operand's sign" rule the rest of `eval` follows. Total, and the same
     /// width as the operand (`i32::cast_unsigned` is `u32`).
     SignednessCast,
+    /// The inherent `pow`: `a.pow(b)`.
+    ///
+    /// Like [`Intrinsic::Abs`] its failure is a **panic** (`assert!` on overflow),
+    /// not a value, and there is no family-prefixed spelling of the plain call to
+    /// fall back on -- the four families' `wrapping_pow`/`checked_pow`/… are their
+    /// own `Intrinsic::Pow` shapes. So it yields a [`Outcome::ValueOrPanic`], and
+    /// the executor turns the failure predicate into a reachable-panic obligation,
+    /// the same polarity as the families' `pow` (which the plain call's debug
+    /// `assert!` mirrors). Total on both signednesses.
+    PowPanic,
     /// The inherent `Ord::clamp`: `x.clamp(lo, hi)`.
     ///
     /// Three operands, so it does not fit `eval`'s two-operand signature and is
@@ -1253,6 +1267,13 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if short == "checked_ilog10" {
         return Some(Intrinsic::CheckedIlog(LogKind::Ilog10));
     }
+    // The inherent `pow`: `a.pow(b)`. Matched by its exact name, before the
+    // family split, so it is not read as a family-prefixed `pow` (there is no
+    // such spelling) -- the plain call is its own shape because its failure is a
+    // *panic*, not a value, exactly like `abs`.
+    if short == "pow" {
+        return Some(Intrinsic::PowPanic);
+    }
     if short == "reverse_bits" {
         return Some(Intrinsic::BitReverse);
     }
@@ -1710,9 +1731,13 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // failure is an overflow, and an overflow is a *value* in every family --
         // `wrapping` wraps, `saturating` clamps, `checked` returns `None` and
         // `overflowing` sets the flag. Nothing here can panic, so there is no
-        // panic to hide. The plain `pow`, which panics on overflow, is not a
-        // modelled name at all: `classify` has no prefix for it.
+        // panic to hide. The plain `pow`, which panics on overflow, is its own
+        // shape (`Intrinsic::PowPanic`) and is admitted below.
         Intrinsic::Pow(_) => w <= POW_MAX_WIDTH,
+        // The inherent `pow`. Its value and failure are the same fold the families'
+        // `pow` uses, so it is admitted at the same bound; the difference is only
+        // that its failure is a panic obligation rather than a value.
+        Intrinsic::PowPanic => w <= POW_MAX_WIDTH,
         // The mixed-signedness additions. The operand of the method's own type
         // has the method's sign, and the other operand's sign is what tells the
         // model which one it is reading; the method itself exists on *both*
@@ -1925,6 +1950,16 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
                 },
                 Family::Overflowing => Outcome::Tuple { value, overflowed: fails },
             }
+        }
+        // The inherent `pow`: the same fold as the families' `pow`, but the
+        // failure is a **panic** rather than a value, so it yields a
+        // [`Outcome::ValueOrPanic`] (the same shape `abs` and `clamp` use).
+        Intrinsic::PowPanic => {
+            if result_w != w {
+                return None;
+            }
+            let (value, fails) = pow_fold(x, y, w, signed)?;
+            Outcome::ValueOrPanic { value, fails }
         }
         // The mixed-signedness additions. `y` is the addend, whose signedness is
         // the *opposite* of the method's own, and `signed` is the method's own --
@@ -2794,15 +2829,18 @@ fn ascii_kind(short: &str) -> Option<AsciiKind> {
 
 /// The byte-order method a name is, if any.
 ///
-/// Only the *integer*-returning forms are matched: `to_be`, `to_le` and `to_ne`.
-/// The `_bytes` forms (`to_be_bytes`) return an *array*, not an integer, so the
-/// model has no single word to produce for them; they are left unclassified and
-/// stay unmodelled, which is the honest answer rather than writing a word into an
-/// array local.
+/// Only the *integer*-returning forms are matched: `to_be`, `to_le`, `from_be`
+/// and `from_le`. Each is a byte permutation of the same width, and `from_be`/
+/// `from_le` are the involutions of `to_be`/`to_le` -- a conversion from a byte
+/// order on the same target endianness is the same swap -- so one model serves
+/// both directions. The `_bytes` forms (`to_be_bytes`) return an *array*, not an
+/// integer, so the model has no single word to produce for them; they are left
+/// unclassified and stay unmodelled, which is the honest answer rather than
+/// writing a word into an array local.
 fn byte_order_kind(short: &str) -> Option<ByteOrderKind> {
     Some(match short {
-        "to_be" => ByteOrderKind::Be,
-        "to_le" => ByteOrderKind::Le,
+        "to_be" | "from_be" => ByteOrderKind::Be,
+        "to_le" | "from_le" => ByteOrderKind::Le,
         _ => return None,
     })
 }
@@ -3837,11 +3875,12 @@ mod tests {
             classify("core::num::<impl u8>::wrapping_pow"),
             Some(Intrinsic::Pow(Family::Wrapping))
         );
-        // The plain `pow` panics on overflow and has no family prefix, so it is
-        // refused rather than modelled -- and so is `pow` under a prefix that is
-        // not one of the four.
-        assert_eq!(classify("pow"), None);
-        assert_eq!(classify("core::num::<impl u8>::pow"), None);
+        // The plain `pow` panics on overflow and has no family prefix, so it is its
+        // own shape (`Intrinsic::PowPanic`) rather than a family member -- the
+        // prefix split below must not see it, and `pow` under a prefix that is not
+        // one of the four is refused.
+        assert_eq!(classify("pow"), Some(Intrinsic::PowPanic));
+        assert_eq!(classify("core::num::<impl u8>::pow"), Some(Intrinsic::PowPanic));
         assert_eq!(classify("unchecked_pow"), None);
         assert_eq!(classify("powf"), None);
         // `next_power_of_two` is modelled now, but the prefix split must not read
@@ -5948,6 +5987,36 @@ mod tests {
         );
     }
 
+    /// The plain inherent `pow` agrees with Rust, panic included, over the whole
+    /// `u8`/`i8` base domain.
+    ///
+    /// `pow`'s exponent is a `u32` in `core`, but the model folds over the
+    /// exponent's *value*, so an eight-bit exponent exercises the same fold for
+    /// every exponent a `u8` can hold. The oracle is Rust's own `checked_pow`: the
+    /// value where it is `Some`, and a panic exactly where it is `None` -- so a
+    /// model that wrapped instead of panicking fails at the first overflowing pair.
+    #[test]
+    fn the_plain_pow_agrees_with_rust() {
+        check_value_or_panic_binary(
+            Intrinsic::PowPanic,
+            8,
+            false,
+            |xb| xb as i64,
+            |x, y| i64::from((x as u8).pow(y as u32)),
+            |x, y| (x as u8).checked_pow(y as u32).is_none(),
+            "u8::pow",
+        );
+        check_value_or_panic_binary(
+            Intrinsic::PowPanic,
+            8,
+            true,
+            |xb| signed_of(xb, 8),
+            |x, y| i64::from((x as i8).pow(y as u32)),
+            |x, y| (x as i8).checked_pow(y as u32).is_none(),
+            "i8::pow",
+        );
+    }
+
     /// The Euclidean pair and `div_ceil` agree with Rust's value everywhere the
     /// call is defined, and their panic predicate fires exactly where it panics.
     ///
@@ -6506,6 +6575,11 @@ mod tests {
         assert_eq!(classify("core::num::<impl u16>::swap_bytes"), Some(Intrinsic::ByteSwap));
         assert_eq!(classify("core::num::<impl u32>::to_be"), Some(Intrinsic::ByteOrder(ByteOrderKind::Be)));
         assert_eq!(classify("core::num::<impl u32>::to_le"), Some(Intrinsic::ByteOrder(ByteOrderKind::Le)));
+        // `from_be`/`from_le` are the *associated functions* (`u16::from_be(x)`)
+        // that invert `to_be`/`to_le` on the same target, so they classify to the
+        // same byte-order shapes rather than being refused.
+        assert_eq!(classify("core::num::<impl u32>::from_be"), Some(Intrinsic::ByteOrder(ByteOrderKind::Be)));
+        assert_eq!(classify("core::num::<impl u32>::from_le"), Some(Intrinsic::ByteOrder(ByteOrderKind::Le)));
         assert_eq!(classify("core::num::<impl u8>::to_ascii_uppercase"), Some(Intrinsic::AsciiCase(AsciiCaseKind::Upper)));
         assert_eq!(classify("core::num::<impl u8>::to_ascii_lowercase"), Some(Intrinsic::AsciiCase(AsciiCaseKind::Lower)));
         assert_eq!(classify("core::num::<impl u32>::is_multiple_of"), Some(Intrinsic::Bool(BoolKind::MultipleOf)));

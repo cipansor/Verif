@@ -5030,8 +5030,10 @@ pub fn overflowing_add_wrapped_value_below_operand_tripwire(x: u8, y: u8) -> (u8
 // All four families are modelled because `pow`'s failure is an *overflow*, and an
 // overflow is a value in every family: `wrapping_pow` wraps, `saturating_pow`
 // clamps, `checked_pow` returns `None` and `overflowing_pow` sets the flag. The
-// plain `pow`, which panics on overflow, is not modelled at all -- hiding that
-// panic is not something a proof may do.
+// plain `pow` is modelled too, as `Intrinsic::PowPanic`: its failure is a panic
+// (`assert!` on overflow), so it yields a reachable-panic obligation rather than a
+// value, and a model that wrapped or clamped instead of panicking would *hide* the
+// panic -- the one thing a proof may not do.
 //
 // Each shape carries one verifying contract and one tripwire, per the standing
 // rule.
@@ -5160,6 +5162,44 @@ pub fn wrapping_pow_zero_exponent_is_one(x: u8) -> u8 {
 /// ensures: ret == 1
 pub fn wrapping_pow_one_exponent_is_one_tripwire(x: u8) -> u8 {
     x.wrapping_pow(1)
+}
+
+/// The plain `pow`: `3^5` is `243`, in range, so no panic. The contract names the
+/// exact power, so a model that read the wrong number of exponent bits shows as a
+/// wrong value rather than a wrong panic.
+/// requires: true
+/// ensures: ret == 243
+pub fn plain_pow_three_to_five_is_243() -> u8 {
+    3u8.pow(5)
+}
+
+/// The tripwire: `2^8` overflows a `u8`, so the plain `pow` *panics* rather than
+/// wrapping to `0`. The claim that the value is `0` is false on every path -- the
+/// only live path panics -- so it must be refuted (by the panic, not by a wrapped
+/// value).
+/// requires: true
+/// ensures: ret == 0
+pub fn plain_pow_two_to_eight_would_panic_tripwire() -> u8 {
+    2u8.pow(8)
+}
+
+/// The panic-freedom control: `2^7` is `128`, exactly in range, so `2u8.pow(7)`
+/// cannot panic and the panic obligation must be discharged.
+/// requires: true
+/// ensures: ret == 128
+pub fn plain_pow_two_to_seven_does_not_panic() -> u8 {
+    2u8.pow(7)
+}
+
+/// The panic is *reachable*, not vacuous: a symbolic base in a range that admits
+/// overflow, with the constant exponent `8` that a `u8` cannot hold for any base
+/// `>= 2`. This is the fixture that pins the panic polarity -- a model that
+/// treated the plain `pow` as total would prove this panic-free, which is the
+/// false proof the shape exists to prevent. It must FAIL on the panic obligation.
+/// requires: a >= 2
+/// ensures: true
+pub fn plain_pow_panic_is_reachable(a: u8) -> u8 {
+    a.pow(8)
 }
 
 
@@ -10642,6 +10682,49 @@ pub fn to_be_is_not_the_identity_here_cannot_prove_this() -> u16 {
 /// ensures: ret == 0x1234
 pub fn to_le_on_a_little_endian_target_is_the_identity() -> u16 {
     0x1234u16.to_le()
+}
+
+/// `from_be` is the involution of `to_be`: on a little-endian target both are the
+/// same byte swap, so `from_be` swaps here too.
+/// requires: true
+/// ensures: ret == 0x3412
+pub fn from_be_on_a_little_endian_target_swaps() -> u16 {
+    u16::from_be(0x1234)
+}
+
+/// The tripwire: on a little-endian target `from_be` is *not* the identity. A
+/// model that read `from_be` as a no-op -- or that took it for a `to_le`-style
+/// identity -- would prove this.
+/// requires: true
+/// ensures: ret == 0x1234
+pub fn from_be_is_not_the_identity_here_cannot_prove_this() -> u16 {
+    u16::from_be(0x1234)
+}
+
+/// `from_le` on a little-endian target is the identity, the mirror of `from_be`.
+/// requires: true
+/// ensures: ret == 0x1234
+pub fn from_le_on_a_little_endian_target_is_the_identity() -> u16 {
+    u16::from_le(0x1234)
+}
+
+/// A `to_be`/`from_be` round trip is the identity on every target: the two are the
+/// same permutation, so applying it twice cancels. This is the property that makes
+/// `from_be` the involution of `to_be`, and it holds whatever the target's
+/// endianness.
+/// requires: true
+/// ensures: ret == 0x1234
+pub fn to_be_then_from_be_is_the_identity() -> u16 {
+    u16::from_be(0x1234u16.to_be())
+}
+
+/// The tripwire for the round trip: `to_le` then `from_be` is *not* the identity
+/// when the two directions disagree, so a model that collapsed every byte-order
+/// method to one no-op would prove this.
+/// requires: true
+/// ensures: ret == 0x1234
+pub fn to_le_then_from_be_is_not_the_identity_cannot_prove_this() -> u16 {
+    u16::from_be(0x1234u16.to_le())
 }
 
 /// `to_ascii_uppercase` maps `b'a'..=b'z'` to their uppercase letters and leaves
