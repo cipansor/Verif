@@ -9272,3 +9272,60 @@ a check ran, and every verdict carries the obligation it discharged.
 
 `SOUNDNESS.md` and `tests/soundness.rs` are the A1 increment; `ROADMAP.md` marks
 A1 done, and the README's layout and link sections name the new file.
+
+## The soundness ledger needed commits and dates, and the test that reads them
+
+The A1 increment added `SOUNDNESS.md` (the false-proof ledger) and a test that the
+fixtures it names exist. Reviewing it found four holes, all the same shape: the
+ledger *read* as evidence without *being* evidence, and the test could not tell.
+
+**The ledger omitted the historical defects.** The engine and imperative
+incidents were grouped as class summaries ("a limit that truncates, five
+instances"), and the review's eleven earlier false proofs appeared only as a
+count. That leaves those layers out of the two-week pause and makes the four-week
+clock unverifiable, because a summary has no date to compute from. The fix is a
+second table — rows 22–35, one per instance, with a fixture, a commit and a date —
+so "when did the engine last produce a false proof" is a lookup (2026-11-12, the
+`ensures false` divergence) rather than a guess. The class summaries survive as
+the *clusters* paragraph, which is the finding; the rows are the evidence.
+
+**The MIR row dates were all wrong.** Every row said `2026-11-13` (the date the
+ledger was written, not the date of the fix). The real dates came from
+`git log --all -S"fn <fixture>"` — and the `--all` matters: the crate was
+`discharge` until 2026-10-30 and its directory was `discharge/` until the move to
+the repository root (`3797cf2`, 2026-10-27), so a fixture whose commit predates
+the move is invisible to `git log -S` on the current path. The oldest MIR row is
+2026-10-29, not 2026-11-13; the densest cluster (rows 1–9) is 2026-10-29 …
+2026-11-02. Recovering this needed `git fetch --unshallow` — the workspace clone
+was shallow, and `git log -S` over a shallow history returns the boundary commit
+(`57325da`) for *every* pre-boundary query, which reads as "all fixed on the same
+day". That is the trap: a shallow clone makes a history question answer with a
+plausible wrong answer, not an error.
+
+**The edition row's fixture was prose.** Row 21 named "the E4 matrix and the 2021
+`extern "C"` fixture" — no backticked identifier, so the extractor found nothing
+there and the 18-name minimum still passed if either edition test vanished. Both
+are now named: `a_2021_only_file_is_verified_under_its_own_edition` and
+`every_edition_compiles_the_corpus_to_the_same_verdicts`.
+
+**The test promised a date check it did not make, and accepted helpers.** The
+module doc said it pinned that the newest date is not in the future; no test read
+a date. And `declared_fns` accepted *any* `fn` of the right name — so removing a
+test while a same-named helper survived left the check green. Both are fixed:
+`fns_in` distinguishes a `#[test] fn` from a plain `fn` (and a non-test match is a
+failure), and `no_ledger_date_is_in_the_future` parses each row's date and
+compares it to today's UTC date, computed in-process (a civil-from-days
+conversion, so no dependency). A cell may also name its file (`` `tests/call.rs` ``),
+which pins the test to that file — a fixture that moved files fails.
+
+Each new guard was checked by breaking it: pointing a fixture at the wrong file
+fails with the file named, naming a non-test helper (`report_source_hint`) fails
+with "not a `#[test]`", a future date fails with "in the future (today is …)", a
+missing commit fails with "exactly one commit", and deleting the engine table
+fails the row-count floor.
+
+The general lesson is the one this file keeps finding: **a document is a claim,
+and every field of it needs a reader.** The commit column was added to make A1
+computable; the test reads it. The date column was added for the clock; the test
+reads it. The fixture column was there from the start; the test now reads it as a
+*test*, not merely a name. A column nothing reads is the same as no column.

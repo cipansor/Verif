@@ -7,7 +7,9 @@ record of every false proof this project has found and fixed, so that the rate i
 a number rather than an impression.
 
 It is the A1 item of [`ROADMAP.md`](ROADMAP.md): track the false-proof rate, and
-pause feature work on any layer that produced one in the last two weeks.
+pause feature work on any layer that produced one in the last two weeks. The
+clock restarts on every row below, so the *date* and *commit* columns are what the
+criterion is computed from, not decoration.
 
 ## How to read a row
 
@@ -23,38 +25,46 @@ Each row is one defect that produced a **wrong verdict**. The classes are:
   `rustc` rejects, or off the wrong value.
 
 Every row names a **fixture**: a test that fails if the fix is undone. A row
-without a fixture would be a claim, not evidence. The fixtures live in
-`tests/mir.rs` unless the row says otherwise; the `src/mir/spec.rs` unit tests
-are noted where the guard runs without a `rustc`.
+without a fixture would be a claim, not evidence. The fixture column is the
+**fourth cell** of every table (after `#`, `Symptom`, `Class`), so a single
+extractor reads both tables; a fixture cell may name more than one test, and may
+name the file it lives in as `` `path/to/file.rs` ``, which pins the test to that
+file. The fixtures live in `tests/mir.rs` unless the row says otherwise; the
+`src/mir/spec.rs` unit tests are noted where the guard runs without a `rustc`.
+
+The **commit** is the one that fixed the defect (and, where the two differ,
+carried the fixture); `git show <commit>` reproduces the change. The commit for a
+row whose defect predates the crate's move to the repository root (2026-10-27)
+resolves only with `git log --all`, because the fixture file moved with the crate.
 
 ## The MIR frontend
 
 The frontend reads `rustc`'s textual MIR and turns contracts into queries. These
 are the defects where it produced a wrong verdict.
 
-| # | Symptom | Class | Fixture | Fixed |
-|---|---|---|---|---|
-| 1 | `0xFF` read as decimal `0`, so `requires: x == 0xFF` meant `x == 0` and a false postcondition was proved | false proof | `a_radix_literal_is_read_at_its_radix` | 2026-11-13 |
-| 2 | `128` accepted for an `i8` (it fits eight *unsigned* bits), read as `-128`, so `x <= 128` admitted nothing | false proof | `an_out_of_range_literal_is_refused_not_wrapped` | 2026-11-13 |
-| 3 | `200u8 + 100u8` folded mod width to `44`, so `x <= 200 + 100` *narrowed* the precondition and a false postcondition held | false proof | `an_overflowing_constant_expression_is_refused_not_wrapped` (spec unit test) | 2026-11-13 |
-| 4 | A left-hand constant's signedness was dropped, so `0 < a` for an `i8` compared unsigned and `i8::MIN` read as the *largest* value | false proof | `a_constant_left_signed_compare_is_signed_not_unsigned` | 2026-11-13 |
-| 5 | `-1i8 as i16` zero-filled to `255`, so `a as i16 == 255` was proved for a signed source | false proof | `a_widening_cast_respects_the_sources_signedness` | 2026-11-13 |
-| 6 | A signed slice element was read as unsigned in a *contract*, so `xs[0] >= 0` over `&[i8]` was a tautology | false proof | `a_signed_element_is_read_as_signed_in_the_contract` | 2026-11-13 |
-| 7 | A typed constant mask (`-1i8 & 1`, `1u8 & 1`) was marked untyped, so a pairing `rustc` rejects was decided | wrong verdict | `a_typed_constant_mask_keeps_its_type` | 2026-11-13 |
-| 8 | A fixed-width constant (`1i8`) was resized to a partner of another width (`x as i16`), deciding an `E0308` program | wrong verdict | `a_fixed_width_constant_may_not_meet_a_partner_of_another_width` | 2026-11-13 |
-| 9 | An untyped fold that overflows its operand width (`(!0 + 1) < 1u8`) was decided instead of refused | wrong verdict | `an_untyped_fold_that_overflows_the_operand_width_is_refused` (spec unit test) | 2026-11-13 |
-| 10 | A function-local `const` was keyed by its bare name, so it was in scope in *every* function's contract | false proof | `a_local_const_is_not_in_scope_in_another_function` | 2026-11-13 |
-| 11 | A contract on an inherent method was keyed by its bare name and dropped; a dropped contract is `Verified { obligations: 0 }` | false proof | `a_contract_on_an_inherent_method_is_resolved_and_checked` | 2026-11-13 |
-| 12 | A branching `const` (`if false { 7 } else { 8 }`) folded to its first arm, so `K == 7` was proved while `K` is `8` | false proof | `a_branching_const_does_not_fold_to_its_first_arm` | 2026-11-13 |
-| 13 | A local trait method sharing an intrinsic's name was answered by the intrinsic model, so a body that disagrees with `core` proved `core`'s value | false proof | `a_trait_method_sharing_an_intrinsic_name_is_answered_by_its_body` | 2026-11-13 |
-| 14 | A field write through a `&mut` (`(*_1).0 = v`) was dropped, so a postcondition was checked against the stale seed | false proof | `a_field_write_through_a_mutable_reference_is_applied` | 2026-11-12 |
-| 15 | Two same-named structs in different modules collided in the layout table, so drop glue read the wrong layout | false proof | `two_same_named_structs_do_not_share_a_layout` | 2026-11-16 |
-| 16 | A diverging call in its cleanup form (`-> bbN` with a live `Drop` local) was dropped, so a reachable panic was never checked | false proof | `a_diverging_call_in_a_function_with_a_drop_local_is_checked` | 2026-11-13 |
-| 17 | Drop glue of a struct whose field has its own destructor ran only the outer one, hiding a panicking field destructor | false proof | `a_destructor_body_is_executed_and_its_panic_is_an_obligation` | 2026-11-15 |
-| 18 | The `unwind:` bound counted *block entries*, so a two-iteration loop verified under `unwind: 1` | false proof | `the_unwind_bound_counts_the_whole_loop_not_one_latch` | 2026-11-16 |
-| 19 | `RangeInclusive::next` tested the *unsigned* successor-overflow flag, so a signed inclusive range never terminated and a true contract became a bound failure | false refutation | `a_signed_inclusive_range_stops_at_its_boundary` | 2026-11-16 |
-| 20 | `next` advanced an empty range, so a second `next` returned an element Rust never yields | wrong verdict | `an_empty_inclusive_range_stays_empty` | 2026-11-16 |
-| 21 | The edition was pinned to 2024, so valid 2021 code (`extern "C"`) was refused, and code that lowers differently was verified under an edition the crate does not build with | lost proof / wrong edition | the E4 matrix and the 2021 `extern "C"` fixture | 2026-11-13 |
+| # | Symptom | Class | Fixture | Commit | Fixed |
+|---|---|---|---|---|---|
+| 1 | `0xFF` read as decimal `0`, so `requires: x == 0xFF` meant `x == 0` and a false postcondition was proved | false proof | `a_radix_literal_is_read_at_its_radix` | `504484b` | 2026-10-30 |
+| 2 | `128` accepted for an `i8` (it fits eight *unsigned* bits), read as `-128`, so `x <= 128` admitted nothing | false proof | `an_out_of_range_literal_is_refused_not_wrapped` | `6e5b299` | 2026-10-30 |
+| 3 | `200u8 + 100u8` folded mod width to `44`, so `x <= 200 + 100` *narrowed* the precondition and a false postcondition held | false proof | `an_overflowing_constant_expression_is_refused_not_wrapped` (`src/mir/spec.rs`) | `3b8b610` | 2026-10-31 |
+| 4 | A left-hand constant's signedness was dropped, so `0 < a` for an `i8` compared unsigned and `i8::MIN` read as the *largest* value | false proof | `a_constant_left_signed_compare_is_signed_not_unsigned` | `24bebe1` | 2026-10-29 |
+| 5 | `-1i8 as i16` zero-filled to `255`, so `a as i16 == 255` was proved for a signed source | false proof | `a_widening_cast_respects_the_sources_signedness` | `d715d2a` | 2026-10-29 |
+| 6 | A signed slice element was read as unsigned in a *contract*, so `xs[0] >= 0` over `&[i8]` was a tautology | false proof | `a_signed_element_is_read_as_signed_in_the_contract` | `b3dfe86` | 2026-11-01 |
+| 7 | A typed constant mask (`-1i8 & 1`, `1u8 & 1`) was marked untyped, so a pairing `rustc` rejects was decided | wrong verdict | `a_typed_constant_mask_keeps_its_type` | `fd7591c` | 2026-11-02 |
+| 8 | A fixed-width constant (`1i8`) was resized to a partner of another width (`x as i16`), deciding an `E0308` program | wrong verdict | `a_fixed_width_constant_may_not_meet_a_partner_of_another_width` | `745fa3e` | 2026-11-02 |
+| 9 | An untyped fold that overflows its operand width (`(!0 + 1) < 1u8`) was decided instead of refused | wrong verdict | `an_untyped_fold_that_overflows_the_operand_width_is_refused` (`src/mir/spec.rs`) | `4ac7186` | 2026-11-02 |
+| 10 | A function-local `const` was keyed by its bare name, so it was in scope in *every* function's contract | false proof | `a_local_const_is_not_in_scope_in_another_function` | `dd1ca69` | 2026-11-09 |
+| 11 | A contract on an inherent method was keyed by its bare name and dropped; a dropped contract is `Verified { obligations: 0 }` | false proof | `a_contract_on_an_inherent_method_is_resolved_and_checked` | `f482de8` | 2026-11-09 |
+| 12 | A branching `const` (`if false { 7 } else { 8 }`) folded to its first arm, so `K == 7` was proved while `K` is `8` | false proof | `a_branching_const_does_not_fold_to_its_first_arm` | `057bd20` | 2026-11-10 |
+| 13 | A local trait method sharing an intrinsic's name was answered by the intrinsic model, so a body that disagrees with `core` proved `core`'s value | false proof | `a_trait_method_sharing_an_intrinsic_name_is_answered_by_its_body` | `d4c15af` | 2026-11-10 |
+| 14 | A field write through a `&mut` (`(*_1).0 = v`) was dropped, so a postcondition was checked against the stale seed | false proof | `a_field_write_through_a_mutable_reference_is_applied` | `08a6065` | 2026-11-04 |
+| 15 | Two same-named structs in different modules collided in the layout table, so drop glue read the wrong layout | false proof | `two_same_named_structs_do_not_share_a_layout` | `3bf73ea` | 2026-11-16 |
+| 16 | A diverging call in its cleanup form (`-> bbN` with a live `Drop` local) was dropped, so a reachable panic was never checked | false proof | `a_diverging_call_in_a_function_with_a_drop_local_is_checked` | `451c73f` | 2026-11-13 |
+| 17 | Drop glue of a struct whose field has its own destructor ran only the outer one, hiding a panicking field destructor | false proof | `a_destructor_body_is_executed_and_its_panic_is_an_obligation` | `f260560` | 2026-11-15 |
+| 18 | The `unwind:` bound counted *block entries*, so a two-iteration loop verified under `unwind: 1` | false proof | `the_unwind_bound_counts_the_whole_loop_not_one_latch` | `3bf73ea` | 2026-11-16 |
+| 19 | `RangeInclusive::next` tested the *unsigned* successor-overflow flag, so a signed inclusive range never terminated and a true contract became a bound failure | false refutation | `a_signed_inclusive_range_stops_at_its_boundary` | `3bf73ea` | 2026-11-16 |
+| 20 | `next` advanced an empty range, so a second `next` returned an element Rust never yields | wrong verdict | `an_empty_inclusive_range_stays_empty` | `3bf73ea` | 2026-11-16 |
+| 21 | The edition was pinned to 2024, so valid 2021 code (`extern "C"`) was refused, and code that lowers differently was verified under an edition the crate does not build with | lost proof / wrong edition | `a_2021_only_file_is_verified_under_its_own_edition`, `every_edition_compiles_the_corpus_to_the_same_verdicts` (`tests/mir.rs`) | `8ae3503` | 2026-11-13 |
 
 The clusters are the lesson: rows 1–9 are all the *contract reader's* value and
 width model; rows 10–13 are all *name resolution* (a name bound to the wrong
@@ -65,51 +75,73 @@ found one at a time.
 
 ## The engine and the imperative layer
 
-These are documented in [`AGENTS.md`](AGENTS.md); they are listed here so the
-ledger covers the whole stack rather than only the frontend.
+These are documented in [`AGENTS.md`](AGENTS.md). Each row here is one *instance*
+of a class, with its own fixture and commit, so the two-week pause can be applied
+to the engine and the imperative layer as well as to the frontend — a class
+summary would leave their fix dates unfindable.
 
-- **A limit that truncates instead of reporting** (five instances). A bounded
-  buffer or a width silently dropped evidence, so a summary outran the evidence:
-  an under-declared call frame, a `Total` computed by counting instead of
-  discharging, obligations dropped at `MAX_OBLIGATIONS`, a frame truncated at
-  `MAX_WRITES`, an `exists_guarded` index truncated to the bound's width. Fixed by
-  making the partiality part of the *type* (`Frame::complete`, `push_checked`,
-  `Obligation::discharge`), not by a flag.
-- **Vacuity** (four instances). A proof with no evidence: an unsatisfiable
-  precondition, an unsatisfiable `Assume` in the body, a bound too narrow to name
-  `len`, a call to `ensures false`. Reported as failures (`VacuousPrecondition`,
-  `VacuousAssume`, `DivergentCall`) rather than proofs.
-- **A proof object with no lifetime** (two instances). `Certificate` and
-  `Report` stored term ids into a resettable arena, so a proof from one scope
-  named a different formula in the next. Fixed by packing the arena generation
-  into the id itself.
-- **A kernel rule with no bounds** (`Imp<P, Q>` with no `Theorem` bound accepted
-  `Truth => Falsity`). Fixed with the bounds and a `compile_fail` doctest.
-- **A printer that is part of the proof** (three exporter bugs: polarity, sort,
-  direction). Each made the external evidence not apply. Fixed with an independent
-  SMT-LIB reader and a tautology corpus (`examples/z3diff.rs`).
-- **A `to_int` that floored and a `from_int` that wrapped** in `Fixed` (Q16.16).
-  Both total, so the proof layer could not see them; found by testing the *value*.
+| # | Class | Symptom | Fixture | Commit | Fixed |
+|---|---|---|---|---|---|
+| 22 | false proof | An under-declared call frame let a caller prove a clobbered variable survived the call | `a_declared_frame_longer_than_the_cap_is_refused` (`tests/call.rs`) | `c0080b1` | 2026-10-26 |
+| 23 | false proof | A callee writing more than the cap made the caller's derived frame look complete, so a prefix of the truth passed | `a_call_to_an_over_cap_callee_makes_the_caller_frame_incomplete` (`tests/call.rs`) | `fd15f98` | 2026-10-27 |
+| 24 | false proof | `Report::terminates` *counted* variant obligations instead of discharging them, so a non-decreasing measure read `Total` | `a_total_claim_is_not_made_for_a_divergent_loop` (`tests/modular_differential.rs`) | `fa178ef` | 2026-10-25 |
+| 25 | false proof | `MAX_OBLIGATIONS` dropped obligations silently, so a failing `LoopExit` sat outside the buffer and the report said `verified` | `assertions_beyond_the_cap_are_reported_not_hidden` (`tests/wp.rs`) | `8d7120c` | 2026-10-27 |
+| 26 | false proof | `exists_guarded` truncated the index to the bound's width, so a concrete index wrapped and was treated as inside | `the_guarded_quantifiers_do_not_truncate_their_index` (`tests/quant.rs`) | `40f94c0` | 2026-10-25 |
+| 27 | vacuity | An unsatisfiable precondition made `pre => wp(body, post)` a theorem for any body | `an_unreachable_precondition_is_not_a_proof` (`tests/wp.rs`) | `8c812d8` | 2026-10-25 |
+| 28 | vacuity | An unsatisfiable `Assume` inside the body made everything downstream vacuously true | `an_unreachable_assume_is_not_a_proof` (`tests/wp.rs`) | `779f1e9` | 2026-10-26 |
+| 29 | vacuity | A bound exactly as wide as the address could not name `len`, so the standard postcondition was unsatisfiable | `a_bound_the_same_width_as_the_address_is_rejected` (`tests/mem.rs`) | `a85ebe6` | 2026-10-25 |
+| 30 | vacuity | A call to `ensures false` never returns, so the post-call state was empty and the continuation vacuously true | `a_call_to_a_callee_whose_postcondition_is_unsatisfiable_fails` (`tests/mir.rs`) | `c60ff40` | 2026-11-12 |
+| 31 | false proof | `Certificate` stored a bare term id, so one from a reset scope named a different formula and certified a falsehood | `a_certificate_does_not_survive_an_arena_reset` (`tests/kernel.rs`) | `f9f6f4d` | 2026-10-25 |
+| 32 | false proof | `Report` held term ids with no arena generation, so a report read after a reset answered `Unknown` for every obligation | `a_report_is_only_valid_in_the_arena_that_built_it` (`tests/wp.rs`) | `732aebf` | 2026-10-28 |
+| 33 | false proof | The kernel's `Imp<P, Q>` had no `Theorem` bound, so `assert_proof!(Imp<Truth, Falsity>)` compiled | `the_imp_associated_proof_type_is_a_function_between_proofs` (`tests/kernel.rs`) | `4601e9d` | 2026-10-26 |
+| 34 | false proof | The SMT-LIB printer's polarity, sort and direction bugs made the external evidence not apply (a solver proved a different formula) | `the_export_checker_rejects_what_the_old_exporter_printed` (`tests/differential.rs`) | `d687a45` | 2026-10-26 |
+| 35 | wrong verdict | `Fixed::to_int` floored instead of truncating and `from_int` wrapped instead of saturating — both total, so the proof layer could not see them | `fixed_to_int_truncates_toward_zero`, `fixed_from_int_saturates_instead_of_wrapping` (`src/logic.rs`) | `c35b456` | 2026-10-26 |
+
+## Unavailable evidence
+
+The rows above are complete: every one has a date, a commit and a fixture, and
+the commit resolves in this repository. Three things about the record are worth
+stating so a reader does not mistake a gap for completeness:
+
+- **The pre-rename commits are found under `--all`.** The crate was `discharge`
+  until 2026-10-30 and its directory was `discharge/` until the move to the
+  repository root (`3797cf2`, 2026-10-27). A fixture whose commit predates the
+  move is not reached by `git log -S` on the current path; `git log --all -S`
+  is. Every engine row above was recovered that way.
+- **The review's eleven earlier false proofs are rows 22–35 here, not a count.**
+  They were the raw material in `AGENTS.md`; each now has its own dated row, so
+  "when did the engine last produce a false proof" is answerable (2026-11-12,
+  row 30) rather than hidden in a summary.
+- **A defect with no surviving fixture is not recorded as a row.** The ledger is
+  a list of *evidence*; a row that cannot point at a test that fails on the
+  unfixed code would be a claim, which is the failure mode this file exists to
+  avoid. If such a defect is found, it is fixed and given a fixture in the same
+  commit, or it is noted here explicitly — none is outstanding.
 
 ## The rate, and the exit criterion
 
 The review's data (2025-11-04 … 2025-11-12) counted at least eleven false proofs;
-the MIR-frontend table above records twenty-one wrong verdicts across
-2026-11-12 … 2026-11-16, which is the same order of magnitude and the same
-pattern — most found by a differential oracle or a hand probe, not by a unit test
-written after the fact.
+the tables above record thirty-five wrong verdicts across 2026-10-25 … 2026-11-16,
+which is the same order of magnitude and the same pattern — most found by a
+differential oracle or a hand probe, not by a unit test written after the fact.
+The densest cluster is the contract reader (rows 1–9, 2026-10-29 … 2026-11-02),
+which is why the standing rule is to probe the *neighbours* of a fix.
 
 The roadmap's exit for a "beta" claim is **four consecutive weeks with no new
 false proof while the independent corpus keeps growing**. That clock restarts on
-each row above; the most recent is 2026-11-16. Until it clears, a `verified` is
-evidence that a check *ran*, not yet that it is trustworthy on its own — which is
-why every verdict the frontend reports carries the obligation it discharged, and
-why `tests/mir.rs` replays each counterexample against the compiled function.
+each row above; the most recent is **2026-11-16**. Until it clears, a `verified`
+is evidence that a check *ran*, not yet that it is trustworthy on its own — which
+is why every verdict the frontend reports carries the obligation it discharged,
+and why `tests/mir.rs` replays each counterexample against the compiled function.
 
 ## Keeping this honest
 
-- A new row is added in the commit that fixes the defect, with its fixture.
+- A new row is added in the commit that fixes the defect, with its fixture, its
+  commit hash and its date.
 - A row's fixture must be confirmed to **fail** when the fix is reverted; a test
   that passes on the broken code is decoration.
 - The classes are the point, not the count: when a row is added, check whether a
   sibling shape shares the cause, and add it in the same commit if so.
+- `tests/soundness.rs` checks all of the above mechanically: every fixture name
+  must be a `#[test]` (not merely a same-named helper), in the file the cell
+  names, and no row's date may be in the future.

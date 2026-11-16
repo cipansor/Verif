@@ -347,11 +347,13 @@ with no new false proof while the independent corpus keeps growing.
     false proof in the last two weeks.
   - Exit for "beta": four weeks in a row with no new false proof, while the
     independent corpus keeps growing.
-  - Move: **build**. `SOUNDNESS.md` now carries the ledger (21 MIR-frontend rows
-    plus the engine/vacuity/handle classes), and `tests/soundness.rs` extracts the
-    fixture column and fails if any named fixture no longer exists — so a renamed
-    test cannot leave a row pointing at nothing. The clock restarts on each row;
-    the most recent is 2026-11-16.
+  - Move: **build**. `SOUNDNESS.md` carries the ledger: 21 MIR-frontend rows and
+    14 engine/imperative rows (the review's "eleven earlier false proofs", now
+    dated rows rather than a count), each with a **commit**, a **date** and a
+    fixture. `tests/soundness.rs` checks it mechanically — every fixture must be a
+    `#[test]` (not a same-named helper), in the file the cell names, every row must
+    carry a commit and a `YYYY-MM-DD` date, and no date may be in the future. The
+    clock restarts on each row; the most recent is 2026-11-16.
 
 ---
 
