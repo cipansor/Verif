@@ -81,12 +81,16 @@
 //! * `unchecked_*` is undefined behaviour on overflow. There is no value to
 //!   model, and a proof about UB is not a proof, so it is refused.
 //! * `pow` is modelled as a fold over the exponent's bits (see [`POW_MAX_WIDTH`]).
-//!   `rotate_*`, `abs_diff`, the float ops and the
-//!   `next_multiple_of`/`div_*` helpers remain absent, and an unmodelled name is
-//!   refused rather than approximated. The other `is_*` predicates
-//!   (`is_ascii*`, `is_negative`, the digit predicates) are absent too: they
-//!   answer about a *character* or a *sign*, not about the bits the engine holds,
-//!   and each would need its own definition rather than a shared one.
+//!   `next_multiple_of`/`div_ceil`/`div_floor`/`midpoint`/`rem_euclid` and the
+//!   float ops remain absent, and an unmodelled name is refused rather than
+//!   approximated. So do the sign predicates `is_negative`/`is_positive`: each
+//!   would need its own definition rather than a shared one.
+//!
+//! `abs_diff`, `rotate_left`/`rotate_right` and the ten `is_ascii_*` classes are
+//! modelled, and this header said otherwise for a while -- the list of what is
+//! modelled has to move with the tables below it. The unit test
+//! `the_documented_modelled_set_matches_classify` pins the four spellings so a
+//! later removal cannot leave the prose behind again.
 
 use crate::mir::parse::{BinOp, Ty};
 use crate::smt::{self, Pred, Var};
@@ -4015,6 +4019,43 @@ mod tests {
         );
         assert!(classify("rotate_left_signed").is_none());
         assert!(classify("abs_diff_thing").is_none());
+    }
+    /// The module header's "what is modelled" list must match the tables below it.
+    ///
+    /// The header claimed `abs_diff`, `rotate_*` and `is_ascii_*` "remain absent"
+    /// while all four were modelled -- a doc claim that drifted from the code, the
+    /// class of defect the README warns about. This pins the four spellings, so a
+    /// later removal cannot leave the prose behind again.
+    #[test]
+    fn the_documented_modelled_set_matches_classify() {
+        assert_eq!(classify("core::num::<impl u8>::abs_diff"), Some(Intrinsic::AbsDiff));
+        assert_eq!(
+            classify("core::num::<impl u8>::rotate_left"),
+            Some(Intrinsic::Rotate(RotateKind::Left))
+        );
+        assert_eq!(
+            classify("core::num::<impl u8>::rotate_right"),
+            Some(Intrinsic::Rotate(RotateKind::Right))
+        );
+        // All ten ASCII classes, so "the ten `is_ascii_*` classes" is a count a
+        // reader can check rather than a number to trust.
+        for name in [
+            "is_ascii_digit",
+            "is_ascii_alphabetic",
+            "is_ascii_alphanumeric",
+            "is_ascii_uppercase",
+            "is_ascii_lowercase",
+            "is_ascii_hexdigit",
+            "is_ascii_whitespace",
+            "is_ascii_punctuation",
+            "is_ascii_control",
+            "is_ascii",
+        ] {
+            assert!(
+                classify(&format!("core::num::<impl u8>::{name}")).is_some(),
+                "the header says `{name}` is modelled, so it must classify"
+            );
+        }
     }
 
     /// The unary shapes are `is_unary`; the two-operand families are not.

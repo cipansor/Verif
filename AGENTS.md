@@ -4250,7 +4250,8 @@ is the one an addend-signedness swap refutes.
 by design, because they panic on a zero divisor and modelling them as total would
 hide that panic; `overflowing_div`/`overflowing_rem` join them for the same reason.
 `pow` and the mixed-signedness additions are now modelled, so neither is a reachable
-gap. `rotate_*`, `abs_diff` and the `next_multiple_of`/`div_*` helpers remain reachable
+gap. `rotate_*` and `abs_diff` were gaps when this was written and are modelled now
+(see C6 in `ROADMAP.md`); the `next_multiple_of`/`div_*` helpers remain reachable
 and unmodelled. The bit-count proofs do **not** go in `verif-arithmetic`: their oracle here is Rust's own method, checked
 exhaustively over the whole operand domain, which is a stronger oracle than a
 small-domain enumeration would be. A third engine with less coverage is not a proof,
