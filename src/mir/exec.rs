@@ -5376,6 +5376,7 @@ fn try_intrinsic(
             intrinsics::Intrinsic::Unary(..)
             | intrinsics::Intrinsic::Bool(_)
             | intrinsics::Intrinsic::Abs
+            | intrinsics::Intrinsic::UnsignedAbs
             | intrinsics::Intrinsic::Signum
             | intrinsics::Intrinsic::Ilog(_)
             | intrinsics::Intrinsic::NextPowerOfTwo
@@ -5401,7 +5402,17 @@ fn try_intrinsic(
                 // is unsigned and non-negative -- but it is the type's sign, and
                 // labelling it anything else would be a second opinion about a
                 // type this code already knows.
-                env.set(dest, Val::Sym(v, Sign::of_bool(signed)));
+                //
+                // `unsigned_abs` is the exception: its result type is the unsigned
+                // sibling of the operand's (`i32::unsigned_abs` is `u32`), so the
+                // label is unsigned. The value is the same magnitude, and reading
+                // `128` as `-128` would mis-type the very input the method exists
+                // for.
+                let sign = match op {
+                    intrinsics::Intrinsic::UnsignedAbs => Sign::Unsigned,
+                    _ => Sign::of_bool(signed),
+                };
+                env.set(dest, Val::Sym(v, sign));
                 Ok(Vec::new())
             }
             Outcome::Option { tag, payload } => {

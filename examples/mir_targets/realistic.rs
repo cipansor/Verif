@@ -10269,6 +10269,46 @@ pub fn abs_min_can_overflow(x: i8) -> i8 {
     x.abs()
 }
 
+/// The inherent `iN::unsigned_abs`: the same magnitude as `abs`, read as the
+/// unsigned type. `i8::unsigned_abs(-128)` is `128u8`, so the result is always
+/// `>= 0` as an *unsigned* value -- and unlike `abs` the call is total, with no
+/// panic at `MIN`. The postcondition is the value's own range.
+/// requires: true
+/// ensures: ret >= 0
+pub fn unsigned_abs_reads(x: i32) -> u32 {
+    x.unsigned_abs()
+}
+
+/// The `MIN` boundary, which is the whole reason the shape is not `abs`: the
+/// magnitude of `i8::MIN` (`128`) fits the unsigned result, so this call does
+/// *not* panic and the postcondition is exactly the magnitude. A model that
+/// reused the signed `abs`'s failure predicate -- or read the magnitude back as a
+/// signed `-128` -- would fail here.
+/// requires: x == i8::MIN
+/// ensures: ret == 128
+pub fn unsigned_abs_of_min_is_the_magnitude(x: i8) -> u8 {
+    x.unsigned_abs()
+}
+
+/// The tripwire for `unsigned_abs`'s *value*: the result is `|x|`, so claiming
+/// `ret <= 127` is false for a wide `i32` at `x == 1000`. A model that treated
+/// the call as uninterpreted -- or as a constant -- would prove this.
+/// requires: true
+/// ensures: ret <= 127
+pub fn unsigned_abs_is_a_value_cannot_prove_this(x: i32) -> u32 {
+    x.unsigned_abs()
+}
+
+/// The control that separates `unsigned_abs` from `abs`: at `MIN` the signed
+/// `abs` panics, but `unsigned_abs` is total, so this function has *no* panic
+/// obligation to discharge and must verify with `requires: true`. A model that
+/// gave `unsigned_abs` the signed `abs`'s failure predicate would refute it.
+/// requires: true
+/// ensures: ret >= 0
+pub fn unsigned_abs_of_min_is_panic_free(x: i8) -> u8 {
+    x.unsigned_abs()
+}
+
 /// `Ord::clamp`, the three-operand trait method. With `lo <= hi` the one panic
 /// (`assert!(lo <= hi)`) is discharged, and the postcondition is the clamp's own
 /// range: the result is at or above `lo` and at or below `hi`. `x` may be

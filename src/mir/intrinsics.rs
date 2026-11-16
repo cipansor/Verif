@@ -85,15 +85,15 @@
 //! * `unchecked_*` is undefined behaviour on overflow. There is no value to
 //!   model, and a proof about UB is not a proof, so it is refused.
 //! * `pow` is modelled as a fold over the exponent's bits (see [`POW_MAX_WIDTH`]).
-//!   `next_multiple_of`/`div_ceil`/`div_floor`/`midpoint`/`rem_euclid` and the
-//!   float ops remain absent, and an unmodelled name is refused rather than
-//!   approximated.
+//!   `div_floor` and the float ops remain absent, and an unmodelled name is
+//!   refused rather than approximated.
 //!
 //! `abs_diff`, `rotate_left`/`rotate_right`, the ten `is_ascii_*` classes and the
 //! sign predicates `is_negative`/`is_positive` are modelled, and this header said
 //! otherwise for a while -- the list of what is modelled has to move with the
 //! tables below it. The unit test `the_documented_modelled_set_matches_classify`
-//! pins the four spellings so a later removal cannot leave the prose behind again.
+//! pins the spellings it names so a later removal cannot leave the prose behind
+//! again.
 
 use crate::mir::parse::{BinOp, Ty};
 use crate::smt::{self, Pred, Var};
@@ -435,6 +435,16 @@ pub enum Intrinsic {
     /// `assert`. `abs` exists only on the signed types, so a signed operand is the
     /// method's own meaning and an unsigned one is not this method at all.
     Abs,
+    /// The inherent `unsigned_abs` on a signed integer: `i32::unsigned_abs`.
+    ///
+    /// Its value is the same magnitude `abs` computes, read as the *unsigned*
+    /// type (`i8::unsigned_abs(-128)` is `128u8`). The model is therefore the same
+    /// `0 - x`/`x` `ite` the families' `abs` uses, and it needs no failure
+    /// predicate: at `MIN` the truncating `0 - x` yields the correct magnitude
+    /// (`0 - 0x80 == 0x80 == 128`), which is exactly the bit pattern the *signed*
+    /// `abs` cannot represent -- so `unsigned_abs` is total where `abs` panics.
+    /// Signed-only, like `abs`.
+    UnsignedAbs,
     /// The inherent `Ord::clamp`: `x.clamp(lo, hi)`.
     ///
     /// Three operands, so it does not fit `eval`'s two-operand signature and is
@@ -877,6 +887,7 @@ impl Intrinsic {
                         | BoolKind::Positive
                 )
                 | Intrinsic::Abs
+                | Intrinsic::UnsignedAbs
                 | Intrinsic::Signum
                 | Intrinsic::NextPowerOfTwo
                 | Intrinsic::CheckedNextPowerOfTwo
@@ -1128,6 +1139,12 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     // families' `wrapping_abs`/`checked_abs`/… are matched by the split below.
     if short == "abs" {
         return Some(Intrinsic::Abs);
+    }
+    // The inherent `unsigned_abs`: the same magnitude as `abs`, read as the
+    // unsigned type. Its result type is the unsigned sibling of the receiver's
+    // (`i32::unsigned_abs` is `u32`), so it is labelled unsigned on the way out.
+    if short == "unsigned_abs" {
+        return Some(Intrinsic::UnsignedAbs);
     }
     // The inherent `abs_diff`, `rotate_left` and `rotate_right`. Like `abs` they
     // are not family-prefixed, so they are matched before the split; unlike it
@@ -1590,6 +1607,10 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // `MIN`, which is the whole reason it is a separate shape: the failure is
         // an obligation, not a value.
         Intrinsic::Abs => signed,
+        // `unsigned_abs` is signed-only too (it is the unsigned reading of a
+        // signed value), but unlike `abs` it is *total*: the magnitude at `MIN`
+        // fits the unsigned result, so there is no failure predicate.
+        Intrinsic::UnsignedAbs => signed,
         // `Ord::clamp`. It has a value at every input, and the one panic
         // (`lo > hi`) is a failure predicate the executor discharges. Modelled on
         // both signednesses: the comparisons are the type's own, which the model
@@ -1929,6 +1950,18 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             }
             let fails = unary_failure(UnOp::Abs, x, w, signed)?;
             Outcome::ValueOrPanic { value: smt::truncate(unary_result(UnOp::Abs, x, w), result_w), fails }
+        }
+        // The inherent `unsigned_abs`. Its value is the *same* `unary_result` the
+        // families' `abs` uses -- `0 - x` where the operand is negative, `x`
+        // otherwise -- but read as an unsigned value with no failure: the
+        // truncating subtraction is exactly the magnitude even at `MIN` (where the
+        // signed `abs` is the value that does not fit). It is a plain value, so the
+        // executor labels the result unsigned.
+        Intrinsic::UnsignedAbs => {
+            if result_w == 0 || result_w > 64 {
+                return None;
+            }
+            Outcome::Value(smt::truncate(unary_result(UnOp::Abs, x, w), result_w))
         }
         // `abs_diff`: `|x - y|`, computed at one bit of headroom so the
         // subtraction cannot wrap, then narrowed back. The result is the *unsigned*
@@ -5232,6 +5265,13 @@ mod tests {
             classify("core::num::<impl i8>::is_positive"),
             Some(Intrinsic::Bool(BoolKind::Positive))
         );
+        // The inherent `abs`/`unsigned_abs`: the same magnitude, one panicking at
+        // `MIN` and one total, so they are distinct shapes rather than one.
+        assert_eq!(classify("core::num::<impl i32>::abs"), Some(Intrinsic::Abs));
+        assert_eq!(
+            classify("core::num::<impl i32>::unsigned_abs"),
+            Some(Intrinsic::UnsignedAbs)
+        );
     }
 
     /// The unary shapes are `is_unary`; the two-operand families are not.
@@ -6310,6 +6350,42 @@ mod tests {
                         smt::evaluate_pred(fails, env),
                         Some(want_fails),
                         "abs panic at {w} bits, bits {xb:#x}: want {want_fails}"
+                    );
+                }
+            });
+        }
+    }
+
+    /// The inherent `unsigned_abs` agrees with Rust everywhere, and never fails.
+    ///
+    /// Its value is the same `unary_result` the families' `abs` uses, read as an
+    /// *unsigned* magnitude: `i8::unsigned_abs(-128)` is `128u8`, which is the
+    /// input the signed `abs` cannot represent. So the value is checked against
+    /// `iN::unsigned_abs` at every input, and the outcome is asserted to be a
+    /// plain `Value` -- there is no failure predicate, because the magnitude
+    /// always fits the unsigned result. The `MIN` input is named explicitly, so a
+    /// model that reused the signed `abs`'s failure (or truncated the magnitude to
+    /// a signed read) fails the test rather than passing at the easy inputs.
+    #[test]
+    fn the_unsigned_abs_agrees_with_rust() {
+        for w in [1u8, 4, 8, 16] {
+            smt::with_fresh(|| {
+                let a = smt::var(w);
+                let outcome =
+                    eval(Intrinsic::UnsignedAbs, a, a, w, true, w).expect("unsigned_abs is modelled");
+                let Outcome::Value(value) = outcome else {
+                    panic!("unsigned_abs is total, so it must be a plain value, got a failure");
+                };
+                let ai = smt::index(a);
+                for xb in 0..(1u64 << w) {
+                    let x = signed_of(xb, w);
+                    let env = |i: u32| if i == ai { Some(xb) } else { None };
+                    let got = smt::evaluate(value, env);
+                    let want = x.unsigned_abs() & mask_of(w);
+                    assert_eq!(
+                        got,
+                        Some(want),
+                        "unsigned_abs at {w} bits, bits {xb:#x}: the model says {got:?}, Rust says {want:#x}"
                     );
                 }
             });

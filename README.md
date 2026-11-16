@@ -2087,6 +2087,14 @@ refused. `src/mir/intrinsics.rs` holds the model:
   clamp reads `i8::MIN` as below `0`. Both are refused on a non-primitive self
   type, and `clamp` is admitted only under the standard library's `Ord` path, the
   same rule `min`/`max` follow.
+- The inherent `iN::unsigned_abs` is the same magnitude as `abs` read as the
+  *unsigned* type (`i8::unsigned_abs(-128)` is `128u8`), so it reuses the same
+  `0 - x`/`x` `ite` — but it is *total* where `abs` panics: at `MIN` the
+  truncating subtraction is exactly the magnitude, which is the very bit pattern
+  the signed `abs` cannot represent. It is therefore a plain value with no
+  failure predicate, labelled unsigned on the way out so `128` is not read back as
+  `-128`. The pair is what makes `abs`'s panic meaningful: one call fails at `MIN`
+  and its sibling does not.
 - `iN::abs_diff` and `iN::rotate_left`/`rotate_right` are total, so they are plain
   values rather than a value-and-panic pair. `abs_diff`'s result is the *unsigned*
   magnitude even on a signed type — `i8::abs_diff(-128, 127)` is `255u8` — so the

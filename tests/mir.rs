@@ -10575,21 +10575,31 @@ fn a_diverging_call_in_a_function_with_a_drop_local_is_checked() {
     }
 }
 
-/// `iN::abs` and `Ord::clamp` are modelled, and their *panic* is modelled too.
+/// `iN::abs`, `iN::unsigned_abs` and `Ord::clamp` are modelled, and `abs`'s
+/// *panic* is modelled too.
 ///
-/// These are the first modelled methods whose failure is a **panic** rather than
-/// a value or an `Option`, so the two halves have to be checked apart. A model
-/// that returned `|x|` with no panic predicate would verify `abs_min_can_overflow`
-/// (which panics at `i8::MIN`); a model that returned a constant would prove the
-/// value tripwires. Each true direction is asserted `Verified` and each false
-/// direction `Failed`, and the panic entries are pinned to a `panic` kind so an
-/// unrelated refusal cannot satisfy them.
+/// `abs` and `clamp` are the first modelled methods whose failure is a **panic**
+/// rather than a value or an `Option`, so the two halves have to be checked
+/// apart. A model that returned `|x|` with no panic predicate would verify
+/// `abs_min_can_overflow` (which panics at `i8::MIN`); a model that returned a
+/// constant would prove the value tripwires. Each true direction is asserted
+/// `Verified` and each false direction `Failed`, and the panic entries are pinned
+/// to a `panic` kind so an unrelated refusal cannot satisfy them.
+///
+/// `unsigned_abs` is the contrast that makes `abs`'s panic meaningful: the same
+/// magnitude, read as the unsigned type, so it is *total* even at `MIN`
+/// (`i8::MIN.unsigned_abs()` is `128u8`). Its `requires: true` control must
+/// verify, which a model that gave it `abs`'s failure predicate could not.
 #[test]
 fn abs_and_clamp_are_modelled_with_their_panics() {
     let names = [
         "abs_small_reads",
         "abs_small_is_a_value_cannot_prove_this",
         "abs_min_can_overflow",
+        "unsigned_abs_reads",
+        "unsigned_abs_of_min_is_the_magnitude",
+        "unsigned_abs_of_min_is_panic_free",
+        "unsigned_abs_is_a_value_cannot_prove_this",
         "clamp_builtin_reads",
         "clamp_builtin_can_panic",
         "clamp_builtin_is_a_value_cannot_prove_this",
@@ -10597,7 +10607,14 @@ fn abs_and_clamp_are_modelled_with_their_panics() {
     ];
     let Some(report) = verify_realistic(&names) else { return };
 
-    for name in ["abs_small_reads", "clamp_builtin_reads", "clamp_builtin_signed_reads"] {
+    for name in [
+        "abs_small_reads",
+        "unsigned_abs_reads",
+        "unsigned_abs_of_min_is_the_magnitude",
+        "unsigned_abs_of_min_is_panic_free",
+        "clamp_builtin_reads",
+        "clamp_builtin_signed_reads",
+    ] {
         let o = outcome(&report, name);
         assert!(o.is_verified(), "`{name}` must verify, got: {o}");
     }
@@ -10607,7 +10624,11 @@ fn abs_and_clamp_are_modelled_with_their_panics() {
     // precondition that discharges the panic -- so a refutation on the panic
     // instead of the postcondition would mean the entry is not testing the value
     // at all (the `abs` panic fires at `i32::MIN`, before the value is read).
-    for name in ["abs_small_is_a_value_cannot_prove_this", "clamp_builtin_is_a_value_cannot_prove_this"] {
+    for name in [
+        "abs_small_is_a_value_cannot_prove_this",
+        "unsigned_abs_is_a_value_cannot_prove_this",
+        "clamp_builtin_is_a_value_cannot_prove_this",
+    ] {
         let o = outcome(&report, name);
         match o {
             FnOutcome::Failed { kind, .. } => assert!(

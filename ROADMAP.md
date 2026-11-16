@@ -512,6 +512,17 @@ with no new false proof while the independent corpus keeps growing.
     Eleven fixtures (seven true, three tripwires, one panic) are in `realistic.rs`
     (**532 of 986**), pinned by `the_new_num_methods_verify_and_their_tripwires_refute`
     in `tests/mir.rs`.
+  - Progress (cont.): `iN::unsigned_abs` is modelled — the same magnitude `abs`
+    computes, read as the *unsigned* type (`i8::unsigned_abs(-128)` is `128u8`),
+    and *total* where `abs` panics: at `MIN` the truncating `0 - x` is exactly the
+    magnitude, the bit pattern the signed `abs` cannot represent. So it is a plain
+    value with no failure predicate, labelled unsigned on the way out so `128` is
+    not read back as `-128`; a model that gave it `abs`'s panic, or read the
+    magnitude signed, fails at the `MIN` fixture. Checked exhaustively against
+    Rust at 1/4/8/16 bits (`the_unsigned_abs_agrees_with_rust`), with five fixtures
+    (three true, one tripwire, one `requires: true` panic-freedom control) in
+    `realistic.rs` (**535 of 990**), pinned by
+    `abs_and_clamp_are_modelled_with_their_panics` in `tests/mir.rs`.
   - Remaining: the *generic* `<[T]>::first/get/len/is_empty` (`first_or<T>`) need
     monomorphisation, which is C10: `first_or`'s element type has no width and its
     slice length is never seeded (the frontend refuses a receiver whose length it
