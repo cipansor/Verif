@@ -4493,7 +4493,22 @@ struct Parser<'a> {
     /// The scan skips any token inside a recorded range, so the inner guards are the
     /// only ones applied -- each payload restricted to its own variant, which is the
     /// correct reading.
+    ///
+    /// The range is *not* dropped by a negation, and that is deliberate: a negated
+    /// payload clause is guarded by [`Parser::parse_cmp`]'s `!` arm, which applies the
+    /// discriminant guard to the whole negated predicate. The range stays recorded so
+    /// the enclosing conjunct's scan skips the already-guarded tokens.
     guarded_groups: Vec<(usize, usize)>,
+    /// True while [`Parser::parse_cmp`] is parsing the operand of a `!`.
+    ///
+    /// A negation must not guard its operand's payload clause *inside* the `!`:
+    /// `!(ret.Ok == 9)` as `!(tag == 0 => payload == 9)` is false on an `Err` return,
+    /// a false refutation, while the equivalent `ret.Ok != 9` reads
+    /// `tag == 0 => payload != 9`, true there. A payload clause is *scoped* to its
+    /// variant, and the scope wraps the whole clause including the negation, so the
+    /// guard is applied by the `!` arm *outside* the `not`, and `guard_ret_payloads`
+    /// returns its clause unchanged while this is set.
+    in_negation: bool,
     /// The width a shift amount's bare literals are floored at, or `0` outside an
     /// amount.
     ///
@@ -4698,6 +4713,7 @@ impl<'a> Parser<'a> {
             range: BTreeMap::new(),
             bare_literals: BTreeSet::new(),
             guarded_groups: Vec::new(),
+            in_negation: false,
             amount_floor: 0,
             ret_absent: "`ret` is only meaningful in `ensures`",
         }
@@ -4962,6 +4978,13 @@ impl<'a> Parser<'a> {
         if self.ret_payload_guards.is_empty() {
             return p;
         }
+        // Inside the operand of a `!` the clause is *not* guarded here: the guard
+        // belongs outside the negation (`tag == 0 => payload != 9`, not
+        // `tag == 0 => payload == 9` negated). `parse_cmp`'s `!` arm applies it to
+        // the whole negated predicate once the operand is parsed.
+        if self.in_negation {
+            return p;
+        }
         let mut guard: Option<Pred> = None;
         for (i, t) in self.toks[from..to.min(self.toks.len())].iter().enumerate() {
             // A payload name inside a parenthesized group is already guarded by the
@@ -4990,6 +5013,46 @@ impl<'a> Parser<'a> {
             None => p,
             Some(g) => smt::implies(g, p),
         }
+    }
+
+    /// The discriminant guard for the payload names in `[from, to)`, as a bare
+    /// predicate, and the number of *distinct* discriminants those names carry.
+    ///
+    /// The `!` arm of [`Self::parse_cmp`] uses this to re-guard a *negated* payload
+    /// clause: the clause's payload names are scoped to their variant, and the scope
+    /// wraps the whole clause, so the guard is `tag == disc => !clause` rather than
+    /// `!(tag == disc => clause)`. The two differ on the other variant's paths --
+    /// the second is false there, a false refutation, and the first is true, the
+    /// vacuous reading a payload clause is supposed to have. Multiple names of *one*
+    /// discriminant are conjoined (the reading `parse_and` gives the positive
+    /// spelling); names of *different* discriminants cannot share one scope, so the
+    /// caller refuses that shape rather than conjoining two contradictory guards.
+    ///
+    /// Unlike [`Self::guard_ret_payloads`] this scans *every* token in the range,
+    /// `guarded_groups` included: it runs on the operand of a `!`, whose inner
+    /// predicate groups are exactly the clauses the negation scopes, so their
+    /// payloads must be re-guarded from outside the negation.
+    fn ret_payload_guard_for(&self, from: usize, to: usize) -> (Option<Pred>, usize) {
+        if self.ret_payload_guards.is_empty() {
+            return (None, 0);
+        }
+        let mut guard: Option<Pred> = None;
+        let mut discs: Vec<u64> = Vec::new();
+        for t in &self.toks[from..to.min(self.toks.len())] {
+            if let Tok::Ident(name) = t {
+                if let Some((tag, disc)) = self.ret_payload_guards.get(name) {
+                    if !discs.contains(disc) {
+                        discs.push(*disc);
+                    }
+                    let g = smt::eq_const(*tag, *disc);
+                    guard = Some(match guard {
+                        None => g,
+                        Some(prev) => smt::and(prev, g),
+                    });
+                }
+            }
+        }
+        (guard, discs.len())
     }
 
     /// The value of a term that has no free variable, if it is constant.
@@ -5735,8 +5798,39 @@ impl<'a> Parser<'a> {
             return Ok(p);
         }
         if self.bang_is_predicate() && self.eat_op("!") {
-            let inner = self.parse_cmp()?;
-            return Ok(smt::not(inner));
+            // A payload clause is *scoped* to its variant, and the scope wraps the
+            // whole clause, including a negation. So the operand is parsed with the
+            // inner guard suppressed (`in_negation`), and the discriminant guard is
+            // applied to the *negated* predicate afterwards: `!(ret.Ok == 9)` reads
+            // `tag == 0 => payload != 9` (true on an `Err` return, vacuously), not
+            // `!(tag == 0 => payload == 9)` (false there -- a false refutation).
+            let start = self.pos;
+            let saved = self.in_negation;
+            self.in_negation = true;
+            let inner = self.parse_cmp();
+            self.in_negation = saved;
+            let inner = inner?;
+            let negated = smt::not(inner);
+            // The guard is read *before* the group's range is treated as handled, so
+            // the scan sees the payload names the negation covers. The group path
+            // already recorded the range in `guarded_groups`, so the enclosing
+            // conjunct's scan will not apply a *second* guard on top of this one.
+            let (guard, distinct) = self.ret_payload_guard_for(start, self.pos);
+            // A negation that spans *two* variants (`!(ret.Ok == 9 && ret.Err == 8)`)
+            // has no single scope: the conjunction is vacuous per variant, and its
+            // negation would have to hold on both, which is not what the source
+            // means. Refusing is the honest reading -- a skip, not a verdict against
+            // a guard that cannot be stated.
+            if distinct > 1 {
+                return Err(self.err(
+                    "a negated clause names payloads of more than one variant, which \
+                     has no single scope",
+                ));
+            }
+            return Ok(match guard {
+                Some(g) => smt::implies(g, negated),
+                None => negated,
+            });
         }
         // A parenthesized *predicate*, as in `!(a == MIN && b == -1)`. Which
         // meaning a `(` has is decided by a lookahead to its matching `)`: if a

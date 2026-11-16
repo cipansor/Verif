@@ -2728,11 +2728,15 @@ pub fn grouped_payload_conjunction_cannot_prove_this(r: Result<u8, u8>) -> Resul
     r
 }
 
-/// The true companion: the same grouped conjunction with the payload values the
-/// body actually produces. A fix that refused every grouped conjunction would
-/// pass the tripwire above but fail this.
+/// The true companion: a genuine *mixed-variant* conjunction that holds. The body
+/// passes `r` through under `requires: r.is_err() && r.Err == 7`, so on the `Err`
+/// path `ret.Err == 7` holds and `ret.Ok == 0` is vacuous (its variant is not
+/// taken). The group therefore verifies, and a fix that blanket-refused every
+/// mixed-variant group would *skip* it -- which is how this distinguishes
+/// preserved support from blanket rejection, where a single-variant control could
+/// not.
 /// requires: r.is_err() && r.Err == 7
-/// ensures: (ret.Err == 7)
+/// ensures: (ret.Ok == 0 && ret.Err == 7)
 pub fn grouped_payload_conjunction_ok(r: Result<u8, u8>) -> Result<u8, u8> {
     r
 }
@@ -2743,6 +2747,44 @@ pub fn grouped_payload_conjunction_ok(r: Result<u8, u8>) -> Result<u8, u8> {
 /// ensures: ret.Ok == 9 && ret.Err == 8
 pub fn ungrouped_payload_conjunction_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
     r
+}
+
+/// A *negated* payload comparison must read the discriminant guard from
+/// *outside* the negation. `!(ret.Ok == 9)` on a pass-through under
+/// `requires: r.is_err() && r.Err == 7` holds: `ret.Ok` has no value on the `Err`
+/// path, so the clause is vacuously true there. Before the fix the guard was
+/// applied inside the `!` (`!(tag == 0 => payload == 9)`), which is *false* on the
+/// `Err` path, so this valid contract was refuted while the equivalent
+/// `ret.Ok != 9` verified.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: !(ret.Ok == 9)
+pub fn negated_payload_comparison(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The `!=` spelling of the same claim, which must agree with the negated `==`
+/// spelling: both verify.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: ret.Ok != 9
+pub fn negated_payload_comparison_inequality(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The tripwire: on an `Ok(9)` return `ret.Ok` *is* `9`, so both spellings of the
+/// negation are false. A fix that made every negated payload clause vacuous would
+/// pass the true pair above but fail this.
+/// requires: true
+/// ensures: !(ret.Ok == 9)
+pub fn negated_payload_comparison_cannot_prove_this() -> Result<u8, u8> {
+    Ok(9)
+}
+
+/// A negation spanning *two* variants has no single scope, so it is refused
+/// rather than given a contradictory guard. A skip, not a verdict.
+/// requires: true
+/// ensures: !(ret.Ok == 9 && ret.Err == 8)
+pub fn negated_payload_mixed_variant_is_refused() -> Result<u8, u8> {
+    Ok(9)
 }
 
 /// `ret.Pair` denotes the payload variant's *first* field: `Duo::Pair(1, 2)` makes

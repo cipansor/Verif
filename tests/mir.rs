@@ -5818,6 +5818,13 @@ fn a_parenthesized_comparison_is_a_bool_operand() {
 ///   overwritten by it, so `ret.Ok == ret__v_Ok` compared the payload with itself
 ///   and verified. The binding is now dropped on a collision, so the contract is
 ///   refused -- a skip, never a proof against the wrong value.
+/// * **A *negated* payload comparison** read its discriminant guard from *inside*
+///   the `!`: `!(ret.Ok == 9)` became `!(tag == 0 => payload == 9)`, which is false
+///   on an `Err` return, so a valid contract was refuted while the equivalent
+///   `ret.Ok != 9` verified. The guard is now applied outside the negation, and
+///   the two spellings agree -- both verify, and both are refuted on an `Ok(9)`
+///   body. A negation that spans two variants has no single scope, so it is
+///   refused rather than given a contradictory guard.
 #[test]
 fn payload_summaries_cannot_prove_a_false_claim() {
     let names = [
@@ -5827,6 +5834,10 @@ fn payload_summaries_cannot_prove_a_false_claim() {
         "duo_pair_first_field",
         "duo_pair_second_field_cannot_prove_this",
         "payload_binding_shadow_tripwire",
+        "negated_payload_comparison",
+        "negated_payload_comparison_inequality",
+        "negated_payload_comparison_cannot_prove_this",
+        "negated_payload_mixed_variant_is_refused",
     ];
     let Some(report) = verify_realistic(&names) else {
         return;
@@ -5848,6 +5859,19 @@ fn payload_summaries_cannot_prove_a_false_claim() {
     assert!(
         matches!(o, FnOutcome::Skipped { .. }),
         "`payload_binding_shadow_tripwire` must be refused, got: {o}"
+    );
+    // The negation fix: the `!(…)` and `!=` spellings must agree, both verifying
+    // here (the `Err` path leaves `ret.Ok` vacuous), and both refuted on an `Ok(9)`
+    // body. The mixed-variant negation has no single scope, so it is refused.
+    for name in ["negated_payload_comparison", "negated_payload_comparison_inequality"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    assert_refuted(&report, "negated_payload_comparison_cannot_prove_this");
+    let o = outcome(&report, "negated_payload_mixed_variant_is_refused");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "`negated_payload_mixed_variant_is_refused` must be refused, got: {o}"
     );
 }
 
