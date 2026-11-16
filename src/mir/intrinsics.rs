@@ -186,6 +186,18 @@ pub const CONTINUE_TAG: u64 = 0;
 /// residual (the error) a `?` propagates. See [`CONTINUE_TAG`].
 pub const BREAK_TAG: u64 = 1;
 
+/// The discriminants of `core::cmp::Ordering`'s variants, which `Ord::cmp`
+/// returns. Unlike `Option`/`Result` the numbering is signed and negative for
+/// `Less`: `Less` is -1, `Equal` 0, `Greater` 1, all read at the enum's `i8`
+/// discriminant width. A three-way comparison is exactly the sign of `x - y`, so
+/// the model is `ite(slt(x, y), LESS, ite(slt(y, x), GREATER, EQUAL))` and the
+/// three constants are the tags a `switchInt` on `discriminant(_)` compares.
+pub const ORDERING_LESS: i64 = -1;
+/// `Ordering::Equal`'s discriminant. See [`ORDERING_LESS`].
+pub const ORDERING_EQUAL: i64 = 0;
+/// `Ordering::Greater`'s discriminant. See [`ORDERING_LESS`].
+pub const ORDERING_GREATER: i64 = 1;
+
 /// What a modelled intrinsic computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intrinsic {
@@ -447,6 +459,16 @@ pub enum Intrinsic {
     /// take `&self`, so the executor follows the reference as it does for the
     /// `is_ascii_*` receivers.
     Cmp(PartialCmpKind),
+    /// `Ord::cmp`: the three-way ordering, returning `core::cmp::Ordering`.
+    ///
+    /// The sibling of [`Intrinsic::MinMax`] and the same trait-method shape: the
+    /// dump spells a call `<u8 as Ord>::cmp`, naming the trait rather than a
+    /// `core::num::<impl …>` path, so the model is a fallback behind the same-dump
+    /// lookup. Unlike every other modelled shape the result is a *three-variant
+    /// enum* whose tag is a signed `i8` discriminant (`Less` = -1, `Equal` = 0,
+    /// `Greater` = 1), so the executor writes the discriminant/payload pair rather
+    /// than a single value. `eval` returns `None` for it.
+    OrdCmp,
     /// A widening integer conversion: `From::from` or `Into::into`.
     ///
     /// Like [`Intrinsic::MinMax`] this is a *trait* method, so the dump spells a
@@ -1211,6 +1233,18 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
         }
         return Some(Intrinsic::Clamp);
     }
+    // `Ord::cmp`: the third `Ord` trait method, and admitted the same narrow way
+    // as `min`/`max`/`clamp` -- the trait path must be the standard library's
+    // `Ord`, so a module-qualified local `m::Ord` is refused, and the caller's
+    // same-dump lookup answers a crate-root `Ord` before the model is consulted.
+    // The result is an `Ordering` enum, which the executor writes rather than
+    // `eval`.
+    if short == "cmp" {
+        if !names_ord_trait(name) {
+            return None;
+        }
+        return Some(Intrinsic::OrdCmp);
+    }
     // `From::from`/`Into::into`. These are *trait* methods with a type parameter,
     // so the dump spells `<u16 as From<u8>>::from`: the trait path is read the same
     // way `Ord`'s is (see `trait_path`), which is what keeps a module-qualified
@@ -1704,6 +1738,13 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // here; `eval` never sees them and the executor answers them from the
         // stores (or refuses a receiver whose enum state it does not hold).
         Intrinsic::TryBranch | Intrinsic::FromResidual => true,
+        // `Ord::cmp` reads the receiver and the other operand as *values* (a
+        // comparison of two bit-vectors), but writes an `Ordering` enum -- a
+        // discriminant/payload pair -- rather than a plain value, so `eval` does
+        // not serve it and the executor answers it (see `ord_cmp`). Total here so
+        // an `is_modelled` probe does not report it unmodelled; the executor
+        // refuses an operand whose sign it cannot read.
+        Intrinsic::OrdCmp => true,
         // `abs_diff` computes at one bit of headroom, so it needs a width below the
         // engine's 64. It exists on both signednesses -- on an unsigned type it is
         // a plain magnitude -- so there is no membership fact to check.
@@ -1913,6 +1954,12 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
     if matches!(op, Intrinsic::TryBranch | Intrinsic::FromResidual) {
         return None;
     }
+    // `Ord::cmp` produces an `Ordering` enum, which is a discriminant/payload pair
+    // rather than a single value, so `eval` has nothing to hand back. The executor
+    // answers it (see `ord_cmp`).
+    if matches!(op, Intrinsic::OrdCmp) {
+        return None;
+    }
     Some(match op {
         // Answered by `eval_slice` from the executor's length variable; the early
         // return above keeps them from reaching here.
@@ -1936,6 +1983,11 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         // stores; the early return above keeps them from reaching here.
         Intrinsic::TryBranch | Intrinsic::FromResidual => {
             unreachable!("the `?` operator's calls are answered from the enum stores")
+        }
+        // Answered by the executor's `ord_cmp` from the destination's discriminant
+        // store; the early return above keeps it from reaching here.
+        Intrinsic::OrdCmp => {
+            unreachable!("`Ord::cmp` is answered from the discriminant store")
         }
         // The bit counts, each built at the operand's width and widened to the
         // result type. A count cannot exceed the operand width, so `w` bits hold
@@ -5826,6 +5878,17 @@ mod tests {
         );
         // The `_signed` near misses stay refused.
         assert!(classify("<u8 as Ord>::min_signed").is_none());
+        // `Ord::cmp` is the third method on the same trait, so it is admitted on
+        // the same paths and refused for the same foreign ones. It is its own
+        // shape, not `min`/`max`: its result is an `Ordering` enum, not an
+        // operand, so reading it as either would be a wrong value.
+        assert_eq!(classify("<u8 as Ord>::cmp"), Some(Intrinsic::OrdCmp));
+        assert_eq!(classify("<i8 as core::cmp::Ord>::cmp"), Some(Intrinsic::OrdCmp));
+        assert_eq!(classify("<u32 as std::cmp::Ord>::cmp"), Some(Intrinsic::OrdCmp));
+        assert!(classify("<u8 as m::Ord>::cmp").is_none());
+        assert!(classify("<u8 as MyOrd>::cmp").is_none());
+        assert!(classify("<u8 as ord_shim::Ord>::cmp").is_none());
+        assert_ne!(classify("<u8 as Ord>::cmp"), Some(Intrinsic::MinMax(MinMaxKind::Min)));
     }
 
     /// The `PartialEq`/`PartialOrd` comparisons classify only under the standard

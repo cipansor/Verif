@@ -19,7 +19,7 @@ output decides the number, so the table is a measurement rather than a claim:
 | Corpus | Command | Verified / decided |
 |---|---|---|
 | `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 18 / 33 |
-| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 559 / 1027 |
+| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 564 / 1035 |
 | `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **16 / 21 (76%)** |
 
 `everyday.rs` is the honest one: ordinary Rust written by an external reviewer,
@@ -590,10 +590,41 @@ with no new false proof while the independent corpus keeps growing.
     (five true, one local-trait pair, two tripwires) in `realistic.rs` (**559 of
     1027**), pinned by
     `partial_cmp_methods_are_modelled_and_a_local_trait_still_wins`.
+  - Progress (cont.): `Ord::cmp` is modelled — the third method on the same
+    `Ord` trait, admitted by the same narrow rule (`is_ord_callee`: the standard
+    library's `Ord` path and a primitive self type), and the *first* modelled
+    shape whose result is a three-variant enum rather than a value, an `Option` or
+    a `(value, flag)` tuple. Its result is `core::cmp::Ordering`, whose
+    discriminants are the *signed* `i8` values `Less` = -1, `Equal` = 0, `Greater`
+    = 1, so the executor writes the destination's *discriminant* (the variants are
+    unit, so there is no payload) and the `switchInt` on `discriminant(_)` decides.
+    A three-way comparison is the sign of `x - y`, so the tag is
+    `ite(slt(x, y), Less, ite(sgt(x, y), Greater, Equal))` — the two comparisons the
+    `PartialOrd` operators already build, at the operands' common width and sign —
+    and the tag is built from the *eight-bit two's-complement pattern* of the
+    constants, because `smt::word` refuses the out-of-range `-1`. Both operands are
+    `&Self`, so the executor follows both references to their referents, the same
+    step the `PartialEq`/`PartialOrd` receivers take; an operand whose sign cannot
+    be read is *refused*, because ordering `i8::MIN` unsigned places it above every
+    other value (a wrong ordering, not a weaker proof). The tag width is
+    `Ordering`'s own `i8` discriminant, not the destination local's declared width,
+    so a locally built `Ordering` and a `switchInt` against rustc's `-1`/`0`/`1`
+    arm constants agree. Six fixtures (five true, one tripwire) in `realistic.rs`
+    (**564 of 1035**), pinned by `ord_cmp_returns_the_ordering_enum` in
+    `tests/mir.rs`; the classify guard (the standard paths admitted, a foreign
+    `m::Ord`/`MyOrd`/`ord_shim::Ord` refused, and `cmp` not mistaken for `min`) is
+    pinned by `the_ord_names_classify_and_their_neighbours_do_not` in
+    `src/mir/intrinsics.rs`.
   - Remaining: the *generic* `<[T]>::first/get/len/is_empty` (`first_or<T>`) need
     monomorphisation, which is C10: `first_or`'s element type has no width and its
     slice length is never seeded (the frontend refuses a receiver whose length it
-    does not hold, which is the honest answer, not a bug).
+    does not hold, which is the honest answer, not a bug). A *locally constructed*
+    `Ordering` (a `cmp` body that returns `Ordering::Greater`) is also still
+    unmodelled — the executor resolves an enum-variant path constant through
+    `variant_index`, which knows `Option`/`Result`/`ControlFlow` but not
+    `Ordering` — so a local trait's `cmp` body is `incomplete` even though a `core`
+    `Ord::cmp` call decides. That is a `variant_index` gap, not a `cmp` one, and is
+    scheduled with the enum-construction work rather than here.
 - **C7. Arithmetic scale and speed.** · P0 · in progress · Kani, Boolector,
   Bitwuzla
   - Gap: `u32::wrapping_mul` is past the 32-bit model; `clamp_std` takes 9.9 s.

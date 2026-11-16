@@ -1962,6 +1962,43 @@ fn partial_cmp_methods_are_modelled_and_a_local_trait_still_wins() {
     }
 }
 
+/// `Ord::cmp` is modelled, returning the `Ordering` enum whose three variants a
+/// `switchInt` on `discriminant(_)` selects.
+///
+/// The verifying entries pin all three arms -- `ord_cmp_less_arm`,
+/// `ord_cmp_equal_arm` and `ord_cmp_greater_arm` return distinct constants so each
+/// arm proves which tag the model produced -- plus `ord_cmp_matches_less` (the
+/// `matches!` spelling) and `ord_cmp_signed_is_not_unsigned`, which pins the signed
+/// ordering on `i8::MIN` (its bits sort the other way unsigned, so an unsigned
+/// model would take the `Greater` arm). The refuting entry is the tripwire:
+/// `x.cmp(&y) == Less` is not `x <= y`, so it fails at `x == y` -- a model that
+/// read the tag as unsigned (comparing the `Less` discriminant `0xff` against
+/// `255`) or that confused `Less` with `Equal` would *prove* it.
+#[test]
+fn ord_cmp_returns_the_ordering_enum() {
+    let verified = [
+        "ord_cmp_less_arm",
+        "ord_cmp_equal_arm",
+        "ord_cmp_greater_arm",
+        "ord_cmp_matches_less",
+        "ord_cmp_signed_is_not_unsigned",
+    ];
+    let refuted = ["ord_cmp_is_not_le_tripwire"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
 /// A widening conversion (`From::from`/`Into::into`) is modelled, by the source's
 /// signedness.
 ///

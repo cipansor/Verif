@@ -9650,3 +9650,50 @@ cross-error-type pair; each has its `_cannot_prove_this` twin, so the corpus-wid
 `no_cannot_prove_entry_is_ever_verified` invariant holds them too. The model was
 checked for teeth by neutering the `TryBranch` classification: the test then fails
 on the first `verified` assertion.
+
+## A modelled call whose result is an enum, not a value
+
+Every modelled `core` method so far produced a *value* -- a word, a `bool`, an
+`Option`'s discriminant/payload pair, or the `(value, flag)` tuple of the
+`overflowing_*` family -- so the executor could always be handed one term to write
+to the destination local. `Ord::cmp` is the first whose result is a **three-variant
+enum with no payload**, `core::cmp::Ordering`, and the difference is where the
+answer has to be written: the *discriminant* store, not the value store.
+
+Three things make it a distinct shape rather than a `min`/`max` variant:
+
+- **The discriminants are signed.** `Less` is `-1`, `Equal` `0`, `Greater` `1`, read
+  at the enum's own `i8` discriminant width. A `switchInt` on `discriminant(_)`
+  compares against rustc's arm constants, and `Less` prints as the eight-bit pattern
+  `255`. So the tag is built from the *pattern* (`(-1i64 as u64) & 0xff`), because
+  `smt::word` refuses a value outside the width -- the same "a literal is a claim
+  about a width" rule that governs the contract reader, here on the executor side.
+- **The tag's width is the enum's, not the destination's.** The dump declares an
+  `Ordering` local as `isize` (`dest_w == 64`), but the discriminant is an `i8`, and
+  a tag built at 64 bits would not equal the 8-bit arm constants. The width comes
+  from the enum's discriminants, exactly as for a seeded or constructed enum tag.
+- **The value is the sign of `x - y`, built from the comparisons the `PartialOrd`
+  operators already build.** `ite(slt(x, y), Less, ite(sgt(x, y), Greater, Equal))`
+  -- no subtraction, so nothing can wrap, and a method call cannot disagree with
+  `x < y`. Both operands are `&Self`, so the executor follows *both* references to
+  their referents (the receiver through the existing `pointee` step, the second
+  through the same one).
+
+The guard is `is_ord_callee`, the same narrow rule `min`/`max`/`clamp` use: the
+standard library's `Ord` path and a primitive self type. A foreign trait of the
+same name (`m::Ord`, `MyOrd`, `ord_shim::Ord`) is refused by `classify`, and a
+crate-root trait that prints bare is answered by the same-dump lookup first -- so
+the model is a *fallback*, never an override of a real body. The operand's sign is a
+*refusal* when it cannot be read: ordering `i8::MIN` unsigned places it above every
+other value, a wrong ordering rather than a weaker proof.
+
+What is *not* modelled, and the reason is worth stating: a *locally constructed*
+`Ordering` (`_0 = Greater` in a `cmp` body) resolves through `variant_index`, which
+knows `Option`/`Result`/`ControlFlow` but not `Ordering`. So a local trait's `cmp`
+body is `incomplete` even though a `core` `Ord::cmp` call decides. That is a
+`variant_index` gap -- the same "a standard enum has a fixed numbering no source
+declares" problem `Option`/`Result` already solved -- and belongs with the
+enum-construction work, not with the `cmp` model. Adding `Ordering` to
+`variant_index` without also teaching the *contract* reader its variants would
+introduce a name the two sides disagree about, which is the false-proof direction,
+so the two must land together.

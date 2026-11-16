@@ -9229,6 +9229,83 @@ pub fn local_partial_ord_lt_is_not_the_model_tripwire(x: u8, y: u8) -> bool {
     cmp_shim::PartialOrd::lt(&x, &y)
 }
 
+/// `Ord::cmp` is the third `Ord` trait method, and unlike every other modelled
+/// shape its result is a *three-variant enum*, `core::cmp::Ordering`, whose
+/// discriminants are the signed `i8` values `Less` = -1, `Equal` = 0, `Greater` =
+/// 1. The dump lowers a `match x.cmp(&y)` to `_n = discriminant(_k); switchInt(move
+/// _n) -> [-1: …, 0: …, 1: …, otherwise: unreachable]`, so the model writes the
+/// destination's *discriminant* (the variants are unit, so there is no payload) and
+/// the `switchInt` decides.
+///
+/// The three arms return distinct constants, so each arm pins which tag the model
+/// produced: `Less` and `Greater` separate a swapped operands, and `Equal`
+/// separates the third arm.
+/// requires: x < y
+/// ensures: ret == 1
+pub fn ord_cmp_less_arm(x: u8, y: u8) -> i8 {
+    match x.cmp(&y) {
+        core::cmp::Ordering::Less => 1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => -1,
+    }
+}
+
+/// The `Equal` arm, reached only when `x == y`.
+/// requires: x == y
+/// ensures: ret == 0
+pub fn ord_cmp_equal_arm(x: u8, y: u8) -> i8 {
+    match x.cmp(&y) {
+        core::cmp::Ordering::Less => 1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => -1,
+    }
+}
+
+/// The `Greater` arm. The precondition separates it from `Less`, so a model that
+/// swapped the two comparisons would take the `Less` arm and return `1`.
+/// requires: x > y
+/// ensures: ret == -1
+pub fn ord_cmp_greater_arm(x: u8, y: u8) -> i8 {
+    match x.cmp(&y) {
+        core::cmp::Ordering::Less => 1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => -1,
+    }
+}
+
+/// The signed ordering is not the unsigned one, through the three-way result.
+/// `i8::MIN`'s bits (`0x80`) are the largest *unsigned* byte, so an unsigned model
+/// would take the `Greater` arm and return `-1`; as a signed value `MIN` is below
+/// `1`, so the `Less` arm returns `1`.
+/// requires: x == i8::MIN
+/// requires: y == 1
+/// ensures: ret == 1
+pub fn ord_cmp_signed_is_not_unsigned(x: i8, y: i8) -> i8 {
+    match x.cmp(&y) {
+        core::cmp::Ordering::Less => 1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => -1,
+    }
+}
+
+/// The `matches!` form: `x.cmp(&y) == Ordering::Less` lowers to the same
+/// `switchInt`, and a model that read the tag as unsigned would compare the
+/// `Less` discriminant `0xff` against `255` and take the arm for every input.
+/// requires: true
+/// ensures: ret == (x < y)
+pub fn ord_cmp_matches_less(x: u8, y: u8) -> bool {
+    matches!(x.cmp(&y), core::cmp::Ordering::Less)
+}
+
+/// The false direction: `x.cmp(&y) == Less` is not `x <= y`, so with no
+/// precondition it must be refuted at `x == y`. A model that read the tag as
+/// unsigned -- or that confused `Less` with `Equal` -- would prove it.
+/// requires: true
+/// ensures: ret == (x <= y)
+pub fn ord_cmp_is_not_le_tripwire(x: u8, y: u8) -> bool {
+    matches!(x.cmp(&y), core::cmp::Ordering::Less)
+}
+
 /// A local trait whose *name* collides with a modelled conversion's, and whose
 /// owner type does too.
 ///

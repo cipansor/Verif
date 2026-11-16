@@ -5151,6 +5151,72 @@ fn from_residual(name: &str, args: &[Operand], dest: &Place, env: &mut Env) -> R
     Ok(())
 }
 
+/// Answer `Ord::cmp`, whose result is a `core::cmp::Ordering` enum.
+///
+/// The sibling of [`Intrinsic::MinMax`] -- the same trait-method spelling
+/// (`<u8 as Ord>::cmp`) admitted by the same narrow rule -- and the first modelled
+/// shape whose result is a *three-variant enum* rather than a value or an
+/// `Option`. So the executor writes the destination's *discriminant* (and no
+/// payload: `Ordering`'s variants are unit) rather than a value, and the
+/// `switchInt` on `discriminant(_)` that follows decides.
+///
+/// A three-way comparison is the sign of `x - y`, so the tag is `Less` where
+/// `x < y`, `Greater` where `x > y`, and `Equal` otherwise -- one `ite` over the
+/// two comparisons the `PartialOrd` operators already build, at the operands'
+/// common width and sign. The tag's width is `Ordering`'s own `i8` discriminant,
+/// so the switch compares against the `-1`/`0`/`1` constants rustc prints (the
+/// negative one as its eight-bit two's-complement pattern, which is why the tag
+/// is built from the pattern and not through `word`, which refuses an
+/// out-of-range value).
+fn ord_cmp(name: &str, args: &[Operand], dest: &Place, env: &mut Env) -> Result<(), String> {
+    use intrinsics::{Intrinsic, Outcome, PartialCmpKind};
+    let (Some(a), Some(b)) = (args.first(), args.get(1)) else {
+        return Err(format!("unmodelled arity for `{name}`"));
+    };
+    // Both operands are `&Self` (`&self` and `&other`), so the *referent* is the
+    // value; a pointer has no bit-vector meaning, exactly as for the
+    // `PartialEq`/`PartialOrd` comparisons. `pointee` follows the reference and is
+    // a no-op for a by-value operand.
+    let value = |env: &Env, op: &Operand| match op {
+        Operand::Copy(p) | Operand::Move(p) => match env.get(&env.pointee(p)) {
+            Val::Sym(v, s) => Some((v, s)),
+            _ => None,
+        },
+        Operand::Const(_) => None,
+    };
+    let (Some((x, sx)), Some((y, _))) = (value(env, a), value(env, b)) else {
+        return Err(format!("unmodelled argument to `{name}`"));
+    };
+    let w = smt::bits(x);
+    // The sign is a refusal when it could not be read: ordering `i8::MIN`
+    // unsigned would place it above every other value, a wrong ordering rather
+    // than a weaker proof.
+    let signed = sx
+        .known()
+        .ok_or_else(|| format!("`{name}` on an operand whose sign is not modelled"))?;
+    let bool_of = |kind: PartialCmpKind| -> Result<Pred, String> {
+        match intrinsics::eval(Intrinsic::Cmp(kind), x, y, w, signed, w) {
+            Some(Outcome::Bool(p)) => Ok(p),
+            _ => Err(format!("`{name}` past what the model covers at {w} bits")),
+        }
+    };
+    let lt = bool_of(PartialCmpKind::Lt)?;
+    let gt = bool_of(PartialCmpKind::Gt)?;
+    let tag_w = 8u8;
+    let bits = |d: i64| (d as u64) & ((1u64 << tag_w) - 1);
+    let tag = smt::ite(
+        lt,
+        smt::word(bits(intrinsics::ORDERING_LESS), tag_w),
+        smt::ite(
+            gt,
+            smt::word(bits(intrinsics::ORDERING_GREATER), tag_w),
+            smt::word(bits(intrinsics::ORDERING_EQUAL), tag_w),
+        ),
+    );
+    env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+    Ok(())
+}
+
 /// Answer a modelled `core::num` call, if the callee is one.
 ///
 /// `None` means the callee is not a modelled intrinsic, and the caller falls
@@ -5337,6 +5403,13 @@ fn try_intrinsic(
     }
     if let intrinsics::Intrinsic::FromResidual = op {
         return Some(from_residual(name, args, dest, env).map(|()| Vec::new()));
+    }
+    // `Ord::cmp`: the three-way ordering, whose result is an `Ordering` enum. Like
+    // the `?` desugaring's calls it writes an enum's discriminant and payload
+    // rather than a single value, so it is answered here, before the generic
+    // operand read below.
+    if let intrinsics::Intrinsic::OrdCmp = op {
+        return Some(ord_cmp(name, args, dest, env).map(|()| Vec::new()));
     }
     // The ASCII class tests and the ASCII case conversions take `&self`, so the
     // operand is a reference whose *referent* is the byte. rustc prints `_3 = &_1;
