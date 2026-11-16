@@ -9529,6 +9529,40 @@ computable; the test reads it. The date column was added for the clock; the test
 reads it. The fixture column was there from the start; the test now reads it as a
 *test*, not merely a name. A column nothing reads is the same as no column.
 
+## A method's *membership* and its *value* are two facts, and each has its own trap
+
+The `C6` work keeps finding the same shape in two directions, and both are worth
+naming because they are easy to reintroduce.
+
+**Membership: a shape exists on more types than the first spelling suggests.**
+`div_euclid`/`rem_euclid` were modelled on the *signed* types only, on the
+reasoning that "the unsigned spelling is the plain `/` and `%`" -- which is true
+and is *why* they should be modelled, not why they should be refused. On an
+unsigned receiver the remainder is never negative, so the Euclidean and
+truncating forms coincide: the Euclidean quotient is the plain `udiv` and the
+remainder the plain `urem`. The sign is the *whole* difference, so the model
+picks the plain unsigned divider for an unsigned receiver and the adjusted signed
+one otherwise. The trap is reading "this method is only interesting on the signed
+types" as "this method does not exist on the unsigned ones" -- the two are
+different claims, and `is_modelled` is where the difference lives.
+
+**Value: a family that expresses overflow as a value can share a name with one
+that panics.** The four `pow` families (`wrapping_pow`, `saturating_pow`,
+`checked_pow`, `overflowing_pow`) express overflow as a value, so they are
+`Intrinsic::Pow(family)`. The plain `iN::pow` **panics** on overflow and has no
+family-prefixed spelling to fall back on, so it is its own shape,
+`Intrinsic::PowPanic`, producing a reachable-panic obligation rather than a
+value. A model that wrapped or clamped it would *hide the panic* -- the one thing
+this frontend must never do. The fixtures pin the polarity by *kind* (the failure
+must be a `panic` whose message names `pow`, not a postcondition and not some
+later divide), so a value-only assertion cannot pass on the wrong model.
+
+Both were pinned the same way the rest of `C6` is: a differential unit test over
+the whole `u8`/`i8` domain against Rust's own method, and a corpus true/tripwire
+pair whose tripwire is exactly the value a plausible wrong model computes (the
+signed adjustment `% + 3`, the wrapped product). The corpus-wide
+`no_cannot_prove_entry_is_ever_verified` sweep holds the tripwires too.
+
 ## The `?` operator: two calls, two enum stores, and one boundary left refused
 
 `expr?` is modelled, and the desugaring has three steps the model has to agree on
