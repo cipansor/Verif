@@ -10749,3 +10749,24 @@ pub fn result_try_in_either_branch_cannot_prove_this(
         Ok(v)
     }
 }
+
+/// A `?` that widens the error type: `Result<u8, u8>` into a function returning
+/// `Result<u8, u16>`, so the residual `u8` is converted by `From`. The conversion
+/// happens inside `from_residual`, so a model that copied the error value without
+/// widening it would refute the `200` claim (or, at the wrong width, accept a
+/// wrong one).
+/// requires: r.is_err() && r.Err == 200
+/// ensures: ret.is_err() && ret.Err == 200
+pub fn result_try_widens_the_error(r: Result<u8, u8>) -> Result<u8, u16> {
+    let v = r?;
+    Ok(v)
+}
+
+/// The false direction of [`result_try_widens_the_error`]: the widened error is
+/// `200`, not `201`, so the claim is refutable.
+/// requires: r.is_err() && r.Err == 200
+/// ensures: ret.Err == 201
+pub fn result_try_widens_the_error_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u16> {
+    let v = r?;
+    Ok(v)
+}
