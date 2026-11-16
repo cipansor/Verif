@@ -1007,6 +1007,16 @@ pub fn names_range(name: &str) -> bool {
     };
     has_segment("ops::RangeInclusive")
         || has_segment("ops::Range")
+        // rustc 1.85 (the MSRV) prints the `as`-projection form with the type
+        // *unqualified* -- `<RangeInclusive<u32> as IntoIterator>::into_iter`,
+        // `<Range<u32> as Iterator>::next` -- where current stable qualifies it
+        // (`<std::ops::RangeInclusive<u32> as …>`). Both are the standard library's
+        // type; a user type named `RangeInclusive` in a local module prints
+        // `m::RangeInclusive`, which this arm would also match, but the same-dump
+        // body is resolved before the model, so a local type is answered by its own
+        // body and never reaches here.
+        || name.starts_with("<RangeInclusive<")
+        || name.starts_with("<Range<")
         || name.starts_with("RangeInclusive::")
         || name.starts_with("Range::")
 }
@@ -2821,6 +2831,74 @@ mod tests {
         // A different method the model does not know stays unmodelled.
         assert_eq!(classify("core::option::Option::<u8>::map"), None);
         assert_eq!(classify("core::result::Result::<u8, u16>::map"), None);
+    }
+
+    /// The `for`-loop range names classify, in the spelling every toolchain prints.
+    ///
+    /// This is an MSRV defect, not a hypothetical: rustc **1.85** prints the
+    /// `as`-projection form with the type *unqualified*
+    /// (`<RangeInclusive<u32> as IntoIterator>::into_iter`) where current stable
+    /// qualifies it (`<std::ops::RangeInclusive<u32> as IntoIterator>::into_iter`).
+    /// `names_range` required an `ops::` segment, so every `for` loop was
+    /// `incomplete: call to unmodelled function` on the compiler the manifest
+    /// promises to support -- and green on 1.99, which is why only gate 14 (the
+    /// MSRV run) caught it. Both spellings must classify, and a user type named
+    /// `RangeInclusive` in a module (`m::RangeInclusive`) must not.
+    #[test]
+    fn the_for_loop_range_names_classify_in_both_toolchain_spellings() {
+        // The qualified form current stable prints.
+        assert_eq!(
+            classify("std::ops::RangeInclusive::<u32>::new"),
+            Some(Intrinsic::Range(RangeMethod::New))
+        );
+        assert_eq!(
+            classify("<std::ops::RangeInclusive<u32> as IntoIterator>::into_iter"),
+            Some(Intrinsic::Range(RangeMethod::IntoIter))
+        );
+        assert_eq!(
+            classify("<std::ops::RangeInclusive<u32> as Iterator>::next"),
+            Some(Intrinsic::Range(RangeMethod::Next))
+        );
+        // The unqualified form rustc 1.85 (the MSRV) prints.
+        assert_eq!(
+            classify("<RangeInclusive<u32> as IntoIterator>::into_iter"),
+            Some(Intrinsic::Range(RangeMethod::IntoIter))
+        );
+        assert_eq!(
+            classify("<RangeInclusive<i8> as IntoIterator>::into_iter"),
+            Some(Intrinsic::Range(RangeMethod::IntoIter))
+        );
+        assert_eq!(
+            classify("<RangeInclusive<u32> as Iterator>::next"),
+            Some(Intrinsic::Range(RangeMethod::Next))
+        );
+        assert_eq!(
+            classify("RangeInclusive::<u32>::new"),
+            Some(Intrinsic::Range(RangeMethod::New))
+        );
+        // The exclusive range's two spellings.
+        assert_eq!(
+            classify("std::ops::Range::<u32>::new"),
+            Some(Intrinsic::Range(RangeMethod::New))
+        );
+        assert_eq!(
+            classify("<Range<u32> as IntoIterator>::into_iter"),
+            Some(Intrinsic::Range(RangeMethod::IntoIter))
+        );
+        assert_eq!(
+            classify("<Range<u32> as Iterator>::next"),
+            Some(Intrinsic::Range(RangeMethod::Next))
+        );
+        // A user type spelled `RangeInclusive`/`Range` in a module is not the
+        // standard library's: `m::RangeInclusive` has no `ops::` segment and does
+        // not start with `<Range…`, so it is refused. (A same-dump body is answered
+        // by the executor before the model in any case.)
+        assert_eq!(classify("m::RangeInclusive::<u32>::new"), None);
+        assert_eq!(classify("m::Range::<u32>::new"), None);
+        // The neighbouring range types are not `Iterator`s and never drive a `for`
+        // loop, so they are refused.
+        assert_eq!(classify("std::ops::RangeFrom::<u32>::new"), None);
+        assert_eq!(classify("std::ops::RangeTo::<u32>::new"), None);
     }
 
     /// The `overflowing_*` family, two-operand, against `core` over all of `u8`

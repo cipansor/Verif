@@ -6488,6 +6488,34 @@ oracle and false of the crate and its MIR frontend. When a comment states a tool
 requirement, check it against a second toolchain before trusting it; a wrong comment here is the
 kind of thing that gets copied into a downstream build script and never questioned again.
 
+**A second toolchain-shaped spelling: the `for`-loop range projection.** The same rule
+found the next one. rustc prints the `for`-loop desugaring's `as`-projection with the
+type *qualified* on current stable and *unqualified* on 1.85:
+
+```text
+1.99:  <std::ops::RangeInclusive<u32> as IntoIterator>::into_iter
+1.85:  <RangeInclusive<u32> as IntoIterator>::into_iter
+```
+
+`names_range` required an `ops::` segment, so on the MSRV the type segment was
+`RangeInclusive<u32>`, the predicate returned `false`, `classify` fell through, and
+*every `for` loop over a range* was `incomplete: call to unmodelled function
+<RangeInclusive<u32> as IntoIterator>::into_iter`. It was green on 1.99, so the only
+thing that could see it was gate 14 -- the MSRV run -- and it did: four `tests/mir.rs`
+cases (`a_signed_inclusive_range_stops_at_its_boundary`, `an_empty_inclusive_range_stays_empty`,
+`a_loop_without_a_contract_names_the_missing_contract`, `the_for_loop_range_desugaring_is_modelled`)
+were red on 1.85 and green on 1.99, exactly the shape the `Len`/`PtrMetadata` defect had.
+The predicate now accepts the unqualified `as`-projection form too
+(`name.starts_with("<RangeInclusive<") || name.starts_with("<Range<")`), pinned by
+`the_for_loop_range_names_classify_in_both_toolchain_spellings`, which asserts both
+spellings classify and that a user `m::RangeInclusive` is still refused.
+
+The lesson is the one this section already states, made concrete a second time: a
+predicate that keys on a *printed spelling* is a claim about a toolchain, and the only
+way to know the claim holds is to run the second toolchain. The MSRV gate is not
+ceremony around `cargo check` -- it runs the frontend's whole suite against the floor
+rustc, which is what turns "supports 1.85" from a build into a behaviour.
+
 ## A tuple struct is a struct too: its fields are numbered by position
 
 `struct_head` recognised only a *braced* body, so `pub struct Pair(pub u8, pub u8)`
