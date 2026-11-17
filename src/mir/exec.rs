@@ -5134,9 +5134,15 @@ fn enum_method(
         OptionMethod::OkOr => args.get(1).and_then(|a| operand_ty(cur, a)),
         OptionMethod::Ok => receiver_error_type(cur, &opt),
         OptionMethod::Err => receiver_ok_type(cur, &opt),
+        OptionMethod::And => receiver_some_type(cur, &opt),
+        OptionMethod::Or => receiver_some_type(cur, &opt),
         _ => None,
     };
-    if matches!(kind, OptionMethod::OkOr | OptionMethod::Ok | OptionMethod::Err) {
+    if matches!(
+        kind,
+        OptionMethod::OkOr | OptionMethod::Ok | OptionMethod::Err | OptionMethod::And
+            | OptionMethod::Or
+    ) {
         if let Some(ty) = dropped_ty {
             match has_drop_glue(prog, callees.structs(), &ty) {
                 Ok(false) => {}
@@ -5249,6 +5255,63 @@ fn enum_method(
             if let Some((payload, sign, pw)) = payload {
                 env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(payload, sign), pw);
             }
+            Vec::new()
+        }
+        OptionMethod::Or | OptionMethod::And => {
+            // `or`/`and` take a second `Option` of the same type and return one of
+            // the two by the receiver's tag:
+            //   `or`:  `Some` -> the receiver, `None` -> `other`
+            //   `and`: `Some` -> `other`,    `None` -> the receiver (`None`)
+            // The result's tag is an `ite` on the receiver's tag, and *both*
+            // payloads are carried unconditionally -- each is read only on the path
+            // whose tag selects it, so a path that does not select a payload never
+            // reads it. That is what makes the shape total and lossless: no branch
+            // of the `switchInt` that consumes the result finds an unbound payload.
+            // The receiver's own payload, and the argument's tag/payload. The
+            // argument is an `Option` by value, so its parts live on its local.
+            let Some((Val::Sym(recv_payload, recv_sign), recv_w)) =
+                env.payloads.get(&(opt.local, payload_variant)).copied()
+            else {
+                return Err(format!("`{name}` on a receiver whose payload is not modelled"));
+            };
+            let arg_opt = match args.get(1).and_then(|d| match d {
+                Operand::Copy(p) | Operand::Move(p) => Some(env.pointee(p)),
+                _ => None,
+            }) {
+                Some(a) => a,
+                None => return Err(format!("`{name}` on an argument that is not a place")),
+            };
+            let Some(Val::Sym(arg_tag, _)) = env.discriminants.get(&arg_opt.local).copied() else {
+                return Err(format!("`{name}` on an argument whose enum state is not modelled"));
+            };
+            let Some((Val::Sym(arg_payload, arg_sign), arg_w)) =
+                env.payloads.get(&(arg_opt.local, payload_variant)).copied()
+            else {
+                return Err(format!("`{name}` on an argument whose payload is not modelled"));
+            };
+            // `is_some(tag)` is `tag == Some`.
+            let is_some = smt::eq_const(tag, payload_variant);
+            let (result_tag, result_payload, result_sign, result_w) = match kind {
+                OptionMethod::Or => (
+                    smt::ite(is_some, tag, arg_tag),
+                    smt::ite(is_some, recv_payload, arg_payload),
+                    recv_sign,
+                    recv_w,
+                ),
+                _ => (
+                    smt::ite(is_some, arg_tag, tag),
+                    smt::ite(is_some, arg_payload, recv_payload),
+                    arg_sign,
+                    arg_w,
+                ),
+            };
+            env.set_discriminant(dest.local, Val::Sym(result_tag, Sign::Unsigned));
+            env.set_payload(
+                dest.local,
+                payload_variant,
+                Val::Sym(result_payload, result_sign),
+                result_w,
+            );
             Vec::new()
         }
         // `unwrap`/`unwrap_or` read the payload, which `checked_*` recorded
@@ -8069,6 +8132,19 @@ fn receiver_ok_type(f: &MirFn, p: &Place) -> Option<Ty> {
     let inner = spec::angle_inner(name)?;
     let args = crate::mir::parse::split_top_level(inner, ',');
     args.first().map(|t| Ty::parse(t.trim()))
+}
+
+/// The `T` of an `Option<T>` receiver's declared type, for the drop-glue check on
+/// `Option::or`/`Option::and` (which drop one of the two payloads).
+fn receiver_some_type(f: &MirFn, p: &Place) -> Option<Ty> {
+    let Ty::Other(name) = f.ty_of(p.local)? else {
+        return None;
+    };
+    if !name.starts_with("Option") && !name.contains("::Option") {
+        return None;
+    }
+    let inner = spec::angle_inner(name)?;
+    Some(Ty::parse(inner.trim()))
 }
 
 /// The declared type of an operand, for the enum-method glue checks.

@@ -3421,6 +3421,74 @@ pub fn err_moves_the_payload_tripwire(r: Result<u8, u8>) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// `Option::or` and `Option::and`: the two total, closure-free combinators.
+//
+// Each returns one of its two `Option`s by the receiver's tag, so the result tag
+// is an `ite` on that tag and both payloads are carried. `or` is the receiver on
+// `Some` and the argument on `None`; `and` is the mirror. A model that fixed the
+// result tag to a constant, or swapped the two payloads, proves a tripwire.
+
+/// `Some(x).or(y)` is the receiver, so the result's payload is `x`'s -- pinned by
+/// reading the result back through `unwrap` with the receiver's payload fixed.
+/// requires: x.is_some() && x.Some == 7
+/// ensures: ret == 7
+pub fn or_some_is_the_receiver(x: Option<u8>, y: Option<u8>) -> u8 {
+    x.or(y).unwrap()
+}
+
+/// The false twin: `or` on a `Some` receiver must not yield the *argument*'s
+/// payload.
+/// requires: x.is_some() && x.Some == 7 && y.Some == 8
+/// ensures: ret == 8
+pub fn or_some_is_the_receiver_tripwire(x: Option<u8>, y: Option<u8>) -> u8 {
+    x.or(y).unwrap()
+}
+
+/// `None.or(y)` is `y`: the result's payload is the argument's.
+/// requires: x.is_none() && y.is_some() && y.Some == 9
+/// ensures: ret == 9
+pub fn or_none_is_the_argument(x: Option<u8>, y: Option<u8>) -> u8 {
+    x.or(y).unwrap()
+}
+
+/// The false twin: `or` on a `None` receiver must not keep the receiver's tag
+/// (`None`), which would leave `unwrap` a value it does not have.
+/// requires: x.is_none() && y.is_some() && y.Some == 9
+/// ensures: ret == 8
+pub fn or_none_is_the_argument_tripwire(x: Option<u8>, y: Option<u8>) -> u8 {
+    x.or(y).unwrap()
+}
+
+/// `Some(x).and(y)` is `y`: the receiver's payload is dropped, the argument's
+/// returned.
+/// requires: x.is_some() && y.is_some() && y.Some == 9
+/// ensures: ret == 9
+pub fn and_some_is_the_argument(x: Option<u8>, y: Option<u8>) -> u8 {
+    x.and(y).unwrap()
+}
+
+/// The false twin: `and` on a `Some` receiver must not keep the receiver's value.
+/// requires: x.is_some() && x.Some == 7 && y.is_some() && y.Some == 9
+/// ensures: ret == 7
+pub fn and_some_is_the_argument_tripwire(x: Option<u8>, y: Option<u8>) -> u8 {
+    x.and(y).unwrap()
+}
+
+/// `None.and(y)` is `None` (the receiver), so the result is never `Some`.
+/// requires: x.is_none()
+/// ensures: ret == false
+pub fn and_none_is_the_receiver(x: Option<u8>, y: Option<u8>) -> bool {
+    x.and(y).is_some()
+}
+
+/// The false twin: `None.and(y)` must not become `y`.
+/// requires: x.is_none()
+/// ensures: ret == true
+pub fn and_none_is_the_receiver_tripwire(x: Option<u8>, y: Option<u8>) -> bool {
+    x.and(y).is_some()
+}
+
+// ---------------------------------------------------------------------------
 // Conversions whose source variant is *constructed*, not seeded. A locally
 // constructed `None`/`Err`/`Ok` records only the payload that variant carries,
 // so the inactive variant has no payload to move. The conversion must still

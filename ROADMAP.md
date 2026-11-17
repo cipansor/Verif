@@ -315,6 +315,13 @@ keeps growing.
     its fields bind. Pinned by `a_user_type_named_str_is_not_the_primitive_str`,
     which asserts both directions -- the user field resolves and refutes a fixed
     value, and the primitive length is still a symbolic input.
+  - `Option::or`/`Option::and`: total, closure-free. Each returns one of its two
+    `Option`s by the receiver's tag, so the result tag is an `ite` on it and both
+    payloads are carried; `or` is the receiver on `Some` and the argument on
+    `None`, `and` the mirror. The dropped operand's payload type drives the glue
+    check (the argument for `or`, the receiver for `and`), so a `T` with an
+    unmodelled destructor is refused. Eight fixtures (four true, four tripwires),
+    pinned by `option_or_and_are_total_and_select_the_right_operand`.
   - Remaining: `map`/`map_err`/`and_then`/`unwrap_or_else` (closures). The `?`
     operator is modelled (see the `?` progress note above).
 - **C3. Ranges and `for` loops.** · P0 · done · Kani, Verus, Prusti

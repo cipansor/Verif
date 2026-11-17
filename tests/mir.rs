@@ -6442,6 +6442,62 @@ fn the_option_result_conversions_handle_constructed_variants_and_grouping() {
     }
 }
 
+/// `Option::or` and `Option::and` are total, and the *right* operand's tag and
+/// payload cross.
+///
+/// Each combinator returns one of its two `Option`s by the receiver's tag, so the
+/// result's tag is an `ite` on that tag and both payloads are carried. `or` is the
+/// receiver on `Some` and the argument on `None`; `and` is the mirror, dropping the
+/// receiver's payload on `Some`.
+///
+/// Three things are pinned, each a way the model could be wrong:
+///
+/// * the tag: `or` on a `None` receiver must take the *argument's* tag, and `and`
+///   on a `Some` receiver must take the argument's -- so the two tripwires that
+///   claim the receiver's own value are refuted.
+/// * the payload: the selected payload is read back through `unwrap`, so a model
+///   that recorded the wrong one refutes the true direction and cannot prove the
+///   false one.
+///
+/// The drop-glue rule is shared with `ok`/`err`: `or` drops the argument's payload
+/// on the `Some` path and `and` drops the receiver's, so a `T` whose destructor is
+/// not modelled is refused rather than read as glue-free.
+#[test]
+fn option_or_and_are_total_and_select_the_right_operand() {
+    let names = [
+        "or_some_is_the_receiver",
+        "or_some_is_the_receiver_tripwire",
+        "or_none_is_the_argument",
+        "or_none_is_the_argument_tripwire",
+        "and_some_is_the_argument",
+        "and_some_is_the_argument_tripwire",
+        "and_none_is_the_receiver",
+        "and_none_is_the_receiver_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "or_some_is_the_receiver",
+        "or_none_is_the_argument",
+        "and_some_is_the_argument",
+        "and_none_is_the_receiver",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "or_some_is_the_receiver_tripwire",
+        "or_none_is_the_argument_tripwire",
+        "and_some_is_the_argument_tripwire",
+        "and_none_is_the_receiver_tripwire",
+    ] {
+        // A *refutation*, not merely "not verified": a swap of the two operands
+        // must produce a counterexample, and a skip would not be evidence.
+        assert_refuted(&report, name);
+    }
+}
+
 /// A `&mut bool` argument's final value is a predicate, not a word.
 ///
 /// The postcondition's bare `c` means the value the body left at the target. A

@@ -873,6 +873,13 @@ pub enum OptionMethod {
     /// `Result::err()`: `Some(payload)` on `Err`, `None` on `Ok`. The `Ok` payload
     /// is dropped, so its destructor is the glue the executor checks.
     Err,
+    /// `Option::or(other)`: the receiver on `Some`, `other` on `None`. Total. The
+    /// *value* is one `ite` on the tag; both payloads are carried, so no path is
+    /// lost.
+    Or,
+    /// `Option::and(other)`: `other` on `Some`, the receiver (`None`) on `None`.
+    /// Total, and the mirror of [`OptionMethod::Or`].
+    And,
 }
 
 /// A widening integer conversion: `u16::from(x)` where `x: u8`, `x.into()`.
@@ -1240,6 +1247,8 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             "is_some" => return Some(Intrinsic::OptionMethod(OptionMethod::IsSuccess)),
             "is_none" => return Some(Intrinsic::OptionMethod(OptionMethod::IsFailure)),
             "ok_or" => return Some(Intrinsic::OptionMethod(OptionMethod::OkOr)),
+            "or" => return Some(Intrinsic::OptionMethod(OptionMethod::Or)),
+            "and" => return Some(Intrinsic::OptionMethod(OptionMethod::And)),
             _ => {}
         }
     }
