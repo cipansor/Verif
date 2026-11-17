@@ -11787,6 +11787,82 @@ pub fn tri_invariant_cannot_prove_this(n: u32) -> u32 {
         }
     }
 
+    /// A loop whose body calls a *recursive* function must terminate the write-set
+    /// discovery, and a reference-carrying recursive callee must still have its
+    /// write propagated.
+    ///
+    /// The write-set walk follows each resolved callee to find what it writes
+    /// through a reference. Before it was cycle-aware, each invocation allocated
+    /// its own block-visit set, which stops a CFG cycle within one function and
+    /// cannot stop a call cycle *between* invocations: a loop calling a
+    /// self-recursive function followed the self-call forever and overflowed the
+    /// stack, aborting the whole run. The walk now carries the set of functions on
+    /// the call stack and, on a cycle, includes the call's reference arguments --
+    /// the only caller storage a callee can reach -- so a recursive callee with no
+    /// reference argument contributes nothing and one with a reference has it
+    /// havoced.
+    #[test]
+    fn a_loop_that_calls_a_recursive_function_terminates_and_is_sound() {
+        let src = r#"
+/// requires: true
+/// decreases: n
+/// ensures: ret == n
+pub fn count_down(n: u8) -> u8 {
+    if n == 0 { 0 } else { count_down(n - 1) + 1 }
+}
+
+/// requires: true
+/// decreases: n
+/// ensures: ret == n
+pub fn walk(n: u8, c: &mut u8) -> u8 {
+    if n == 0 { 0 } else { *c += 1; walk(n - 1, c) }
+}
+
+/// requires: n <= 3
+/// invariant: i <= 3
+/// ensures: ret <= 3
+pub fn loop_calls_recursive(n: u8) -> u8 {
+    let mut i = 0u8; let mut s = 0u8;
+    while i < 3 { s = count_down(n); i += 1; }
+    s
+}
+
+/// requires: n <= 3
+/// invariant: i <= 3
+/// ensures: ret == 0
+pub fn loop_calls_recursive_cannot_prove_this(n: u8) -> u8 {
+    let mut i = 0u8; let mut s = 0u8;
+    while i < 3 { s = count_down(n); i += 1; }
+    s
+}
+"#;
+        // The crash vehicle: a scalar-only call into a self-recursive callee. The
+        // walk must *return* (a stack overflow aborts the binary, so reaching the
+        // assertion at all is half the evidence), and the loop must be decided --
+        // the false twin refuted on its postcondition, not skipped.
+        for name in ["loop_calls_recursive", "loop_calls_recursive_cannot_prove_this"] {
+            let Some(o) = verify_src(name, src) else { return };
+            assert!(
+                !matches!(o, FnOutcome::Skipped { .. } | FnOutcome::Incomplete { .. }),
+                "`{name}` must be decided, not refused: a cycle-aware write-set walk \
+                 terminates; a refusal here means the walk gave up, got: {o}"
+            );
+        }
+        let Some(f) = verify_src("loop_calls_recursive_cannot_prove_this", src) else {
+            return;
+        };
+        match f {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "the false twin must fail on its postcondition, got `{kind}`"
+            ),
+            other => panic!(
+                "the false twin claims `ret == 0` for a loop returning `n` and must be \
+                 refuted, got: {other}"
+            ),
+        }
+    }
+
     /// C3 exit criterion, second half: a loop with no contract is reported as a
     /// *missing loop contract*, not as an unmodelled construct.
     ///

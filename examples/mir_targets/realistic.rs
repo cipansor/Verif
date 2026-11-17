@@ -772,6 +772,122 @@ pub fn call_writes_through_in_a_loop_cannot_prove_this(x: &mut u8) -> u8 {
     *x
 }
 
+/// A loop calling a *self-recursive* function. The interprocedural write-set walk
+/// follows a resolved callee to find what it writes through a reference; without a
+/// call-cycle guard it followed `count_down`'s self-call forever and overflowed the
+/// stack, aborting the whole run -- even though `count_down` takes no reference and
+/// so cannot write anything of the caller's.
+/// requires: n <= 3
+/// decreases: n
+/// ensures: ret == n
+pub fn count_down(n: u8) -> u8 {
+    if n == 0 { 0 } else { count_down(n - 1) + 1 }
+}
+
+/// invariant: s <= 2 && i <= 3
+/// ensures: ret <= 2
+pub fn loop_calls_recursive() -> u8 {
+    let mut i = 0u8;
+    let mut s = 0u8;
+    while i < 3 {
+        s = count_down(2);
+        i += 1;
+    }
+    s
+}
+
+/// The false twin: `count_down(2)` is 2, so `ret == 0` is false.
+/// invariant: s <= 2 && i <= 3
+/// ensures: ret == 0
+pub fn loop_calls_recursive_cannot_prove_this() -> u8 {
+    let mut i = 0u8;
+    let mut s = 0u8;
+    while i < 3 {
+        s = count_down(2);
+        i += 1;
+    }
+    s
+}
+
+/// A loop calling a *mutually* recursive pair. `is_even`/`is_odd` call each other,
+/// so the write-set walk meets a two-function cycle, not just a self-call.
+/// requires: n <= 3
+/// decreases: n
+/// ensures: ret <= 1
+pub fn is_even(n: u8) -> u8 {
+    if n == 0 { 0 } else { is_odd(n - 1) }
+}
+
+/// requires: n <= 3
+/// decreases: n
+/// ensures: ret <= 1
+pub fn is_odd(n: u8) -> u8 {
+    if n == 0 { 1 } else { is_even(n - 1) }
+}
+
+/// invariant: s <= 1 && i <= 3
+/// ensures: ret <= 1
+pub fn loop_calls_mutual_recursive() -> u8 {
+    let mut i = 0u8;
+    let mut s = 0u8;
+    while i < 3 {
+        s = is_even(2);
+        i += 1;
+    }
+    s
+}
+
+/// The false twin: `is_even(2)` is 0, so `ret == 2` is false.
+/// invariant: s <= 1 && i <= 3
+/// ensures: ret == 2
+pub fn loop_calls_mutual_recursive_cannot_prove_this() -> u8 {
+    let mut i = 0u8;
+    let mut s = 0u8;
+    while i < 3 {
+        s = is_even(2);
+        i += 1;
+    }
+    s
+}
+
+/// A loop calling a *reference-carrying* self-recursive function. The call cycle
+/// is refused rather than followed, but the call's reference argument is included
+/// directly -- a callee can only affect caller storage through a reference -- so
+/// `x` is havoced. The false twin proves that: with the reference omitted, `*x`
+/// would keep its entry value `0` and `ret == 0` would be *proven*.
+/// requires: true
+/// decreases: n
+/// ensures: ret == n
+pub fn bump_n(n: u8, c: &mut u8) -> u8 {
+    if n == 0 { 0 } else { *c = c.wrapping_add(1); bump_n(n - 1, c) }
+}
+
+/// requires: x == 0
+/// invariant: i <= 3
+/// ensures: ret <= 255
+pub fn loop_calls_ref_recursive(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 {
+        bump_n(1, x);
+        i += 1;
+    }
+    *x
+}
+
+/// The false twin: `x` is written through the recursive callee, so `ret == 0` is
+/// false -- a model that dropped the reference from the havoc would prove it.
+/// requires: x == 0
+/// invariant: i <= 3
+/// ensures: ret == 0
+pub fn loop_calls_ref_recursive_cannot_prove_this(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 {
+        bump_n(1, x);
+        i += 1;
+    }
+    *x
+}
+
 // ---------------------------------------------------------------------------
 // `core::num` intrinsics: modelled directly rather than through their bodies.
 //

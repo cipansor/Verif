@@ -3159,6 +3159,37 @@ fn successors(t: &Term) -> Vec<usize> {
 /// nothing here: its effects are the executor's to model, and the loop's own writes
 /// are still collected. Recursion is bounded by the `visited` set.
 fn loop_writes(prog: &MirProgram, f: &MirFn, header: usize) -> Vec<u32> {
+    let mut visiting: BTreeSet<usize> = BTreeSet::new();
+    if let Some(i) = prog.fns.iter().position(|g| std::ptr::eq(g, f)) {
+        visiting.insert(i);
+    }
+    collect_writes(prog, f, header, &mut visiting)
+}
+
+/// The body of [`loop_writes`], threading the set of functions on the *call
+/// stack*.
+///
+/// The block walk is bounded by `seen` (per function), but the interprocedural
+/// step -- following a callee to find what it writes through a reference -- needs
+/// its own guard: a loop that calls a *recursive* function would otherwise follow
+/// the self-call forever. Each `collect_writes` invocation allocates a fresh
+/// `seen`, which stops a CFG cycle within one function and cannot stop a call
+/// cycle between invocations, so `loop_calls_recursive` overflowed the stack.
+///
+/// A function already on the stack is a cycle we cannot summarise exactly. Rather
+/// than skip it (which would drop the reference writes propagated around the
+/// cycle -- the review's warning), the call's *reference arguments* are included
+/// directly: a callee can only affect caller storage through a reference, so
+/// those are exactly the caller locals a cycle could reach. A recursive callee
+/// with no reference argument (`count_down(n: u8)`) therefore contributes nothing
+/// and the traversal terminates; a reference-carrying one has those locals
+/// havoced, which is the sound direction.
+fn collect_writes(
+    prog: &MirProgram,
+    f: &MirFn,
+    header: usize,
+    visiting: &mut BTreeSet<usize>,
+) -> Vec<u32> {
     let mut writes: BTreeMap<u32, ()> = BTreeMap::new();
     writes.insert(0, ());
     let mut seen: BTreeMap<usize, ()> = BTreeMap::new();
@@ -3196,28 +3227,43 @@ fn loop_writes(prog: &MirProgram, f: &MirFn, header: usize) -> Vec<u32> {
             // `x` on every iteration, but the call's destination is `bump`'s
             // return local, not `x`: the write-through was invisible, `x` kept
             // its entry value, the exit guard folded and `ensures: ret == 0`
-            // was `Verified` for a body returning 3. The callee's write set is
-            // folded back onto the arguments the call passed.
+            // was `Verified` for a body returning 3.
             if let Callee::Name(name) = callee {
                 if let Some(k) = resolve_callee(prog, name) {
-                    let callee_fn = &prog.fns[k];
-                    let Some(entry) = callee_fn.blocks.first().map(|b| b.id) else { continue };
-                    for &w in &loop_writes(prog, callee_fn, entry) {
-                        // The callee local `w` is written; the call passed it
-                        // `args[i]`, so the caller local that argument names is what
-                        // the write reaches. The mapping is positional:
-                        // `callee_fn.arg_locals[i]` is the callee's local for the
-                        // call's `args[i]`.
-                        if let Some(i) = callee_fn.arg_locals.iter().position(|&l| l == w) {
-                            if let Some(Operand::Copy(p) | Operand::Move(p)) = args.get(i) {
-                                // Only a *reference* argument shares storage with
-                                // the caller; a by-value argument is the callee's
-                                // own copy and its writes die with the frame, so
-                                // havocing the caller local for one would discard
-                                // information the body never touches -- the same
-                                // boundary the inliner's `by_value_indexed` keeps.
+                    if visiting.contains(&k) {
+                        // A call cycle: include this call's reference arguments,
+                        // the only caller storage a callee can reach.
+                        for a in args {
+                            if let Operand::Copy(p) | Operand::Move(p) = a {
                                 if matches!(f.ty_of(p.local), Some(Ty::Ref(_))) {
                                     writes.insert(p.local, ());
+                                }
+                            }
+                        }
+                    } else {
+                        let callee_fn = &prog.fns[k];
+                        let Some(entry) = callee_fn.blocks.first().map(|b| b.id) else {
+                            continue;
+                        };
+                        visiting.insert(k);
+                        let callee_writes = collect_writes(prog, callee_fn, entry, visiting);
+                        visiting.remove(&k);
+                        for w in callee_writes {
+                            // The callee local `w` is written; the call passed it
+                            // `args[i]`, so the caller local that argument names is
+                            // what the write reaches. The mapping is positional:
+                            // `callee_fn.arg_locals[i]` is the callee's local for
+                            // the call's `args[i]`.
+                            if let Some(i) = callee_fn.arg_locals.iter().position(|&l| l == w) {
+                                if let Some(Operand::Copy(p) | Operand::Move(p)) = args.get(i) {
+                                    // Only a *reference* argument shares storage
+                                    // with the caller; a by-value argument is the
+                                    // callee's own copy and its writes die with
+                                    // the frame -- the boundary the inliner's
+                                    // `by_value_indexed` keeps.
+                                    if matches!(f.ty_of(p.local), Some(Ty::Ref(_))) {
+                                        writes.insert(p.local, ());
+                                    }
                                 }
                             }
                         }
@@ -10317,10 +10363,28 @@ fn count_via_helper(_1: u8) -> u8 {
         );
 
         // Two definitions that share owner *and* method (a genuine ambiguity) are
-        // refused rather than answered with one of them.
+        // refused rather than answered with one of them. The use is a *projected*
+        // spelling (`call_trait_path` reduces its owner to `a::Custom`), and both
+        // candidates' owners match it -- `a::Custom` exactly and `Custom` as a
+        // `::`-aligned suffix -- so the only reason to return `None` is the
+        // ambiguity branch. The single-candidate control below returns `Some`, so
+        // the refusal is not merely "nothing matched".
         let mut ambiguous: BTreeMap<String, Vec<String>> = BTreeMap::new();
         ambiguous.insert("a::Custom::m::promoted[0]".into(), vec!["one".into()]);
-        ambiguous.insert("b::Custom::m::promoted[0]".into(), vec!["two".into()]);
-        assert_eq!(lookup_promoted(&ambiguous, "Custom::m::promoted[0]"), None);
+        ambiguous.insert("Custom::m::promoted[0]".into(), vec!["two".into()]);
+        assert_eq!(
+            lookup_promoted(&ambiguous, "<Self as a::Custom>::m::promoted[0]"),
+            None,
+            "two candidates whose owner matches the use must be refused"
+        );
+        // The control: with only the exact-owner candidate, the same use resolves,
+        // so the `None` above is the ambiguity and not a failed match.
+        let mut single: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        single.insert("a::Custom::m::promoted[0]".into(), vec!["one".into()]);
+        assert_eq!(
+            lookup_promoted(&single, "<Self as a::Custom>::m::promoted[0]"),
+            Some(vec!["one".to_string()]),
+            "a single matching candidate must resolve"
+        );
     }
 }

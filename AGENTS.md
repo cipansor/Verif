@@ -9920,4 +9920,30 @@ constant and prints the use with the projection; current stable inlines it, so t
 bug was invisible on the toolchain the crate is developed against -- the same
 "toolchain-shaped" class the CTFE brace-block finding named.
 
+### Interprocedural write-set discovery needs its own cycle guard
+
+Following a resolved callee to find what it writes *through a reference* is a walk
+over the call graph, and the block-visit set that bounds the walk within one
+function cannot bound a cycle *between* invocations. A loop calling a
+self-recursive function (`while i < 3 { s = count_down(n); i += 1 }`) therefore
+followed `count_down`'s self-call forever and overflowed the stack -- a crash, not
+a refusal, and one that reaches a function with *no* reference argument, because
+the recursion happens before the argument filter.
+
+The walk now carries the set of functions on the call stack (`visiting`) alongside
+the per-function block set. On a cycle it does not skip the callee -- that would
+drop reference writes propagated around the cycle, which is the unsound direction
+-- but includes the call's *reference arguments* directly: a callee can only affect
+caller storage through a reference, so those are exactly the caller locals a cycle
+could reach. A recursive callee with no reference contributes nothing and the walk
+terminates; one with a reference has it havoced. This is the same shape as the
+inliner's `by_value_indexed`/`by_ref` split: a reference shares storage across the
+boundary, a by-value argument does not.
+
+The general rule, alongside the earlier "a bound on one resource is not a bound on
+the others": a guard that stops a *syntactic* cycle (a block revisiting itself) is
+not a guard against a *semantic* one (a function calling itself). Each recursion
+over a structure the program can make cyclic needs the cycle set threaded through
+it, and the fix is to decide what the cycle contributes rather than to cut it.
+
 
