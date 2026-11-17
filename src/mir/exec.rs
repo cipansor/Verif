@@ -2927,7 +2927,7 @@ where
         None => None,
         Some(text) => match detect_loop(f) {
             Some((header, back_edges)) => {
-                let havoc = loop_writes(f, header);
+                let havoc = loop_writes(prog, f, header);
                 Some(Cut {
                     func: root,
                     header,
@@ -3141,7 +3141,24 @@ fn successors(t: &Term) -> Vec<usize> {
 /// return value (`s` in `sum_to` is `_0`), and leaving it out would leave the
 /// exit edge holding the *pre-loop* return value -- which is precisely the hole
 /// this set exists to close.
-fn loop_writes(f: &MirFn, header: usize) -> Vec<u32> {
+///
+/// "Write" is an *effect*, not a syntax: a write through a reference reaches the
+/// referent, and a call reaches whatever the callee writes through its reference
+/// arguments. The header havoc replaces every local in this set with a fresh
+/// value, so an under-approximation keeps the entry value in the header state and
+/// the exit guard can fold -- a false proof. Two ways that happened, both fixed
+/// here: a `&mut` destination (`*p = v`) whose referent was not followed, and a
+/// call (`bump(x)` where `bump(c: &mut u8)`) whose write-through was invisible
+/// because only the call's *destination* was collected.
+///
+/// A callee is looked up through `resolve_callee` (the same rule the inliner uses)
+/// and, if found, every local it writes is folded back onto the argument the call
+/// passed it -- an argument that is a reference (`&mut u8`) is modelled as its
+/// referent, so the caller local that argument names is the one to havoc. A callee
+/// that is not in this program (a `core` intrinsic, an unmodelled call) contributes
+/// nothing here: its effects are the executor's to model, and the loop's own writes
+/// are still collected. Recursion is bounded by the `visited` set.
+fn loop_writes(prog: &MirProgram, f: &MirFn, header: usize) -> Vec<u32> {
     let mut writes: BTreeMap<u32, ()> = BTreeMap::new();
     writes.insert(0, ());
     let mut seen: BTreeMap<usize, ()> = BTreeMap::new();
@@ -3172,8 +3189,33 @@ fn loop_writes(f: &MirFn, header: usize) -> Vec<u32> {
         // had when the header was first entered. The induction step then proved the
         // invariant for that one value rather than for the loop, and a postcondition
         // that only holds on the first iteration came back `Verified`.
-        if let Term::Call { dest, .. } = &block.term {
+        if let Term::Call { callee, args, dest, .. } = &block.term {
             writes.insert(dest.local, ());
+            // ...and whatever the callee writes *through* a reference argument.
+            // `while i < 3 { bump(x); i += 1 }` with `bump(c: &mut u8)` writes
+            // `x` on every iteration, but the call's destination is `bump`'s
+            // return local, not `x`: the write-through was invisible, `x` kept
+            // its entry value, the exit guard folded and `ensures: ret == 0`
+            // was `Verified` for a body returning 3. The callee's write set is
+            // folded back onto the arguments the call passed.
+            if let Callee::Name(name) = callee {
+                if let Some(k) = resolve_callee(prog, name) {
+                    let callee_fn = &prog.fns[k];
+                    let Some(entry) = callee_fn.blocks.first().map(|b| b.id) else { continue };
+                    for &w in &loop_writes(prog, callee_fn, entry) {
+                        // The callee local `w` is written; the call passed it
+                        // `args[i]`, so the caller local that argument names is what
+                        // the write reaches. The mapping is positional:
+                        // `callee_fn.arg_locals[i]` is the callee's local for the
+                        // call's `args[i]`.
+                        if let Some(i) = callee_fn.arg_locals.iter().position(|&l| l == w) {
+                            if let Some(Operand::Copy(p) | Operand::Move(p)) = args.get(i) {
+                                writes.insert(p.local, ());
+                            }
+                        }
+                    }
+                }
+            }
         }
         for t in successors(&block.term) {
             stack.push(t);

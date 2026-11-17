@@ -735,6 +735,43 @@ pub fn ref_arg_written_in_a_loop_cannot_prove_this(x: &mut u8) -> u8 {
     *x
 }
 
+/// A helper that writes through its `&mut` argument. Called in a loop, its write
+/// reaches the caller local `x`, so `x` must be in the loop's havoc set.
+/// requires: c == 0
+/// ensures: ret == c + 1
+pub fn bump_once(c: &mut u8) -> u8 {
+    *c += 1;
+    *c
+}
+
+/// A call in a loop whose *write-through* reaches `x`. Only the call's
+/// *destination* was collected by the havoc, so `x` kept its entry value, the exit
+/// guard folded, and `ensures: ret == 0` was `Verified` for a body returning 3.
+/// requires: x == 0
+/// invariant: x == i && i <= 3
+/// ensures: ret <= 3
+pub fn call_writes_through_in_a_loop_holds(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 {
+        bump_once(x);
+        i += 1;
+    }
+    *x
+}
+
+/// The false twin: `bump_once` runs three times, so `ret == 0` is false.
+/// requires: x == 0
+/// invariant: x == i && i <= 3
+/// ensures: ret == 0
+pub fn call_writes_through_in_a_loop_cannot_prove_this(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 {
+        bump_once(x);
+        i += 1;
+    }
+    *x
+}
+
 // ---------------------------------------------------------------------------
 // `core::num` intrinsics: modelled directly rather than through their bodies.
 //

@@ -5098,6 +5098,8 @@ fn a_loop_havocs_what_it_writes_through() {
         "while_writes_through_ref_cannot_prove_this",
         "ref_arg_written_in_a_loop_holds",
         "ref_arg_written_in_a_loop_cannot_prove_this",
+        "call_writes_through_in_a_loop_holds",
+        "call_writes_through_in_a_loop_cannot_prove_this",
     ];
     let Some(report) = verify_realistic(&names) else { return };
     let outcome = |name: &str| {
@@ -5113,6 +5115,7 @@ fn a_loop_havocs_what_it_writes_through() {
         "for_loop_invariant_holds",
         "while_writes_through_ref_holds",
         "ref_arg_written_in_a_loop_holds",
+        "call_writes_through_in_a_loop_holds",
     ] {
         assert!(
             outcome(holds).is_verified(),
@@ -5124,6 +5127,7 @@ fn a_loop_havocs_what_it_writes_through() {
         "for_loop_invariant_cannot_prove_this",
         "while_writes_through_ref_cannot_prove_this",
         "ref_arg_written_in_a_loop_cannot_prove_this",
+        "call_writes_through_in_a_loop_cannot_prove_this",
     ] {
         match outcome(twin) {
             FnOutcome::Failed { kind, .. } => assert!(
