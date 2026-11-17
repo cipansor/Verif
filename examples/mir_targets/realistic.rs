@@ -3786,27 +3786,31 @@ pub fn contract_wrapping_add_on_an_untyped_receiver_is_refused(x: u8) -> u8 {
 }
 
 /// `wrapping_shl`/`wrapping_shr` reduce the amount modulo the width, the same
-/// reduction a rotation does, so `x.wrapping_shl(8)` is `x` at eight bits. The
-/// body's shift and the contract's `ret <= 255` are one value, and the two
-/// amount-boundary cases (`8`, `9`) are the ones the modulo decides.
-/// requires: true
-/// ensures: ret <= 255
+/// reduction a rotation does, so `1u8.wrapping_shl(8)` is `1` (`wrapping_shl(0)`)
+/// rather than the `0` a saturating shift would give. The amount is pinned to the
+/// width exactly, so this *verifies only under the reduction*: a model that
+/// saturated the amount (the engine's plain variable shift) would compute `0` and
+/// refute it. The twin below is the mirror -- it claims the saturated `0`, which
+/// only an unreduced model would prove.
+/// requires: x == 1 && n == 8
+/// ensures: ret == 1
 pub fn wrapping_shl_reduces_its_amount(x: u8, n: u32) -> u8 {
     x.wrapping_shl(n)
 }
 
-/// The false twin: `1u8.wrapping_shl(8)` is `1`, not `2`, so the modulo is what
-/// makes this refuted rather than a proof about a shift the engine saturated to
-/// zero.
+/// The false twin: `1u8.wrapping_shl(8)` is `1`, not `0`. A model that did *not*
+/// reduce the amount -- the engine's own variable shift saturates `n >= w` to `0`
+/// -- would prove this, so the pair separates "the amount reduces" from "the
+/// amount saturates", which a `ret <= 255` bound could not.
 /// requires: x == 1 && n == 8
-/// ensures: ret == 2
-pub fn wrapping_shl_is_not_a_plain_shift_tripwire(x: u8, n: u32) -> u8 {
+/// ensures: ret == 0
+pub fn wrapping_shl_amount_is_not_saturated_tripwire(x: u8, n: u32) -> u8 {
     x.wrapping_shl(n)
 }
 
 /// `wrapping_shr` is *arithmetic* on a signed receiver: `-8i8.wrapping_shr(1)` is
-/// `-4`, so a model that took the logical shift would refute this. The amount is
-/// reduced modulo the width (`9` is `1`), which the second half pins.
+/// `-4`, so a model that took the logical shift would refute this. This pins the
+/// *shift kind* (the amount `1` is below the width, so reduction is not involved).
 /// requires: x == -8 && n == 1
 /// ensures: ret == -4
 pub fn wrapping_shr_signed_is_arithmetic(x: i8, n: u32) -> i8 {
@@ -3822,8 +3826,9 @@ pub fn wrapping_shr_signed_is_not_logical_tripwire(x: i8, n: u32) -> i8 {
 }
 
 /// The unsigned receiver is the logical shift: `128u8.wrapping_shr(9)` is `64`
-/// (`9` reduces to `1`), not a sign fill. This is the mirror of the signed entry
-/// above and pins that the *sign* decides which shift is used.
+/// (`9` reduces to `1`), not a sign fill. This pins *both* the shift kind (a sign
+/// fill would give `192`) and the amount reduction (a saturating shift would give
+/// `0`), so a model that got either wrong fails it.
 /// requires: x == 128 && n == 9
 /// ensures: ret == 64
 pub fn wrapping_shr_unsigned_is_logical(x: u8, n: u32) -> u8 {

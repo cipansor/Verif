@@ -7757,15 +7757,18 @@ fn a_wrapping_method_in_a_contract_is_read_as_the_operator_it_denotes() {
 /// fail it); these corpus entries pin the *end-to-end* verdicts, so a regression
 /// in the wiring -- not just the model -- is caught.
 ///
-/// Each true entry has a false twin that a wrong model would *prove*: the tripwire
-/// that claims `2` for `1u8.wrapping_shl(8)` is false only because the amount
-/// reduces (`1`), and the one that claims `124` for `-8i8.wrapping_shr(1)` is false
-/// only because the shift is arithmetic (`-4`).
+/// Each true entry has a false twin that a wrong model would *prove*, and each
+/// pair is *discriminating*: the left-shift pair pins the amount reduction (the
+/// true entry claims `1`, the twin claims the saturated `0`, so only a reducing
+/// model proves one and refutes the other -- a `ret <= 255` bound would satisfy
+/// both), the signed right-shift pair pins the shift *kind* (`-4` vs the logical
+/// `124`), and the unsigned right-shift entry pins both at once (`64`: a sign fill
+/// would give `192`, a saturating shift `0`).
 #[test]
 fn wrapping_shifts_are_modelled_with_the_amount_reduced_modulo_the_width() {
     let Some(report) = verify_realistic(&[
         "wrapping_shl_reduces_its_amount",
-        "wrapping_shl_is_not_a_plain_shift_tripwire",
+        "wrapping_shl_amount_is_not_saturated_tripwire",
         "wrapping_shr_signed_is_arithmetic",
         "wrapping_shr_signed_is_not_logical_tripwire",
         "wrapping_shr_unsigned_is_logical",
@@ -7781,7 +7784,7 @@ fn wrapping_shifts_are_modelled_with_the_amount_reduced_modulo_the_width() {
         assert!(o.is_verified(), "`{name}` must verify, got: {o}");
     }
     for name in [
-        "wrapping_shl_is_not_a_plain_shift_tripwire",
+        "wrapping_shl_amount_is_not_saturated_tripwire",
         "wrapping_shr_signed_is_not_logical_tripwire",
     ] {
         let o = outcome(&report, name);

@@ -676,10 +676,15 @@ with no new false proof while the independent corpus keeps growing.
     saturates to zero), so `checked_shl`/`overflowing_shl`/`saturating_shl` stay
     refused rather than guessed at. Checked exhaustively against Rust's own
     methods over the whole `u8`/`i8` operand domain
-    (`wrapping_shifts_agree_with_rust`), with a mutation to a logical shift and
-    one that drops the amount reduction each caught; five fixtures (three true,
-    two tripwires) in `realistic.rs` (**583 of 1065**), pinned by
-    `wrapping_shifts_are_modelled_with_the_amount_reduced_modulo_the_width`.
+    (`wrapping_shifts_agree_with_rust`). The corpus pairs are *discriminating*: the
+    left-shift pair pins the amount reduction (the true entry claims `1`, its twin
+    the saturated `0`, so only a reducing model proves one and refutes the other --
+    a `ret <= 255` bound would satisfy both), the signed right-shift pair pins the
+    shift kind (`-4` vs the logical `124`), and the unsigned right-shift entry pins
+    both at once (`64`). Five fixtures (three true, two tripwires) in
+    `realistic.rs` (**583 of 1065**), pinned by
+    `wrapping_shifts_are_modelled_with_the_amount_reduced_modulo_the_width`; the
+    no-reduction mutation flips both left-shift verdicts and fails that test.
 - **C7. Arithmetic scale and speed.** · P0 · in progress · Kani, Boolector,
   Bitwuzla
   - Gap: `u32::wrapping_mul` is past the 32-bit model; `clamp_std` takes 9.9 s.
