@@ -3597,6 +3597,43 @@ pub fn and_slices_selects_the_argument_tripwire(a: &[u8], b: &[u8]) -> u8 {
     *a.first().and(b.first()).unwrap()
 }
 
+/// `Option<T>::and<U>` permits a *different* payload type, and the result's
+/// element is always the argument's. Building a `Select` over the receiver's
+/// (`u8`) and the argument's (`u16`) elements demanded equal widths for unrelated
+/// types and marked the query ill-formed, so the deref was `incomplete` even with
+/// both slices nonempty. Carrying the argument identity alone is both exact and
+/// width-safe.
+/// requires: a.len() > 0 && b.len() > 0 && b[0] == 9
+/// ensures: ret == 9
+pub fn and_different_width_deref(a: &[u8], b: &[u16]) -> u16 {
+    *a.first().and(b.first()).unwrap()
+}
+
+/// The false twin: the deref is `b[0] == 9`, never the receiver's `a[0]`.
+/// requires: a.len() > 0 && b.len() > 0 && a[0] == 3 && b[0] == 9
+/// ensures: ret == 3
+pub fn and_different_width_deref_tripwire(a: &[u8], b: &[u16]) -> u16 {
+    *a.first().and(b.first()).unwrap()
+}
+
+/// A scalar `Option` receiver with a slice-reference argument: the receiver
+/// carries no element identity at all, so the result identity is the argument's.
+/// The old code's `(None, Some(a))` arm only took the argument when the receiver
+/// tag proved it was not selected, which is `or`'s rule; `and` selects the
+/// *argument* on a `Some` receiver, so it must take it unconditionally.
+/// requires: x.is_some() && b.len() > 0 && b[0] == 9
+/// ensures: ret == 9
+pub fn and_scalar_receiver_ref_argument(x: Option<u8>, b: &[u8]) -> u8 {
+    *x.and(b.first()).unwrap()
+}
+
+/// The false twin: the receiver is a scalar, so the deref is always `b[0] == 9`.
+/// requires: x.is_some() && b.len() > 0 && b[0] == 9
+/// ensures: ret == 5
+pub fn and_scalar_receiver_ref_argument_tripwire(x: Option<u8>, b: &[u8]) -> u8 {
+    *x.and(b.first()).unwrap()
+}
+
 /// `Result::unwrap_or_default` destroys the error on the `Err` branch, so a
 /// `Result<u8, Boom>` whose `Boom` destructor panics must be *refused*, not
 /// reported panic-free. The `Boom` type is defined here so the glue check reads

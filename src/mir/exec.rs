@@ -5393,31 +5393,41 @@ fn enum_method(
             let cond = smt::eq_const(tag, payload_variant);
             let r = env.slice_elem_ref.get(&opt.local).cloned();
             let a = env.slice_elem_ref.get(&arg_opt.local).cloned();
-            // `Some(v)` when the receiver's tag is a known discriminant, so the
-            // `is_some` test is decided and one operand is provably not selected.
-            let known_tag = smt::evaluate(tag, |_| None);
             let is_and = matches!(kind, OptionMethod::And);
-            // Whether the receiver is selected: `or` selects it on `Some`, `and` on
-            // `None`.
-            let recv_selected_known = known_tag.map(|v| (v == payload_variant) != is_and);
-            let composed = match (r, a) {
-                (Some(r), Some(a)) => {
-                    let (then, els) = if is_and { (a, r) } else { (r, a) };
-                    Some(ElemId::Select(cond, Box::new(then), Box::new(els)))
+            let composed = if is_and {
+                // `Option<T>::and<U>` returns `Some(arg)` on a `Some` receiver and
+                // `None` otherwise, so the *result's* element -- read only on the
+                // `Some` path -- is always the argument's. The receiver's element is
+                // never the result, and its type may differ (`Option<&u8>` receiver,
+                // `Option<&u16>` argument), so a `Select` over both would demand
+                // equal widths for unrelated types and mark the query ill-formed.
+                // Carrying the argument identity alone is both exact and
+                // width-safe.
+                a
+            } else {
+                // `Some(v)` when the receiver's tag is a known discriminant, so the
+                // `is_some` test is decided and one operand is provably not selected.
+                let known_tag = smt::evaluate(tag, |_| None);
+                // Whether the receiver is selected: `or` selects it on `Some`.
+                let recv_selected_known = known_tag.map(|v| v == payload_variant);
+                match (r, a) {
+                    (Some(r), Some(a)) => {
+                        Some(ElemId::Select(cond, Box::new(r), Box::new(a)))
+                    }
+                    // The receiver's identity is missing: usable only when the tag
+                    // says the receiver is not the selected operand.
+                    (None, Some(a)) => match recv_selected_known {
+                        Some(false) => Some(a),
+                        _ => None,
+                    },
+                    // The argument's identity is missing: usable only when the tag
+                    // says the receiver *is* the selected operand.
+                    (Some(r), None) => match recv_selected_known {
+                        Some(true) => Some(r),
+                        _ => None,
+                    },
+                    (None, None) => None,
                 }
-                // The receiver's identity is missing: usable only when the tag says
-                // the receiver is not the selected operand.
-                (None, Some(a)) => match recv_selected_known {
-                    Some(false) => Some(a),
-                    _ => None,
-                },
-                // The argument's identity is missing: usable only when the tag says
-                // the receiver *is* the selected operand.
-                (Some(r), None) => match recv_selected_known {
-                    Some(true) => Some(r),
-                    _ => None,
-                },
-                (None, None) => None,
             };
             if let Some(id) = composed {
                 env.slice_elem_ref.insert(dest.local, id);

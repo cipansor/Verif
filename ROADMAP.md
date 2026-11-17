@@ -19,7 +19,7 @@ output decides the number, so the table is a measurement rather than a claim:
 | Corpus | Command | Verified / total |
 |---|---|---|
 | `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 18 / 33 |
-| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 608 / 1112 |
+| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 610 / 1116 |
 | `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **18 / 21 (86%)** |
 
 `everyday.rs` is the honest one: ordinary Rust written by an external reviewer,
@@ -336,6 +336,16 @@ keeps growing.
     signed (the old code hard-coded `Sign::Unsigned`). Fixtures `chained_or_selects_the_first`,
     `and_with_a_conditional_argument`, `signed_or_element_is_signed` and their
     `_cannot_prove_this` twins.
+  - **`and` with a different-width argument (ill-formed query, fixed).** `Option<T>::and<U>`
+    permits a different payload type and returns the *argument* on `Some`, so its result
+    element is always the argument's. Building a `Select` over the receiver's (`u8`) and
+    the argument's (`u16`) slice elements asked `smt::ite` for equal widths and marked the
+    query ill-formed, so `*a.first().and(b.first()).unwrap()` was `incomplete` even with
+    both slices nonempty. `and` now carries the argument's identity alone (exact and
+    width-safe), which also fixes the scalar-receiver case (`Option<u8>.and(&[u8])`), where
+    the old `(None, Some(a))` arm applied `or`'s "only when the tag proves it" rule to a
+    combinator that selects the argument unconditionally. Fixtures
+    `and_different_width_deref`, `and_scalar_receiver_ref_argument` and their twins.
   - Remaining: `map`/`map_err`/`and_then`/`unwrap_or_else` (closures). The `?`
     operator is modelled (see the `?` progress note above).
 - **C3. Ranges and `for` loops.** · P0 · done · Kani, Verus, Prusti
