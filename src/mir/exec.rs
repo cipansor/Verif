@@ -453,9 +453,22 @@ impl Obligation {
     /// an impossible postcondition as a universal truth, which is the opposite of
     /// the finding. So the string is built per kind and per verdict, and the
     /// `Unsat` postcondition says what actually happened.
+    ///
+    /// A counterexample is rendered with the source names the MIR `debug` bindings
+    /// recorded (`x = 224` rather than `v1:u8 = 224`); see [`Self::failure_detail_named`].
     pub fn failure_detail(&self) -> String {
+        self.failure_detail_named(&[])
+    }
+
+    /// [`Self::failure_detail`], but a counterexample is rendered with `names`.
+    ///
+    /// `names` is `(source name, variable index)`, the frontend's `debug` bindings.
+    /// A variable with no name keeps its `v{index}:u{width}` spelling, so naming is
+    /// a readability improvement and never a loss: the fallback is exactly what the
+    /// unnamed rendering prints.
+    pub fn failure_detail_named(&self, names: &[(&str, u32)]) -> String {
         match &self.verdict {
-            Verdict::Counterexample(c) => c.to_string(),
+            Verdict::Counterexample(c) => c.render_named(names),
             Verdict::Valid => match self.kind {
                 // A panic query is `path => can_happen`; `Valid` means it always
                 // happens, and there is no single witness to name.

@@ -813,7 +813,16 @@ Exit: one real `no_std` crate with a dependency verified end to end with
   - Gap: a report says `v1:u8 = 224`, not `x = 224`. The `debug x => _1` names
     exist; the stable text dump has no per-statement spans, so line numbers come
     from the source scanner or the `rustc_public` path.
-  - Exit: `x = 224` in a report.
+  - Exit: `x = 224` in a report. **Met** — the witness is rendered with the
+    `debug` names (`a = 32768`, `n = 16`, `d = 0`), and a variable with no source
+    name keeps its `v{index}:u{width}` spelling, so naming is a readability
+    improvement and never a loss. See [`Cex::render_named`] and
+    [`Obligation::failure_detail_named`]; pinned by
+    `a_counterexample_is_rendered_with_source_names`. The README's `mir_demo`
+    transcript is regenerated from the run.
+  - What remains: source *line* numbers in the report (the second half of the
+    exit). The stable text dump has none, so this needs the source scanner or the
+    `rustc_public` path; the name half is done.
   - Move: **build**.
 - **U5. A test harness that never passes vacuously.** · P0 · done · —
   - Gap: about 21 tests in `tests/mir.rs` use

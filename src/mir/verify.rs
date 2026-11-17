@@ -1029,9 +1029,17 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         // The diagnosis is per-kind: an `Unsat` postcondition holds for *no*
         // input, while a `Valid` panic fires on *every* input. Both leave no
         // witness, so the detail cannot be one shared string.
+        //
+        // The witness is rendered with the source names the `debug` bindings
+        // recorded, so a report says `x = 224` rather than `v1:u8 = 224`. A
+        // variable with no source name -- a temporary, a promoted constant --
+        // keeps its `v{index}:u{width}` spelling, so the fallback is exactly the
+        // old rendering.
+        let names: Vec<(&str, u32)> =
+            f.local_names.iter().map(|(&l, n)| (n.as_str(), l)).collect();
         return FnOutcome::Failed {
             kind: ob.kind.to_string(),
-            detail: ob.failure_detail(),
+            detail: ob.failure_detail_named(&names),
         };
     }
     if report.undecided() > 0 {

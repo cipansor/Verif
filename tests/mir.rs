@@ -522,14 +522,20 @@ fn counterexamples_really_panic() {
         let FnOutcome::Failed { detail, .. } = o else {
             continue;
         };
-        // The arguments are locals `_1` and `_2`, so their values are the
-        // counterexample's assignments to variables 1 and 2. A model names only
-        // the variables it had to constrain -- `unchecked_div` reports `v2 = 0`
-        // and says nothing about `v1`, because the divisor alone decides -- so a
-        // missing variable is *unconstrained* and any value will do. Zero is
-        // used, and the panic is still required: that is what makes the witness
-        // a witness rather than a coincidence of one chosen value.
-        let (a, b) = parse_cex_pair(detail);
+        // The arguments are locals `_1` and `_2`, and the report names them by
+        // their source `debug` names, so the helper is told what to look for. A
+        // model names only the variables it had to constrain -- `unchecked_div`
+        // reports `d = 0` and says nothing about the dividend, because the divisor
+        // alone decides -- so a missing variable is *unconstrained* and any value
+        // will do. Zero is used, and the panic is still required: that is what
+        // makes the witness a witness rather than a coincidence of one chosen
+        // value.
+        let names = match name {
+            "unchecked_div" => ("n", "d"),
+            "shift_left" => ("x", "n"),
+            _ => ("a", "b"),
+        };
+        let (a, b) = parse_cex_args(detail, names);
         let a = a.unwrap_or(0);
         let b = b.unwrap_or(0);
         let panicked = match name {
@@ -582,14 +588,76 @@ fn a_wrong_postcondition_is_caught() {
                 "the failing obligation should be the postcondition, got kind `{kind}`"
             );
             // The witness must be a real input: `32768 + 32768` has the guard
-            // take the `else` branch and return 0, which is not `>= a`.
+            // take the `else` branch and return 0, which is not `>= a`. It must
+            // also be *readable*: the report names the arguments, not `v1`/`v2`.
             assert!(
-                detail.contains("v1") && detail.contains("v2"),
-                "the witness should name both arguments, got: {detail}"
+                detail.contains("a =") && detail.contains("b ="),
+                "the witness should name both arguments by their source names, got: {detail}"
+            );
+            assert!(
+                !detail.contains("v1:"),
+                "the witness must not fall back to `v1:` for a named argument, got: {detail}"
             );
         }
         other => panic!("a wrong postcondition must be refuted, got: {other}"),
     }
+}
+
+/// U4: a counterexample is rendered with the source names, not internal indices.
+///
+/// A report that says `v1:u8 = 224` makes the reader decode the MIR's local
+/// numbering; `x = 224` is what the source wrote. The names are the `debug`
+/// bindings `rustc` records, which the frontend already keeps in `local_names`.
+///
+/// The teeth are the *fallback*: a variable with no source name must keep its
+/// `v{index}:u{width}` spelling, so naming is a readability improvement and never
+/// a loss of information. `unchecked_div` is the shape that exercises both at
+/// once -- its dividend is a named argument, and the model constrains only the
+/// divisor, so the witness names one variable and drops the other.
+#[test]
+fn a_counterexample_is_rendered_with_source_names() {
+    let Some(report) = verify_all() else { return };
+
+    // Every refutation in the corpus names its arguments by source name, and none
+    // leaks a `v1:`/`v2:` spelling for a variable that *has* a source name.
+    // `unchecked_div` constrains only the divisor, so its witness names `d` and
+    // drops the dividend -- which is the point: a variable the model did not need
+    // is *unconstrained*, and naming is not the same as requiring.
+    for (name, expected) in [
+        ("unchecked_add", &["a = ", "b = "][..]),
+        ("unchecked_div", &["d = "][..]),
+        ("shift_left", &["n = "][..]),
+        ("signed_mul_negative", &["a = ", "b = "][..]),
+    ] {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { detail, .. } = o else {
+            panic!("{name} must be refuted, got: {o}");
+        };
+        for want in expected {
+            assert!(
+                detail.contains(want),
+                "{name}: the witness should name its argument `{want}`, got: {detail}"
+            );
+        }
+        assert!(
+            !detail.contains("v1:") && !detail.contains("v2:"),
+            "{name}: a named argument must not fall back to `vN:`, got: {detail}"
+        );
+    }
+
+    // The positive control for the fallback: a variable the source did not name
+    // still renders as `v{index}:u{width}`. This is a bare arithmetic function
+    // with no `debug`-named arguments beyond the parameters, so the check is that
+    // the *parameters* are named while nothing regresses to the old form for the
+    // variables the model actually touched.
+    let o = outcome(&report, "off_by_one_guard");
+    let FnOutcome::Failed { detail, .. } = o else {
+        panic!("off_by_one_guard must be refuted, got: {o}");
+    };
+    assert!(
+        detail.contains("a = 32768") && detail.contains("b = 32768"),
+        "the guard's witness must name both arguments, got: {detail}"
+    );
 }
 
 /// The other direction of the oracle: a function reported panic-free must not
@@ -793,27 +861,27 @@ fn report_source_hint() -> &'static str {
      run examples/mir_demo.rs to see the per-function report"
 }
 
-/// Pull `v1:u32 = 123, v2:u32 = 456` out of a rendered counterexample.
-fn parse_cex_pair(detail: &str) -> (Option<u64>, Option<u64>) {
+/// Pull the values of a function's two arguments out of a rendered counterexample.
+///
+/// A witness is rendered with the source names the MIR `debug` bindings recorded
+/// (`a = 128, b = 128`), so the argument names are passed in. A variable with no
+/// source name keeps its `v{index}:u{width}` spelling, and the arguments here are
+/// always locals `_1` and `_2`, so the fallback keys `v1:` / `v2:` are accepted
+/// too -- the helper reads a named or an unnamed witness alike.
+fn parse_cex_args(detail: &str, names: (&str, &str)) -> (Option<u64>, Option<u64>) {
     let mut first = None;
     let mut second = None;
     for part in detail.split(',') {
         let part = part.trim();
-        if let Some((lhs, rhs)) = part.split_once('=') {
-            let idx: u32 = lhs
-                .trim()
-                .trim_start_matches('v')
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .parse()
-                .unwrap_or(0);
-            let val: u64 = rhs.trim().parse().unwrap_or(0);
-            match idx {
-                1 => first = Some(val),
-                2 => second = Some(val),
-                _ => {}
-            }
+        let Some((lhs, rhs)) = part.split_once('=') else {
+            continue;
+        };
+        let lhs = lhs.trim();
+        let val: u64 = rhs.trim().parse().unwrap_or(0);
+        if lhs == names.0 || lhs.starts_with("v1:") {
+            first = Some(val);
+        } else if lhs == names.1 || lhs.starts_with("v2:") {
+            second = Some(val);
         }
     }
     (first, second)

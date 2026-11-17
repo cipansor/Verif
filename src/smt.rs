@@ -198,6 +198,51 @@ impl Cex {
         self.n == 0
     }
 
+    /// Render the model with source names, e.g. `x = 224, y = 0`.
+    ///
+    /// `names` maps a variable index to the source name the MIR `debug` binding
+    /// recorded for its local. An index with no name -- a temporary, a promoted
+    /// constant, a variable the frontend created for an aggregate part -- falls
+    /// back to `v{index}:u{width}`, so the rendering is always at least as
+    /// readable as the plain `Display` output and never less.
+    ///
+    /// The type of `names` is a slice of pairs rather than a map because the
+    /// engine is `no_std` and allocation-free: the caller owns the table and this
+    /// is a lookup, not an allocation.
+    ///
+    /// `std`-only, like its one caller: the MIR frontend that renders reports is
+    /// behind the `std` feature, so this method is too rather than dragging an
+    /// allocator into the bare-metal build.
+    #[cfg(feature = "std")]
+    pub fn render_named(&self, names: &[(&str, u32)]) -> String {
+        // The write into a `String` cannot fail, so the `fmt::Result` is ignored
+        // rather than threaded back.
+        let mut out = String::new();
+        let _ = self.fmt_named(&mut out, names);
+        out
+    }
+
+    /// The one rendering behind both [`fmt::Display`] (which passes no names) and
+    /// [`Self::render_named`], so the fallback spelling and the truncation marker
+    /// cannot drift between the two.
+    fn fmt_named<W: fmt::Write>(&self, w: &mut W, names: &[(&str, u32)]) -> fmt::Result {
+        for (i, (v, w_, val)) in self.assignments[..self.n as usize].iter().enumerate() {
+            if i > 0 {
+                w.write_str(", ")?;
+            }
+            match names.iter().find(|(_, idx)| idx == v) {
+                Some((name, _)) => write!(w, "{name} = {val}")?,
+                None => write!(w, "v{v}:u{w_} = {val}")?,
+            }
+        }
+        if !self.is_complete() {
+            // Say so in the rendering, not only in the API: a truncated witness printed
+            // as if complete is the failure mode this flag exists to prevent.
+            write!(w, " … {}/{} shown (TRUNCATED)", self.n, self.total)?;
+        }
+        Ok(())
+    }
+
     /// True when every variable the model touched is present.
     ///
     /// A complete model is a witness: replaying its assignments satisfies the query. An
@@ -216,18 +261,9 @@ impl Cex {
 
 impl fmt::Display for Cex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, (v, w, val)) in self.assignments[..self.n as usize].iter().enumerate() {
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            write!(f, "v{}:u{} = {}", v, w, val)?;
-        }
-        if !self.is_complete() {
-            // Say so in the rendering, not only in the API: a truncated witness printed
-            // as if complete is the failure mode this flag exists to prevent.
-            write!(f, " … {}/{} shown (TRUNCATED)", self.n, self.total)?;
-        }
-        Ok(())
+        // No name table: the unnamed spelling is the fallback inside `fmt_named`,
+        // so there is one rendering rather than two that can drift.
+        self.fmt_named(f, &[])
     }
 }
 

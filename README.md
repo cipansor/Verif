@@ -1366,25 +1366,25 @@ rate_limit       verified (5 obligation(s), 2 panic(s) ruled out)
 sat_add          verified (4 obligation(s), 2 panic(s) ruled out)
 sat_sub          verified (1 obligation(s), 1 panic(s) ruled out)
 shift_const      verified (1 obligation(s), 1 panic(s) ruled out)
-shift_left       FAILED: panic: attempt to shift left by `{}`, which would overflow — v2:u16 = 16
+shift_left       FAILED: panic: attempt to shift left by `{}`, which would overflow — n = 16
 sat_shift        verified (1 obligation(s), 1 panic(s) ruled out)
 sat_mul          verified (3 obligation(s), 3 panic(s) ruled out)
-unchecked_add    FAILED: panic: attempt to compute `{} + {}`, which would overflow — v1:u16 = 32768, v2:u16 = 32768
-unchecked_sub    FAILED: panic: attempt to compute `{} - {}`, which would overflow — v1:u16 = 0, v2:u16 = 32768
-unchecked_div    FAILED: panic: attempt to divide `{}` by zero — v2:u32 = 0
-unchecked_mul    FAILED: panic: attempt to compute `{} * {}`, which would overflow — v1:u8 = 128, v2:u8 = 128
-off_by_one_guard FAILED: postcondition — v1:u16 = 32768, v2:u16 = 32768
+unchecked_add    FAILED: panic: attempt to compute `{} + {}`, which would overflow — a = 32768, b = 32768
+unchecked_sub    FAILED: panic: attempt to compute `{} - {}`, which would overflow — a = 0, b = 32768
+unchecked_div    FAILED: panic: attempt to divide `{}` by zero — d = 0
+unchecked_mul    FAILED: panic: attempt to compute `{} * {}`, which would overflow — a = 128, b = 128
+off_by_one_guard FAILED: postcondition — a = 32768, b = 32768
 clamp_signed     verified (3 obligation(s), 0 panic(s) ruled out)
 checked_div_signed verified (3 obligation(s), 2 panic(s) ruled out)
-unchecked_div_signed FAILED: panic: attempt to divide `{}` by zero — v2:u16 = 0
-signed_add_misguarded FAILED: panic: attempt to compute `{} + {}`, which would overflow — v1:u8 = 128, v2:u8 = 128
+unchecked_div_signed FAILED: panic: attempt to divide `{}` by zero — b = 0
+signed_add_misguarded FAILED: panic: attempt to compute `{} + {}`, which would overflow — a = 128, b = 128
 signed_add_guarded verified (2 obligation(s), 1 panic(s) ruled out)
 signed_mul_guarded verified (2 obligation(s), 1 panic(s) ruled out)
-signed_mul_negative FAILED: panic: attempt to compute `{} * {}`, which would overflow — v1:u8 = 128, v2:u8 = 128
+signed_mul_negative FAILED: panic: attempt to compute `{} * {}`, which would overflow — a = 128, b = 128
 checked_neg      verified (2 obligation(s), 1 panic(s) ruled out)
-assert_guarded   verified (2 obligation(s), 0 panic(s) ruled out)
-assert_misguarded FAILED: panic: assertion failed: n <= 100 — v1:u8 = 128
-panic_guarded    verified (2 obligation(s), 0 panic(s) ruled out)
+assert_guarded   verified (1 obligation(s), 0 panic(s) ruled out)
+assert_misguarded FAILED: panic: assertion failed: n <= 100 — n = 128
+panic_guarded    verified (1 obligation(s), 0 panic(s) ruled out)
 
 verified=14 failed=10 incomplete=0
 All expectations met.
@@ -1395,6 +1395,12 @@ Rust with no annotations of any kind. The counterexample `32768 + 32768` is read
 off the MIR, and `tests/mir.rs` feeds exactly that pair back into the compiled
 function and requires the panic. That is the property worth having: the witness is
 checked against `rustc`'s own code generator, not against another model.
+
+The witness is rendered with the **source names** `rustc` recorded in its `debug`
+bindings — `a = 32768`, `n = 16`, `d = 0` — rather than internal local indices. A
+variable with no source name (a temporary, a promoted constant) keeps its
+`v{index}:u{width}` spelling, so naming is a readability improvement and never a
+loss.
 
 ### Contracts are doc comments, and that is forced
 
