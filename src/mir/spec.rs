@@ -4533,6 +4533,21 @@ struct Parser<'a> {
     ///
     /// [`amount_width`]: Self::amount_width
     amount_floor: u8,
+    /// The token indices at which an *identifier the parser was given* (an
+    /// argument, `ret`, a local, `old(...)`, `*name`) was consumed, rather than a
+    /// written literal, an associated constant (`i8::MIN`) or a `const` item.
+    ///
+    /// This is *lexical* provenance, and it has to be: a name can be bound to a
+    /// constant term -- an invariant is evaluated in the loop-head state, where a
+    /// counter like `i` holds the constant it had on entry (`0`) -- so a name and
+    /// a written `0` can be the *same* hash-consed term. Keying provenance on the
+    /// term id marked a written literal as a name (a written `0 - 1` was accepted
+    /// because an argument was pinned to `0` elsewhere in the contract). Rust never
+    /// treats a variable's arithmetic as a constant expression, so `i - 1` is a
+    /// wrapping subtraction, not the compile error `0u32 - 1u32`; a `const` *item*
+    /// and an associated constant, by contrast, Rust really does const-evaluate, so
+    /// they stay written constants.
+    name_tokens: BTreeSet<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4715,6 +4730,7 @@ impl<'a> Parser<'a> {
             ret_payload_guards: BTreeMap::new(),
             range: BTreeMap::new(),
             bare_literals: BTreeSet::new(),
+            name_tokens: BTreeSet::new(),
             guarded_groups: Vec::new(),
             in_negation: false,
             amount_floor: 0,
@@ -5143,6 +5159,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Whether the token span `[lo, hi)` the parser just consumed contains an
+    /// identifier that resolved to a *name* rather than a written constant.
+    ///
+    /// See [`name_tokens`](Self::name_tokens) for why this is lexical. A span with
+    /// no name token is a written constant expression -- a literal, a `const` item,
+    /// an associated bound (`i8::MIN`), or a fold of those -- and Rust
+    /// const-evaluates it, so the fold's overflow refusals apply. A span that
+    /// contains a name is a variable's arithmetic, which Rust never const-evaluates.
+    fn span_has_name(&self, lo: usize, hi: usize) -> bool {
+        self.name_tokens.range(lo..hi).next().is_some()
+    }
+
     /// Record `v`'s envelope as the union of its operands' envelopes, so a
     /// bitwise, shift or `/`/`%` result carries the literals underneath it to the
     /// later range check even though the operation itself adds no literal.
@@ -5359,12 +5387,24 @@ impl<'a> Parser<'a> {
         sa: Sign,
         b: Var,
         sb: Sign,
+        a_is_name: bool,
+        b_is_name: bool,
     ) -> Result<Option<(Var, Sign)>, SpecError> {
         // Only a fold of two constants can be decided here; a symbolic operand
         // leaves the operation to the engine.
         let (Some(_), Some(_)) = (self.const_value(a), self.const_value(b)) else {
             return Ok(None);
         };
+        // A *name* that happens to hold a constant (a loop counter bound to its
+        // entry value in an invariant) is not a written constant expression, and
+        // Rust never range-checks a variable's arithmetic as one: `i - 1` on a
+        // `u32` `i` is a wrapping subtraction, not `0u32 - 1u32`. Leave it to the
+        // engine rather than refusing it as a written underflow. The flags are
+        // lexical (see `name_tokens`), because a name and a written literal can be
+        // the *same* hash-consed term.
+        if a_is_name || b_is_name {
+            return Ok(None);
+        }
         let w = smt::bits(a);
         let signed = sa.eval() || sb.eval();
         let (va, vb) = (self.signed_value(a, sa.eval()), self.signed_value(b, sb.eval()));
@@ -6277,9 +6317,13 @@ impl<'a> Parser<'a> {
 
     /// The additive level: `+` and `-`, tighter than the bitwise operators.
     fn parse_add(&mut self) -> Result<(Var, Sign), SpecError> {
+        let start = self.pos;
         let (mut left, mut sgn) = self.parse_mul()?;
+        let mut left_is_name = self.span_has_name(start, self.pos);
         while let Some(op) = self.eat_any(&["+", "-"]) {
+            let op_start = self.pos - 1;
             let (r, rs) = self.parse_mul()?;
+            let r_is_name = self.span_has_name(op_start + 1, self.pos);
             // A signed constant added to an unsigned name (`x + -1` for a `u8`) is
             // a rustc error, and reading the negation as `255` would prove
             // `x + -1 >= 0` for every `x` -- a false proof, exactly as at the
@@ -6293,16 +6337,21 @@ impl<'a> Parser<'a> {
             // A constant sum or difference is folded *exactly*, so a result that
             // overflows the operand width is refused (as rustc refuses the
             // constant expression) instead of wrapping to a wrong value. A result
-            // that fits is left to the ordinary operator.
-            if let Some((v, s)) = self.fold_const_arith(op, l, sgn, r, rs)? {
+            // that fits is left to the ordinary operator. A *name* operand is not a
+            // written constant, so the fold's refusals do not apply to it.
+            if let Some((v, s)) =
+                self.fold_const_arith(op, l, sgn, r, rs, left_is_name, r_is_name)?
+            {
                 self.record_fold_result(v, pl, pr, s);
                 left = v;
                 sgn = s;
+                left_is_name = left_is_name || r_is_name;
                 continue;
             }
             left = if op == "+" { smt::add(l, r) } else { smt::sub(l, r) };
             self.record_fold_result(left, pl, pr, Sign::combine(sgn, rs));
             sgn = Sign::combine(sgn, rs);
+            left_is_name = left_is_name || r_is_name;
         }
         Ok((left, sgn))
     }
@@ -6318,9 +6367,13 @@ impl<'a> Parser<'a> {
     /// imprecise. A *symbolic* divisor is modelled exactly (the engine's divider is
     /// total), which mirrors the body.
     fn parse_mul(&mut self) -> Result<(Var, Sign), SpecError> {
+        let start = self.pos;
         let (mut left, mut sgn) = self.parse_cast()?;
+        let mut left_is_name = self.span_has_name(start, self.pos);
         while let Some(op) = self.eat_any(&["*", "/", "%"]) {
+            let op_start = self.pos - 1;
             let (r, rs) = self.parse_cast()?;
+            let r_is_name = self.span_has_name(op_start + 1, self.pos);
             // The divisor must be checked for *zero*, not for "is a bare zero
             // literal". `x % (1 - 1)` folds to `x % 0` at the additive level, and
             // the raw-literal `const_of` missed it, so the reader built `srem(x, 0)`
@@ -6361,11 +6414,15 @@ impl<'a> Parser<'a> {
             // A constant `/` or `%` can overflow (`i8::MIN / -1`), which rustc
             // rejects; the fold refuses it rather than wrapping. `*` is folded
             // exactly, so a constant product too wide for the operand is refused
-            // instead of wrapping to a wrong value.
-            if let Some((v, s)) = self.fold_const_arith(op, l, sgn, r, rs)? {
+            // instead of wrapping to a wrong value. A *name* operand is not a
+            // written constant, so the fold's refusals do not apply to it.
+            if let Some((v, s)) =
+                self.fold_const_arith(op, l, sgn, r, rs, left_is_name, r_is_name)?
+            {
                 self.record_fold_result(v, pl, pr, s);
                 left = v;
                 sgn = s;
+                left_is_name = left_is_name || r_is_name;
                 continue;
             }
             let signed = sgn.eval() || rs.eval();
@@ -6378,6 +6435,7 @@ impl<'a> Parser<'a> {
             };
             self.record_fold_result(left, pl, pr, Sign::combine(sgn, rs));
             sgn = Sign::combine(sgn, rs);
+            left_is_name = left_is_name || r_is_name;
         }
         Ok((left, sgn))
     }
@@ -6431,6 +6489,7 @@ impl<'a> Parser<'a> {
                 return Err(self.err("`*` must be applied to a name"));
             };
             self.pos += 1;
+            self.name_tokens.insert(self.pos - 1);
             let v = *self
                 .args
                 .get(&inner)
@@ -6757,6 +6816,7 @@ impl<'a> Parser<'a> {
             Some(Tok::Ident(name)) => {
                 self.pos += 1;
                 if name == "ret" || name == "result" {
+                    self.name_tokens.insert(self.pos - 1);
                     let v = self.ret.ok_or_else(|| self.err(self.ret_absent))?;
                     // A trailing `.field` here means the field was not bound: the
                     // return has no such component or variant payload. `rewrite_fields`
@@ -6797,6 +6857,7 @@ impl<'a> Parser<'a> {
                 // Gated on the `(` so an argument *named* `old` still resolves:
                 // `old == 5` is the argument, `old(c)` is the operator.
                 if name == "old" && matches!(self.peek(), Some(Tok::Op(o)) if o == "(") {
+                    self.name_tokens.insert(self.pos - 1);
                     self.pos += 1;
                     // `old(*c)` and `old(c)` name the same entry value: the deref
                     // is the explicit spelling of the referent the bare name
@@ -6806,6 +6867,7 @@ impl<'a> Parser<'a> {
                         return Err(self.err("`old(...)` must name a variable"));
                     };
                     self.pos += 1;
+                    self.name_tokens.insert(self.pos - 1);
                     if !self.eat_op(")") {
                         return Err(self.err("`old(...)` takes a single name"));
                     }
@@ -6893,6 +6955,7 @@ impl<'a> Parser<'a> {
                 // reading the constant there would bind the wrong value -- a false
                 // proof, not a refusal.
                 if let Some(v) = self.args.get(&name).copied() {
+                    self.name_tokens.insert(self.pos - 1);
                     let s = self.is_signed_name(&name);
                     return Ok((v, Sign::from_bool(s)));
                 }
@@ -8347,6 +8410,31 @@ mod tests {
             &old,
         );
         assert!(err.is_err(), "a bare `u32` is not a predicate");
+    }
+
+    /// A name that *holds* a constant is not a written constant expression.
+    ///
+    /// An invariant is evaluated in the loop-head state, where a counter like `i`
+    /// is bound to the value it holds on entry (`0`). `i - 1` is then two constant
+    /// operands, and the fold treated it as the written expression `0 - 1` and
+    /// refused it as an unsigned underflow -- even though `i` is a variable, and
+    /// Rust never range-checks a variable's arithmetic as a constant expression.
+    /// Pinned here, not only in the nightly-gated MIR tests.
+    #[test]
+    fn a_name_holding_a_constant_is_not_a_written_constant_expression() {
+        let mut names = BTreeMap::new();
+        names.insert("i".to_string(), smt::word(0, 32));
+        let signed = BTreeSet::new();
+        let consts = BTreeMap::new();
+        assert!(
+            eval_invariant("i - 1 <= 5", &names, &signed, &consts).is_ok(),
+            "a name holding `0` must not be read as the written constant `0`"
+        );
+        // The *written* form is still refused: rustc rejects `0u32 - 1u32`.
+        assert!(
+            eval_invariant("0 - 1 <= 5", &names, &signed, &consts).is_err(),
+            "the written `0 - 1` is still a rustc const-eval error"
+        );
     }
 
     /// A contract cast sets the target's width *and* sign, and a chain applies

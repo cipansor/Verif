@@ -5336,6 +5336,48 @@ fn a_callee_contract_is_never_assumed() {
     }
 }
 
+/// A loop counter's arithmetic in an invariant is a *variable*'s arithmetic, not
+/// a written constant expression.
+///
+/// The invariant is evaluated in the loop-head state, where the counter is bound
+/// to the value it holds on entry (`0`). `i - 1` then has two constant operands,
+/// and the fold read it as the *written* `0 - 1` and refused it as an unsigned
+/// underflow -- even though Rust never range-checks a variable's arithmetic as a
+/// constant expression. The refusal was a lost proof, not a false one, but it made
+/// the commonest accumulator invariant unreadable. The written form is still
+/// refused, and that negative control is what keeps the fix from dropping the
+/// rustc-mirroring check.
+#[test]
+fn a_counter_arithmetic_in_an_invariant_is_not_a_written_constant() {
+    let Some(report) = verify_realistic(&[
+        "an_invariant_subtracts_from_a_counter",
+        "an_invariant_subtracts_from_a_counter_cannot_prove_this",
+        "an_invariant_written_underflow_is_refused",
+    ]) else {
+        return;
+    };
+
+    let o = outcome(&report, "an_invariant_subtracts_from_a_counter");
+    assert!(
+        o.is_verified(),
+        "a counter's `i - 1` is a variable's arithmetic and must be read; got: {o}"
+    );
+
+    // The false twin proves the shape is *decided*, not discharged vacuously.
+    let o = outcome(&report, "an_invariant_subtracts_from_a_counter_cannot_prove_this");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "the false twin must be refuted, not proved; got: {o}"
+    );
+
+    // The *written* `0 - 1` is still a rustc const-eval error, so it is refused.
+    let o = outcome(&report, "an_invariant_written_underflow_is_refused");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. } | FnOutcome::Incomplete { .. }),
+        "the written `0 - 1` must still be refused, not decided; got: {o}"
+    );
+}
+
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
 /// toolchain.
 ///

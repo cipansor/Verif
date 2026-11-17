@@ -7505,6 +7505,48 @@ pub fn an_invariant_not_preserved_cannot_prove_this(n: u8) -> u8 {
     i
 }
 
+/// A loop counter is a *variable*, so its arithmetic is not a constant
+/// expression.
+///
+/// The invariant is evaluated in the loop-head state, where `i` is bound to the
+/// value it holds on entry. `i - 1` then has two constant operands when the entry
+/// value is a constant, and the fold read it as the *written* expression and
+/// refused it as an unsigned underflow -- even though Rust never range-checks a
+/// variable's arithmetic as a constant expression. The counter's entry value is a
+/// coincidence of the state, not a literal in the source.
+/// requires: n <= 100
+/// invariant: i - 1 <= n
+/// ensures: ret <= 101
+pub fn an_invariant_subtracts_from_a_counter(n: u32) -> u32 {
+    let mut i = 1u32;
+    while i <= n { i += 1; }
+    i
+}
+
+/// The false twin: the same body, and the invariant no longer implies the
+/// postcondition, so it must not verify. This is the evidence that the shape above
+/// is *decided* rather than discharged vacuously.
+/// requires: n <= 100
+/// invariant: i - 1 <= n
+/// ensures: ret <= 0
+pub fn an_invariant_subtracts_from_a_counter_cannot_prove_this(n: u32) -> u32 {
+    let mut i = 1u32;
+    while i <= n { i += 1; }
+    i
+}
+
+/// The *written* constant underflow is still refused: `0u32 - 1u32` is a rustc
+/// const-eval error, so a contract carrying it is malformed rather than
+/// imprecise. The negative control for [`an_invariant_subtracts_from_a_counter`].
+/// requires: n <= 100
+/// invariant: 0 - 1 <= n
+/// ensures: ret <= 101
+pub fn an_invariant_written_underflow_is_refused(n: u32) -> u32 {
+    let mut i = 1u32;
+    while i <= n { i += 1; }
+    i
+}
+
 /// A variable shift whose amount is *wider* than the value, which is the shape
 /// rustc prints: the amount of `a >> b` may be any integer type.
 ///
