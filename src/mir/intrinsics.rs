@@ -1187,6 +1187,23 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             return Some(Intrinsic::SliceGet);
         }
     }
+    // `str::len`/`is_empty`. A `str` is unsized exactly as `[T]` is, so its
+    // length is the same kind of symbolic input and the same two intrinsics
+    // answer it; only the *path* differs (`core::str::<impl str>::len`). The
+    // length binding is done by the binder for a `&str` argument (see
+    // `FieldEnv::bind_indexed_len`), and a receiver whose length is not bound is
+    // refused there rather than given an invented number. `String` is a
+    // different path (`alloc::string::String`), so a `String::len` stays
+    // unmodelled rather than being answered with a slice length it does not
+    // have.
+    if names_str_impl(name) {
+        if short == "is_empty" {
+            return Some(Intrinsic::SliceIsEmpty);
+        }
+        if short == "len" {
+            return Some(Intrinsic::SliceLen);
+        }
+    }
     // `Vec::new`/`push`/`len`. Like the slice shapes these read the receiver's
     // own state (a length the executor tracks) rather than a bit-vector operand,
     // so the executor answers them; `eval` returns `None`. The *path* is checked
@@ -1598,6 +1615,19 @@ pub fn names_from_residual(name: &str) -> bool {
 /// does not have.
 pub fn names_slice_impl(name: &str) -> bool {
     name.contains("slice::<impl [")
+}
+
+/// True when a call names an inherent method on `str`.
+///
+/// `len` and `is_empty` are spelled the same on `[T]`, `Vec`, `String` and many
+/// user types, so the *path* is the only thing that separates them. rustc prints
+/// a `str` method as `core::str::<impl str>::len` (or the `std::str` spelling),
+/// so the `str::<impl str>` projection is what is checked. A `String::len`
+/// (`alloc::string::String::len`) has no `str::<impl str>`, and a user type
+/// spelled `str` is impossible (it is a primitive), so this cannot collide with
+/// a local type.
+pub fn names_str_impl(name: &str) -> bool {
+    name.contains("str::<impl str>")
 }
 
 /// True when a call names an inherent method on the standard library's `Vec`.

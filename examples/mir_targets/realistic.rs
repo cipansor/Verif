@@ -12212,3 +12212,40 @@ pub fn checked_next_power_of_two_out_of_range_is_none(a: u8) -> Option<u8> {
     a.checked_next_power_of_two()
 }
 
+/// A `&str` length is a symbolic input, so an unbounded one bounds nothing but
+/// itself.
+/// requires: true
+/// ensures: ret <= s.len()
+pub fn str_len_is_itself(s: &str) -> usize {
+    s.len()
+}
+
+/// The length is pinned by the precondition, so the body's read is that value --
+/// the contract's `s.len()` and the body's are one variable.
+/// requires: s.len() == 3
+/// ensures: ret == 3
+pub fn str_len_pinned(s: &str) -> usize {
+    s.len()
+}
+
+/// The false twin: an unbounded `&str` length is not a fixed value.
+/// requires: true
+/// ensures: ret == 4
+pub fn str_len_cannot_prove_this(s: &str) -> usize {
+    s.len()
+}
+
+/// `is_empty` reads the same length variable, so it agrees with `len`.
+/// requires: s.len() == 0
+/// ensures: ret
+pub fn str_is_empty_pinned(s: &str) -> bool {
+    s.is_empty()
+}
+
+/// The false twin of `str_is_empty_pinned`: a non-empty string is not empty.
+/// requires: s.len() == 5
+/// ensures: ret
+pub fn str_is_empty_cannot_prove_this(s: &str) -> bool {
+    s.is_empty()
+}
+

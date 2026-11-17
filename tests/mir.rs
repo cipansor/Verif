@@ -6947,6 +6947,52 @@ pub fn model_would_say_zero() -> usize { let v = Vec::new(); v.len() }
     );
 }
 
+/// A `&str` argument's length is a symbolic input, exactly as a `&[T]` slice's is.
+///
+/// `str` is unsized, so its length lives in the fat pointer and is a caller
+/// choice, not a constant in the type. `s.len()`/`s.is_empty()` read only that
+/// length, so they are modelled the same way the slice ones are -- the same two
+/// intrinsics, a different path (`core::str::<impl str>::len`). The length is
+/// bound by the contract binder, so a body's `s.len()` and a contract's `s.len()`
+/// name one variable: a `requires: s.len() == 3` pins the body's read, and the
+/// false twin is refuted.
+///
+/// `String` is deliberately *not* covered: it is a different type
+/// (`alloc::string::String`), so `String::len` stays an honest refusal rather
+/// than being answered with a length the model does not hold.
+#[test]
+fn a_str_length_is_a_symbolic_input() {
+    let src = r#"
+/// requires: true
+/// ensures: ret <= s.len()
+pub fn len_bound(s: &str) -> usize { s.len() }
+
+/// The length is pinned by the precondition, so the body's read is that value.
+/// requires: s.len() == 3
+/// ensures: ret == 3
+pub fn pinned_len(s: &str) -> usize { s.len() }
+
+/// The false twin: an unbounded `&str` length is not 4.
+/// requires: true
+/// ensures: ret == 4
+pub fn wrong_len_cannot_prove_this(s: &str) -> usize { s.len() }
+
+/// `is_empty` reads the same variable, so it agrees with `len`.
+/// requires: s.len() == 0
+/// ensures: ret
+pub fn empty_is_empty(s: &str) -> bool { s.is_empty() }
+"#;
+    for name in ["len_bound", "pinned_len", "empty_is_empty"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    let Some(o) = verify_src("wrong_len_cannot_prove_this", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "an unbounded `&str` length must not be provable as `4`; got: {o}"
+    );
+}
+
 /// A `&mut [u8]` slice write must reach the store the read consults.
 ///
 /// This is the gap the `&raw const (fake) (*_1)` parse closed. Before it, the

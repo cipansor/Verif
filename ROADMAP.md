@@ -419,8 +419,8 @@ keeps growing.
     `exec::Indexed::elem_w`). Every *element* operation on a `&[T]` stays refused,
     which is the honest split; see the progress note below.
   - Also modelled since: `signum`, `div_euclid`/`rem_euclid`, `div_ceil`,
-    `midpoint`, `next_multiple_of`, `ilog2`/`ilog10`, and the `next_power_of_two`
-    pair — see the progress notes below.
+    `midpoint`, `next_multiple_of`, `ilog2`/`ilog10`, the `next_power_of_two`
+    pair, and `str::len`/`str::is_empty` — see the progress notes below.
   - Approach: the C2 contract library, plus a published list of the modelled
     `core` items with each item's oracle.
   - Exit: `abs_small`, `clamp_builtin`, `digit`, `first_or` verified; the list is
@@ -719,6 +719,20 @@ keeps growing.
     `realistic.rs` (**583 of 1065**), pinned by
     `wrapping_shifts_are_modelled_with_the_amount_reduced_modulo_the_width`; the
     no-reduction mutation flips both left-shift verdicts and fails that test.
+  - Progress (cont.): `str::len`/`str::is_empty` are modelled. A `str` is unsized
+    exactly as `[T]` is, so its length is the same kind of symbolic input and the
+    *same two intrinsics* answer it — only the path differs
+    (`core::str::<impl str>::len`). The `&str` argument's length is bound by the
+    contract binder with the unmodelled-width sentinel (the same `bind_indexed_len`
+    a generic `&[T]` uses), so `s.len()` in a contract and `PtrMetadata` in the
+    body name one variable and a `requires: s.len() == 3` pins the body's read.
+    `String` is deliberately not covered: it is a different type
+    (`alloc::string::String`), so `String::len` stays an honest refusal rather than
+    being answered with a length the model does not hold — a `String::len` call has
+    no `str::<impl str>` in its path. Five fixtures in `realistic.rs` (three true,
+    two tripwires), pinned by `a_str_length_is_a_symbolic_input`; reverting either
+    the binding or the classifier fails that test. `realistic.rs`
+    **583 of 1065 -> 586 of 1070**.
 - **C7. Arithmetic scale and speed.** · P0 · in progress · Kani, Boolector,
   Bitwuzla
   - Gap: `u32::wrapping_mul` is past the 32-bit model; `clamp_std` takes 9.9 s.
