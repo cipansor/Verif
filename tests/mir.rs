@@ -6596,6 +6596,48 @@ fn option_or_and_are_total_and_select_the_right_operand() {
     }
 }
 
+/// `Option<&T>::copied()`/`cloned()` is the everyday `v.first().copied()` idiom:
+/// the value the payload reference addresses, with the receiver's tag unchanged.
+///
+/// The model stores a `&T` payload as the value it addresses, so the result's
+/// payload is the receiver's -- `v.first().copied()` and `*v.first().unwrap()`
+/// name one word. Two things are pinned, each a way the model could be wrong:
+///
+/// * the payload: the copied value must be the slice's own element, so a claim
+///   about the element verifies and a claim about a different value is refuted.
+/// * the tag: `copied` keeps the receiver's tag, so on an empty slice `unwrap_or`
+///   takes the default rather than panicking -- a model that fixed the tag to
+///   `Some` would refute `copied_empty_is_none`.
+///
+/// `cloned` is the same shape as `copied` for a `Copy` element, so one arm serves
+/// both and the `cloned` fixture pins that the shared arm is reached.
+#[test]
+fn option_copied_and_cloned_copy_the_payload_with_the_tag() {
+    let names = [
+        "copied_first_is_the_element",
+        "copied_first_tripwire",
+        "copied_get_is_the_element",
+        "copied_get_tripwire",
+        "copied_empty_is_none",
+        "cloned_first_is_the_element",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "copied_first_is_the_element",
+        "copied_get_is_the_element",
+        "copied_empty_is_none",
+        "cloned_first_is_the_element",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in ["copied_first_tripwire", "copied_get_tripwire"] {
+        assert_refuted(&report, name);
+    }
+}
+
 /// A `&mut bool` argument's final value is a predicate, not a word.
 ///
 /// The postcondition's bare `c` means the value the body left at the target. A

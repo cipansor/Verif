@@ -5434,6 +5434,24 @@ fn enum_method(
             }
             Vec::new()
         }
+        // `Option<&T>::copied()`/`cloned()`: the value the payload reference
+        // addresses, with the receiver's tag unchanged. The model stores a `&T`
+        // payload as the value it addresses, so the result's payload *is* the
+        // receiver's -- `v.first().copied()` and `*v.first().unwrap()` name one
+        // word. Only the tag passes through; the element identity is dropped,
+        // because the result is a value, not a reference, so a later `*` on it is
+        // not a modelled read. A receiver with no payload on some path is refused
+        // (the same rule `or`/`and` apply), because the copied value would be one
+        // the receiver never holds.
+        OptionMethod::Copied => {
+            let payload =
+                payload_if_some(env, opt.local, tag, payload_variant, "a receiver", name)?;
+            env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+            if let Some((payload, sign, w)) = payload {
+                env.set_payload(dest.local, payload_variant, Val::Sym(payload, sign), w);
+            }
+            Vec::new()
+        }
         // `unwrap`/`unwrap_or` read the payload, which `checked_*` recorded
         // *unconditionally* -- it is only ever read on a path whose tag is the
         // success variant, which rustc guarantees by emitting the downcast

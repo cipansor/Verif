@@ -214,6 +214,57 @@ pub fn first_match_empty_takes_none(xs: &[u8]) -> u8 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `Option<&T>::copied()` / `cloned()`: the everyday `v.first().copied()` idiom.
+//
+// The model stores a `&T` payload as the value it addresses, so `copied`'s result
+// payload is the receiver's -- `v.first().copied()` and `*v.first().unwrap()` name
+// one word. Only the tag passes through; a model that dropped the tag, or produced
+// a fresh payload, proves a tripwire.
+
+/// `xs.first().copied()` is the slice's own element 0, reached without a deref.
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 5
+pub fn copied_first_is_the_element(xs: &[u8]) -> u8 {
+    xs.first().copied().unwrap()
+}
+
+/// The false direction: the copied value is the element, not a fresh one.
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 6
+pub fn copied_first_tripwire(xs: &[u8]) -> u8 {
+    xs.first().copied().unwrap()
+}
+
+/// `get(k).copied()` names `xs[k]`, so the subscript and the method agree.
+/// requires: xs.len() > 1 && xs[1] == 7
+/// ensures: ret == 7
+pub fn copied_get_is_the_element(xs: &[u8]) -> u8 {
+    xs.get(1).copied().unwrap()
+}
+
+/// The false direction for `get`'s `copied` form.
+/// requires: xs.len() > 1 && xs[1] == 7
+/// ensures: ret == 8
+pub fn copied_get_tripwire(xs: &[u8]) -> u8 {
+    xs.get(1).copied().unwrap()
+}
+
+/// `copied` keeps the receiver's tag, so on an empty slice `unwrap_or` takes the
+/// default -- a model that fixed the tag to `Some` would panic here.
+/// requires: xs.len() == 0
+/// ensures: ret == 0
+pub fn copied_empty_is_none(xs: &[u8]) -> u8 {
+    xs.first().copied().unwrap_or(0)
+}
+
+/// `cloned` is the same shape as `copied` for a `Copy` element.
+/// requires: xs.len() > 0 && xs[0] == 9
+/// ensures: ret == 9
+pub fn cloned_first_is_the_element(xs: &[u8]) -> u8 {
+    xs.first().cloned().unwrap()
+}
+
 /// A fixed-size array argument. Unlike a slice the length is a *type*
 /// constant, so `a.len()` is not an input and the bounds check is against a
 /// literal: `_3 = Lt(_2, const 4_usize)`. That literal is what makes this shape

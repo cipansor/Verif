@@ -890,6 +890,18 @@ pub enum OptionMethod {
     /// `Option::and(other)`: `other` on `Some`, the receiver (`None`) on `None`.
     /// Total, and the mirror of [`OptionMethod::Or`].
     And,
+    /// `Option<&T>::copied()` / `Option<&T>::cloned()`: the value the payload
+    /// reference addresses, with the tag unchanged.
+    ///
+    /// The model stores a `&T` payload as the *value* it addresses (the
+    /// single-owner reading every reference in this frontend takes), so the
+    /// result's payload is the receiver's -- `v.first().copied()` and
+    /// `*v.first().unwrap()` name one word. Only the tag passes through
+    /// unchanged, and the element identity is dropped, because the result is a
+    /// value rather than a reference, so a later `*` on it is not modelled.
+    /// `copied` and `cloned` are the same shape (`Copy` and `Clone` both copy the
+    /// referent), so one variant serves both.
+    Copied,
 }
 
 /// A widening integer conversion: `u16::from(x)` where `x: u8`, `x.into()`.
@@ -1261,6 +1273,9 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             "ok_or" => return Some(Intrinsic::OptionMethod(OptionMethod::OkOr)),
             "or" => return Some(Intrinsic::OptionMethod(OptionMethod::Or)),
             "and" => return Some(Intrinsic::OptionMethod(OptionMethod::And)),
+            "copied" | "cloned" => {
+                return Some(Intrinsic::OptionMethod(OptionMethod::Copied))
+            }
             _ => {}
         }
     }

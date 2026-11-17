@@ -784,6 +784,23 @@ keeps growing.
     two tripwires), pinned by `a_str_length_is_a_symbolic_input`; reverting either
     the binding or the classifier fails that test. `realistic.rs`
     **583 of 1065 -> 586 of 1070**.
+  - Progress (cont.): `Option<&T>::copied`/`cloned` are modelled — the everyday
+    `v.first().copied().unwrap_or(0)` idiom, and the two closure-free methods that
+    turn a `slice::first`/`get` result into the element's own value. The model
+    stores a `&T` payload as the value it addresses (the single-owner reading every
+    reference here takes), so the result's payload *is* the receiver's and only the
+    tag passes through unchanged; the element identity is dropped, because the
+    result is a value rather than a reference, so a later `*` on it is not a
+    modelled read. A receiver with no payload on some path is refused (the rule
+    `or`/`and` already apply), and `copied`/`cloned` share one arm because `Copy`
+    and `Clone` both copy the referent. Six fixtures in `realistic.rs` (four true,
+    two tripwires), pinned by
+    `option_copied_and_cloned_copy_the_payload_with_the_tag`; the tag half is what
+    the `copied_empty_is_none` fixture pins (a model that fixed the tag to `Some`
+    would panic on `unwrap_or`), and the payload half is what the two tripwires
+    pin (a claim about a different element refutes). `realistic.rs`
+    **615 of 1125** (from **611 of 1119**; six new fixtures, four verified and two
+    refuted).
 - **C7. Arithmetic scale and speed.** · P0 · in progress · Kani, Boolector,
   Bitwuzla
   - Gap: `u32::wrapping_mul` is past the 32-bit model; `clamp_std` takes 9.9 s.
