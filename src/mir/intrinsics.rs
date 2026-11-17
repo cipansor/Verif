@@ -78,22 +78,25 @@
 //!   the trap here: it reports `MIN / -1` in its flag, which makes it look like a
 //!   total form of division, but its flag is not the whole failure predicate and
 //!   the zero divisor still panics.
-//! * The shifts are refused because the families disagree: `wrapping_shl` takes
-//!   the amount modulo the width, while the engine's variable shift saturates to
-//!   zero, and `checked_shl` returns `None` past the width. Three behaviours
-//!   under one name is not something to guess at.
+//! * `wrapping_shl`/`wrapping_shr` take the amount modulo the width, so they are
+//!   modelled as a shift by the low `log2(w)` bits (the same reduction a rotation
+//!   does), with `shr` arithmetic on a signed receiver and logical on an unsigned
+//!   one. The *other* shift spellings are refused because the families disagree:
+//!   the engine's variable shift saturates to zero past the width, while
+//!   `checked_shl` returns `None` and `overflowing_shl` reports a flag. Three
+//!   behaviours under one name is not something to guess at.
 //! * `unchecked_*` is undefined behaviour on overflow. There is no value to
 //!   model, and a proof about UB is not a proof, so it is refused.
 //! * `pow` is modelled as a fold over the exponent's bits (see [`POW_MAX_WIDTH`]).
 //!   `div_floor` and the float ops remain absent, and an unmodelled name is
 //!   refused rather than approximated.
 //!
-//! `abs_diff`, `rotate_left`/`rotate_right`, the ten `is_ascii_*` classes and the
-//! sign predicates `is_negative`/`is_positive` are modelled, and this header said
-//! otherwise for a while -- the list of what is modelled has to move with the
-//! tables below it. The unit test `the_documented_modelled_set_matches_classify`
-//! pins the spellings it names so a later removal cannot leave the prose behind
-//! again.
+//! `abs_diff`, `rotate_left`/`rotate_right`, `wrapping_shl`/`wrapping_shr`, the
+//! ten `is_ascii_*` classes and the sign predicates `is_negative`/`is_positive`
+//! are modelled, and this header said otherwise for a while -- the list of what is
+//! modelled has to move with the tables below it. The unit test
+//! `the_documented_modelled_set_matches_classify` pins the spellings it names so a
+//! later removal cannot leave the prose behind again.
 
 use crate::mir::parse::{BinOp, Ty};
 use crate::smt::{self, Pred, Var};
@@ -361,6 +364,18 @@ pub enum Intrinsic {
     /// is a barrel shifter in each direction OR-ed together, with the amount read
     /// modulo the width. It exists on both signednesses and is total.
     Rotate(RotateKind),
+    /// `iN::wrapping_shl`/`wrapping_shr`: a shift with the amount reduced modulo
+    /// the width.
+    ///
+    /// Total, and the amount is a `u32` beside a value of the method's own width.
+    /// `core` reduces it modulo the width (`1u8.wrapping_shl(8)` is `1`), so it is
+    /// the *same* reduction a rotation does -- one `and`, no divider -- rather than
+    /// the plain `<<`/`>>` (which panic past the width) or the engine's variable
+    /// shift (which saturates to zero). `wrapping_shr` is *arithmetic* on a signed
+    /// type (it fills from the sign bit, `-8i8.wrapping_shr(1)` is `-4`) and
+    /// *logical* on an unsigned one, so the sign decides which. Exists on both
+    /// signednesses.
+    WrappingShift(ShiftKind),
     /// `iN::signum`: `-1`, `0` or `1` according to the sign of the operand.
     ///
     /// It exists only on the *signed* types (`u32::signum` is not a method), so a
@@ -970,6 +985,19 @@ pub enum RotateKind {
     Right,
 }
 
+/// Which way a `wrapping_shl`/`wrapping_shr` shifts.
+///
+/// The direction is the whole content for `shr`, whose fill depends on the
+/// receiver's signedness (arithmetic for a signed type, logical for an unsigned
+/// one); `shl` fills with zeros either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShiftKind {
+    /// `wrapping_shl`: bits move toward the high end, zeros shift in.
+    Left,
+    /// `wrapping_shr`: bits move toward the low end; the fill follows the sign.
+    Right,
+}
+
 impl Intrinsic {
     /// True for the shapes that take one operand and no operator.
     ///
@@ -1287,6 +1315,17 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     }
     if short == "rotate_right" {
         return Some(Intrinsic::Rotate(RotateKind::Right));
+    }
+    // The wrapping shifts. Their amount is reduced modulo the width, exactly as a
+    // rotation's is, so they are matched here rather than by the family split --
+    // which would see `shl`/`shr` and look for an operator of that name (there is
+    // none: the shift families genuinely disagree, so a plain `<<`/`>>` inside a
+    // family is not the same operation and is not read).
+    if short == "wrapping_shl" {
+        return Some(Intrinsic::WrappingShift(ShiftKind::Left));
+    }
+    if short == "wrapping_shr" {
+        return Some(Intrinsic::WrappingShift(ShiftKind::Right));
     }
     // The remaining total, family-less value methods. Like `abs_diff` and the
     // rotations they are matched before the family split, which would otherwise
@@ -1758,6 +1797,11 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // non-power-of-two width is refused rather than answered with the wrong
         // rotation.
         Intrinsic::Rotate(_) => (1..=64).contains(&w) && w.is_power_of_two(),
+        // The wrapping shifts reduce the amount the same way a rotation does, so
+        // they share its power-of-two requirement for the same reason: the
+        // reduction is the low `log2(w)` bits, which is `n mod w` only when `w` is
+        // a power of two. They exist on both signednesses and are total.
+        Intrinsic::WrappingShift(_) => (1..=64).contains(&w) && w.is_power_of_two(),
         // `signum` exists only on the *signed* types, so an unsigned receiver is
         // not this method. Total.
         Intrinsic::Signum => signed,
@@ -2268,6 +2312,16 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             }
             Outcome::Value(rotate(x, y, w, kind))
         }
+        // The wrapping shifts: the same modulo-width amount a rotation reduces to,
+        // then a shift. `wrapping_shr` fills from the sign bit on a signed type
+        // (arithmetic) and with zeros on an unsigned one (logical), so the sign
+        // decides the engine's shift kind.
+        Intrinsic::WrappingShift(kind) => {
+            if w == 0 || w > 64 {
+                return None;
+            }
+            Outcome::Value(wrapping_shift(x, y, w, signed, kind))
+        }
         // `signum`: `-1`, `0` or `1`. The two comparisons are the engine's signed
         // ones, so `MIN` is below zero; `-1` is the all-ones pattern at `w` bits.
         Intrinsic::Signum => {
@@ -2472,6 +2526,32 @@ pub fn rotate(x: Var, n: Var, w: u8, kind: RotateKind) -> Var {
             let lo = smt::shift_var(smt::Shift::LogicalRight, x, low);
             let hi = smt::shift_var(smt::Shift::Left, x, smt::sub(smt::word(w as u64, smt::bits(n)), low));
             smt::bor(lo, hi)
+        }
+    }
+}
+
+/// `x.wrapping_shl(n)` / `x.wrapping_shr(n)` at width `w`.
+///
+/// `core` reduces the amount modulo the width (`1u8.wrapping_shl(8)` is `1`), the
+/// same reduction a rotation does, so the amount is the low `log2(w)` bits -- one
+/// `and`, no divider. The shift itself is the engine's variable shift: `shl` is
+/// zeros in, and `shr` fills from the sign bit on a signed receiver (arithmetic)
+/// and with zeros on an unsigned one (logical). The reduced amount is always
+/// below the width, so the engine's saturation-at-the-width case is never reached
+/// -- the reduction is exactly what keeps the shift well-defined.
+pub fn wrapping_shift(x: Var, n: Var, w: u8, signed: bool, kind: ShiftKind) -> Var {
+    let bits = (w as u32).trailing_zeros();
+    let low_mask = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+    let low = smt::band(n, smt::word(low_mask as u64, smt::bits(n)));
+    match kind {
+        ShiftKind::Left => smt::shift_var(smt::Shift::Left, x, low),
+        ShiftKind::Right => {
+            let dir = if signed {
+                smt::Shift::ArithmeticRight
+            } else {
+                smt::Shift::LogicalRight
+            };
+            smt::shift_var(dir, x, low)
         }
     }
 }
@@ -4693,10 +4773,13 @@ mod tests {
     #[test]
     fn unmodelled_names_are_refused() {
         // Unknown operator: `shl` is not in the operator table, so the whole
-        // suffix fails to match. (`pow` *is* modelled now -- it is its own shape,
-        // not an operator -- so it is no longer an example here.)
-        assert!(classify("wrapping_shl").is_none());
+        // suffix fails to match. `wrapping_shl` *is* modelled now -- it is its own
+        // shape, not a family operator -- so the remaining shift spellings are the
+        // examples: `checked_shl` and `overflowing_shl` carry the same suffix and
+        // still fail to match an operator.
         assert!(classify("checked_shl").is_none());
+        assert!(classify("overflowing_shl").is_none());
+        assert!(classify("saturating_shl").is_none());
         assert!(classify("unchecked_add").is_none());
         // The suffix is matched whole, so a near miss is not read as a modelled
         // shape. `add_signed` *is* modelled now, but only the exact spelling: a
@@ -5579,6 +5662,20 @@ mod tests {
         );
         assert!(classify("rotate_left_signed").is_none());
         assert!(classify("abs_diff_thing").is_none());
+        // The wrapping shifts are matched by their exact tail too, so the plain
+        // `<<`/`>>` families (which the engine must *not* guess at) stay refused.
+        assert_eq!(
+            classify("core::num::<impl u8>::wrapping_shl"),
+            Some(Intrinsic::WrappingShift(ShiftKind::Left))
+        );
+        assert_eq!(
+            classify("core::num::<impl i32>::wrapping_shr"),
+            Some(Intrinsic::WrappingShift(ShiftKind::Right))
+        );
+        assert!(classify("core::num::<impl u8>::wrapping_shl_thing").is_none());
+        assert!(classify("core::num::<impl u8>::checked_shl").is_none());
+        assert!(classify("core::num::<impl u8>::overflowing_shr").is_none());
+        assert!(classify("core::num::<impl u8>::saturating_shl").is_none());
     }
     /// The module header's "what is modelled" list must match the tables below it.
     ///
@@ -5596,6 +5693,14 @@ mod tests {
         assert_eq!(
             classify("core::num::<impl u8>::rotate_right"),
             Some(Intrinsic::Rotate(RotateKind::Right))
+        );
+        assert_eq!(
+            classify("core::num::<impl u8>::wrapping_shl"),
+            Some(Intrinsic::WrappingShift(ShiftKind::Left))
+        );
+        assert_eq!(
+            classify("core::num::<impl u8>::wrapping_shr"),
+            Some(Intrinsic::WrappingShift(ShiftKind::Right))
         );
         // All ten ASCII classes, so "the ten `is_ascii_*` classes" is a count a
         // reader can check rather than a number to trust.
@@ -6139,6 +6244,95 @@ mod tests {
                     .expect("a rotation is modelled")
                 else {
                     panic!("a rotation must produce a plain value");
+                };
+                let (ai, bi) = (smt::index(a), smt::index(b));
+                smt::evaluate(v, |i| {
+                    if i == ai {
+                        Some(x as u64)
+                    } else if i == bi {
+                        Some(n as u64)
+                    } else {
+                        None
+                    }
+                })
+            });
+            assert_eq!(got, Some(want as u64), "{why} ({x:#x}, {n})");
+        }
+    }
+
+    /// The wrapping shifts agree with Rust's own `wrapping_shl`/`wrapping_shr`.
+    ///
+    /// The oracle is `core`'s methods themselves, walked over the whole operand
+    /// domain: the amount is the second operand's bits, and the reduction modulo
+    /// the width is what the model must reproduce. The signed `wrapping_shr` is the
+    /// half a logical shift would get wrong (it fills from the sign bit), so both
+    /// signednesses are swept.
+    #[test]
+    fn wrapping_shifts_agree_with_rust() {
+        // `wrapping_shl` on `u8` and `i8`. The amount is a `u32` in the dump; the
+        // check passes it at the value's width, which is all the reduction reads.
+        for (signed, label) in [(false, "u8::wrapping_shl"), (true, "i8::wrapping_shl")] {
+            check(
+                Intrinsic::WrappingShift(ShiftKind::Left),
+                8,
+                signed,
+                if signed {
+                    |b| i8::from_ne_bytes([b as u8]) as i64
+                } else {
+                    |b| b as i64
+                },
+                if signed { |v| v as u8 as u64 } else { |v| v as u64 },
+                move |x, n| {
+                    let r = if signed {
+                        (x as i8).wrapping_shl(n as u32) as u8
+                    } else {
+                        (x as u8).wrapping_shl(n as u32)
+                    };
+                    Some(i64::from(r))
+                },
+                label,
+            );
+        }
+        // `wrapping_shr`: logical on `u8`, arithmetic on `i8`. The signed case is
+        // the one a logical shift refutes at a negative operand, so the oracle is
+        // Rust's own method rather than a re-derived rule.
+        check(
+            Intrinsic::WrappingShift(ShiftKind::Right),
+            8,
+            false,
+            |b| b as i64,
+            |v| v as u64,
+            |x, n| Some(i64::from((x as u8).wrapping_shr(n as u32))),
+            "u8::wrapping_shr",
+        );
+        check(
+            Intrinsic::WrappingShift(ShiftKind::Right),
+            8,
+            true,
+            |b| i8::from_ne_bytes([b as u8]) as i64,
+            |v| v as u8 as u64,
+            |x, n| Some(i64::from((x as i8).wrapping_shr(n as u32) as u8)),
+            "i8::wrapping_shr",
+        );
+        // The named boundaries, so a failure names the input that broke: the
+        // amount reduces modulo the width, `shl` is zeros in, and `shr` fills from
+        // the sign bit on a signed receiver and with zeros on an unsigned one.
+        for (kind, signed, x, n, want, why) in [
+            (ShiftKind::Left, false, 1u8, 8u32, 1u8, "shl by the width is the identity"),
+            (ShiftKind::Left, false, 1, 9, 2, "shl by w+1 is by 1"),
+            (ShiftKind::Right, false, 128, 8, 128, "unsigned shr by the width is the identity"),
+            (ShiftKind::Right, false, 128, 9, 64, "unsigned shr by w+1 is by 1"),
+            (ShiftKind::Right, true, 0x80, 8, 0x80, "signed shr by the width is the identity"),
+            (ShiftKind::Right, true, 0x80, 9, 0xc0, "signed shr by w+1 is by 1, sign-filled"),
+            (ShiftKind::Right, true, 0xf8, 1, 0xfc, "signed shr by 1 fills from the sign"),
+        ] {
+            let got = smt::with_fresh(|| {
+                let (a, b) = (smt::var(8), smt::var(32));
+                let Outcome::Value(v) =
+                    eval(Intrinsic::WrappingShift(kind), a, b, 8, signed, 8)
+                        .expect("a wrapping shift is modelled")
+                else {
+                    panic!("a wrapping shift must produce a plain value");
                 };
                 let (ai, bi) = (smt::index(a), smt::index(b));
                 smt::evaluate(v, |i| {

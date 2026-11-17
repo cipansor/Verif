@@ -663,6 +663,23 @@ with no new false proof while the independent corpus keeps growing.
     `a_generic_slices_length_is_modelled_but_its_element_is_not` and six corpus
     fixtures (three verify, one refutes, one skips on purpose, one refutes the
     element claim is not proved).
+  - Progress (cont.): `iN::wrapping_shl`/`wrapping_shr` are modelled. `core`
+    reduces the amount modulo the width (`1u8.wrapping_shl(8)` is `1`), which is
+    exactly the reduction a rotation does — the low `log2(w)` bits, one `and` and
+    no divider — so the two share the amount computation and the power-of-two
+    width requirement. `wrapping_shl` fills with zeros; `wrapping_shr` is
+    *arithmetic* on a signed receiver (`-8i8.wrapping_shr(1)` is `-4`) and
+    *logical* on an unsigned one, so the sign decides the engine's shift kind.
+    These are the *only* shift spellings the model takes: the plain families
+    genuinely disagree (`checked_shl` returns `None` past the width,
+    `overflowing_shl` reports a flag, and the engine's own variable shift
+    saturates to zero), so `checked_shl`/`overflowing_shl`/`saturating_shl` stay
+    refused rather than guessed at. Checked exhaustively against Rust's own
+    methods over the whole `u8`/`i8` operand domain
+    (`wrapping_shifts_agree_with_rust`), with a mutation to a logical shift and
+    one that drops the amount reduction each caught; five fixtures (three true,
+    two tripwires) in `realistic.rs` (**583 of 1065**), pinned by
+    `wrapping_shifts_are_modelled_with_the_amount_reduced_modulo_the_width`.
 - **C7. Arithmetic scale and speed.** · P0 · in progress · Kani, Boolector,
   Bitwuzla
   - Gap: `u32::wrapping_mul` is past the 32-bit model; `clamp_std` takes 9.9 s.

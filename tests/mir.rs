@@ -7749,6 +7749,49 @@ fn a_wrapping_method_in_a_contract_is_read_as_the_operator_it_denotes() {
     }
 }
 
+/// `wrapping_shl`/`wrapping_shr` are modelled as a shift by the amount reduced
+/// modulo the width, with `shr` arithmetic on a signed receiver and logical on an
+/// unsigned one. The model was checked against Rust's own methods over the whole
+/// `u8`/`i8` operand domain in `intrinsics::tests::wrapping_shifts_agree_with_rust`
+/// (a mutation to a logical shift, and one that drops the amount reduction, each
+/// fail it); these corpus entries pin the *end-to-end* verdicts, so a regression
+/// in the wiring -- not just the model -- is caught.
+///
+/// Each true entry has a false twin that a wrong model would *prove*: the tripwire
+/// that claims `2` for `1u8.wrapping_shl(8)` is false only because the amount
+/// reduces (`1`), and the one that claims `124` for `-8i8.wrapping_shr(1)` is false
+/// only because the shift is arithmetic (`-4`).
+#[test]
+fn wrapping_shifts_are_modelled_with_the_amount_reduced_modulo_the_width() {
+    let Some(report) = verify_realistic(&[
+        "wrapping_shl_reduces_its_amount",
+        "wrapping_shl_is_not_a_plain_shift_tripwire",
+        "wrapping_shr_signed_is_arithmetic",
+        "wrapping_shr_signed_is_not_logical_tripwire",
+        "wrapping_shr_unsigned_is_logical",
+    ]) else {
+        return;
+    };
+    for name in [
+        "wrapping_shl_reduces_its_amount",
+        "wrapping_shr_signed_is_arithmetic",
+        "wrapping_shr_unsigned_is_logical",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "wrapping_shl_is_not_a_plain_shift_tripwire",
+        "wrapping_shr_signed_is_not_logical_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` is false under the correct model and must be refuted, got: {o}"
+        );
+    }
+}
+
 /// The contract operators that were missing (`/ % << >>`), and the precedence
 /// they need. A missing operator is a dropped obligation -- the contract is
 /// unreadable and the function silently leaves the check set -- so each entry
@@ -11814,7 +11857,7 @@ pub fn count_down(n: u8) -> u8 {
 
 /// requires: true
 /// decreases: n
-/// ensures: ret == n
+/// ensures: ret == 0
 pub fn walk(n: u8, c: &mut u8) -> u8 {
     if n == 0 { 0 } else { *c = c.wrapping_add(1); walk(n - 1, c) }
 }
@@ -11859,6 +11902,36 @@ pub fn loop_calls_ref_recursive_cannot_prove_this(x: &mut u8) -> u8 {
     while i < 3 { walk(1, x); i += 1; }
     *x
 }
+
+/// A *mutual* recursion cycle reached from an invariant loop: `even_w` calls
+/// `odd_w` calls `even_w`. The write-set walk must terminate on the cycle
+/// (`visiting` holds the functions on the stack), and neither callee writes a
+/// reference, so the loop's only write is its own counter. Before the cycle
+/// guard this was an unbounded recursion between *invocations* and overflowed the
+/// stack, aborting the whole run.
+/// requires: n <= 8
+/// invariant: i <= 3
+/// ensures: ret <= 1
+pub fn loop_calls_mutual_recursive(n: u8) -> u8 {
+    let mut i = 0u8;
+    let mut s = 0u8;
+    while i < 3 { s = even_w(n); i += 1; }
+    s
+}
+
+/// requires: true
+/// decreases: n
+/// ensures: ret <= 1
+pub fn even_w(n: u8) -> u8 {
+    if n == 0 { 1 } else { odd_w(n - 1) }
+}
+
+/// requires: true
+/// decreases: n
+/// ensures: ret <= 1
+pub fn odd_w(n: u8) -> u8 {
+    if n == 0 { 0 } else { even_w(n - 1) }
+}
 "#;
         // The crash vehicle: a scalar-only call into a self-recursive callee. The
         // walk must *return* (a stack overflow aborts the binary, so reaching the
@@ -11877,6 +11950,18 @@ pub fn loop_calls_ref_recursive_cannot_prove_this(x: &mut u8) -> u8 {
                  terminates; a refusal here means the walk gave up, got: {o}"
             );
         }
+        // A loop reaching a *mutually* recursive callee. Mutual recursion has no
+        // single decreasing measure here, so it is not *proved* -- but the
+        // write-set walk must still terminate on the cycle (reaching this
+        // assertion at all is the evidence: an unbounded walk aborts the binary),
+        // and the loop must never come back `Verified`, which would be a proof of
+        // an unmodelled call.
+        let Some(m) = verify_src("loop_calls_mutual_recursive", src) else { return };
+        assert!(
+            !m.is_verified(),
+            "a loop reaching a mutually recursive callee must not be *proved* (mutual \
+             recursion is not modelled), got: {m}"
+        );
         let Some(f) = verify_src("loop_calls_recursive_cannot_prove_this", src) else {
             return;
         };

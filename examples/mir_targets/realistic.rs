@@ -3785,6 +3785,51 @@ pub fn contract_wrapping_add_on_an_untyped_receiver_is_refused(x: u8) -> u8 {
     x
 }
 
+/// `wrapping_shl`/`wrapping_shr` reduce the amount modulo the width, the same
+/// reduction a rotation does, so `x.wrapping_shl(8)` is `x` at eight bits. The
+/// body's shift and the contract's `ret <= 255` are one value, and the two
+/// amount-boundary cases (`8`, `9`) are the ones the modulo decides.
+/// requires: true
+/// ensures: ret <= 255
+pub fn wrapping_shl_reduces_its_amount(x: u8, n: u32) -> u8 {
+    x.wrapping_shl(n)
+}
+
+/// The false twin: `1u8.wrapping_shl(8)` is `1`, not `2`, so the modulo is what
+/// makes this refuted rather than a proof about a shift the engine saturated to
+/// zero.
+/// requires: x == 1 && n == 8
+/// ensures: ret == 2
+pub fn wrapping_shl_is_not_a_plain_shift_tripwire(x: u8, n: u32) -> u8 {
+    x.wrapping_shl(n)
+}
+
+/// `wrapping_shr` is *arithmetic* on a signed receiver: `-8i8.wrapping_shr(1)` is
+/// `-4`, so a model that took the logical shift would refute this. The amount is
+/// reduced modulo the width (`9` is `1`), which the second half pins.
+/// requires: x == -8 && n == 1
+/// ensures: ret == -4
+pub fn wrapping_shr_signed_is_arithmetic(x: i8, n: u32) -> i8 {
+    x.wrapping_shr(n)
+}
+
+/// The logical reading of the same call, which is the wrong one for a signed
+/// receiver: `-8i8.wrapping_shr(1)` is `-4` (`0xfc`), never `124` (`0x7c`).
+/// requires: x == -8 && n == 1
+/// ensures: ret == 124
+pub fn wrapping_shr_signed_is_not_logical_tripwire(x: i8, n: u32) -> i8 {
+    x.wrapping_shr(n)
+}
+
+/// The unsigned receiver is the logical shift: `128u8.wrapping_shr(9)` is `64`
+/// (`9` reduces to `1`), not a sign fill. This is the mirror of the signed entry
+/// above and pins that the *sign* decides which shift is used.
+/// requires: x == 128 && n == 9
+/// ensures: ret == 64
+pub fn wrapping_shr_unsigned_is_logical(x: u8, n: u32) -> u8 {
+    x.wrapping_shr(n)
+}
+
 /// Unary `-` binds *tighter* than `as` in Rust, so `-x as u8` is `(-x) as u8`,
 /// not `-(x as u8)`. The two readings agree on the value here — negation and
 /// truncation commute — but not on the *type*: Rust's is `u8`, the other is
