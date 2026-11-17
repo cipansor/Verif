@@ -9864,3 +9864,39 @@ for a reference. It is the same distinction the seeding loop already makes
 (`decl.referent()`), so the two now agree by construction rather than by the
 havoc happening to be called on scalars only.
 
+### The havoc must follow a call's write-through, not only its destination
+
+The same set had a fourth miss, and this one is the frame rule the crate already
+states for calls: **a call writes through its reference arguments.** `loop_writes`
+collected a `Term::Call`'s *destination* local -- the fix for a counter advanced by
+`i = i.wrapping_add(1)` -- but a call like `bump(x)` writes `x` (the caller local),
+and its *destination* is `bump`'s return local, a different local entirely. So the
+write-through was invisible:
+
+```rust
+/// requires: x == 0
+/// invariant: x == i && i <= 3
+/// ensures: ret == 0          // false: `bump` runs three times
+pub fn call_in_loop_false(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 { bump_once(x); i += 1; }   // bump_once(c: &mut u8) { *c += 1; *c }
+    *x                          // returns 3
+}
+```
+
+`x` kept its entry value, the exit guard folded, and the false postcondition was
+`Verified`. The fix folds the callee's own write set back onto the arguments the
+call passed: `loop_writes` now takes `prog`, resolves each callee through
+`resolve_callee` (the inliner's rule, so a `core` intrinsic and an ambiguous tail
+both contribute nothing), and for every local the callee writes that is one of its
+`arg_locals`, marks the caller local the corresponding argument names. Recursion is
+bounded by the same `visited` set that bounds the block walk.
+
+This is the loop-havoc twin of the call-frame rule (`writes` in `wp.rs`): a call's
+frame is derived from what the callee *does*, mapped through the actuals, not from
+the call's syntax. The syntactic destination of a call is only the first
+approximation of its effect, exactly as the syntactic destination of `*p = v` is.
+Both misses came from reading the syntax; the fix is to read the effect, which is
+the direction the frame rule already documents.
+
+
