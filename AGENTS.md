@@ -9989,3 +9989,58 @@ Two collision guards matter. A user type spelled `Vec` in a local module
 first regardless. And `Vec::<u8>::len` is **not** read as a slice length -- the
 slice path is matched on `core::slice::<impl [T]>`, so the two lengths (a slice's
 symbolic input, a `Vec`'s tracked model) cannot be confused.
+
+## A primitive name a user type can shadow: bind the primitive only when nothing declares it
+
+Adding `str::len`/`is_empty` bound a `&str` argument's symbolic length in the
+contract binder. That is right for the *primitive* `str`, and wrong for a user
+type that shadows the name: Rust lets a crate write `pub struct str { .. }`, and
+rustc prints a crate-root type by its **bare** name, so `&str` in the dump means
+either one. The binder's early `if name == "str"` therefore bound a field-less
+type over the user's struct, and a contract naming `s.value` came back `skipped:
+unknown field`. An AI review caught it as a regression in the commit that added
+the feature.
+
+The fix is precedence, not a special case: the primitive is meant only when no
+declared layout names `str`, so the guard is
+`name == "str" && struct_lookup(structs, name).is_none()`. A user `str` then falls
+through to the struct branch and its fields bind.
+
+This is the same rule the enum path already follows -- a *declared* layout wins
+over the reader's built-in knowledge of a standard type (`Shadow { Some, None }`
+is not `Option`). The general shape: when the reader recognises a name by
+spelling (a primitive, a standard container, a prelude enum), and a user can
+write that same spelling, the *declaration* is consulted first. A spelling-based
+test alone is a false match, and here the false match was a silent drop of a
+field binding.
+
+Pinned by `a_user_type_named_str_is_not_the_primitive_str`, which asserts **both**
+directions (the user field resolves and refutes a fixed value; the primitive
+length is still a symbolic input), so a fix that simply refused every `str`
+argument fails it. Teeth checked by reverting the guard.
+
+The `String` half is deliberate and stays a refusal: a `String`'s own type is
+`alloc::string::String`, so a `s.len()` on one goes through a deref to a `&str`
+local the binder never saw. That is an honest gap, not the shadowing bug.
+
+## A stale review is not evidence the code is fixed -- reproduce every finding
+
+A review round listed six code findings. Five named bugs the previous `Vec` round
+had already fixed (`vec_elem_ty` full-path identity, `havoc_parts` clearing
+`vec_len`, `collect_writes` cycle awareness, `copy_parts` moving `vec_len`,
+`lookup_promoted`'s method key). Only one was live, and it was a regression the
+commit under review had just introduced.
+
+The lesson is the order of work: reproduce *each* finding against the reviewer's
+own example at HEAD before acting, and record the command's output. Acting on the
+five already-fixed ones would have re-done finished work; dismissing the batch as
+"stale" would have shipped the live regression. The two mistakes look identical
+from the outside and only the reproduction tells them apart. The reply to the
+review says which five were already fixed and *how* it was checked, rather than
+just "addressed".
+
+A related trap on the other side: a finding that names a *test* can be stale too.
+`walk`'s contract, `bump_n`'s contract, the left-shift pair and the unnamed-witness
+assertion were all already corrected -- re-reading each one is what distinguished
+"already fixed" from "still open", and two of them were fixed by an *earlier*
+round that the review had not seen.
