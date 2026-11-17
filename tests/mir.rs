@@ -1945,8 +1945,17 @@ fn partial_cmp_methods_are_modelled_and_a_local_trait_still_wins() {
         "partial_ge_method_is_the_operator",
         "partial_lt_signed_is_not_unsigned",
         "local_partial_ord_lt_is_answered_by_its_body",
+        // A comparison against a *constant* operand: the literal is a promoted
+        // constant referenced by place in unoptimised MIR, so this is the shape
+        // that pins the promoted-scalar collection.
+        "partial_eq_const_is_the_operator",
+        "partial_lt_const_signed_is_not_unsigned",
     ];
-    let refuted = ["partial_lt_is_not_le_tripwire", "local_partial_ord_lt_is_not_the_model_tripwire"];
+    let refuted = [
+        "partial_lt_is_not_le_tripwire",
+        "local_partial_ord_lt_is_not_the_model_tripwire",
+        "partial_lt_const_is_not_le_tripwire",
+    ];
     let Some(report) = verify_realistic(&verified) else { return };
     for name in verified {
         let o = outcome(&report, name);

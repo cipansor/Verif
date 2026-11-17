@@ -9236,6 +9236,37 @@ pub fn local_partial_ord_lt_is_not_the_model_tripwire(x: u8, y: u8) -> bool {
     cmp_shim::PartialOrd::lt(&x, &y)
 }
 
+/// A comparison against a *constant* operand. In unoptimised MIR the literal is
+/// promoted to its own item (`const F::promoted[0]: &u8 = { _1 = const 5_u8; _0 =
+/// &_1; }`) and the call passes a reference to it, so the operand is a place
+/// naming a promoted constant, not an inline `Const`. Before the promoted scalar
+/// was collected the reference's referent was unknown and the call came back
+/// `unmodelled argument to <u8 as PartialEq>::eq` -- every comparison against a
+/// literal bound, an everyday idiom.
+/// requires: x == 5
+/// ensures: ret == true
+pub fn partial_eq_const_is_the_operator(x: u8) -> bool {
+    x.eq(&5)
+}
+
+/// The signed reading is the content: `i8::MIN < -1` is true signed, and false
+/// unsigned (`MIN`'s bits, `0x80`, are the largest *unsigned* byte). A model that
+/// read the promoted `-1` as unsigned would refute this.
+/// requires: x == i8::MIN
+/// ensures: ret == true
+pub fn partial_lt_const_signed_is_not_unsigned(x: i8) -> bool {
+    x.lt(&-1)
+}
+
+/// The false direction on a constant operand: `x.lt(&100)` is not `x <= 100`, so
+/// it fails at `x == 100`. A model that read `lt` as `le` -- or that ignored the
+/// constant and compared the operand with itself -- would prove it.
+/// requires: x == 100
+/// ensures: ret == true
+pub fn partial_lt_const_is_not_le_tripwire(x: i32) -> bool {
+    x.lt(&100)
+}
+
 /// `Ord::cmp` is the third `Ord` trait method, and unlike every other modelled
 /// shape its result is a *three-variant enum*, `core::cmp::Ordering`, whose
 /// discriminants are the signed `i8` values `Less` = -1, `Equal` = 0, `Greater` =

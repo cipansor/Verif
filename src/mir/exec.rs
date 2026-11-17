@@ -5751,7 +5751,19 @@ fn try_intrinsic(
                 Val::Sym(v, _) => v,
                 _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
             },
-            Operand::Const(_) => return Some(Err(format!("unmodelled argument to `{name}`"))),
+            // A *constant* second operand has no referent to follow, so it is read
+            // directly. This arm is defensive: an unoptimised dump promotes a
+            // literal operand to its own item and passes a reference to it
+            // (`x.eq(&5)` lowers to `_3 = const F::promoted[0]; … Eq(copy _1,
+            // copy _3)`), which the `Copy`/`Move` arm above resolves through the
+            // promoted constant the parser now records. A bare `const` operand is
+            // a shape no current dump prints, so refusing it would only refuse a
+            // term a future printer or a deserialised dump could hand in -- and the
+            // direct read is the honest one either way.
+            Operand::Const(_) => match operand(env, a) {
+                Val::Sym(v, _) => v,
+                _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+            },
         },
         Some(a) => match operand(env, a) {
             Val::Sym(v, _) => v,

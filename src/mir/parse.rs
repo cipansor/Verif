@@ -3053,6 +3053,16 @@ fn parse_program_impl(
         // The array literal is the `_1 = [const "a", const "b"];` statement of the
         // body; `_0 = &_1;` is the borrow and carries no string.
         let mut strs = Vec::new();
+        // A *scalar* promoted constant is how rustc lowers `x.eq(&5)` in
+        // unoptimised MIR: the literal `5` is promoted to its own item
+        // (`const F::promoted[0]: &u8 = { _1 = const 5_u8; _0 = &_1; }`) and the
+        // call passes a reference to it. The use site reads
+        // `const F::promoted[0]`, so recording the scalar under the promoted name
+        // lets `operand` resolve it, exactly as a named `const` item does. Only a
+        // body whose sole value statement is a scalar literal is recorded: an
+        // array body has no single word to store (the `&[&str]` case above), and
+        // a body that computes its value is left unmodelled rather than guessed.
+        let mut scalar: Option<Const> = None;
         for l in lines[li + 1..].iter().take_while(|l| !l.starts_with('}')) {
             let t = l.trim();
             if let Some(rest) = t.strip_prefix("_1 = [") {
@@ -3065,6 +3075,19 @@ fn parse_program_impl(
                     }
                 }
             }
+            // `_1 = const <scalar>;` -- the promoted value. The value local is
+            // always `_1` (the return `_0` is `&_1`), so only that local is read:
+            // a body that computes its value (`_2 = AddWithOverflow(…)`) has no
+            // `_1 = const` statement and is left unmodelled, and no other local's
+            // literal can be mistaken for the value.
+            if let Some(rhs) = t.strip_prefix("_1 = ").map(|r| r.trim_end_matches(';')) {
+                if let Some(c) = rhs.strip_prefix("const ") {
+                    scalar = Some(parse_const(c));
+                }
+            }
+        }
+        if let Some(c) = scalar {
+            prog.consts.insert(name.to_string(), c);
         }
         prog.promoted_strs.insert(name.to_string(), strs);
     }
@@ -3772,6 +3795,41 @@ fn add(_1: u32, _2: u32) -> u32 {
             prog.promoted_strs
                 .get("range_shim::<impl at /tmp/x.rs:4:5: 4:30>::m::promoted[0]"),
             Some(&vec!["boom".to_string()])
+        );
+    }
+
+    /// A *scalar* promoted constant is collected as a `const`, so a comparison
+    /// against a literal operand resolves.
+    ///
+    /// In unoptimised MIR `x.eq(&5)` promotes the literal `5` to its own item
+    /// (`const F::promoted[0]: &u8 = { _1 = const 5_u8; _0 = &_1; }`) and the call
+    /// passes a reference to it. The use site reads `const F::promoted[0]`, so the
+    /// value has to be in the `const` table for the operand to fold; without it
+    /// the reference's referent is unknown and the call is unmodelled. An array
+    /// body (the `&[&str]` case) has no single word, so it is recorded only in
+    /// `promoted_strs`, never as a scalar.
+    #[test]
+    fn a_scalar_promoted_constant_is_collected_as_a_const() {
+        let dump = "const f::promoted[0]: &u8 = {\n\
+                    \x20   let mut _0: &u8;\n    let mut _1: u8;\n\n    bb0: {\n        \
+                    _1 = const 5_u8;\n        _0 = &_1;\n        return;\n    }\n}\n\
+                    const g::promoted[0]: &[&str; 1] = {\n\
+                    \x20   let mut _0: &[&str; 1];\n    let mut _1: [&str; 1];\n\n    bb0: {\n        \
+                    _1 = [const \"boom\"];\n        _0 = &_1;\n        return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        assert_eq!(
+            prog.consts.get("f::promoted[0]"),
+            Some(&Const::UInt(5, Some(Ty::U8))),
+            "a scalar promoted constant must be a `const`"
+        );
+        assert!(
+            !prog.consts.contains_key("g::promoted[0]"),
+            "an array body has no single word and must not become a scalar `const`"
+        );
+        assert_eq!(
+            prog.promoted_strs.get("g::promoted[0]"),
+            Some(&vec!["boom".to_string()]),
+            "the array body is still recorded as string pieces"
         );
     }
 

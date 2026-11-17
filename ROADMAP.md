@@ -615,6 +615,25 @@ with no new false proof while the independent corpus keeps growing.
     `m::Ord`/`MyOrd`/`ord_shim::Ord` refused, and `cmp` not mistaken for `min`) is
     pinned by `the_ord_names_classify_and_their_neighbours_do_not` in
     `src/mir/intrinsics.rs`.
+  - Progress (cont.): a `PartialEq`/`PartialOrd` comparison against a *constant*
+    operand is decided. The gap was not in the model but in the frontend: an
+    unoptimised dump promotes a literal operand to its own item
+    (`x.eq(&5)` lowers to `_3 = const F::promoted[0]; … Eq(copy _1, copy _3)`,
+    where `const F::promoted[0]: &u8 = { _1 = const 5_u8; _0 = &_1; }`), and the
+    parser recorded only the *string-array* promoted constants (`panic!` messages),
+    never a scalar one. So the operand place named a constant the table did not
+    hold, the reference's referent was unknown, and every comparison against a
+    literal bound -- `x.ge(&0)`, `x.lt(&100)`, `x.eq(&i8::MIN)`, an everyday idiom
+    -- came back `unmodelled argument to <u8 as PartialEq>::eq`. The parser now
+    records a promoted body whose sole value statement is a scalar literal as a
+    `const` (an array or struct-literal body still has no single word and is left
+    to `promoted_strs`). The `&self`/`&other` reference-following was already
+    there; only the value it reached was missing. Three fixtures (two true, one
+    tripwire) in `realistic.rs` (**566 of 1036**, from 564 of 1033), pinned by
+    `partial_cmp_methods_are_modelled_and_a_local_trait_still_wins` and by the
+    parser unit test `a_scalar_promoted_constant_is_collected_as_a_const`. The
+    exec arm that reads a *bare* `Const` operand is kept as a defensive path (no
+    current dump prints it) with a comment saying so.
   - Remaining: the *generic* `<[T]>::first/get/len/is_empty` (`first_or<T>`) need
     monomorphisation, which is C10: `first_or`'s element type has no width and its
     slice length is never seeded (the frontend refuses a receiver whose length it
