@@ -636,6 +636,75 @@ pub fn count_evens(n: u8) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// The loop cut havocs what the loop writes *through*, not what it names.
+//
+// A `for` loop advances its `RangeInclusive` through `&mut`, so the syntactic
+// destination is the reference and the aggregate has no bit width: neither the
+// referent nor the range's parts were havoced at the header. The exit guard then
+// folded to `false`, the exit edge was pruned as unreachable, and a false
+// postcondition was `Verified`. The pairs below pin both directions: the true
+// contract verifies, the false twin is refuted.
+// ---------------------------------------------------------------------------
+
+/// A `for` loop whose postcondition the loop actually establishes.
+/// requires: n <= 100
+/// invariant: s <= 5050
+/// ensures: ret <= 5050
+pub fn for_loop_invariant_holds(n: u32) -> u32 {
+    let mut s = 0;
+    for i in 0..=n {
+        s = i.min(5050);
+    }
+    s
+}
+
+/// The false twin: the same loop, a postcondition it does not establish. When the
+/// iterator state was not havoced this came back `Verified` -- the false proof.
+/// requires: n <= 100
+/// invariant: s <= 5050
+/// ensures: ret <= 3
+pub fn for_loop_invariant_cannot_prove_this(n: u32) -> u32 {
+    let mut s = 0;
+    for i in 0..=n {
+        s = i.min(5050);
+    }
+    s
+}
+
+/// A `while` loop that writes through a reference taken *before* the loop, so the
+/// referent must be havoced at the header. The invariant is a *relation* between
+/// the referent and the counter -- `x <= k` alone is never inductive for
+/// `x += 1` -- which is what makes it both preserved and enough for the exit.
+/// requires: true
+/// invariant: x == i && i <= 3
+/// ensures: ret <= 3
+pub fn while_writes_through_ref_holds() -> u8 {
+    let mut x = 0u8;
+    let p = &mut x;
+    let mut i = 0u8;
+    while i < 3 {
+        *p += 1;
+        i += 1;
+    }
+    x
+}
+
+/// The false twin for the reference write.
+/// requires: true
+/// invariant: x == i && i <= 3
+/// ensures: ret == 0
+pub fn while_writes_through_ref_cannot_prove_this() -> u8 {
+    let mut x = 0u8;
+    let p = &mut x;
+    let mut i = 0u8;
+    while i < 3 {
+        *p += 1;
+        i += 1;
+    }
+    x
+}
+
+// ---------------------------------------------------------------------------
 // `core::num` intrinsics: modelled directly rather than through their bodies.
 //
 // These were the "a call to `core` makes the path unknown" gap. `checked_*`,

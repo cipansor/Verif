@@ -9780,3 +9780,51 @@ place that sees it, and it sees it as a *verdict* difference, not an error -- wh
 14 runs the frontend's own suite against the floor rather than merely compiling it. The
 `#![feature(…)]` header plus `RUSTC_BOOTSTRAP` is what makes the corpus *compile* on 1.85; the
 promoted-const reconciliation is what makes its *verdicts* agree across the floor.
+
+## The loop cut must havoc what the loop writes *through*, not what it names
+
+A `for` loop with an `invariant:` verified a false postcondition. The invariant was
+`i <= n`-shaped, the body advanced the iterator, and the loop's exit edge was
+*pruned as unsatisfiable* before the postcondition was ever checked. The tell is
+that the loop obligations themselves were fine -- `LoopInvariantInit` and
+`LoopInvariantPreserve` both came back `Valid` -- so the verdict looked healthy
+while the function's own postcondition was never reached.
+
+Two things were wrong, and both are the same mistake: **the havoc set named the
+locals the loop *syntactically* writes, but the header state depends on the locals
+it *effectively* writes.**
+
+- **A write through a reference.** `let p = &mut x; *p += 1` lowers to
+  `(*_2) = ...`, whose syntactic destination is the reference local `_2`, not `x`.
+  `loop_writes` collected `_2`; the havoc replaced `_2`, and `x` kept the value it
+  had at entry. `resolve` does not help here -- it rewrites an *explicit* `*_2`
+  projection, and the havoc was called with a bare local. `pointee` is the one-level
+  value step that follows `_2` to `_1`, and the havoc now uses it.
+- **A widthless local.** The iterator is a `RangeInclusive<u32>`, a struct, so
+  `Ty::width()` is `None` and its value lives in the *parts* stores, not in
+  `locals`. The havoc's `if let Some(w) = ty.width()` therefore skipped it
+  entirely, and the range's `start`/`end`/`exhausted` fields kept their entry
+  values. The fix replaces each part with a fresh value (`Env::havoc_parts`): a
+  word part gets a fresh variable of its own width and sign, so a model that reads
+  it -- `RangeInclusive::next` reads `start`/`end` -- still resolves, while a part
+  the store cannot re-randomise is dropped to `Unknown`.
+
+Both are *over*-approximations, which is the safe direction: havocing a local the
+loop never writes loses information, never soundness. The consequence is visible
+in the probes -- a loop that writes through a reference now refutes a `true`
+contract that names the entry-time value, because the header is an arbitrary
+state, which is exactly the reading the invariant rule asks for.
+
+The general shape, and the one to carry forward: **an invariant is a claim about
+*every* state the header can be reached in, so the havoc set must be closed under
+the loop's *effects*, not its syntax.** A reference is an effect on its referent; an
+aggregate is an effect on its parts. The rule is the mirror of the `writes` frame
+rule for calls -- derive the real frame from what the code *does*, and the
+syntactic destination is only the first approximation of it.
+
+The `tri_invariant` fixture had been passing *because of* the bug: its invariant
+was `s <= 5050` over a body doing `s += i`, which is **not inductive** (from
+`s == 5050` and `i == 100` the sum is `5150`). It verified only because the exit
+edge was pruned. The fixture now uses an inductive invariant (`s = i.min(5050)`)
+and a `tri_invariant_cannot_prove_this` tripwire is asserted to be refuted -- the
+standing rule that a new shape is not "supported" until a tripwire fails.

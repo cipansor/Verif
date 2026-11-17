@@ -5076,6 +5076,61 @@ fn no_cannot_prove_entry_is_ever_verified() {
     );
 }
 
+/// The loop cut havocs what the loop writes *through*, not what it names.
+///
+/// A `for` loop advances its `RangeInclusive` through `&mut` and the range is a
+/// widthless aggregate, so the loop header must havoc both the referent of the
+/// reference and the aggregate's parts. When it havoced neither, the header state
+/// kept the entry-time iterator value, the exit guard folded to `false`, the exit
+/// edge was pruned as unsatisfiable, and the postcondition was never checked -- a
+/// `for` loop whose postcondition was false came back `Verified`.
+///
+/// The two corpus pairs pin both directions: the true contract verifies and the
+/// false twin is refuted. The false twin is also covered by the corpus-wide
+/// `no_cannot_prove_entry_is_ever_verified` sweep; this test adds the *positive*
+/// half, so a fix that refused every loop invariant would fail here.
+#[test]
+fn a_loop_havocs_what_it_writes_through() {
+    let names = [
+        "for_loop_invariant_holds",
+        "for_loop_invariant_cannot_prove_this",
+        "while_writes_through_ref_holds",
+        "while_writes_through_ref_cannot_prove_this",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    let outcome = |name: &str| {
+        report
+            .outcomes
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("`{name}` must be in the report"))
+            .1
+            .clone()
+    };
+    for holds in ["for_loop_invariant_holds", "while_writes_through_ref_holds"] {
+        assert!(
+            outcome(holds).is_verified(),
+            "`{holds}` establishes its postcondition and must verify, got: {}",
+            outcome(holds)
+        );
+    }
+    for twin in [
+        "for_loop_invariant_cannot_prove_this",
+        "while_writes_through_ref_cannot_prove_this",
+    ] {
+        match outcome(twin) {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition") || kind.contains("invariant"),
+                "`{twin}` must fail on its own claim, got `{kind}`"
+            ),
+            other => panic!(
+                "`{twin}` claims a false postcondition and must be refuted; a header \
+                 that is not havoced proves it, got: {other}"
+            ),
+        }
+    }
+}
+
 /// A deep term is refused, not allowed to overflow the stack.
 ///
 /// The engine's contract is that a query it cannot decide is *reported*: `Unknown`,
