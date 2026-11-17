@@ -860,6 +860,14 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     length is never invented — `v.len()` on an unmodelled receiver is a refusal.
     A user type spelled `Vec` in a local module is not the standard one (the
     same-dump lookup answers its own body first, `classify` refuses `m::Vec`).
+  - Three soundness holes in this model were found by review and fixed in
+    `8dd4d21` (ledger rows 34–36): the container identity is the *full* path
+    (`std::vec::Vec` / `alloc::vec::Vec`), so a user `struct Vec<T>` with a
+    panicking `Drop` is no longer treated as glue-free; the loop-header havoc
+    refreshes the tracked length to a fresh `usize`, so an inductive pushing loop
+    no longer reads the entry length at the exit (`ret == 0` for `ret == 3`); and
+    a `Vec` move (`let w = v`) and a returned vector transfer the length to the
+    destination rather than dropping it.
   - Remaining: the **element** model (`get`/`index`, so a `push`ed value can be
     read back), `pop`, `String`, `Box`, and symbolic-length slices.
   - Move: **build**.

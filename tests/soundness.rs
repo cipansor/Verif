@@ -150,10 +150,10 @@ fn the_ledger_keeps_a_row_for_every_defect_in_both_tables() {
         .find("## The engine and the imperative layer")
         .expect("the engine section header must exist");
     let (mir, engine) = ledger.split_at(split);
-    // The MIR table's rows are numbered 1..=33 and the engine table's 34..=49; the
+    // The MIR table's rows are numbered 1..=36 and the engine table's 37..=52; the
     // counts are asserted exactly so adding or dropping a defect is a deliberate
     // edit to this number, made in the same commit as the row.
-    assert_eq!(rows(mir).len(), 33, "the MIR table must keep its 33 rows");
+    assert_eq!(rows(mir).len(), 36, "the MIR table must keep its 36 rows");
     assert_eq!(rows(engine).len(), 16, "the engine table must keep its 16 rows");
     // And the numbering is contiguous across the two, so a row cannot be renumbered
     // into a gap without the check noticing.
@@ -168,8 +168,8 @@ fn the_ledger_keeps_a_row_for_every_defect_in_both_tables() {
         .collect();
     assert_eq!(
         nums,
-        (1..=49).collect::<Vec<u32>>(),
-        "the ledger's row numbers must be 1..=49 with no gaps or duplicates"
+        (1..=52).collect::<Vec<u32>>(),
+        "the ledger's row numbers must be 1..=52 with no gaps or duplicates"
     );
 }
 
