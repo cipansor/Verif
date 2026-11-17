@@ -802,6 +802,12 @@ struct Indexed {
     /// The width of one element, which is the *referent's* width (`u8` for
     /// `&[u8]` or `[u8; 4]`), not the length's. Taking it from `len` would make
     /// every element 64 bits wide and mis-size every read.
+    ///
+    /// `0` means the width is **not modelled** — a generic `&[T]`, where `T` is
+    /// an unbound type parameter. The length is still a real value (`len` and
+    /// `is_empty` read only the length), so the store exists and those answer;
+    /// every *element* operation refuses `0` rather than inventing a width, so
+    /// `v[0]` on a `&[T]` is a missing value, never a wrong one.
     elem_w: u8,
     /// The signedness of one element. Every element of an array or slice has the
     /// same type, so one sign serves them all; an element read out of this store
@@ -892,6 +898,13 @@ impl Env {
         if s.poisoned {
             return None;
         }
+        // An unmodelled element width (a generic `&[T]`) has no element variable
+        // to create: a width is what makes the variable a value, and inventing one
+        // would mis-size every read. Refusing keeps an element read a missing
+        // value; the *length* is unaffected, so `len`/`is_empty` still answer.
+        if s.elem_w == 0 {
+            return None;
+        }
         let sign = Sign::of_bool(s.elem_signed);
         if let Some(v) = s.elems.get(&index) {
             return Some((*v, sign));
@@ -921,6 +934,10 @@ impl Env {
     fn index_chain(&mut self, local: u32, index: Var) -> Option<Val> {
         let (n, elem_w, elem_signed) = {
             let s = self.indexed.get(&local)?;
+            // An unmodelled element width has no elements to build a chain from.
+            if s.elem_w == 0 {
+                return None;
+            }
             // An array's steps come from its type; a slice's from the contract.
             (s.fixed_len.or(s.slice_steps)?, s.elem_w, s.elem_signed)
         };

@@ -1188,10 +1188,10 @@ fn the_independent_corpus_does_not_regress() {
         .filter(|(_, o)| matches!(o, FnOutcome::Verified { .. }))
         .count();
     assert!(
-        verified >= 16,
-        "everyday.rs verified {verified} of {} functions, down from 16 (76%); a regression \
-         dropped coverage of ordinary Rust. Run: cargo run --features std --example \
-         mir_coverage -- {EVERYDAY}",
+        verified >= 17,
+        "everyday.rs verified {verified} of {} functions, down from 17 (81%); a regression \
+         dropped coverage of ordinary Rust below Phase 1's 80% exit criterion. Run: cargo run \
+         --features std --example mir_coverage -- {EVERYDAY}",
         report.outcomes.len()
     );
 }
@@ -5034,6 +5034,12 @@ fn no_cannot_prove_entry_is_ever_verified() {
             "the self-call to a trait default body is unmodelled, so the path is cut \
              before the false claim is checked",
         ),
+        (
+            "generic_slice_element_cannot_prove_this",
+            "a generic `&[T]` has no element width, so `v[0]` is an unmodelled element \
+             read and `ret == d` is unreadable -- the length is modelled, the element \
+             is not, so the claim is a skip rather than a refutation",
+        ),
     ];
     let mut checked = 0usize;
     let mut liars = Vec::new();
@@ -6806,6 +6812,83 @@ pub fn get_symbolic_index_is_refused(xs: &[u8], i: usize) -> u8 {
         !o.is_verified()
             && matches!(&o, FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. }),
         "`xs.get(i)` for a symbolic `i` must be refused, not modelled; got: {o}"
+    );
+}
+
+/// A generic `&[T]` has a *length* even though its element width is unknown.
+///
+/// `T` is an unbound type parameter, so there is no element width to model and
+/// every element operation must stay refused. But `len`/`is_empty` read only the
+/// length, which is a `usize` input whatever `T` is — so the length is bound and
+/// those functions decide. This pins both halves: the length functions verify, and
+/// an element-naming contract is a refusal, never a proof. The two tripwires are
+/// the teeth: `generic_slice_len_is_zero_cannot_prove_this` must be *refuted*
+/// (the length is a real value, not a constant `0`), and
+/// `generic_slice_element_cannot_prove_this` must not be *verified* (the element
+/// has no width, so a claim about it cannot be discharged).
+#[test]
+fn a_generic_slices_length_is_modelled_but_its_element_is_not() {
+    let src = r#"
+/// requires: true
+/// ensures: ret == v.len()
+pub fn len_of<T: Copy>(v: &[T]) -> usize {
+    v.len()
+}
+
+/// requires: true
+/// ensures: ret == (v.len() == 0)
+pub fn empty_of<T: Copy>(v: &[T]) -> bool {
+    v.is_empty()
+}
+
+/// requires: true
+/// ensures: true
+pub fn first_or_of<T: Copy>(v: &[T], d: T) -> T {
+    if v.is_empty() { d } else { v[0] }
+}
+
+/// requires: true
+/// ensures: ret == 0
+pub fn len_is_zero_cannot_prove_this<T: Copy>(v: &[T]) -> usize {
+    v.len()
+}
+
+/// requires: true
+/// ensures: ret == d
+pub fn element_cannot_prove_this<T: Copy>(v: &[T], d: T) -> T {
+    if v.is_empty() { d } else { v[0] }
+}
+"#;
+    let Some(o) = verify_src("len_of", src) else { return };
+    assert!(
+        o.is_verified(),
+        "`v.len()` on a `&[T]` reads only the length, which is modelled; got: {o}"
+    );
+    let Some(o) = verify_src("empty_of", src) else { return };
+    assert!(
+        o.is_verified(),
+        "`v.is_empty()` is `len == 0`, decided by the length alone; got: {o}"
+    );
+    let Some(o) = verify_src("first_or_of", src) else { return };
+    assert!(
+        o.is_verified(),
+        "`first_or` is guarded by `is_empty`, which the length decides, so the \
+         bounds check on `v[0]` is discharged; got: {o}"
+    );
+    // The teeth: a false length claim is refuted (the length is a real input),
+    // and an element claim is not proved (the element has no width).
+    let Some(o) = verify_src("len_is_zero_cannot_prove_this", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`v.len() == 0` is false for a non-empty slice, so this must be refuted \
+         (a verified verdict would mean the length was folded to the constant 0); \
+         got: {o}"
+    );
+    let Some(o) = verify_src("element_cannot_prove_this", src) else { return };
+    assert!(
+        !o.is_verified(),
+        "a generic slice's element has no width, so `ret == d` must never be \
+         reported verified; got: {o}"
     );
 }
 

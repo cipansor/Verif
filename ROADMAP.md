@@ -19,8 +19,8 @@ output decides the number, so the table is a measurement rather than a claim:
 | Corpus | Command | Verified / decided |
 |---|---|---|
 | `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 18 / 33 |
-| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 564 / 1035 |
-| `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **16 / 21 (76%)** |
+| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 569 / 1041 |
+| `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **17 / 21 (81%)** |
 
 `everyday.rs` is the honest one: ordinary Rust written by an external reviewer,
 not shaped for the tool. `realistic.rs` is a regression corpus (about a third of
@@ -377,10 +377,13 @@ with no new false proof while the independent corpus keeps growing.
     `abs_small`, `clamp_builtin`, `digit`, `first_or` incomplete. All but
     `first_or` are now modelled (`min`/`max`, `From`/`Into`, `clamp`,
     `abs`, `abs_diff`, `rotate_*`, the `is_ascii_*` classes, the sign predicates,
-    `slice::len`/`is_empty`, and `slice::first`/`get`). `first_or` stays
-    incomplete because it is *generic* (`<T: Copy>`), which is C10, not this item
-    — the earlier note that `first`/`get` were "blocked on monomorphisation" was
-    wrong for a concrete `&[u8]`, which is what `everyday.rs` uses.
+    `slice::len`/`is_empty`, and `slice::first`/`get`). `first_or` now decides
+    too: it is *generic* (`<T: Copy>`), and the earlier note that a generic slice
+    needs monomorphisation was wrong for the *length* half — `v.len()`/`v.is_empty()`
+    read only the length, which is a `usize` input whatever `T` is, so the length is
+    bound even when the element width is unknown (the `0` sentinel in
+    `exec::Indexed::elem_w`). Every *element* operation on a `&[T]` stays refused,
+    which is the honest split; see the progress note below.
   - Also modelled since: `signum`, `div_euclid`/`rem_euclid`, `div_ceil`,
     `midpoint`, `next_multiple_of`, `ilog2`/`ilog10`, and the `next_power_of_two`
     pair — see the progress notes below.
@@ -634,16 +637,32 @@ with no new false proof while the independent corpus keeps growing.
     parser unit test `a_scalar_promoted_constant_is_collected_as_a_const`. The
     exec arm that reads a *bare* `Const` operand is kept as a defensive path (no
     current dump prints it) with a comment saying so.
-  - Remaining: the *generic* `<[T]>::first/get/len/is_empty` (`first_or<T>`) need
-    monomorphisation, which is C10: `first_or`'s element type has no width and its
-    slice length is never seeded (the frontend refuses a receiver whose length it
-    does not hold, which is the honest answer, not a bug). A *locally constructed*
-    `Ordering` (a `cmp` body that returns `Ordering::Greater`) is also still
-    unmodelled — the executor resolves an enum-variant path constant through
-    `variant_index`, which knows `Option`/`Result`/`ControlFlow` but not
-    `Ordering` — so a local trait's `cmp` body is `incomplete` even though a `core`
-    `Ord::cmp` call decides. That is a `variant_index` gap, not a `cmp` one, and is
-    scheduled with the enum-construction work rather than here.
+  - Remaining: the *element* half of a *generic* `<[T]>::first/get` needs a
+    monomorphised element type, which is C10: `first_or<T>`'s element has no width,
+    so `v[0]` stays refused. The *length* half does not need it, and now decides:
+    `v.len()`/`v.is_empty()` read only the length, which is a `usize` input whatever
+    `T` is, so a generic slice's length is bound even when the element width is
+    unknown (`bind_indexed_len` accepts the `0` sentinel). `first_or` in `everyday.rs`
+    verifies because its guard is `is_empty` — the bounds check on `v[0]` is
+    discharged from the length — even though the `v[0]` arm itself is an unmodelled
+    element read. A *locally constructed* `Ordering` (a `cmp` body that returns
+    `Ordering::Greater`) is also still unmodelled — the executor resolves an
+    enum-variant path constant through `variant_index`, which knows
+    `Option`/`Result`/`ControlFlow` but not `Ordering` — so a local trait's `cmp`
+    body is `incomplete` even though a `core` `Ord::cmp` call decides. That is a
+    `variant_index` gap, not a `cmp` one, and is scheduled with the
+    enum-construction work rather than here.
+  - Progress (cont.): **the generic slice's length is modelled.** `first_or` in
+    `everyday.rs` moved from `incomplete` to `verified`, taking the file to
+    **17/21 (81%)** — Phase 1's 80% exit criterion is met. The change is the `0`
+    sentinel in `exec::Indexed::elem_w` (the element width is *not modelled* for a
+    `&[T]`), with `bind_indexed_len` accepting it and every element path
+    (`index_elem`, `index_chain`, the slice intrinsic read) refusing it. The length
+    functions (`len`, `is_empty`) and a length-guarded element read decide; a
+    contract that *names* a generic element is a refusal, never a proof. Pinned by
+    `a_generic_slices_length_is_modelled_but_its_element_is_not` and six corpus
+    fixtures (three verify, one refutes, one skips on purpose, one refutes the
+    element claim is not proved).
 - **C7. Arithmetic scale and speed.** · P0 · in progress · Kani, Boolector,
   Bitwuzla
   - Gap: `u32::wrapping_mul` is past the 32-bit model; `clamp_std` takes 9.9 s.

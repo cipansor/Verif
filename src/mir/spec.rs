@@ -3463,7 +3463,10 @@ impl FieldEnv {
         elem_w: u8,
         elem_signed: bool,
     ) -> Option<Var> {
-        if !(1..=64).contains(&elem_w) {
+        // `elem_w == 0` is the unmodelled-width sentinel (a generic `&[T]`): the
+        // length is still a value, so it is bound, but no element can be, which is
+        // what keeps `v.len()`/`v.is_empty()` answerable while `v[0]` stays refused.
+        if elem_w != 0 && !(1..=64).contains(&elem_w) {
             return None;
         }
         let len_name = format!("{arg}__len");
@@ -7665,9 +7668,20 @@ pub fn field_env_named(
         // A slice argument: `&[u8]`. Its length is a symbolic input, and its
         // elements are bound on demand (by `bind_index_refs` for the contract and
         // by the executor for the body).
+        //
+        // A *generic* `&[T]` has no element width (`elem.width()` is `None`), but
+        // its length is still a value: `v.len()`/`v.is_empty()` read only the
+        // length. Binding it with the `0` sentinel keeps those answerable while
+        // every element operation stays refused, which is what lets an ordinary
+        // generic slice helper decide instead of being dropped whole.
         if let Ty::Slice(elem) = base {
-            if let Some(w) = elem.width() {
-                env.bind_indexed_len(l, &arg, w, elem.is_signed());
+            match elem.width() {
+                Some(w) => {
+                    env.bind_indexed_len(l, &arg, w, elem.is_signed());
+                }
+                None => {
+                    env.bind_indexed_len(l, &arg, 0, false);
+                }
             }
             continue;
         }

@@ -428,6 +428,73 @@ pub fn slice_unbounded_index_refused(xs: &[u8], i: usize) -> u8 {
     xs[i]
 }
 
+/// A *generic* slice's length is a value even though `T` has no width.
+///
+/// `&[T]` with `T` an unbound type parameter has no element width to model, but
+/// `v.len()` reads only the length, which is a `usize` input regardless of `T`.
+/// So the length is bound and the function decides; every *element* operation on
+/// the same receiver stays refused (see the entry below), which is the split that
+/// keeps the answer honest.
+/// requires: true
+/// ensures: ret == v.len()
+pub fn generic_slice_len<T: Copy>(v: &[T]) -> usize {
+    v.len()
+}
+
+/// `is_empty` is `len == 0`, so it needs the length and nothing about `T`.
+/// requires: true
+/// ensures: ret == (v.len() == 0)
+pub fn generic_slice_is_empty<T: Copy>(v: &[T]) -> bool {
+    v.is_empty()
+}
+
+/// The ordinary "first element or default" helper over a generic slice.
+///
+/// This is `everyday.rs`'s `first_or`: the `else` arm reads `v[0]`, whose width
+/// is unknown, but the *guard* is `is_empty`, which the length decides, so the
+/// bounds check on `v[0]` is discharged and the function decides. A contract that
+/// *names* the element would be unreadable (see the tripwire below); the shape
+/// that decides is the one whose postcondition does not, which is exactly the
+/// honest split.
+/// requires: true
+/// ensures: true
+pub fn generic_slice_first_or<T: Copy>(v: &[T], d: T) -> T {
+    if v.is_empty() {
+        d
+    } else {
+        v[0]
+    }
+}
+
+/// A generic slice's *element* has no width, so a contract about one is refused,
+/// never proved.
+///
+/// The body returns `v.len()`, and the contract claims `0` — false for any
+/// non-empty slice. `v.len()` is modelled (the length is a `usize`), so this is
+/// refuted rather than skipped; the point is that the *length* half of a generic
+/// slice is real and the verdict is not vacuous.
+/// requires: true
+/// ensures: ret == 0
+pub fn generic_slice_len_is_zero_cannot_prove_this<T: Copy>(v: &[T]) -> usize {
+    v.len()
+}
+
+/// A generic slice's element read is unmodelled, so a contract naming the result
+/// is unreadable rather than proved.
+///
+/// `ret == d` is false whenever the slice is non-empty, and this must never be
+/// reported `verified`. The element has no width, so the read is a missing value,
+/// which surfaces as a refusal — the honest direction.
+/// requires: true
+/// ensures: ret == d
+pub fn generic_slice_element_cannot_prove_this<T: Copy>(v: &[T], d: T) -> T {
+    if v.is_empty() {
+        d
+    } else {
+        v[0]
+    }
+}
+
 /// An array built in the body, so the elements are concrete rather than inputs.
 /// requires: true
 /// ensures: ret == 20
