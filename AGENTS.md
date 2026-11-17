@@ -9828,3 +9828,39 @@ was `s <= 5050` over a body doing `s += i`, which is **not inductive** (from
 edge was pruned. The fixture now uses an inductive invariant (`s = i.min(5050)`)
 and a `tri_invariant_cannot_prove_this` tripwire is asserted to be refuted -- the
 standing rule that a new shape is not "supported" until a tripwire fails.
+
+### The havoc must size a local the way it was seeded, not by its declared type
+
+The same havoc had a third miss, one level down: it read `ty.width()` on the local's
+*declared* type. For a scalar local that is the seeded width, but for a **reference**
+it is not -- `Ty::Ref(inner)` has `width() == None`, and the frontend models a
+reference *as its referent*, so a `&mut u8` argument's value is seeded at the
+referent's width (8) and lives in `locals`. Reading `width()` on the `Ty::Ref`
+returned `None`, sent the local to the aggregate branch, and left the referent at
+the value it held at entry. The exit guard then folded, the exit edge was pruned,
+and a false postcondition was `Verified`:
+
+```rust
+/// requires: x == 0
+/// invariant: x == i && i <= 3
+/// ensures: ret == 0          // false: the loop increments `*x` three times
+pub fn w_false(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 { *x += 1; i += 1; }
+    *x                       // returns 3
+}
+```
+
+The fix sizes the havoc by `ty.referent()` -- the same one-level collapse
+`Ty::referent` already performs for seeding -- so a written-through reference
+argument is havoced like the scalar it holds. A `&mut u8` is the commonest shape,
+and a `&mut u8` argument written in a loop is exactly the shape an induction over
+a reference-carrying function needs.
+
+The general rule this completes: **havoc a local at the width and sign it was
+*seeded* at, which for a reference is its referent's.** `width()` answers "is this
+a bit-vector type", not "how wide is the value this local holds", and the two differ
+for a reference. It is the same distinction the seeding loop already makes
+(`decl.referent()`), so the two now agree by construction rather than by the
+havoc happening to be called on scalars only.
+
