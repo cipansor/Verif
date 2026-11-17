@@ -11600,6 +11600,13 @@ pub fn for_too_few() -> u32 {
     /// does not resolve it -- recorded in `ROADMAP.md` C3. The false twin is the
     /// evidence the range state is *read*: a model that returned a constant would
     /// prove it.
+    ///
+    /// The range's iterator state is written *through `&mut`*, so the loop header
+    /// must havoc the range local (and its parts). When it did not, the exit guard
+    /// folded to `false`, the exit edge was pruned as unreachable, and a false
+    /// postcondition came back `Verified` -- the reason `tri_invariant` now uses an
+    /// inductive invariant (`s = i.min(5050)`, not `s += i`) and
+    /// `tri_invariant_cannot_prove_this` is asserted to be refuted.
     #[test]
     fn the_for_loop_range_desugaring_is_modelled() {
         let src = r#"
@@ -11635,7 +11642,16 @@ pub fn for_exclusive_counts() -> u32 {
 /// ensures: ret <= 5050
 pub fn tri_invariant(n: u32) -> u32 {
     let mut s = 0;
-    for i in 0..=n { s += i; }
+    for i in 0..=n { s = i.min(5050); }
+    s
+}
+
+/// requires: n <= 100
+/// invariant: s <= 5050
+/// ensures: ret <= 3
+pub fn tri_invariant_cannot_prove_this(n: u32) -> u32 {
+    let mut s = 0;
+    for i in 0..=n { s = i.min(5050); }
     s
 }
 "#;
@@ -11658,6 +11674,17 @@ pub fn tri_invariant(n: u32) -> u32 {
                  refuted; a model that ignored the range state would prove it, got: {other}"
             ),
         }
+        // The invariant tripwire: a `for` loop whose postcondition is false. The
+        // loop's *iterator state* is written through `&mut`, so the havoc at the
+        // header must reach it. When it did not, the exit guard folded to `false`,
+        // the exit edge was pruned as unreachable, and this function came back
+        // `Verified` -- a false proof. It must now be refuted.
+        let Some(g) = verify_src("tri_invariant_cannot_prove_this", src) else { return };
+        assert!(
+            !g.is_verified(),
+            "a `for` loop whose postcondition is false must not verify; a model that does \
+             not havoc the iterator state proves it, got: {g}"
+        );
     }
 
     /// C3 exit criterion, second half: a loop with no contract is reported as a

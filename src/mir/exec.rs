@@ -1867,6 +1867,77 @@ impl Env {
         self.elems_path.retain(|(l, chain, _), _| *l != local || !chain.starts_with(prefix));
     }
 
+    /// Replace every *part* of an aggregate local with a fresh value.
+    ///
+    /// A loop that writes an aggregate -- the `RangeInclusive` a `for` loop
+    /// advances through `&mut`, or a struct whose field the body assigns -- leaves
+    /// its parts at the values they held at entry. The loop header must instead be
+    /// an *arbitrary* value of the local's type, so each part is replaced: a word
+    /// part by a fresh variable of its own width and sign (so a model that reads
+    /// it, a range's `start`/`end`, still resolves), and anything the store cannot
+    /// represent as a word by dropping it. Dropping is the sound direction -- a
+    /// stale part is a wrong value, a missing one is a refusal.
+    fn havoc_parts(&mut self, local: u32) {
+        fn refresh(v: &Val) -> Option<Val> {
+            match v {
+                Val::Sym(x, s) => Some(Val::Sym(smt::var(smt::bits(*x)), *s)),
+                Val::Bool(_) => Some(Val::Bool(smt::var(1).eq_val(1))),
+                Val::Agg | Val::Unknown => None,
+            }
+        }
+        for ((l, _), v) in self.fields.iter_mut() {
+            if *l == local {
+                match refresh(v) {
+                    Some(nv) => *v = nv,
+                    None => *v = Val::Unknown,
+                }
+            }
+        }
+        for ((l, _), v) in self.nested.iter_mut() {
+            if *l == local {
+                match refresh(v) {
+                    Some(nv) => *v = nv,
+                    None => *v = Val::Unknown,
+                }
+            }
+        }
+        for ((l, _), v) in self.elems.iter_mut() {
+            if *l == local {
+                match refresh(v) {
+                    Some(nv) => *v = nv,
+                    None => *v = Val::Unknown,
+                }
+            }
+        }
+        for ((l, _, _), v) in self.elems_path.iter_mut() {
+            if *l == local {
+                match refresh(v) {
+                    Some(nv) => *v = nv,
+                    None => *v = Val::Unknown,
+                }
+            }
+        }
+        for ((l, _, _), v) in self.elem_parts.iter_mut() {
+            if *l == local {
+                match refresh(v) {
+                    Some(nv) => *v = nv,
+                    None => *v = Val::Unknown,
+                }
+            }
+        }
+        // A payload, tag or element store has no per-word refresh this run can
+        // trust, so it is dropped: an aggregate the loop wrote is now an arbitrary
+        // value, and a part the store cannot re-randomise must not be readable.
+        self.payloads.retain(|(l, _), _| *l != local);
+        self.discriminants.remove(&local);
+        self.tag_widths.remove(&local);
+        if let Some(s) = self.indexed.get_mut(&local) {
+            s.elems.clear();
+            s.poisoned = true;
+        }
+        self.elems.retain(|(l, _), v| *l != local || !matches!(v, Val::Unknown));
+    }
+
     fn forget_parts(&mut self, local: u32) {
         self.fields.retain(|(l, _), _| *l != local);
         self.nested.retain(|(l, _), _| *l != local);
@@ -3081,8 +3152,17 @@ fn loop_writes(f: &MirFn, header: usize) -> Vec<u32> {
         }
         let Some(block) = f.block(b) else { continue };
         for s in &block.stmts {
-            if let Stmt::Assign(dest, _) = s {
+            if let Stmt::Assign(dest, rv) = s {
                 writes.insert(dest.local, ());
+                // A reference taken inside the loop may be written *through*:
+                // `let p = &mut x; *p += 1` writes `x`, but the syntactic
+                // destination is `p`. Treat the referent as written so the havoc
+                // reaches it. This is an over-approximation -- a shared `&x` is
+                // included too -- which is the safe direction: havocing a local
+                // the loop never writes loses information, never soundness.
+                if let Rvalue::Ref(place) = rv {
+                    writes.insert(place.local, ());
+                }
             }
         }
         // A call writes its destination too, and that write is not a statement:
@@ -4303,7 +4383,25 @@ fn advance(
     // invariant is assumed over those. Only then does the exit edge carry
     // `I && !guard`, which is what lets a postcondition be proved for every state
     // the loop can leave rather than for the one state the first pass produced.
+    // Resolve each written place through the run's reference map first: a loop
+    // that writes `*p` (where `p = &mut x` was taken *before* the loop) writes
+    // `x`, but the syntactic destination is `p`. Without this the header kept
+    // `x`'s entry-state value, the exit guard `x > 100` folded to `false`, the
+    // exit edge was pruned as unreachable, and the postcondition was never
+    // checked -- a false proof. `place.local` and `resolve`'s target are the same
+    // local for every non-reference write, so this only widens the set.
+    let mut havoc: BTreeSet<u32> = BTreeSet::new();
     for &l in &cut.havoc {
+        havoc.insert(l);
+        // The referent of a reference the loop wrote through. `pointee` follows
+        // one level of value indirection (`_2 = &mut _1` records `2 -> _1`), which
+        // `resolve` does not for a bare local: the write `(*_2) = v` names `_2`,
+        // and without this the havoc missed `_1` and its entry-state value kept
+        // the exit guard folded to `false` -- a false proof.
+        let resolved = st.env.pointee(&Place { local: l, proj: Vec::new() });
+        havoc.insert(resolved.local);
+    }
+    for &l in &havoc {
         if let Some(ty) = cur.ty_of(l) {
             if let Some(w) = ty.width() {
                 // `var`, not `var_named`: a fresh variable is the point. A named
@@ -4317,6 +4415,20 @@ fn advance(
                     Val::Sym(smt::var(w), Sign::of(ty))
                 };
                 st.env.locals.insert(l, fresh);
+            } else {
+                // A local with no bit width is an aggregate (a struct, tuple or
+                // array), whose value lives in the parts stores rather than in
+                // `locals`. A loop that writes it -- the `RangeInclusive` a `for`
+                // loop advances through `&mut`, or a `c.lo = ..` field write --
+                // left those parts at the value they had at entry, so the header
+                // state was over-constrained, the exit guard folded, and the
+                // postcondition was never checked: a false proof. Replacing the
+                // whole value is what "an arbitrary value of this type" means, and
+                // dropping the parts is the sound direction -- a word part is
+                // replaced by a fresh variable of its own width so a model that
+                // reads it (a range's `start`/`end`) still resolves, while a
+                // non-word part is dropped to `Unknown`.
+                st.env.havoc_parts(l);
             }
         }
     }
