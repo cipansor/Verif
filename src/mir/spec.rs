@@ -5380,6 +5380,12 @@ impl<'a> Parser<'a> {
     ///
     /// Returns `None` when the exact result already fits, in which case the
     /// ordinary wrapping operator produces the same term and nothing changes.
+    ///
+    /// The two operands are `(value, sign, is-name)` triples plus the operator:
+    /// eight scalars in all, each read independently, which is why the grouping
+    /// clippy would prefer is not clearer here -- the same shape the other
+    /// eight-argument helpers in this crate carry an `allow` for.
+    #[allow(clippy::too_many_arguments)]
     fn fold_const_arith(
         &self,
         op: &str,
