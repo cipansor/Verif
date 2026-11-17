@@ -10044,3 +10044,23 @@ A related trap on the other side: a finding that names a *test* can be stale too
 assertion were all already corrected -- re-reading each one is what distinguished
 "already fixed" from "still open", and two of them were fixed by an *earlier*
 round that the review had not seen.
+
+A *later* round made the same point at larger scale: twelve findings (six severe,
+six non-severe), every one naming a symbol that no longer exists at HEAD --
+`slice_elem_cond`, the flat element-identity representation the `ElemId` commit
+(617a958) had already replaced. The tell was mechanical: `grep slice_elem_cond`
+returned nothing, so the findings were written against a revision before that
+commit. Each was still reproduced against the reviewer's own shape at HEAD
+(`a.first().or(b.first()).or(c.first())`, a user `m::Vec`, a `Vec` moved by
+`let w = v`, `unwrap_or_default` on `Result<_, Boom>`, a mutually recursive pair
+called from a loop), and all twelve came back already fixed -- the positives
+`verified`, the false twins `Failed` with a witness. Naming a symbol that does not
+exist is the cheapest staleness signal there is; grep for it first.
+
+The one *live* blocker in that round was not in the findings at all: clippy 1.100
+promotes `too_many_arguments` to an error under `-D warnings`, so gate 1 was red
+on the rollover toolchain over `fold_const_arith` (eight scalars). It reproduces on
+the unmodified tree (`git stash` and re-run), which is what makes it a rollover and
+not a regression. A review of *findings* is not a review of the *gate*; run the gate
+on the toolchain the reviewer names, or the build stays red behind twelve green
+"already fixed" replies.
