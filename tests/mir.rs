@@ -6638,6 +6638,45 @@ fn option_copied_and_cloned_copy_the_payload_with_the_tag() {
     }
 }
 
+/// `char` is a 32-bit unsigned value, its literals and the `is_ascii_*` predicates.
+///
+/// The predicates are exact at width 32 because every range they test lies inside
+/// `0..=0x7f`, so a value at or above `0x100` is outside all of them -- which is
+/// what `char::is_ascii_digit` means too. `char_high_digit_tripwire` is the
+/// evidence: `'\u{130}'`'s low byte is `'0'`, so a model that masked to eight bits
+/// would *prove* it, while the real predicate is `false`.
+#[test]
+fn char_literals_and_ascii_predicates_are_modelled() {
+    let names = [
+        "char_as_byte",
+        "char_ord_of_a",
+        "char_digit_is_true",
+        "char_digit_tripwire",
+        "char_high_digit_tripwire",
+        "char_high_is_not_digit",
+        "char_newline_is_whitespace",
+        "char_emoji_not_alphabetic",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "char_as_byte",
+        "char_ord_of_a",
+        "char_digit_is_true",
+        "char_high_is_not_digit",
+        "char_newline_is_whitespace",
+        "char_emoji_not_alphabetic",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    // Real refutations, with the scalar value in the witness -- so the literals
+    // were read (120 is `'x'`, 304 is `0x130`) and not skipped.
+    assert_refuted(&report, "char_digit_tripwire");
+    assert_refuted(&report, "char_high_digit_tripwire");
+}
+
 /// A `&mut bool` argument's final value is a predicate, not a word.
 ///
 /// The postcondition's bare `c` means the value the body left at the target. A

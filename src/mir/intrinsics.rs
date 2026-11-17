@@ -1872,11 +1872,18 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // has only the sign flag. It is total, so the only question is the width,
         // which is already bounded above.
         //
-        // The ASCII classes are stricter still: they exist only on `u8`, so the
-        // operand must be eight bits *and* unsigned. A wider or signed operand is
-        // a different method (or not a method), and modelling it as the byte test
-        // would answer a call `core` has no definition for.
-        Intrinsic::Bool(BoolKind::Ascii(_)) => !signed && w == 8,
+        // The ASCII classes are stricter still: they exist only on `u8` and
+        // `char`, so the operand must be unsigned. The width is deliberately *not*
+        // pinned to eight: a `char` is a 32-bit receiver here, and the predicate is
+        // exact at any width above eight, because every range it tests lies inside
+        // `0..=0x7f` and a value at or above `0x100` is outside all of them -- which
+        // is what `char::is_ascii_digit` means too (`(self as u32) as u8` in a byte
+        // range, and a `char` above `0xff` is not in one). The only unsigned
+        // receivers that reach here are `u8` and `char`, since `u16`/`u32`/`u64`
+        // have no such method; a *signed* operand is a different method (or not
+        // one), and modelling it as the byte test would answer a call `core` has no
+        // definition for.
+        Intrinsic::Bool(BoolKind::Ascii(_)) => !signed,
         Intrinsic::Bool(BoolKind::PowerOfTwo) => !signed,
         // `is_negative`/`is_positive` exist only on the *signed* types, so an
         // unsigned receiver is a different method (or not one), and reading the
@@ -5541,20 +5548,62 @@ mod tests {
         }
     }
 
-    /// The ASCII classes are refused on a signed or wider operand, where `core`
-    /// has no such method.
+    /// The ASCII classes are refused on a signed operand, where `core` has no such
+    /// method.
     ///
-    /// They exist only on `u8`, so an `i8` or `u16` receiver is a different method
-    /// (or not a method), and modelling it as the byte test would answer a call
-    /// `core` does not define.
+    /// They exist on `u8` and `char`, both unsigned, so an `i8` receiver is a
+    /// different method (or not a method), and modelling it as the byte test would
+    /// answer a call `core` does not define. The width is *not* part of the
+    /// refusal: a `char` is thirty-two bits and its predicate is the same byte test
+    /// applied to the full value.
     #[test]
-    fn the_ascii_classes_are_refused_off_u8() {
+    fn the_ascii_classes_are_refused_when_signed() {
         let digit = Intrinsic::Bool(BoolKind::Ascii(AsciiKind::Digit));
+        // Both receivers `core` defines the method for: `u8` (eight bits) and
+        // `char` (thirty-two). The predicate is exact at either width, because
+        // every range it tests lies inside `0..=0x7f` and a value at or above
+        // `0x100` is outside all of them -- which is what `char::is_ascii_digit`
+        // means too (`'\u{130}'.is_ascii_digit()` is `false`, though its low byte
+        // is `'0'`).
         assert!(is_modelled(digit, 8, false));
+        assert!(is_modelled(digit, 32, false));
+        // A *signed* operand is a different method (or not one), so it is refused
+        // rather than answered with the byte test.
         assert!(!is_modelled(digit, 8, true));
-        assert!(!is_modelled(digit, 16, false));
+        assert!(!is_modelled(digit, 32, true));
         assert!(eval(digit, smt::var(8), smt::var(8), 8, true, 8).is_none());
-        assert!(eval(digit, smt::var(16), smt::var(16), 16, false, 16).is_none());
+        assert!(eval(digit, smt::var(32), smt::var(32), 32, true, 32).is_none());
+    }
+
+    /// The ASCII class predicates agree with `char`'s own methods over the whole
+    /// 32-bit domain, not only the byte range.
+    ///
+    /// The point of the `char` receiver is the values whose low byte is in range
+    /// but whose value is not: `0x130`, `0x1030`, `0x1_0030` all end in `0x30`
+    /// (`'0'`) and `char::is_ascii_digit` is `false` for every one of them. A model
+    /// that masked to eight bits would accept them, so the walk names them.
+    #[test]
+    fn the_ascii_classes_agree_with_char_over_the_whole_domain() {
+        // `is_ascii_digit` is true exactly for `0x30..=0x39`.
+        let x = smt::var(32);
+        let digit = eval(
+            Intrinsic::Bool(BoolKind::Ascii(AsciiKind::Digit)),
+            x,
+            x,
+            32,
+            false,
+            32,
+        )
+        .expect("a `char` receiver is modelled");
+        let Outcome::Bool(p) = digit else {
+            panic!("an ASCII class is a predicate");
+        };
+        let idx = smt::index(x);
+        for v in [0x30u32, 0x39, 0x2f, 0x3a, 0x130, 0x1030, 0x1_0030, 0x139, 0x80, 0x100] {
+            let want = char::from_u32(v).is_some_and(|c| c.is_ascii_digit());
+            let got = smt::evaluate_pred(p, |i| (i == idx).then_some(v as u64));
+            assert_eq!(got, Some(want), "is_ascii_digit at {v:#x}");
+        }
     }
 
     /// `is_power_of_two` is refused on a signed operand, where `core` has no such

@@ -801,6 +801,30 @@ keeps growing.
     pin (a claim about a different element refutes). `realistic.rs`
     **615 of 1125** (from **611 of 1119**; six new fixtures, four verified and two
     refuted).
+  - Progress (cont.): `char` is modelled. A `char` is a 32-bit unsigned value, so
+    `Ty::Char` parses to width 32 and `c as u8` truncates to the low byte. The
+    `is_ascii_*` predicates (`is_ascii_digit`, `is_ascii_alphabetic`,
+    `is_ascii_alphanumeric`, `is_ascii_whitespace`, `is_ascii_uppercase`,
+    `is_ascii_lowercase`, `is_ascii_punctuation`, `is_ascii_hexdigit`, `is_ascii`)
+    are exact at width 32, because every range they test lies inside `0..=0x7f`
+    and a value at or above `0x100` is outside all of them — which is what
+    `char::is_ascii_digit` means too (`'\u{130}'.is_ascii_digit()` is `false`,
+    though its low byte is `'0'`). The `is_modelled` guard for the ASCII classes
+    therefore drops its `w == 8` clause: a `char` receiver is the same byte test
+    applied to the whole value, verified against `core` over the whole 32-bit
+    domain. A `char` *literal* is read in a contract as its Unicode scalar value
+    (`'0'` is `0x30`, `'\n'` is `0x0a`, `'\u{1F600}'` is `0x1F600`), and it is
+    *typed*: `'0' == 0u8` is `E0308` in Rust, so `Sign::Unsigned` (which does not
+    adapt) makes `align_widths` refuse the mismatch rather than resize the literal.
+    Unicode methods (`is_alphanumeric`, `to_ascii_uppercase`, `to_lowercase`) are
+    still refused — they are not ASCII byte tests. Eight fixtures in
+    `realistic.rs` (six true, two tripwires), pinned by
+    `char_literals_and_ascii_predicates_are_modelled` and the spec unit tests
+    `a_char_literal_is_read_as_its_scalar_value_or_refused` /
+    `a_char_literal_does_not_resize_to_a_narrower_operand` /
+    `the_ascii_classes_agree_with_char_over_the_whole_domain`. `realistic.rs`
+    **621 of 1133** (from **615 of 1125**; eight new fixtures, six verified and two
+    refuted).
 - **C7. Arithmetic scale and speed.** · P0 · in progress · Kani, Boolector,
   Bitwuzla
   - Gap: `u32::wrapping_mul` is past the 32-bit model; `clamp_std` takes 9.9 s.

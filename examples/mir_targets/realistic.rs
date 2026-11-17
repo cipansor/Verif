@@ -265,6 +265,76 @@ pub fn cloned_first_is_the_element(xs: &[u8]) -> u8 {
     xs.first().cloned().unwrap()
 }
 
+// ---------------------------------------------------------------------------
+// `char`: a 32-bit unsigned value, and the `is_ascii_*` predicates on it.
+//
+// A `char` is a Unicode scalar value, but the engine holds it at its 32-bit width
+// and leaves the range unconstrained -- an over-approximation, which is the sound
+// direction. The ASCII classes are exact at that width because every range they
+// test lies inside `0..=0x7f` and a value at or above `0x100` is outside all of
+// them, which is what `char::is_ascii_digit` means too (`'\u{130}'.is_ascii_digit()`
+// is `false` though its low byte is `'0'`).
+
+/// `c as u8` truncates the 32-bit value to its low byte: `'\u{1F600}'` is
+/// `0x1F600`, whose low byte is `0`.
+/// requires: c == '\u{1F600}'
+/// ensures: ret == 0
+pub fn char_as_byte(c: char) -> u8 {
+    c as u8
+}
+
+/// A `char` literal in a contract is its Unicode scalar value, so `'A'` is `65`.
+/// requires: c == 'A'
+/// ensures: ret == 65
+pub fn char_ord_of_a(c: char) -> u8 {
+    c as u8
+}
+
+/// `c.is_ascii_digit()` is true exactly for `'0'..='9'`.
+/// requires: c == '5'
+/// ensures: ret == 1
+pub fn char_digit_is_true(c: char) -> u8 {
+    c.is_ascii_digit() as u8
+}
+
+/// The false direction: `is_ascii_digit` is `0` for a non-digit, so a contract
+/// claiming `1` is refuted.
+/// requires: c == 'x'
+/// ensures: ret == 1
+pub fn char_digit_tripwire(c: char) -> u8 {
+    c.is_ascii_digit() as u8
+}
+
+/// A `char` whose *low byte* is `'0'` is still not an ASCII digit: the predicate
+/// is on the whole 32-bit value, not the byte. `'\u{130}'` is refuted for a claim
+/// of `1`, which a model that masked to eight bits would prove.
+/// requires: c == '\u{130}'
+/// ensures: ret == 1
+pub fn char_high_digit_tripwire(c: char) -> u8 {
+    c.is_ascii_digit() as u8
+}
+
+/// The high-`char` case read the *correct* way: it is not a digit.
+/// requires: c == '\u{130}'
+/// ensures: ret == 0
+pub fn char_high_is_not_digit(c: char) -> u8 {
+    c.is_ascii_digit() as u8
+}
+
+/// A whitespace escape in a contract is its scalar value: `'\n'` is `0x0a`.
+/// requires: c == '\n'
+/// ensures: ret == 1
+pub fn char_newline_is_whitespace(c: char) -> u8 {
+    c.is_ascii_whitespace() as u8
+}
+
+/// A Unicode escape names a scalar value directly.
+/// requires: c == '\u{1F600}'
+/// ensures: ret == 0
+pub fn char_emoji_not_alphabetic(c: char) -> u8 {
+    c.is_ascii_alphabetic() as u8
+}
+
 /// A fixed-size array argument. Unlike a slice the length is a *type*
 /// constant, so `a.len()` is not an input and the bounds check is against a
 /// literal: `_3 = Lt(_2, const 4_usize)`. That literal is what makes this shape

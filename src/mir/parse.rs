@@ -33,6 +33,17 @@ pub enum Ty {
     I64,
     I128,
     Isize,
+    /// `char`, modelled as a 32-bit unsigned value.
+    ///
+    /// A `char` is a Unicode scalar value (`0..=0x10FFFF`, surrogates excluded),
+    /// but the engine holds it at its 32-bit width and leaves the range
+    /// unconstrained. That is an *over*-approximation of the input domain, which is
+    /// the sound direction: a contract proved for every 32-bit value holds for
+    /// every `char`, so the ASCII predicates (which compare the full width against
+    /// byte ranges) are exact, and a magnitude contract may be refuted with a
+    /// counterexample that is not a valid `char` -- a lost proof, never a false
+    /// one.
+    Char,
     /// A tuple, e.g. `(u32, bool)` from an overflowing add.
     Tuple(Vec<Ty>),
     /// A fixed-size array, e.g. `[u32; 3]`.
@@ -61,6 +72,7 @@ impl Ty {
     pub fn width(&self) -> Option<u8> {
         Some(match self {
             Ty::Bool => 1,
+            Ty::Char => 32,
             Ty::U8 => 8,
             Ty::U16 => 16,
             Ty::U32 => 32,
@@ -126,6 +138,7 @@ impl Ty {
         let s = s.trim();
         match s {
             "bool" => return Ty::Bool,
+            "char" => return Ty::Char,
             "u8" => return Ty::U8,
             "u16" => return Ty::U16,
             "u32" => return Ty::U32,

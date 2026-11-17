@@ -4576,7 +4576,87 @@ enum Tok {
     /// == 0xFF` became `x == 0`, so `ensures: ret == 0` was "proved" for a
     /// function returning `255`. A refusal is safe; a wrong number is not.
     BadNum,
+    /// A character literal, as its Unicode scalar value.
+    ///
+    /// A `char` is a 32-bit value in this model, so `'0'` is `0x30` at width 32
+    /// and is *typed* (it does not adapt to meet a narrower operand): `'0' == 0u8`
+    /// is `E0308` in Rust, so it must be refused rather than resized. Its
+    /// signedness is `Unsigned`, which is what makes `align_widths` see the width
+    /// mismatch.
+    Char(u32),
+    /// A character literal the tokenizer could not read exactly (an unknown
+    /// escape, a missing closing quote, a multi-character literal). Refused for
+    /// the same reason as [`Tok::BadNum`]: a wrong constant in a precondition is a
+    /// false proof.
+    BadChar,
     Op(String),
+}
+
+/// Read a Rust character literal starting at `start` (which must be a `'`).
+///
+/// Returns the scalar value and the index just past the closing quote, or `None`
+/// for anything this reader cannot spell exactly: an unterminated literal, a
+/// literal with more than one character, or an escape it does not know. A byte
+/// escape (`'\n'`, `'\u{1F600}'`, `'\\'`, `'\''`) is read; a raw or multi-char
+/// literal is refused, because a guessed value in a contract is a false proof.
+fn read_char_literal(b: &[char], start: usize) -> Option<(u32, usize)> {
+    let mut i = start + 1;
+    let v = if *b.get(i)? == '\\' {
+        i += 1;
+        let e = *b.get(i)?;
+        i += 1;
+        match e {
+            'n' => 0x0a,
+            'r' => 0x0d,
+            't' => 0x09,
+            '\\' => 0x5c,
+            '\'' => 0x27,
+            '"' => 0x22,
+            '0' => 0x00,
+            'x' => {
+                // `'\xNN'`: exactly two hex digits.
+                let hi = b.get(i)?.to_digit(16)?;
+                let lo = b.get(i + 1)?.to_digit(16)?;
+                i += 2;
+                hi * 16 + lo
+            }
+            'u' => {
+                // `'\u{...}'`: a braced hex scalar value.
+                if *b.get(i)? != '{' {
+                    return None;
+                }
+                i += 1;
+                let mut n = 0u32;
+                let mut any = false;
+                while let Some(d) = b.get(i).and_then(|c| c.to_digit(16)) {
+                    n = n.checked_mul(16)?.checked_add(d)?;
+                    any = true;
+                    i += 1;
+                }
+                if !any || *b.get(i)? != '}' {
+                    return None;
+                }
+                i += 1;
+                n
+            }
+            _ => return None,
+        }
+    } else {
+        let ch = *b.get(i)?;
+        // A single character, and not the closing quote (an empty literal `''`).
+        if ch == '\'' {
+            return None;
+        }
+        i += 1;
+        ch as u32
+    };
+    // Exactly one closing quote, and no more characters in the literal.
+    if *b.get(i)? != '\'' {
+        return None;
+    }
+    // A `char` must be a Unicode scalar value.
+    char::from_u32(v)?;
+    Some((v, i + 1))
 }
 
 fn tokenize(s: &str) -> Vec<Tok> {
@@ -4585,6 +4665,29 @@ fn tokenize(s: &str) -> Vec<Tok> {
     let mut i = 0;
     while i < b.len() {
         let c = b[i];
+        if c == '\'' {
+            // A character literal. Read it exactly or refuse it: a wrong constant
+            // in a precondition is a false proof, and `'0'` is the everyday way a
+            // contract names a byte.
+            match read_char_literal(&b, i) {
+                Some((v, next)) => {
+                    out.push(Tok::Char(v));
+                    i = next;
+                }
+                None => {
+                    out.push(Tok::BadChar);
+                    // Consume to the end of the would-be literal so the scan makes
+                    // progress and the parser sees one refusal rather than a
+                    // cascade of stray tokens.
+                    i += 1;
+                    while i < b.len() && b[i] != '\'' {
+                        i += 1;
+                    }
+                    i = (i + 1).min(b.len());
+                }
+            }
+            continue;
+        }
         if c.is_whitespace() {
             i += 1;
             continue;
@@ -6819,6 +6922,17 @@ impl<'a> Parser<'a> {
                 self.bare_literals.insert(v.0 .0);
                 Ok((v, Sign::Literal))
             }
+            Some(Tok::Char(c)) => {
+                self.pos += 1;
+                // A `char` is a 32-bit value, and it is *typed*: `'0' == 0u8` is
+                // `E0308` in Rust, so `Sign::Unsigned` (which does not adapt) makes
+                // `align_widths` refuse a mismatch rather than resizing the literal
+                // to meet a narrower operand. The value is the Unicode scalar
+                // value, exactly as `char as u32` would give it.
+                let v = smt::word(u64::from(c), 32);
+                self.record_const(v, false);
+                Ok((v, Sign::Unsigned))
+            }
             Some(Tok::Ident(name)) => {
                 self.pos += 1;
                 if name == "ret" || name == "result" {
@@ -7018,6 +7132,9 @@ impl<'a> Parser<'a> {
             }
             Some(Tok::BadNum) => {
                 Err(self.err("a numeric literal that is not an exact integer (bad digit for its radix, or past u64)"))
+            }
+            Some(Tok::BadChar) => {
+                Err(self.err("a character literal that is not an exact Unicode scalar value (an unknown escape, a multi-character literal, or a missing quote)"))
             }
             Some(t) => Err(self.err(format!("unexpected token {t:?}"))),
             None => Err(self.err("unexpected end of contract")),
@@ -9492,6 +9609,67 @@ mod tests {
         assert!(p.parse_expr().is_err(), "a folded zero divisor is refused");
         // A constant, non-zero divisor folds and reads: `4 / (1 + 1)` is `2`.
         assert_eq!(smt::evaluate(parse("x / (1 + 1)"), |_| Some(4)), Some(2));
+    }
+
+    /// A character literal is read as its Unicode scalar value, and one that is not
+    /// an exact scalar value is refused.
+    ///
+    /// `'0'` is the everyday way a contract names a byte, and it must read as `0x30`
+    /// at width 32. The escapes (`'\n'`, `'\u{...}'`, `'\\'`, `'\''`, `'\xNN'`) are
+    /// read; a multi-character literal, an unknown escape and an unterminated
+    /// literal are refused, because a guessed value in a contract is a false proof.
+    #[test]
+    fn a_char_literal_is_read_as_its_scalar_value_or_refused() {
+        let mut args = BTreeMap::new();
+        args.insert("c".to_string(), smt::var(32));
+        let unsigned = BTreeSet::new();
+        let val = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, _) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate(v, |_| None).expect("a constant")
+        };
+        let refuses = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            p.parse_expr().is_err() || p.expect_end().is_err()
+        };
+        assert_eq!(val("'0'"), 0x30, "`'0'` is 48");
+        assert_eq!(val("'A'"), 65);
+        assert_eq!(val("'\\n'"), 0x0a, "a newline escape");
+        assert_eq!(val("'\\t'"), 0x09);
+        assert_eq!(val("'\\\\'"), 0x5c, "a backslash escape");
+        assert_eq!(val("'\\''"), 0x27, "an escaped quote");
+        assert_eq!(val("'\\x41'"), 0x41, "a byte escape");
+        assert_eq!(val("'\\u{1F600}'"), 0x1F600, "a Unicode escape");
+        assert_eq!(val("'\u{130}'"), 0x130, "a literal non-ASCII char");
+        // Refusals, never a guessed value.
+        assert!(refuses("'ab'"), "a multi-character literal is refused");
+        assert!(refuses("'\\q'"), "an unknown escape is refused");
+        assert!(refuses("'a"), "an unterminated literal is refused");
+        assert!(refuses("''"), "an empty literal is refused");
+        assert!(refuses("'\\u{110000}'"), "past the Unicode range is refused");
+    }
+
+    /// A `char` literal is *typed*: it does not resize to meet a narrower operand,
+    /// so `'0' == 0u8` is refused exactly as rustc's `E0308` rejects it.
+    ///
+    /// The literal is built at width 32, and `Sign::Unsigned` does not adapt, so
+    /// `align_widths` sees a width mismatch and refuses. A `char` compared against a
+    /// `char` (both 32 bits) still reads, so the refusal is about the *mismatch*, not
+    /// about `char` itself.
+    #[test]
+    fn a_char_literal_does_not_resize_to_a_narrower_operand() {
+        let mut args = BTreeMap::new();
+        args.insert("b".to_string(), smt::var(8));
+        args.insert("c".to_string(), smt::var(32));
+        let unsigned = BTreeSet::new();
+        // A comparison is a *predicate*, so the entry point is `parse_cmp`.
+        let parses = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            p.parse_cmp().is_ok() && p.expect_end().is_ok()
+        };
+        assert!(parses("c == '0'"), "two `char`s compare");
+        assert!(!parses("b == '0'"), "`'0' == 0u8` is `E0308`, so it is refused");
     }
 
     /// A radix literal is read at its *radix*, and one that is not an exact

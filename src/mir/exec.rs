@@ -8040,6 +8040,7 @@ where
 fn drop_is_noop(ty: &Ty) -> bool {
     match ty {
         Ty::Bool
+        | Ty::Char
         | Ty::U8
         | Ty::U16
         | Ty::U32
@@ -8074,6 +8075,7 @@ fn drop_is_noop(ty: &Ty) -> bool {
 fn ty_label(ty: &Ty) -> String {
     match ty {
         Ty::Bool => "bool".into(),
+        Ty::Char => "char".into(),
         Ty::U8 => "u8".into(),
         Ty::U16 => "u16".into(),
         Ty::U32 => "u32".into(),
@@ -8171,6 +8173,7 @@ fn has_drop_glue(
 ) -> Result<bool, String> {
     match ty {
         Ty::Bool
+        | Ty::Char
         | Ty::U8
         | Ty::U16
         | Ty::U32
@@ -8235,6 +8238,7 @@ fn has_field_glue(
 ) -> Result<bool, String> {
     match ty {
         Ty::Bool
+        | Ty::Char
         | Ty::U8
         | Ty::U16
         | Ty::U32
