@@ -12249,3 +12249,34 @@ pub fn str_is_empty_cannot_prove_this(s: &str) -> bool {
     s.is_empty()
 }
 
+/// `unwrap_or_default` is total and yields the payload's own zero on the failure
+/// variant, so a `None` receiver is `0`.
+/// requires: x.is_none()
+/// ensures: ret == 0
+pub fn unwrap_or_default_none_is_zero(x: Option<u8>) -> u8 {
+    x.unwrap_or_default()
+}
+
+/// The false twin: the `Some` path can carry any payload, so a fixed value is not
+/// provable.
+/// requires: true
+/// ensures: ret == 7
+pub fn unwrap_or_default_cannot_prove_this(x: Option<u8>) -> u8 {
+    x.unwrap_or_default()
+}
+
+/// The same shape on a `Result`: the failure variant (`Err`) yields the payload's
+/// zero.
+/// requires: r.is_err()
+/// ensures: ret == 0
+pub fn result_unwrap_or_default_err_is_zero(r: Result<u8, u8>) -> u8 {
+    r.unwrap_or_default()
+}
+
+/// The false twin on a `Result`.
+/// requires: r.is_err()
+/// ensures: ret == 5
+pub fn result_unwrap_or_default_cannot_prove_this(r: Result<u8, u8>) -> u8 {
+    r.unwrap_or_default()
+}
+

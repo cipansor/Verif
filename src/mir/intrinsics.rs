@@ -839,6 +839,11 @@ pub enum OptionMethod {
     /// `unwrap_or(default)`: the payload on the success variant, the default on
     /// the other. Total.
     UnwrapOr,
+    /// `unwrap_or_default()`: the payload on the success variant, `T::default()`
+    /// on the other. Total. The default is the *scalar* zero of the payload's own
+    /// width, which is what `Default` gives for every integer and `bool`; a
+    /// payload with no bit width (a struct) is refused rather than guessed.
+    UnwrapOrDefault,
     /// `unwrap()`: the payload, and a **panic** on the failure variant. The one
     /// shape here whose failure is a panic, so it yields a reachable-panic
     /// obligation rather than a plain value.
@@ -1227,6 +1232,9 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if names_option_impl(name) {
         match short {
             "unwrap_or" => return Some(Intrinsic::OptionMethod(OptionMethod::UnwrapOr)),
+            "unwrap_or_default" => {
+                return Some(Intrinsic::OptionMethod(OptionMethod::UnwrapOrDefault))
+            }
             "unwrap" => return Some(Intrinsic::OptionMethod(OptionMethod::Unwrap)),
             "expect" => return Some(Intrinsic::OptionMethod(OptionMethod::Expect)),
             "is_some" => return Some(Intrinsic::OptionMethod(OptionMethod::IsSuccess)),
@@ -1238,6 +1246,9 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if names_result_impl(name) {
         match short {
             "unwrap_or" => return Some(Intrinsic::OptionMethod(OptionMethod::UnwrapOr)),
+            "unwrap_or_default" => {
+                return Some(Intrinsic::OptionMethod(OptionMethod::UnwrapOrDefault))
+            }
             "unwrap" => return Some(Intrinsic::OptionMethod(OptionMethod::Unwrap)),
             "expect" => return Some(Intrinsic::OptionMethod(OptionMethod::Expect)),
             "is_ok" => return Some(Intrinsic::OptionMethod(OptionMethod::IsSuccess)),

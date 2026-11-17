@@ -5257,27 +5257,47 @@ fn enum_method(
         // projection only inside that arm. So the payload is written without a
         // guard here; the tag's `switchInt` is what keeps a failure path from
         // reaching this read.
-        OptionMethod::Unwrap | OptionMethod::Expect | OptionMethod::UnwrapOr => {
+        OptionMethod::Unwrap | OptionMethod::Expect | OptionMethod::UnwrapOr
+        | OptionMethod::UnwrapOrDefault => {
             let Some((Val::Sym(payload, sign), _)) =
                 env.payloads.get(&(opt.local, payload_variant)).copied()
             else {
                 return Err(format!("`{name}` on a receiver whose payload is not modelled"));
             };
-            let value = if let OptionMethod::UnwrapOr = kind {
-                // `unwrap_or(default)`: the payload on the success variant, the
-                // default on the failure one. The default is the second argument
-                // (`Option::unwrap_or(self, default)`), so a failure receiver
-                // yields it and the method is *total* -- no panic obligation.
-                let default = match args.get(1) {
-                    Some(d) => match operand(env, d) {
-                        Val::Sym(v, _) => v,
-                        _ => return Err(format!("unmodelled default argument to `{name}`")),
-                    },
-                    None => return Err(format!("`{name}` has no default argument")),
-                };
-                smt::ite(smt::eq_const(tag, payload_variant), payload, default)
-            } else {
-                payload
+            let value = match kind {
+                OptionMethod::UnwrapOr => {
+                    // `unwrap_or(default)`: the payload on the success variant, the
+                    // default on the failure one. The default is the second argument
+                    // (`Option::unwrap_or(self, default)`), so a failure receiver
+                    // yields it and the method is *total* -- no panic obligation.
+                    let default = match args.get(1) {
+                        Some(d) => match operand(env, d) {
+                            Val::Sym(v, _) => v,
+                            _ => return Err(format!("unmodelled default argument to `{name}`")),
+                        },
+                        None => return Err(format!("`{name}` has no default argument")),
+                    };
+                    smt::ite(smt::eq_const(tag, payload_variant), payload, default)
+                }
+                OptionMethod::UnwrapOrDefault => {
+                    // `unwrap_or_default()`: the payload on the success variant,
+                    // `T::default()` on the failure one. For every scalar payload
+                    // this tool models, `Default` is the zero of the payload's own
+                    // width -- `0u8`, `0i32`, `false` -- so the default is that
+                    // word, not a fresh input. The width is the payload's own (not
+                    // the destination's, which is the same type here but a
+                    // different local), and a payload with no bit width (a struct)
+                    // is refused rather than given a zero it may not have.
+                    let w = payload.width();
+                    if w == 0 {
+                        return Err(format!(
+                            "`{name}` on a payload whose default value is not modelled"
+                        ));
+                    }
+                    let default = smt::word(0, w);
+                    smt::ite(smt::eq_const(tag, payload_variant), payload, default)
+                }
+                _ => payload,
             };
             env.set(dest, Val::Sym(value, sign));
             if matches!(kind, OptionMethod::Unwrap | OptionMethod::Expect) {

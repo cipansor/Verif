@@ -295,6 +295,26 @@ keeps growing.
     branch-vacuity pair, and two refusals — a non-enum return and a unit variant),
     pinned by `an_enum_return_contract_can_name_a_payload`. This closes the last
     named C2 sub-item; `realistic.rs` **467 of 869 -> 472 of 881**.
+  - Progress (`unwrap_or_default`): `Option::unwrap_or_default` and
+    `Result::unwrap_or_default` are modelled. Both are `unwrap_or(T::default())`,
+    so they reuse the `unwrap_or` arm with the default supplied by the model
+    rather than by an argument: for every scalar payload the tool models,
+    `T::default()` is the zero of the payload's own width (`0u8`, `0i32`,
+    `false`), so the failure variant yields that word. A payload with no bit width
+    (a struct) is refused rather than given a zero it may not have. Both are
+    total -- no panic obligation -- and both are pinned by a `None`/`Err` true
+    entry and a false twin (the `Some`/`Ok` path can carry any payload, so a fixed
+    value is refuted). Four fixtures in `realistic.rs`, pinned by
+    `option_unwrap_or_default_is_the_payload_or_zero`; the corpus carries the
+    `Option` and `Result` directions.
+  - Guard (`str` shadowing): a user type may shadow a primitive name, and rustc
+    prints a crate-root type as the bare name, so `pub struct str { .. }` is
+    spelled `&str` exactly as the primitive is. The primitive `str` length is
+    therefore bound only when no declared layout names `str`
+    (`struct_lookup(..).is_none()`); a user `str` reaches the struct branch and
+    its fields bind. Pinned by `a_user_type_named_str_is_not_the_primitive_str`,
+    which asserts both directions -- the user field resolves and refutes a fixed
+    value, and the primitive length is still a symbolic input.
   - Remaining: `map`/`map_err`/`and_then`/`unwrap_or_else` (closures). The `?`
     operator is modelled (see the `?` progress note above).
 - **C3. Ranges and `for` loops.** · P0 · done · Kani, Verus, Prusti

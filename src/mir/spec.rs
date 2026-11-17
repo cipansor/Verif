@@ -7695,17 +7695,6 @@ pub fn field_env_named(
             continue;
         }
         let Ty::Other(name) = base else { continue };
-        // A `&str` argument: its length is a symbolic input exactly as a slice's
-        // is (a `str` is unsized, so the length lives in the fat pointer), and
-        // `s.len()`/`s.is_empty()` read only that length. Binding it with the
-        // unmodelled-width sentinel keeps those answerable while every element
-        // operation stays refused. A `String` is *not* `str`: its own type is
-        // `alloc::string::String`, so a `s.len()` on one goes through a deref to
-        // a `&str` local the binder never saw and stays a refusal.
-        if name == "str" {
-            env.bind_indexed_len(l, &arg, 0, false);
-            continue;
-        }
         // An enum argument: its tag is a symbolic input with the enum's arity as
         // its domain, and each variant's payload is its own input. Checked before
         // the struct path because an enum name is an `Other` too, and binding it
@@ -7723,6 +7712,23 @@ pub fn field_env_named(
         }
         if let Some(def) = std_enum_def(name) {
             env.bind_enum(l, &arg, name, &def);
+            continue;
+        }
+        // A `&str` argument: its length is a symbolic input exactly as a slice's
+        // is (a `str` is unsized, so the length lives in the fat pointer), and
+        // `s.len()`/`s.is_empty()` read only that length. Binding it with the
+        // unmodelled-width sentinel keeps those answerable while every element
+        // operation stays refused. A `String` is *not* `str`: its own type is
+        // `alloc::string::String`, so a `s.len()` on one goes through a deref to
+        // a `&str` local the binder never saw and stays a refusal.
+        //
+        // Rust lets a user type shadow the primitive name (`pub struct str { .. }`,
+        // which rustc prints at the crate root as the bare `str`), so the
+        // declared layout is consulted *first*: a `str` with a declaration is the
+        // user's type and is bound as a struct below, not as the primitive. Only
+        // when nothing declares `str` is the primitive meant.
+        if name == "str" && struct_lookup(structs, name).is_none() {
+            env.bind_indexed_len(l, &arg, 0, false);
             continue;
         }
         // Recorded whether or not a layout was found, so a contract naming a field

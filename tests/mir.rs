@@ -6993,6 +6993,93 @@ pub fn empty_is_empty(s: &str) -> bool { s.is_empty() }
     );
 }
 
+/// `Option::unwrap_or_default` is total, and its default is the payload's own zero.
+///
+/// The default of every scalar `Default` this tool models is the zero of the
+/// payload's width (`0u8`, `0i32`, `false`), so the failure variant yields that
+/// word rather than a fresh input. The `x.is_none()` pin makes the body's read the
+/// default on every path, and the false twin (`ret == 7`) is refuted because the
+/// `Some` path can carry any payload.
+#[test]
+fn option_unwrap_or_default_is_the_payload_or_zero() {
+    let src = r#"
+/// requires: true
+/// ensures: ret <= 255
+pub fn or_zero(x: Option<u8>) -> u8 { x.unwrap_or_default() }
+
+/// requires: x.is_none()
+/// ensures: ret == 0
+pub fn none_is_zero(x: Option<u8>) -> u8 { x.unwrap_or_default() }
+
+/// requires: true
+/// ensures: ret == 7
+pub fn cannot_prove_this(x: Option<u8>) -> u8 { x.unwrap_or_default() }
+"#;
+    for name in ["or_zero", "none_is_zero"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    let Some(o) = verify_src("cannot_prove_this", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`unwrap_or_default` must not be provable as a fixed `7`; got: {o}"
+    );
+}
+
+/// A user type named `str` is not the primitive `str`.
+///
+/// Rust lets a crate shadow a primitive name, and rustc prints a crate-root type
+/// as the bare name, so a `pub struct str { .. }` argument is spelled `&str`
+/// exactly as the primitive is. Binding the primitive's symbolic length *before*
+/// consulting the declared layout therefore bound a field-less type over the
+/// user's struct, and a contract naming its field could not resolve. The declared
+/// layout now wins; the primitive is meant only when nothing declares `str`.
+///
+/// The primitive direction is asserted too, so a fix that simply refused every
+/// `str` argument would fail this test.
+#[test]
+fn a_user_type_named_str_is_not_the_primitive_str() {
+    let src = r#"
+pub struct str { pub value: u8 }
+
+/// requires: s.value == 3
+/// ensures: ret == 3
+pub fn read(s: &str) -> u8 { s.value }
+
+/// requires: true
+/// ensures: ret == 3
+pub fn read_cannot_prove_this(s: &str) -> u8 { s.value }
+"#;
+    let Some(o) = verify_src("read", src) else { return };
+    assert!(
+        o.is_verified(),
+        "a field of a user `str` must resolve; got: {o}"
+    );
+    let Some(o) = verify_src("read_cannot_prove_this", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "the user `str`'s field is an input, so a fixed value must be refuted; got: {o}"
+    );
+
+    // The primitive is still modelled when nothing declares `str`.
+    let prim = r#"
+/// requires: s.len() == 3
+/// ensures: ret == 3
+pub fn len_is_symbolic(s: &str) -> usize { s.len() }
+
+/// requires: true
+/// ensures: ret == 4
+pub fn wrong_len_cannot_prove_this(s: &str) -> usize { s.len() }
+"#;
+    let Some(o) = verify_src("len_is_symbolic", prim) else { return };
+    assert!(o.is_verified(), "the primitive `str` length must resolve; got: {o}");
+    let Some(o) = verify_src("wrong_len_cannot_prove_this", prim) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "an unpinned `str` length must not be provable as `4`; got: {o}"
+    );
+}
+
 /// A `&mut [u8]` slice write must reach the store the read consults.
 ///
 /// This is the gap the `&raw const (fake) (*_1)` parse closed. Before it, the
