@@ -6777,6 +6777,176 @@ pub fn arg_len_refused(v: &Vec<u8>) -> usize { v.len() }
     );
 }
 
+/// Three soundness holes in the `Vec` length model, each a *false proof*.
+///
+/// The model tracks a length per local (`Env::vec_len`). Each of these had the
+/// length survive a place it should not, so a false postcondition was proved:
+///
+/// * **A user `Vec` is not the container.** A local `struct Vec<T>` whose `Drop`
+///   panics was treated as glue-free (the model matched the bare `Vec`), so the
+///   panic never ran and `f` was reported `Verified`. The container identity is
+///   the *full* path (`std::vec::Vec` / `alloc::vec::Vec`); a user `Vec` is an
+///   ordinary type and its destructor is resolved like any other.
+/// * **The loop header havocs the length.** An inductive loop that pushes has to
+///   forget the entry length, or the exit edge reads it: a `while i < 3 { v.push
+///   (1); i += 1 }` proved `ret == 0` for the real `ret == 3`. `havoc_parts`
+///   refreshes the tracked length to a fresh `usize`.
+/// * **A move carries the length.** `let w = v` (`copy_parts`) and a returned
+///   vector (the call's return merge) both have to transfer the tracked length to
+///   the destination, or `w.len()`/`mk().len()` read a receiver with no length.
+#[test]
+fn a_vec_length_model_does_not_leak_across_a_drop_havoc_or_move() {
+    let src = r#"
+mod m {
+    pub struct Vec<T>(pub T);
+    impl<T> Drop for Vec<T> {
+        fn drop(&mut self) { panic!() }
+    }
+}
+
+/// A user `Vec` whose destructor always panics: `drop` runs it, so this must not
+/// be `verified`. The bare-name model treated `m::Vec<u8>` as glue-free.
+/// requires: true
+/// ensures: true
+pub fn user_vec_drop_panics() { let _x = m::Vec(0u8); }
+
+/// The loop's entry length must be havoced at the header. A model that kept it
+/// reads `0` at the exit and proves this; the body really returns `3`.
+/// requires: true
+/// invariant: i <= 3
+/// ensures: ret == 0
+pub fn loop_push_cannot_prove_this() -> usize {
+    let mut v = Vec::<u8>::new();
+    let mut i = 0u8;
+    while i < 3 { v.push(1); i += 1; }
+    v.len()
+}
+
+/// The control: the same loop, but the postcondition is about the *counter*,
+/// which the invariant does relate (`i <= 3` and the exit guard `i >= 3` give
+/// `i == 3`). Havocing the vector's length must not break this -- a model that
+/// refused every `Vec`-carrying loop would pass the twin above while checking
+/// nothing.
+/// requires: true
+/// invariant: i <= 3
+/// ensures: ret == 3
+pub fn loop_counter_ok() -> u8 {
+    let mut v = Vec::<u8>::new();
+    let mut i = 0u8;
+    while i < 3 { v.push(1); i += 1; }
+    i
+}
+
+/// A move (`let w = v`) must carry the tracked length to the destination.
+/// requires: true
+/// ensures: ret == 1
+pub fn move_ok(n: u8) -> usize { let mut v = Vec::new(); v.push(n); let w = v; w.len() }
+
+/// The false twin: a model that dropped the length on the move reads a receiver
+/// with no length and refuses; one that kept the *source* length and read it
+/// through the wrong local would prove this.
+/// requires: true
+/// ensures: ret == 0
+pub fn move_bad(n: u8) -> usize { let mut v = Vec::new(); v.push(n); let w = v; w.len() }
+
+/// A returned vector must carry its length to the caller's destination.
+/// requires: true
+/// ensures: ret == 0
+pub fn mk() -> Vec<u8> { Vec::new() }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn returned_ok() -> usize { let v = mk(); v.len() }
+"#;
+    // The user `Vec`'s destructor panics, so the function must not be proved.
+    // A refusal is the sound answer (the destructor body's `panic!` is not
+    // modelled as a value), and a refutation is also fine -- only `verified` is a
+    // false proof.
+    let Some(o) = verify_src("user_vec_drop_panics", src) else { return };
+    assert!(
+        !o.is_verified(),
+        "a user `Vec` whose `Drop` panics must not verify; got: {o}"
+    );
+
+    // The loop twin must be *refuted* on its postcondition, not merely refused:
+    // a refusal also satisfies "not verified" and would check nothing.
+    let Some(o) = verify_src("loop_push_cannot_prove_this", src) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("postcondition"),
+            "the loop twin must fail on its postcondition; got `{kind}`"
+        ),
+        other => panic!(
+            "the loop entry length must be havoced, so `ret == 0` for a body \
+             returning 3 must be refuted; got: {other}"
+        ),
+    }
+    // The control: havocing the length must not break a loop whose postcondition
+    // is about a variable the invariant *does* relate.
+    let Some(o) = verify_src("loop_counter_ok", src) else { return };
+    assert!(
+        o.is_verified(),
+        "a `Vec`-carrying loop with a counter postcondition must still verify; got: {o}"
+    );
+
+    // The move: the true direction verifies, the false twin is refuted.
+    let Some(o) = verify_src("move_ok", src) else { return };
+    assert!(o.is_verified(), "a moved vector keeps its length; got: {o}");
+    let Some(o) = verify_src("move_bad", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "the move twin claims `0` for a vector of length 1 and must be refuted; got: {o}"
+    );
+
+    // The returned vector: the caller's destination inherits the length.
+    let Some(o) = verify_src("returned_ok", src) else { return };
+    assert!(o.is_verified(), "a returned vector keeps its length; got: {o}");
+}
+
+/// A user type spelled `Vec` is not the container, and its *methods* are answered
+/// by their own bodies.
+///
+/// `names_vec_impl` accepts a call whose path contains `vec::Vec` or starts with a
+/// bare `Vec::` -- the shortened spelling rustc prints for the *standard*
+/// container when nothing shadows it. A user `Vec` also prints `Vec::<u8>::new`
+/// at the crate root, so the predicate alone cannot separate them. What does is
+/// the executor's same-dump lookup, which resolves the user body *before* the
+/// model: `body_wins` returns 7 from its own `len` and verifies against `ret == 7`,
+/// while the twin claiming the container model's `0` is refuted. This pins that
+/// the model is not consulted for a call that names a body in the dump.
+#[test]
+fn a_user_vec_method_is_answered_by_its_own_body() {
+    let src = r#"
+pub struct Vec<T>(pub T);
+impl Vec<u8> {
+    pub fn new() -> Self { Vec(0) }
+    pub fn len(&self) -> usize { 7 }
+}
+
+/// The user body returns 7, so this verifies -- the model's `0` would refute it.
+/// requires: true
+/// ensures: ret == 7
+pub fn body_wins() -> usize { let v = Vec::new(); v.len() }
+
+/// The twin: the container model would answer `0` and prove this, so a refutation
+/// is the evidence the user body was used.
+/// requires: true
+/// ensures: ret == 0
+pub fn model_would_say_zero() -> usize { let v = Vec::new(); v.len() }
+"#;
+    let Some(o) = verify_src("body_wins", src) else { return };
+    assert!(
+        o.is_verified(),
+        "a user `Vec` method must be answered by its own body; got: {o}"
+    );
+    let Some(o) = verify_src("model_would_say_zero", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "the container model must not answer a user `Vec` call, so `ret == 0` must be \
+         refuted; got: {o}"
+    );
+}
+
 /// A `&mut [u8]` slice write must reach the store the read consults.
 ///
 /// This is the gap the `&raw const (fake) (*_1)` parse closed. Before it, the

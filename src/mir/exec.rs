@@ -1334,6 +1334,11 @@ impl Env {
             self.payloads.iter().filter(|((l, _), _)| *l == s).map(|((_, k), v)| (*k, *v)).collect();
         let disc = self.discriminants.get(&s).copied();
         let indexed = self.indexed.get(&s).cloned();
+        // A tracked `Vec` length is part of the value too: `let w = v` moves the
+        // vector, so the destination has to inherit the length or `w.len()` reads a
+        // receiver with no modelled length. The length is a `usize` word, so it
+        // copies like a part rather than being dropped.
+        let vec_len = self.vec_len.get(&s).copied();
         // Nested paths are parts too, keyed by the local *and* the chain. A copy
         // that moved only the single-field parts would leave `c`'s own `c.i.v`
         // seed in place after `c = d`, so a later `c.i.v` would read `c`'s
@@ -1370,7 +1375,8 @@ impl Env {
             || !path_elems.is_empty()
             || !elem_parts.is_empty()
             || disc.is_some()
-            || indexed.is_some();
+            || indexed.is_some()
+            || vec_len.is_some();
         self.forget_parts(dst);
         for (k, chain, v) in elem_parts {
             self.elem_parts.insert((dst, k, chain), v);
@@ -1395,6 +1401,9 @@ impl Env {
         }
         if let Some(ix) = indexed {
             self.indexed.insert(dst, ix);
+        }
+        if let Some(len) = vec_len {
+            self.vec_len.insert(dst, len);
         }
         any
     }
@@ -1939,6 +1948,15 @@ impl Env {
         self.payloads.retain(|(l, _), _| *l != local);
         self.discriminants.remove(&local);
         self.tag_widths.remove(&local);
+        // A tracked `Vec` length is part of the value the header havocs, so it is
+        // replaced by a fresh `usize`. Leaving it at the entry length would let the
+        // *exit* edge read a length the loop no longer has: an inductive loop that
+        // pushes three times would prove `ret == 0` for the real `ret == 3` -- a
+        // false proof. The fresh variable is the "arbitrary length at the header"
+        // the invariant did not constrain.
+        if let Some(len) = self.vec_len.get_mut(&local) {
+            *len = smt::var(USIZE_WIDTH);
+        }
         if let Some(s) = self.indexed.get_mut(&local) {
             s.elems.clear();
             s.poisoned = true;
@@ -5372,12 +5390,22 @@ fn slice_element(
 
 /// The element type of a `Vec<T>`, from its printed name.
 ///
-/// rustc prints the type as `std::vec::Vec<u8>` (or `alloc::vec::Vec<u8>`, or a
-/// bare `Vec<u8>`), so the element is the balanced `<…>` group. `None` for a
-/// name that is not a `Vec`, or one whose arguments cannot be read.
+/// rustc prints the standard container's *type* as `std::vec::Vec<u8>` (or
+/// `alloc::vec::Vec<u8>`) -- never as a bare `Vec<u8>` -- so the identity is the
+/// full path, not the last segment. This matters for soundness: a user type
+/// spelled `Vec` (`mod m { struct Vec<T>(..) }`, printed `m::Vec<u8>`, or a
+/// crate-root `Vec<u8>`) must **not** be read as the standard container, or a
+/// destructor this model skips would be skipped for a type that is not a `Vec`
+/// at all. So the module path is checked, not discarded.
+///
+/// `None` for a name that is not the standard `Vec`, or one whose arguments
+/// cannot be read.
 fn vec_elem_ty(name: &str) -> Option<Ty> {
-    let bare = name.rsplit("::").next().unwrap_or(name);
-    if bare.split('<').next() != Some("Vec") {
+    // The head before the generic arguments is the path; the standard container's
+    // is `std::vec::Vec` or `alloc::vec::Vec`. A bare `Vec` is a user type (rustc
+    // always qualifies the standard one), so it is refused.
+    let head = name.split('<').next().unwrap_or(name);
+    if head != "std::vec::Vec" && head != "alloc::vec::Vec" {
         return None;
     }
     crate::mir::spec::angle_inner(name).map(Ty::parse)
@@ -7172,6 +7200,25 @@ where
                             }
                         }
                         env.set(dest, ret);
+                        // A returned `Vec` carries its tracked length in the
+                        // callee's `_0`, and the value itself is `Val::Unknown`
+                        // (a `Vec`'s fields are not printed), so this is *not*
+                        // inside the `Val::Agg` guard below. Without the transfer
+                        // `let v = mk(); v.len()` reads a receiver with no modelled
+                        // length -- the same hole the move path (`copy_parts`) had.
+                        // Only a whole-local destination can hold a `Vec`, and a
+                        // returned value replaces what the destination held, so the
+                        // destination's old length is dropped rather than kept.
+                        if dest.proj.is_empty() {
+                            match st.env.vec_len.get(&0).copied() {
+                                Some(len) => {
+                                    env.vec_len.insert(dest.local, len);
+                                }
+                                None => {
+                                    env.vec_len.remove(&dest.local);
+                                }
+                            }
+                        }
                         // A tuple return has components, and the callee stored
                         // them in its *own* return place (`_0.0`, `_0.1`). The
                         // caller's `min2(a, b).0` reads `_2.0`, so the components
@@ -10455,11 +10502,15 @@ fn count_via_helper(_1: u8) -> u8 {
         assert!(!drop_is_noop(&Ty::Other("Guard".into())));
         // A `Vec<T>` is glue-free exactly when its element is: the container's own
         // destructor only runs `T`'s, so `Vec<u8>` runs nothing observable while a
-        // `Vec<Guard>` (a nominal element) does not.
-        assert!(drop_is_noop(&Ty::Other("Vec<u8>".into())));
+        // `Vec<Guard>` (a nominal element) does not. The standard container's
+        // *type* is `std::vec::Vec<T>`; a bare `Vec<T>` is a *user* type, so it is
+        // not the container -- reading it as one would skip a user destructor.
         assert!(drop_is_noop(&Ty::Other("std::vec::Vec<u8>".into())));
-        assert!(!drop_is_noop(&Ty::Other("Vec<Guard>".into())));
-        assert!(!drop_is_noop(&Ty::Other("Vec<String>".into())));
+        assert!(drop_is_noop(&Ty::Other("alloc::vec::Vec<u8>".into())));
+        assert!(!drop_is_noop(&Ty::Other("std::vec::Vec<Guard>".into())));
+        assert!(!drop_is_noop(&Ty::Other("std::vec::Vec<String>".into())));
+        assert!(!drop_is_noop(&Ty::Other("Vec<u8>".into())), "a bare `Vec` is a user type");
+        assert!(!drop_is_noop(&Ty::Other("m::Vec<u8>".into())), "a user `Vec` is not the container");
         // A tuple/array with a nominal leaf inherits the nominal's glue.
         assert!(!drop_is_noop(&Ty::Array(Box::new(Ty::Other("Guard".into())), 2)));
         assert!(!drop_is_noop(&Ty::Tuple(vec![Ty::U8, Ty::Other("String".into())])));
