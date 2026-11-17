@@ -3589,6 +3589,25 @@ fn convert(
     let Some((src_ty, dst_ty)) = intrinsics::conversion_types(name, kind) else {
         return Err(format!("unmodelled conversion `{name}`"));
     };
+    // `u8::from(b)` / `u32::from(b)`: a `bool` source is a one-bit value, and its
+    // conversion is the zero-extension of that bit (`false` -> 0, `true` -> 1). A
+    // `bool` has no integer width, so `int_width` would refuse it; it is answered
+    // here instead. The source is a *predicate* (`Val::Bool`), so it is widened to
+    // the one-bit word the destination holds -- the same step a `bool` `ret` takes.
+    if src_ty == Ty::Bool {
+        let Some(dst_w) = intrinsics::int_width(&dst_ty) else {
+            return Err(format!("`{name}` converts a type the model does not hold"));
+        };
+        let Some(arg) = args.first() else {
+            return Err(format!("unmodelled arity for `{name}`"));
+        };
+        let Val::Bool(p) = operand(env, arg) else {
+            return Err(format!("unmodelled argument to `{name}`"));
+        };
+        let bit = smt::ite(p, smt::word(1, 1), smt::word(0, 1));
+        env.set(dest, Val::Sym(smt::truncate(bit, dst_w), Sign::of(&dst_ty)));
+        return Ok(());
+    }
     let (Some(src_w), Some(dst_w)) =
         (intrinsics::int_width(&src_ty), intrinsics::int_width(&dst_ty))
     else {

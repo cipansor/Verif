@@ -6709,6 +6709,38 @@ fn slice_last_is_an_element_and_array_last_is_exact() {
     assert_refuted(&report, "array_last_is_the_last_element_cannot_prove_this");
 }
 
+/// `u8::from(bool)` -- the one conversion the integer model would otherwise refuse.
+///
+/// A `bool` has no integer width, so `conversion_types` reads the pair but
+/// `int_width` refuses the source. The conversion is the zero-extension of the
+/// one-bit value: `false` -> 0, `true` -> 1. The `true`/`false` pair pins that the
+/// bit is the *value*: a model that fixed it to a constant would prove one and
+/// refute the other, and here `bool_to_u8_of_true_is_one` verifies while its
+/// `false` twin refutes with the witness `b = 0`. The `u32` destination pins the
+/// widening.
+#[test]
+fn a_bool_conversion_is_the_zero_extended_bit() {
+    let names = [
+        "bool_to_u8_is_zero_or_one",
+        "bool_to_u8_of_true_is_one",
+        "bool_to_u8_of_true_is_one_cannot_prove_this",
+        "bool_to_u32_is_zero_or_one",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "bool_to_u8_is_zero_or_one",
+        "bool_to_u8_of_true_is_one",
+        "bool_to_u32_is_zero_or_one",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    // A real refutation, so the bit is the value and not a constant one.
+    assert_refuted(&report, "bool_to_u8_of_true_is_one_cannot_prove_this");
+}
+
 /// A `&mut bool` argument's final value is a predicate, not a word.
 ///
 /// The postcondition's bare `c` means the value the body left at the target. A
@@ -10177,21 +10209,27 @@ pub fn into_signed_matches_cast(x: i8) -> i32 {
 
 /// A call to an *unmodelled* conversion is reported unknown, not guessed.
 ///
-/// `u8::from(true)` is a real `From` impl, but the source is a `bool`, which has no
-/// bit-vector the engine widens -- `u8` is one bit's worth of a value, but a `bool`
-/// local is a predicate, not a word. The model refuses it (rather than guessing a
-/// width from the destination alone), and the path is reported unknown. This pins
-/// that the refusal is a *reported* gap rather than a silent approximation.
+/// `u32::from('a')` is a real `From` impl, but the source is a `char`, whose
+/// conversion is not one of the integer widenings the model reads -- so it is
+/// refused (rather than guessing a width from the destination alone), and the path
+/// is reported unknown. This pins that the refusal is a *reported* gap rather than
+/// a silent approximation. (`u8::from(bool)` used to be the example; it is now
+/// modelled as the zero-extended bit.)
 #[test]
 fn an_unmodelled_conversion_is_reported_unknown_not_guessed() {
+    // `u32::from(char)` is a real `From` impl whose source is not an integer the
+    // engine holds (`char` is modelled as a 32-bit value, but a `char` *conversion*
+    // is not one of the integer widenings), so it stays unmodelled. `u8::from(bool)`
+    // used to be the example here and is now modelled (the zero-extended bit), so
+    // the test names a conversion that is still a refusal.
     let src = r#"
 /// requires: true
 /// ensures: ret == 1
-pub fn from_bool_is_unmodelled(flag: bool) -> u8 {
-    u8::from(flag)
+pub fn from_char_is_unmodelled(c: char) -> u32 {
+    u32::from(c)
 }
 "#;
-    let Some(o) = verify_src("from_bool_is_unmodelled", src) else { return };
+    let Some(o) = verify_src("from_char_is_unmodelled", src) else { return };
     assert!(
         !o.is_verified(),
         "a conversion the model does not hold must not verify; got: {o}"

@@ -836,6 +836,15 @@ keeps growing.
     `slice_last_is_an_element_and_array_last_is_exact`. `realistic.rs`
     **623 of 1137** (from **621 of 1133**; four new fixtures, two verified and two
     refuted).
+  - Progress (cont.): `u8::from(bool)` (and the wider integer destinations) is
+    modelled. A `bool` source has no integer width, so the integer-conversion model
+    would refuse it; the conversion is the *zero-extension of the one-bit value*
+    (`false` -> 0, `true` -> 1), the same step a `bool` `ret` takes, so the executor
+    answers it directly. `u32::from(char)` stays a refusal -- a `char` conversion is
+    not one of the integer widenings. Four fixtures in `realistic.rs` (three true,
+    one tripwire), pinned by `a_bool_conversion_is_the_zero_extended_bit`.
+    `realistic.rs` **626 of 1141** (from **623 of 1137**; four new fixtures, three
+    verified and one refuted).
 - **C7. Arithmetic scale and speed.** · P0 · in progress · Kani, Boolector,
   Bitwuzla
   - Gap: `u32::wrapping_mul` is past the 32-bit model; `clamp_std` takes 9.9 s.

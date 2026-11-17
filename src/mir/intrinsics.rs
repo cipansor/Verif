@@ -980,8 +980,11 @@ pub fn conversion_types(name: &str, kind: Conversion) -> Option<(Ty, Ty)> {
 ///
 /// `u128`/`i128` are excluded: the engine is 64 bits wide, so a conversion *into*
 /// them has no term to build. `bool` and `char` are excluded too -- `u8::from(true)`
-/// and `u32::from('a')` are real `From` impls, but their source is not an integer
-/// whose bits the engine holds, so there is nothing to widen.
+/// and `u32::from('a')` are real `From` impls, but neither is an integer whose bits
+/// this function reads a width and a signedness from. A `bool` source is *not* a
+/// gap: the executor answers `u8::from(bool)` directly as the zero-extension of the
+/// one-bit value (see `convert`), which is why `is_modelled_int` refusing it does
+/// not make the call unmodelled.
 pub fn is_modelled_int(ty: &Ty) -> bool {
     matches!(
         ty,

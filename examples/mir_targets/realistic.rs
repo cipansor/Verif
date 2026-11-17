@@ -12875,3 +12875,33 @@ pub fn slice_last_is_an_element_cannot_prove_this(xs: &[u8]) -> u8 {
 pub fn array_last_is_the_last_element_cannot_prove_this(a: [u8; 4]) -> u8 {
     a.last().copied().unwrap_or(0)
 }
+
+/// `u8::from(bool)` is the zero-extension of the one-bit value: `false` -> 0,
+/// `true` -> 1. A `bool` has no integer width, so this is the one conversion the
+/// integer model would otherwise refuse.
+/// requires: true
+/// ensures: ret <= 1
+pub fn bool_to_u8_is_zero_or_one(b: bool) -> u8 {
+    u8::from(b)
+}
+
+/// The `true` direction, so the bit is the *value* and not a constant zero.
+/// requires: b == true
+/// ensures: ret == 1
+pub fn bool_to_u8_of_true_is_one(b: bool) -> u8 {
+    u8::from(b)
+}
+
+/// The false twin: `false` is 0, so a claim that it is 1 refutes.
+/// requires: b == false
+/// ensures: ret == 1
+pub fn bool_to_u8_of_true_is_one_cannot_prove_this(b: bool) -> u8 {
+    u8::from(b)
+}
+
+/// A wider destination zero-extends the same bit.
+/// requires: true
+/// ensures: ret <= 1
+pub fn bool_to_u32_is_zero_or_one(b: bool) -> u32 {
+    u32::from(b)
+}
