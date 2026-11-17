@@ -281,17 +281,29 @@ keeps growing.
     commonest loop in Rust is out of reach. Evidence: `tri` incomplete.
   - Approach: model `Range`/`RangeInclusive` as structs, `next` as a modelled
     intrinsic, recognise the `for` desugaring, reuse the loop machinery.
-  - Exit: `tri` verified with an `invariant:`; a missing invariant reported as *a
-    missing invariant*, not "unmodelled". ✅
+  - Exit: a `for` loop over a range verified with an `invariant:`; a missing
+    invariant reported as *a missing invariant*, not "unmodelled". ✅ (The
+    invariant must be inductive — see the progress note; `tri`'s own contract is
+    not, so `tri` stays `incomplete` for that honest reason rather than for an
+    unmodelled construct.)
   - Move: **build**.
   - Progress: the desugaring is **built**. `RangeInclusive::new`/`Range::new`,
     `IntoIterator::into_iter` and `Iterator::next` are modelled
     (`intrinsics::Range`/`RangeMethod`, answered by `range_method` from the
     range's struct fields, with `core`'s `forward_overflowing` boundary
     reproduced exactly), and a `for` loop now decides through the existing
-    machinery — `for i in 0..=n { s += i }` verifies with `unwind: 4` and with an
-    `invariant: s <= 5050`, and its false twin is refuted
+    machinery — `for i in 0..=n { s += i }` verifies with `unwind: 4`, and a loop
+    whose body is decided by an **inductive** invariant (`s = i.min(5050)`)
+    verifies with `invariant: s <= 5050`, its false twin refuted
     (`the_for_loop_range_desugaring_is_modelled`).
+  - The invariant has to be **inductive**, and `everyday.rs`'s `tri` is not.
+    `invariant: s <= 5050` over a body doing `s += i` is not inductive (from
+    `s == 5050` and `i == 100` the sum is `5150`), so a loop whose carried state is
+    the *running sum* cannot be proved with a constant bound. The fixture that
+    exercises the invariant path uses `s = i.min(5050)` (inductive); `tri` stays
+    `incomplete` for the honest reason that no contract it declares is inductive.
+    See `AGENTS.md` ("The `tri_invariant` fixture had been passing *because of*
+    the bug") for why the first version of this note was wrong.
   - The second exit half is met too: a loop with no `invariant:` or `unwind:` is
     reported as a *missing loop contract* naming the remedy, not as an unmodelled
     construct — `loop unwound past 9 at bb8 of tri; assuming it exited would be
