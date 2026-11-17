@@ -6677,6 +6677,38 @@ fn char_literals_and_ascii_predicates_are_modelled() {
     assert_refuted(&report, "char_high_digit_tripwire");
 }
 
+/// `slice::last` -- a fresh element for a slice, the exact element for an array.
+///
+/// A slice's length is symbolic, so `xs.last()` names no index the store can pin
+/// and the element is a *fresh* variable: a contract true of every element holds
+/// of the last one (`slice_last_is_an_element` verifies), and a claim that the last
+/// element is a particular value is refuted, because a slice with that element can
+/// exist. An *array*'s length is its type's constant, so `a.last()` is the exact
+/// element `a[N-1]`: `array_last_is_the_last_element` verifies against `a[3] == 7`
+/// and its twin, claiming `a[0] == 9`, refutes. The two directions together show the
+/// element is neither a constant (the array case decides by the actual last element)
+/// nor the first element (the twin refutes).
+#[test]
+fn slice_last_is_an_element_and_array_last_is_exact() {
+    let names = [
+        "slice_last_is_an_element",
+        "array_last_is_the_last_element",
+        "slice_last_is_an_element_cannot_prove_this",
+        "array_last_is_the_last_element_cannot_prove_this",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in ["slice_last_is_an_element", "array_last_is_the_last_element"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    // Real refutations: the fresh element is unconstrained, and the array's last
+    // element is not the first, so neither claim can be proved.
+    assert_refuted(&report, "slice_last_is_an_element_cannot_prove_this");
+    assert_refuted(&report, "array_last_is_the_last_element_cannot_prove_this");
+}
+
 /// A `&mut bool` argument's final value is a predicate, not a word.
 ///
 /// The postcondition's bare `c` means the value the body left at the target. A

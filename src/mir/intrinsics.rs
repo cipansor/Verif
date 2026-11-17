@@ -352,6 +352,18 @@ pub enum Intrinsic {
     /// than reading an arbitrary element -- the same rule a `s[i]` subscript
     /// follows. A literal index (`get(0)`) is exact.
     SliceGet,
+    /// `slice::last`: `Option<&T>` -- `Some(&s[len - 1])` when the slice is
+    /// non-empty, `None` otherwise.
+    ///
+    /// The element is a *fresh* variable, not a named index. A slice's length is
+    /// symbolic, so `s[len - 1]` names no index the store can pin; reading a fresh
+    /// value is an *over*-approximation of the element, which is the sound
+    /// direction -- a contract proved of every element holds of the last one, and a
+    /// claim that is false of some element is refuted (the counterexample is
+    /// permitted, not wrong, because a slice with that element can exist). An
+    /// *array*'s length is a constant, so `a.last()` is the exact element `a[N-1]`
+    /// and is modelled as that element rather than a fresh one.
+    SliceLast,
     /// A method on a `Vec<T>`: `new`, `push` or `len`.
     ///
     /// A `Vec` has no bit-vector value (its fields -- a heap pointer, a length
@@ -1215,6 +1227,9 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
         if short == "first" {
             return Some(Intrinsic::SliceFirst);
         }
+        if short == "last" {
+            return Some(Intrinsic::SliceLast);
+        }
         // `get` is printed with its index type (`::<usize>`), so the tail is not
         // the bare name; match the head before any generic arguments.
         if short == "get" || short.starts_with("get::<") {
@@ -1903,7 +1918,8 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         Intrinsic::SliceLen
         | Intrinsic::SliceIsEmpty
         | Intrinsic::SliceFirst
-        | Intrinsic::SliceGet => true,
+        | Intrinsic::SliceGet
+        | Intrinsic::SliceLast => true,
         // The `Vec` methods. Like the slice shapes they read a length the
         // executor tracks rather than an operand term, so there is no width or
         // sign to check here; `eval` never sees them and the executor answers
@@ -2129,6 +2145,7 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             | Intrinsic::SliceIsEmpty
             | Intrinsic::SliceFirst
             | Intrinsic::SliceGet
+            | Intrinsic::SliceLast
     ) {
         return None;
     }
@@ -2169,7 +2186,8 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         Intrinsic::SliceLen
         | Intrinsic::SliceIsEmpty
         | Intrinsic::SliceFirst
-        | Intrinsic::SliceGet => {
+        | Intrinsic::SliceGet
+        | Intrinsic::SliceLast => {
             unreachable!("slice shapes are answered from the executor's stores")
         }
         // Answered by the executor's `enum_method` from the discriminant/payload
@@ -5851,6 +5869,8 @@ mod tests {
         // read as a slice length -- it is its own length model instead.
         assert_eq!(classify("core::slice::<impl [u8]>::len"), Some(Intrinsic::SliceLen));
         assert_eq!(classify("core::slice::<impl [u8]>::is_empty"), Some(Intrinsic::SliceIsEmpty));
+        assert_eq!(classify("core::slice::<impl [u8]>::first"), Some(Intrinsic::SliceFirst));
+        assert_eq!(classify("core::slice::<impl [u8]>::last"), Some(Intrinsic::SliceLast));
         // A `Vec`'s methods are their own model, not a slice's length: the two
         // lengths are different variables. `new`/`push`/`len` are the modelled
         // surface; `str::len` is neither and stays refused.

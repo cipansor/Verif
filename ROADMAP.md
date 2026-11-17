@@ -825,6 +825,17 @@ keeps growing.
     `the_ascii_classes_agree_with_char_over_the_whole_domain`. `realistic.rs`
     **621 of 1133** (from **615 of 1125**; eight new fixtures, six verified and two
     refuted).
+  - Progress (cont.): `slice::last` is modelled. A slice's length is symbolic, so
+    `xs.last()` names no index the store can pin; the element is a *fresh* variable
+    per slice (keyed by a sentinel index), which is the sound over-approximation —
+    a contract true of every element holds of the last one, and a claim that the
+    last element is a particular value is refuted, because a slice holding it can
+    exist. An *array*'s length is its type's constant, so `a.last()` is the exact
+    element `a[N-1]` and is modelled as that element, so a contract about `a[N-1]`
+    decides. Four fixtures in `realistic.rs` (two true, two tripwires), pinned by
+    `slice_last_is_an_element_and_array_last_is_exact`. `realistic.rs`
+    **623 of 1137** (from **621 of 1133**; four new fixtures, two verified and two
+    refuted).
 - **C7. Arithmetic scale and speed.** · P0 · in progress · Kani, Boolector,
   Bitwuzla
   - Gap: `u32::wrapping_mul` is past the 32-bit model; `clamp_std` takes 9.9 s.

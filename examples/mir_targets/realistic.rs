@@ -12836,3 +12836,42 @@ pub fn signed_or_element_divides_signed(a: &[i8], b: &[i8]) -> i8 {
 pub fn signed_or_element_divides_signed_cannot_prove_this(a: &[i8], b: &[i8]) -> i8 {
     *a.first().or(b.first()).unwrap() / 2
 }
+
+/// `slice::last` on a slice is a fresh element: a contract true of every element
+/// holds of the last one, so this verifies.
+/// requires: xs.len() > 0
+/// ensures: ret <= 255
+pub fn slice_last_is_an_element(xs: &[u8]) -> u8 {
+    match xs.last() {
+        Some(v) => *v,
+        None => 0,
+    }
+}
+
+/// `slice::last` on an *array* is the exact element `a[N-1]`, so a contract about
+/// that element decides rather than being a fresh value.
+/// requires: a[3] == 7
+/// ensures: ret == 7
+pub fn array_last_is_the_last_element(a: [u8; 4]) -> u8 {
+    a.last().copied().unwrap_or(0)
+}
+
+/// The false twin: the fresh element of a slice is not pinned to any value, so a
+/// claim that it is `0` is refuted (a slice whose last element is non-zero exists).
+/// requires: xs.len() > 0
+/// ensures: ret == 0
+pub fn slice_last_is_an_element_cannot_prove_this(xs: &[u8]) -> u8 {
+    match xs.last() {
+        Some(v) => *v,
+        None => 0,
+    }
+}
+
+/// The false twin: the array's last element is `a[3]`, not `a[0]`, so a claim
+/// about the first element refutes.
+/// requires: a[0] == 9
+/// requires: a[3] == 7
+/// ensures: ret == 9
+pub fn array_last_is_the_last_element_cannot_prove_this(a: [u8; 4]) -> u8 {
+    a.last().copied().unwrap_or(0)
+}

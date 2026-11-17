@@ -624,6 +624,15 @@ impl std::fmt::Display for MirReport {
 /// A slice element named by the `(slice local, index)` pair its `&T` points at.
 type ElemRef = (u32, u64);
 
+/// The pseudo-index `slice::last` keys its fresh element variable by.
+///
+/// A slice's length is symbolic, so `s[len - 1]` names no index the store can
+/// pin. The element is a single fresh variable per slice, and this sentinel is
+/// the key that makes every `last()` call on the same slice read the *same*
+/// variable. It cannot collide with a real index: an array's elements are below
+/// `MAX_INDEX_CHAIN`, and a `get(k)` index is a literal far below this.
+const LAST_INDEX: u64 = u64::MAX;
+
 /// The slice element an `Option<&T>` payload names, carried *compositionally* so a
 /// chain of combinators composes rather than each step reading only the operands'
 /// leaf identities.
@@ -5565,13 +5574,27 @@ fn slice_element(
     let Some(s) = env.indexed.get(&recv.local) else {
         return Err(format!("`{name}` on a receiver whose elements are not modelled"));
     };
-    let (sl, elem_w) = (recv.local, s.elem_w);
+    let (sl, elem_w, fixed_len) = (recv.local, s.elem_w, s.fixed_len);
     // `first` names element 0; `get(k)` names element `k`. The index must be a
     // *constant*: a slice's length is symbolic, so a symbolic index has no finite
     // domain and reading "some element" would make `s[i]` a different value per
     // read -- a wrong proof, not a missing one. A literal index is exact.
     let (index, failure) = match op {
         Intrinsic::SliceFirst => (0u64, smt::eq_const(len, 0)),
+        Intrinsic::SliceLast => {
+            // An array's length is its type's constant, so `last` names the exact
+            // element `N-1`. A slice's length is symbolic, so there is no index to
+            // pin; the element is a single fresh variable per slice, keyed by a
+            // sentinel so every `last()` call on the same slice reads the *same*
+            // value (a fresh variable per call would let two `last()` reads
+            // disagree -- a wrong value, not a missing one).
+            let idx = match fixed_len {
+                Some(0) => 0,
+                Some(n) => n - 1,
+                None => LAST_INDEX,
+            };
+            (idx, smt::eq_const(len, 0))
+        }
         _ => {
             let k = match args.get(1) {
                 Some(Operand::Const(Const::UInt(v, _))) => u64::try_from(*v).ok(),
@@ -6067,7 +6090,12 @@ fn try_intrinsic(
     // `k >= len` for `get`), so the arm is decided by the caller's `switchInt`,
     // and the payload is recorded under the `Some` discriminant so a `(_2 as
     // Some).0` downcast -- or the reference's deref -- reads it.
-    if matches!(op, intrinsics::Intrinsic::SliceFirst | intrinsics::Intrinsic::SliceGet) {
+    if matches!(
+        op,
+        intrinsics::Intrinsic::SliceFirst
+            | intrinsics::Intrinsic::SliceGet
+            | intrinsics::Intrinsic::SliceLast
+    ) {
         let p = match first {
             Operand::Copy(p) | Operand::Move(p) => p,
             Operand::Const(_) => return Some(Err(format!("unmodelled argument to `{name}`"))),
