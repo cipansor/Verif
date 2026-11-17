@@ -322,6 +322,20 @@ keeps growing.
     check (the argument for `or`, the receiver for `and`), so a `T` with an
     unmodelled destructor is refused. Eight fixtures (four true, four tripwires),
     pinned by `option_or_and_are_total_and_select_the_right_operand`.
+  - **A chained `or`/`and` selected the wrong element (false proof, fixed).** The
+    element-identity store was *flat* — a combinator recorded one leaf or a
+    leaf-plus-condition — so `a.first().or(b.first()).or(c.first()).unwrap()` lost
+    the inner `or` and the outer combinator read the missing receiver identity as
+    permission to take the argument's element: with `a[0]==5`, `b[0]==7`, `c[0]==9`
+    it **verified** `ret == 9`, which Rust never returns (it returns `a[0] == 5`).
+    The identity is now a compositional tree (`ElemId::Leaf | Select`); a missing
+    operand identity is substituted **only** when the receiver's tag proves that
+    operand is not the selected one, so a symbolic tag with a missing identity
+    leaves the deref unknown rather than wrong. The tree also carries the element's
+    **sign**, so a conditional choice between `&[i8]` elements compares and divides
+    signed (the old code hard-coded `Sign::Unsigned`). Fixtures `chained_or_selects_the_first`,
+    `and_with_a_conditional_argument`, `signed_or_element_is_signed` and their
+    `_cannot_prove_this` twins.
   - Remaining: `map`/`map_err`/`and_then`/`unwrap_or_else` (closures). The `?`
     operator is modelled (see the `?` progress note above).
 - **C3. Ranges and `for` loops.** · P0 · done · Kani, Verus, Prusti
@@ -910,7 +924,13 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     a `Vec` move (`let w = v`) and a returned vector transfer the length to the
     destination rather than dropping it.
   - Remaining: the **element** model (`get`/`index`, so a `push`ed value can be
-    read back), `pop`, `String`, `Box`, and symbolic-length slices.
+    read back), `String`, `Box`, and symbolic-length slices. (`pop` and `is_empty`
+    are done — see the progress note below.)
+  - Progress (`pop`, `is_empty`): `Vec::is_empty` reads the tracked length;
+    `Vec::pop` returns `None` iff the length is zero and decrements it on the
+    non-empty path (the popped element is not modelled, so no payload is
+    fabricated). Fixtures `vec_is_empty_new`, `vec_not_empty_after_push`,
+    `vec_pop_empty_then_len`, `vec_pop_one_is_some` and their twins.
   - Move: **build**.
 - **C12. A specification language that can say more.** · P1 · in progress · Verus,
   Creusot, Prusti, SPARK
