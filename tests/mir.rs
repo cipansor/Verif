@@ -658,6 +658,27 @@ fn a_counterexample_is_rendered_with_source_names() {
         detail.contains("a = 32768") && detail.contains("b = 32768"),
         "the guard's witness must name both arguments, got: {detail}"
     );
+
+    // The unnamed *assignment* itself, not only its absence. A witness whose
+    // constrained variable has no `debug` name (a temporary, a promoted constant,
+    // an aggregate part) must still be rendered, as `v{index}:u{width}`. Dropping
+    // unnamed assignments would silently shrink a witness to the named subset --
+    // and every check above would still pass, because they assert named names are
+    // *present* and unnamed names are *absent from named functions*, never that an
+    // unnamed one appears at all. `a_field_array_write_is_not_the_seed` (in the
+    // realistic corpus) is the shape that produces one: its only constrained
+    // variable is a temporary, so its witness is entirely unnamed.
+    let Some(report) = verify_realistic(&["a_field_array_write_is_not_the_seed"]) else {
+        return;
+    };
+    let o = outcome(&report, "a_field_array_write_is_not_the_seed");
+    let FnOutcome::Failed { detail, .. } = o else {
+        panic!("a_field_array_write_is_not_the_seed must be refuted, got: {o}");
+    };
+    assert!(
+        detail.contains("v") && detail.contains(":u8 = "),
+        "a variable with no source name must still render as `vN:uW = value`, got: {detail}"
+    );
 }
 
 /// The other direction of the oracle: a function reported panic-free must not
@@ -11745,12 +11766,25 @@ pub fn tri_invariant_cannot_prove_this(n: u32) -> u32 {
         // header must reach it. When it did not, the exit guard folded to `false`,
         // the exit edge was pruned as unreachable, and this function came back
         // `Verified` -- a false proof. It must now be refuted.
+        //
+        // The assertion is `Failed` on the *postcondition*, not merely
+        // `!is_verified()`. A refusal (`Incomplete`/`Skipped`) also satisfies
+        // "not verified", so a model that gave up on the range state would pass a
+        // weaker check while checking nothing -- the tripwire would be vacuous. A
+        // refuted postcondition is the evidence the loop was modelled and its exit
+        // state refuted the false claim.
         let Some(g) = verify_src("tri_invariant_cannot_prove_this", src) else { return };
-        assert!(
-            !g.is_verified(),
-            "a `for` loop whose postcondition is false must not verify; a model that does \
-             not havoc the iterator state proves it, got: {g}"
-        );
+        match g {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "the invariant tripwire must fail on its postcondition, got `{kind}`"
+            ),
+            other => panic!(
+                "a `for` loop whose postcondition is false must be refuted, not merely \
+                 undecided; a model that does not havoc the iterator state proves it, and \
+                 one that refuses it checks nothing, got: {other}"
+            ),
+        }
     }
 
     /// C3 exit criterion, second half: a loop with no contract is reported as a

@@ -3210,7 +3210,15 @@ fn loop_writes(prog: &MirProgram, f: &MirFn, header: usize) -> Vec<u32> {
                         // call's `args[i]`.
                         if let Some(i) = callee_fn.arg_locals.iter().position(|&l| l == w) {
                             if let Some(Operand::Copy(p) | Operand::Move(p)) = args.get(i) {
-                                writes.insert(p.local, ());
+                                // Only a *reference* argument shares storage with
+                                // the caller; a by-value argument is the callee's
+                                // own copy and its writes die with the frame, so
+                                // havocing the caller local for one would discard
+                                // information the body never touches -- the same
+                                // boundary the inliner's `by_value_indexed` keeps.
+                                if matches!(f.ty_of(p.local), Some(Ty::Ref(_))) {
+                                    writes.insert(p.local, ());
+                                }
                             }
                         }
                     }
@@ -3603,18 +3611,39 @@ fn lookup_promoted(promoted: &BTreeMap<String, Vec<String>>, use_name: &str) -> 
         return None;
     }
     let use_owner = call_trait_path(use_name).unwrap_or_else(|| use_qual.to_string());
+    // The *method* segment the use names: the last `::` component of its
+    // qualifier. A trait default's promoted constant is spelled
+    // `<Self as Trait>::method::promoted[N]`, so the method is the piece that
+    // distinguishes two defaults on the same trait.
+    let use_method = use_qual.rsplit_once("::").map(|(_, m)| m).unwrap_or(use_qual);
+    let mut found: Option<Vec<String>> = None;
     for (def, pieces) in promoted {
         let Some((def_qual, def_tail)) = def.rsplit_once("::") else { continue };
         if def_tail != use_tail {
             continue;
         }
         // The definition's owner is its qualifier minus the method/item segment.
-        let def_owner = def_qual.rsplit_once("::").map(|(o, _)| o).unwrap_or(def_qual);
+        let (def_owner, def_method) = match def_qual.rsplit_once("::") {
+            Some((o, m)) => (o, m),
+            None => (def_qual, def_qual),
+        };
+        // The *method* must match too. `Custom::aaa::promoted[0]` and
+        // `Custom::zzz::promoted[0]` share an owner and a promotion index, so a
+        // lookup that compared only those returned the first method's message for
+        // the second method's panic -- a report naming a line the caller never ran.
+        if def_method != use_method {
+            continue;
+        }
         if use_owner == def_owner || crate::mir::spec::is_path_suffix(&use_owner, def_owner) {
-            return Some(pieces.clone());
+            // Two definitions still match: refuse rather than pick one, because
+            // either could be the one the use names.
+            if found.is_some() {
+                return None;
+            }
+            found = Some(pieces.clone());
         }
     }
-    None
+    found
 }
 
 /// Whether a local method candidate may answer a *trait* call.
@@ -10256,5 +10285,42 @@ fn count_via_helper(_1: u8) -> u8 {
         // A tuple/array with a nominal leaf inherits the nominal's glue.
         assert!(!drop_is_noop(&Ty::Array(Box::new(Ty::Other("Guard".into())), 2)));
         assert!(!drop_is_noop(&Ty::Tuple(vec![Ty::U8, Ty::Other("String".into())])));
+    }
+
+    /// A projected promoted-constant use resolves to *its own* method's pieces.
+    ///
+    /// Two trait defaults each own a `promoted[0]`; the use
+    /// `<Self as Custom>::zzz::promoted[0]` names the `zzz` method, but the
+    /// fallback compared only the trait owner and the promotion index, so it
+    /// returned `aaa`'s pieces (whichever the map iterated first) and the report
+    /// named a panic message the caller never reached.
+    #[test]
+    fn a_projected_promoted_use_resolves_its_own_method() {
+        let mut promoted: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        promoted.insert("Custom::aaa::promoted[0]".into(), vec!["from aaa".into()]);
+        promoted.insert("Custom::zzz::promoted[0]".into(), vec!["from zzz".into()]);
+
+        // Exact spellings resolve exactly.
+        assert_eq!(
+            lookup_promoted(&promoted, "Custom::zzz::promoted[0]"),
+            Some(vec!["from zzz".to_string()])
+        );
+        // The projected spelling `rustc` prints for a trait default's use resolves
+        // to the *same* method, not to whichever sibling the map yields first.
+        assert_eq!(
+            lookup_promoted(&promoted, "<Self as Custom>::zzz::promoted[0]"),
+            Some(vec!["from zzz".to_string()])
+        );
+        assert_eq!(
+            lookup_promoted(&promoted, "<Self as Custom>::aaa::promoted[0]"),
+            Some(vec!["from aaa".to_string()])
+        );
+
+        // Two definitions that share owner *and* method (a genuine ambiguity) are
+        // refused rather than answered with one of them.
+        let mut ambiguous: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        ambiguous.insert("a::Custom::m::promoted[0]".into(), vec!["one".into()]);
+        ambiguous.insert("b::Custom::m::promoted[0]".into(), vec!["two".into()]);
+        assert_eq!(lookup_promoted(&ambiguous, "Custom::m::promoted[0]"), None);
     }
 }

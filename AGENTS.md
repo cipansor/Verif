@@ -9899,4 +9899,25 @@ approximation of its effect, exactly as the syntactic destination of `*p = v` is
 Both misses came from reading the syntax; the fix is to read the effect, which is
 the direction the frame rule already documents.
 
+### A promoted constant's projected use must name its own method
+
+A promoted constant's *definition* is keyed by its full path
+(`Custom::aaa::promoted[0]`), but a trait default's *use* is spelled with the
+`<Self as Trait>` projection (`<Self as Custom>::zzz::promoted[0]`), which the exact
+lookup misses. The fallback reconciled the two by owner and promotion index -- and
+discarded the method segment. Two defaults on one trait each own a `promoted[0]`, so
+`lookup_promoted` returned whichever the map iterated first, and the report named a
+panic message the caller never reached (`"from aaa"` for a call into `zzz`).
+
+The method segment is the missing key: the use's qualifier ends in the method
+(`zzz`), the definition's owner is its qualifier minus that segment, and both must
+match. A definition that still has no unique method match (two impls of the same
+method on one trait) is *refused* rather than answered with one of them, because
+either could be the one the use names. This is the same "refuse an ambiguous match,
+do not pick one" rule the callee resolver follows, applied to the promoted table.
+The shape only appears on the MSRV (1.85), which promotes a `panic!` message to a
+constant and prints the use with the projection; current stable inlines it, so the
+bug was invisible on the toolchain the crate is developed against -- the same
+"toolchain-shaped" class the CTFE brace-block finding named.
+
 
