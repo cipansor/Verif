@@ -3175,15 +3175,22 @@ fn loop_writes(prog: &MirProgram, f: &MirFn, header: usize) -> Vec<u32> {
 /// the self-call forever. Each `collect_writes` invocation allocates a fresh
 /// `seen`, which stops a CFG cycle within one function and cannot stop a call
 /// cycle between invocations, so `loop_calls_recursive` overflowed the stack.
+/// `visiting` is what makes the traversal terminate.
 ///
 /// A function already on the stack is a cycle we cannot summarise exactly. Rather
-/// than skip it (which would drop the reference writes propagated around the
-/// cycle -- the review's warning), the call's *reference arguments* are included
-/// directly: a callee can only affect caller storage through a reference, so
-/// those are exactly the caller locals a cycle could reach. A recursive callee
-/// with no reference argument (`count_down(n: u8)`) therefore contributes nothing
-/// and the traversal terminates; a reference-carrying one has those locals
-/// havoced, which is the sound direction.
+/// than skip it (which *could* drop reference writes propagated around the cycle),
+/// the call's *reference arguments* are added directly: a callee can only affect
+/// caller storage through a reference, so those are exactly the caller locals a
+/// cycle could reach. A recursive callee with no reference argument (`count_down(n:
+/// u8)`) therefore contributes nothing.
+///
+/// Measured: this inclusion is a *conservative superset*, not the load-bearing
+/// path. For every fixture in the corpus the reference write is already carried by
+/// the callee's own direct scan (the deref store names the argument local) folded
+/// back positionally below; deleting the inclusion changes no verdict, while
+/// deleting the *termination* guard reproduces the overflow. It is kept because it
+/// is the sound direction (it can only add locals to havoc) and because it holds
+/// for a cycle whose write the fold cannot map back.
 fn collect_writes(
     prog: &MirProgram,
     f: &MirFn,
@@ -3231,8 +3238,12 @@ fn collect_writes(
             if let Callee::Name(name) = callee {
                 if let Some(k) = resolve_callee(prog, name) {
                     if visiting.contains(&k) {
-                        // A call cycle: include this call's reference arguments,
-                        // the only caller storage a callee can reach.
+                        // A call cycle: this traversal cannot summarise the callee
+                        // exactly, so add its reference arguments directly -- the
+                        // only caller storage a callee can reach. A conservative
+                        // superset: it can only add locals to havoc. See the note
+                        // on `collect_writes` for why it is not the load-bearing
+                        // path but is kept anyway.
                         for a in args {
                             if let Operand::Copy(p) | Operand::Move(p) = a {
                                 if matches!(f.ty_of(p.local), Some(Ty::Ref(_))) {

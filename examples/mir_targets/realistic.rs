@@ -854,10 +854,12 @@ pub fn loop_calls_mutual_recursive_cannot_prove_this() -> u8 {
 /// is refused rather than followed, but the call's reference argument is included
 /// directly -- a callee can only affect caller storage through a reference -- so
 /// `x` is havoced. The false twin proves that: with the reference omitted, `*x`
-/// would keep its entry value `0` and `ret == 0` would be *proven*.
+/// would keep its entry value `0` and `ret == 0` would be *proven*. The return is
+/// always `0` (the recursion counts the writes, it does not sum them), so the
+/// contract says so rather than claiming the measure.
 /// requires: true
 /// decreases: n
-/// ensures: ret == n
+/// ensures: ret == 0
 pub fn bump_n(n: u8, c: &mut u8) -> u8 {
     if n == 0 { 0 } else { *c = c.wrapping_add(1); bump_n(n - 1, c) }
 }

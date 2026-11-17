@@ -11797,10 +11797,11 @@ pub fn tri_invariant_cannot_prove_this(n: u32) -> u32 {
     /// cannot stop a call cycle *between* invocations: a loop calling a
     /// self-recursive function followed the self-call forever and overflowed the
     /// stack, aborting the whole run. The walk now carries the set of functions on
-    /// the call stack and, on a cycle, includes the call's reference arguments --
-    /// the only caller storage a callee can reach -- so a recursive callee with no
-    /// reference argument contributes nothing and one with a reference has it
-    /// havoced.
+    /// the call stack, which is what terminates it. On a cycle it also includes the
+    /// call's reference arguments -- a conservative superset, since a callee can
+    /// only reach caller storage through a reference; the reference twin below pins
+    /// that the write still reaches the loop's havoc set, whichever mechanism
+    /// carries it.
     #[test]
     fn a_loop_that_calls_a_recursive_function_terminates_and_is_sound() {
         let src = r#"
@@ -11815,7 +11816,7 @@ pub fn count_down(n: u8) -> u8 {
 /// decreases: n
 /// ensures: ret == n
 pub fn walk(n: u8, c: &mut u8) -> u8 {
-    if n == 0 { 0 } else { *c += 1; walk(n - 1, c) }
+    if n == 0 { 0 } else { *c = c.wrapping_add(1); walk(n - 1, c) }
 }
 
 /// requires: n <= 3
@@ -11835,12 +11836,40 @@ pub fn loop_calls_recursive_cannot_prove_this(n: u8) -> u8 {
     while i < 3 { s = count_down(n); i += 1; }
     s
 }
+
+/// A loop calling a *reference-carrying* recursive callee: the call cycle is
+/// refused rather than followed, and the call's reference argument is added
+/// directly. `x` is written through `walk`, so the exit state cannot keep `0`.
+/// requires: x == 0
+/// invariant: i <= 3
+/// ensures: ret <= 255
+pub fn loop_calls_ref_recursive(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 { walk(1, x); i += 1; }
+    *x
+}
+
+/// The false twin: `walk` writes `x`, so `ret == 0` is false. A model that
+/// dropped the reference from the cycle's havoc would prove it.
+/// requires: x == 0
+/// invariant: i <= 3
+/// ensures: ret == 0
+pub fn loop_calls_ref_recursive_cannot_prove_this(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 { walk(1, x); i += 1; }
+    *x
+}
 "#;
         // The crash vehicle: a scalar-only call into a self-recursive callee. The
         // walk must *return* (a stack overflow aborts the binary, so reaching the
         // assertion at all is half the evidence), and the loop must be decided --
         // the false twin refuted on its postcondition, not skipped.
-        for name in ["loop_calls_recursive", "loop_calls_recursive_cannot_prove_this"] {
+        for name in [
+            "loop_calls_recursive",
+            "loop_calls_recursive_cannot_prove_this",
+            "loop_calls_ref_recursive",
+            "loop_calls_ref_recursive_cannot_prove_this",
+        ] {
             let Some(o) = verify_src(name, src) else { return };
             assert!(
                 !matches!(o, FnOutcome::Skipped { .. } | FnOutcome::Incomplete { .. }),
@@ -11859,6 +11888,27 @@ pub fn loop_calls_recursive_cannot_prove_this(n: u8) -> u8 {
             other => panic!(
                 "the false twin claims `ret == 0` for a loop returning `n` and must be \
                  refuted, got: {other}"
+            ),
+        }
+        // The reference-carrying twin is the assertion the earlier version of this
+        // test lacked: a loop calling a *reference-carrying* recursive callee must
+        // still have that reference havoced at the header, so the exit state cannot
+        // keep the entry `0`. It pins the *effect* (the reference write reaches the
+        // exit), not which mechanism carries it: measured, the callee's own direct
+        // scan folded back positionally is what carries it for this shape, and the
+        // cycle branch's reference inclusion is a conservative superset over it.
+        let Some(g) = verify_src("loop_calls_ref_recursive_cannot_prove_this", src) else {
+            return;
+        };
+        match g {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "the reference twin must fail on its postcondition, got `{kind}`"
+            ),
+            other => panic!(
+                "`walk` writes `x` through its reference argument, so `ret == 0` must be \
+                 refuted; a `verified` here means the reference write did not reach the \
+                 loop's havoc set, got: {other}"
             ),
         }
     }
