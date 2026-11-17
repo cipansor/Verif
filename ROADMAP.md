@@ -19,7 +19,7 @@ output decides the number, so the table is a measurement rather than a claim:
 | Corpus | Command | Verified / total |
 |---|---|---|
 | `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 18 / 33 |
-| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 600 / 1096 |
+| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 608 / 1112 |
 | `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **18 / 21 (86%)** |
 
 `everyday.rs` is the honest one: ordinary Rust written by an external reviewer,

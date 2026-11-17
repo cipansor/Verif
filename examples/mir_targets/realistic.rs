@@ -12474,3 +12474,165 @@ pub fn result_unwrap_or_default_cannot_prove_this(r: Result<u8, u8>) -> u8 {
     r.unwrap_or_default()
 }
 
+
+// ---------------------------------------------------------------------------
+// `Vec::is_empty` and `Vec::pop`
+// ---------------------------------------------------------------------------
+
+/// A fresh vector is empty.
+/// requires: true
+/// ensures: ret == 1
+pub fn vec_is_empty_new() -> u8 {
+    Vec::<u8>::new().is_empty() as u8
+}
+
+/// The false twin: a fresh vector is not non-empty.
+/// requires: true
+/// ensures: ret == 0
+pub fn vec_is_empty_new_cannot_prove_this() -> u8 {
+    Vec::<u8>::new().is_empty() as u8
+}
+
+/// After one push the vector is no longer empty.
+/// requires: true
+/// ensures: ret == 0
+pub fn vec_not_empty_after_push() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(1u8);
+    v.is_empty() as u8
+}
+
+/// The false twin: the push made it non-empty, so `is_empty` is not `1`.
+/// requires: true
+/// ensures: ret == 1
+pub fn vec_not_empty_after_push_cannot_prove_this() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(1u8);
+    v.is_empty() as u8
+}
+
+/// `pop` on a fresh vector is `None` and leaves the length at zero.
+/// requires: true
+/// ensures: ret == 0
+pub fn vec_pop_empty_then_len() -> usize {
+    let mut v = Vec::<u8>::new();
+    v.pop();
+    v.len()
+}
+
+/// The false twin: `pop` on a fresh vector cannot leave a length of one.
+/// requires: true
+/// ensures: ret == 1
+pub fn vec_pop_empty_then_len_cannot_prove_this() -> usize {
+    let mut v = Vec::<u8>::new();
+    v.pop();
+    v.len()
+}
+
+/// `pop` on a one-element vector yields `Some` and returns the length to zero.
+/// requires: true
+/// ensures: ret == 1
+pub fn vec_pop_one_is_some() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(9u8);
+    v.pop().is_some() as u8
+}
+
+/// The false twin: `pop` on a one-element vector is not `None`.
+/// requires: true
+/// ensures: ret == 0
+pub fn vec_pop_one_is_some_cannot_prove_this() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(9u8);
+    v.pop().is_some() as u8
+}
+
+// ---------------------------------------------------------------------------
+// Chained `Option` combinators: the element identity must compose
+// ---------------------------------------------------------------------------
+
+/// A chain of `or` selects the *first* non-empty slice's element. The identity
+/// must compose through both combinators; a flat representation that read only
+/// the operands' leaves would take `c`'s element on the `Some` path.
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: c.len() > 0
+/// requires: a[0] == 5
+/// requires: b[0] == 7
+/// requires: c[0] == 9
+/// ensures: ret == 5
+pub fn chained_or_selects_the_first(a: &[u8], b: &[u8], c: &[u8]) -> u8 {
+    *a.first().or(b.first()).or(c.first()).unwrap()
+}
+
+/// The false twin: the chain returns `a[0]` (`5`), never `c[0]` (`9`).
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: c.len() > 0
+/// requires: a[0] == 5
+/// requires: b[0] == 7
+/// requires: c[0] == 9
+/// ensures: ret == 9
+pub fn chained_or_selects_the_first_cannot_prove_this(a: &[u8], b: &[u8], c: &[u8]) -> u8 {
+    *a.first().or(b.first()).or(c.first()).unwrap()
+}
+
+/// `and` with a conditional argument: on `Some` the result is the argument, whose
+/// own element identity is a chain.
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: c.len() > 0
+/// requires: b[0] == 7
+/// requires: c[0] == 9
+/// ensures: ret == 7
+pub fn and_with_a_conditional_argument(a: &[u8], b: &[u8], c: &[u8]) -> u8 {
+    *a.first().and(b.first().or(c.first())).unwrap()
+}
+
+/// The false twin: the argument's `or` selects `b[0]` (`7`), never `c[0]` (`9`).
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: c.len() > 0
+/// requires: b[0] == 7
+/// requires: c[0] == 9
+/// ensures: ret == 9
+pub fn and_with_a_conditional_argument_cannot_prove_this(a: &[u8], b: &[u8], c: &[u8]) -> u8 {
+    *a.first().and(b.first().or(c.first())).unwrap()
+}
+
+/// A conditional choice between two elements of a *signed* slice keeps its
+/// signedness, so `< 0` is a signed comparison.
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: a[0] == -1
+/// ensures: ret == 1
+pub fn signed_or_element_is_signed(a: &[i8], b: &[i8]) -> u8 {
+    (*a.first().or(b.first()).unwrap() < 0) as u8
+}
+
+/// The false twin: `-1 < 0` is true, so the unsigned reading (255) is not `false`.
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: a[0] == -1
+/// ensures: ret == 0
+pub fn signed_or_element_is_signed_cannot_prove_this(a: &[i8], b: &[i8]) -> u8 {
+    (*a.first().or(b.first()).unwrap() < 0) as u8
+}
+
+/// The signedness also drives signed division: `-4 / 2` is `-2`, not `126`.
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: a[0] == -4
+/// ensures: ret == -2
+pub fn signed_or_element_divides_signed(a: &[i8], b: &[i8]) -> i8 {
+    *a.first().or(b.first()).unwrap() / 2
+}
+
+/// The false twin: the unsigned reading of `-4` divided by two is `126`.
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: a[0] == -4
+/// ensures: ret == 126
+pub fn signed_or_element_divides_signed_cannot_prove_this(a: &[i8], b: &[i8]) -> i8 {
+    *a.first().or(b.first()).unwrap() / 2
+}

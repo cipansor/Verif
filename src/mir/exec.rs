@@ -623,8 +623,43 @@ impl std::fmt::Display for MirReport {
 
 /// A slice element named by the `(slice local, index)` pair its `&T` points at.
 type ElemRef = (u32, u64);
-/// A slice element chosen by a tag: `(cond, then, else)`.
-type CondElemRef = (Pred, ElemRef, ElemRef);
+
+/// The slice element an `Option<&T>` payload names, carried *compositionally* so a
+/// chain of combinators composes rather than each step reading only the operands'
+/// leaf identities.
+///
+/// `slice::first`/`get` produce a leaf; `or`/`and` build a `Select` over their two
+/// operands. Keeping the tree (rather than flattening each combinator's result to a
+/// single leaf) is what makes `a.first().or(b.first()).or(c.first())` select the
+/// *first* element on `Some`: a flat representation loses the inner `or`, and the
+/// outer combinator then reads a missing identity as permission to take the
+/// argument's element -- a false proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ElemId {
+    /// A concrete `(slice, index)` the reference was built from.
+    Leaf(ElemRef),
+    /// `cond` selects the first child on true, the second on false. Either child
+    /// may itself be a `Select`, so the tree is not flattened.
+    Select(Pred, Box<ElemId>, Box<ElemId>),
+}
+
+/// Fold an element identity into an `ite` over the element words it names, or
+/// `None` when any leaf is missing or poisoned. `read` resolves a leaf to its word
+/// *and sign*, so a signed slice element keeps its signedness (a conditional choice
+/// between two elements of one slice has one shared sign, which must survive).
+fn eval_elem_id(id: &ElemId, read: &impl Fn(ElemRef) -> Option<Val>) -> Option<Val> {
+    match id {
+        ElemId::Leaf(e) => read(*e),
+        ElemId::Select(c, t, f) => {
+            let then = eval_elem_id(t, read)?;
+            let els = eval_elem_id(f, read)?;
+            match (then, els) {
+                (Val::Sym(a, sa), Val::Sym(b, _)) => Some(Val::Sym(smt::ite(*c, a, b), sa)),
+                _ => None,
+            }
+        }
+    }
+}
 
 /// Local-to-symbolic environment, with side maps for aggregate parts.
 #[derive(Clone, Debug)]
@@ -751,16 +786,12 @@ struct Env {
     /// read names), so the payload is not a fresh value the slice never holds. A
     /// reference this store has no entry for is read as `Unknown` by the deref,
     /// which is the honest answer rather than a wrong element.
-    slice_elem_ref: BTreeMap<u32, ElemRef>,
-    /// The *conditional* form of `slice_elem_ref`: an `Option<&T>` whose element
-    /// identity is one of two sources by a tag.
     ///
-    /// `a.first().or(b.first())` returns `a`'s element on `Some` and `b`'s on
-    /// `None`, so a single `(slice, index)` pair cannot name it. The entry is
-    /// `(cond, then, else)`: `cond` selects, and `then`/`else` are the two
-    /// element identities. `Env::get` reads it into an `ite` over the two element
-    /// words, so the deref is exact rather than unknown.
-    slice_elem_cond: BTreeMap<u32, CondElemRef>,
+    /// The identity is *compositional* ([`ElemId`]), so a chain of `or`/`and`
+    /// composes rather than each step reading only its operands' leaves -- a flat
+    /// representation made `a.first().or(b.first()).or(c.first())` select `c`'s
+    /// element on the `Some` path, a false proof.
+    slice_elem_ref: BTreeMap<u32, ElemId>,
     /// The program's enum layouts, so a variant *construction* constant
     /// (`Mode::Idle`) resolves to its discriminant.
     ///
@@ -886,7 +917,7 @@ impl Env {
             arg_source: BTreeMap::new(),
             indexed: BTreeMap::new(),
             slice_elem_ref: BTreeMap::new(),
-            slice_elem_cond: BTreeMap::new(),
+
             whole_writes: BTreeSet::new(),
             enums: BTreeMap::new(),
             consts: BTreeMap::new(),
@@ -1622,26 +1653,8 @@ impl Env {
                     // payload out and records the element under the destination
                     // local, so the lookup is by this local.
                     if i == 0 {
-                        if let Some((sl, k)) = self.slice_elem_ref.get(&p.local).copied() {
-                            if let Some(s) = self.indexed.get(&sl) {
-                                if s.poisoned {
-                                    return Val::Unknown;
-                                }
-                                let sign = Sign::of_bool(s.elem_signed);
-                                return s
-                                    .elems
-                                    .get(&k)
-                                    .map(|v| Val::Sym(*v, sign))
-                                    .unwrap_or(Val::Unknown);
-                            }
-                        }
-                        // The *conditional* identity: `a.first().or(b.first())` is
-                        // `a`'s element on `Some` and `b`'s on `None`, so the value
-                        // is an `ite` over the two element words -- exact, rather
-                        // than unknown.
-                        if let Some((cond, then, els)) = self.slice_elem_cond.get(&p.local).copied()
-                        {
-                            let read = |(sl, k): (u32, u64)| -> Option<Val> {
+                        if let Some(id) = self.slice_elem_ref.get(&p.local) {
+                            let read = |(sl, k): ElemRef| -> Option<Val> {
                                 let s = self.indexed.get(&sl)?;
                                 if s.poisoned {
                                     return Some(Val::Unknown);
@@ -1649,12 +1662,7 @@ impl Env {
                                 let sign = Sign::of_bool(s.elem_signed);
                                 s.elems.get(&k).map(|v| Val::Sym(*v, sign))
                             };
-                            return match (read(then), read(els)) {
-                                (Some(Val::Sym(a, _)), Some(Val::Sym(b, _))) => {
-                                    Val::Sym(smt::ite(cond, a, b), Sign::Unsigned)
-                                }
-                                _ => Val::Unknown,
-                            };
+                            return eval_elem_id(id, &read).unwrap_or(Val::Unknown);
                         }
                     }
                     if i != 0 || !self.deref_ok.contains_key(&p.local) {
@@ -5366,46 +5374,53 @@ fn enum_method(
             if let Some((payload, sign, w)) = result_payload {
                 env.set_payload(dest.local, payload_variant, Val::Sym(payload, sign), w);
             }
-            // Carry the selected reference's *element identity*. `slice::first`/`get`
-            // produce an `Option<&T>` whose payload names a slice element through
-            // `slice_elem_ref`, and a later `*` deref reads it. The combinators must
-            // pass it on, or the deref is unknown.
+            // Carry the selected reference's *element identity*, *compositionally*.
+            // `slice::first`/`get` produce an `Option<&T>` whose payload names a
+            // slice element through `slice_elem_ref`, and a later `*` deref reads
+            // it. Each combinator builds a node over its operands' own identities
+            // rather than reading a leaf, so a chain composes:
+            //
+            //   `or`:  result = `is_some ? recv : arg`
+            //   `and`: result = `is_some ? arg : recv`
+            //
+            // A missing operand identity is substituted only when that operand
+            // cannot be the one selected -- the receiver's tag proves it. Reading a
+            // missing identity as the *other* operand's on a path that could select
+            // it was the false proof (`a.first().or(b.first()).or(c.first())` took
+            // `c`'s element); a symbolic tag with a missing operand identity is
+            // therefore left unset, which makes the deref unknown rather than wrong.
             env.slice_elem_ref.remove(&dest.local);
-            env.slice_elem_cond.remove(&dest.local);
-            match kind {
-                // `and` returns the argument on `Some` and `None` otherwise, so the
-                // argument's identity always applies -- the `None` path never reads
-                // it.
-                OptionMethod::And => {
-                    if let Some(e) = env.slice_elem_ref.get(&arg_opt.local).copied() {
-                        env.slice_elem_ref.insert(dest.local, e);
-                    }
+            let cond = smt::eq_const(tag, payload_variant);
+            let r = env.slice_elem_ref.get(&opt.local).cloned();
+            let a = env.slice_elem_ref.get(&arg_opt.local).cloned();
+            // `Some(v)` when the receiver's tag is a known discriminant, so the
+            // `is_some` test is decided and one operand is provably not selected.
+            let known_tag = smt::evaluate(tag, |_| None);
+            let is_and = matches!(kind, OptionMethod::And);
+            // Whether the receiver is selected: `or` selects it on `Some`, `and` on
+            // `None`.
+            let recv_selected_known = known_tag.map(|v| (v == payload_variant) != is_and);
+            let composed = match (r, a) {
+                (Some(r), Some(a)) => {
+                    let (then, els) = if is_and { (a, r) } else { (r, a) };
+                    Some(ElemId::Select(cond, Box::new(then), Box::new(els)))
                 }
-                // `or` returns one of the two, so the identity is conditional. A
-                // receiver whose tag is a known `Some` selects the receiver's
-                // element, a known `None` the argument's, and an unknown tag records
-                // the *conditional* identity (`cond` selects between the two), which
-                // `Env::get` reads as an `ite` over the two element words.
-                _ => {
-                    let r = env.slice_elem_ref.get(&opt.local).copied();
-                    let a = env.slice_elem_ref.get(&arg_opt.local).copied();
-                    match (smt::evaluate(tag, |_| None), r, a) {
-                        (Some(v), Some(e), _) if v == payload_variant => {
-                            env.slice_elem_ref.insert(dest.local, e);
-                        }
-                        (Some(_), _, Some(e)) => {
-                            env.slice_elem_ref.insert(dest.local, e);
-                        }
-                        (None, Some(then), Some(els)) if then != els => {
-                            env.slice_elem_cond
-                                .insert(dest.local, (smt::eq_const(tag, payload_variant), then, els));
-                        }
-                        (None, Some(e), _) | (None, _, Some(e)) => {
-                            env.slice_elem_ref.insert(dest.local, e);
-                        }
-                        _ => {}
-                    }
-                }
+                // The receiver's identity is missing: usable only when the tag says
+                // the receiver is not the selected operand.
+                (None, Some(a)) => match recv_selected_known {
+                    Some(false) => Some(a),
+                    _ => None,
+                },
+                // The argument's identity is missing: usable only when the tag says
+                // the receiver *is* the selected operand.
+                (Some(r), None) => match recv_selected_known {
+                    Some(true) => Some(r),
+                    _ => None,
+                },
+                (None, None) => None,
+            };
+            if let Some(id) = composed {
+                env.slice_elem_ref.insert(dest.local, id);
             }
             Vec::new()
         }
@@ -5464,15 +5479,11 @@ fn enum_method(
                 // reference names travels with the payload, so `*_2` on the
                 // destination reads the slice's own element. `unwrap`/`expect`
                 // panic on the failure variant, so the payload here is always the
-                // `Some` element -- no path reaches the deref without it.
-                if let Some(e) = env.slice_elem_ref.get(&opt.local).copied() {
+                // `Some` element -- no path reaches the deref without it. The
+                // identity may be conditional (a chain of `or`/`and`), and it
+                // travels as-is.
+                if let Some(e) = env.slice_elem_ref.get(&opt.local).cloned() {
                     env.slice_elem_ref.insert(dest.local, e);
-                }
-                // The conditional identity (`or`) travels with the payload too: the
-                // `None` path is where `unwrap` panics, so the `Some` element is
-                // exactly the one the payload names.
-                if let Some(e) = env.slice_elem_cond.get(&opt.local).copied() {
-                    env.slice_elem_cond.insert(dest.local, e);
                 }
                 // `unwrap`/`expect` **panic** on the failure variant. The failure
                 // is `tag == failure`, a reachable-failure obligation of the same
@@ -5568,7 +5579,7 @@ fn slice_element(
         Val::Sym(elem, elem_sign),
         elem_w,
     );
-    env.slice_elem_ref.insert(dest.local, (sl, index));
+    env.slice_elem_ref.insert(dest.local, ElemId::Leaf((sl, index)));
     Ok(Vec::new())
 }
 
@@ -5646,6 +5657,40 @@ fn vec_method(
                 return Err(format!("`{name}` on a receiver whose length is not modelled"));
             };
             env.set(dest, Val::Sym(len, Sign::Unsigned));
+            Ok(Vec::new())
+        }
+        VecMethod::IsEmpty => {
+            let l = receiver(env)?;
+            let Some(len) = env.vec_len.get(&l).copied() else {
+                return Err(format!("`{name}` on a receiver whose length is not modelled"));
+            };
+            env.set(dest, Val::Bool(smt::eq_const(len, 0)));
+            Ok(Vec::new())
+        }
+        VecMethod::Pop => {
+            let l = receiver(env)?;
+            let Some(len) = env.vec_len.get(&l).copied() else {
+                return Err(format!("`{name}` on a receiver whose length is not modelled"));
+            };
+            // `pop` returns `None` exactly when the vector is empty, and decrements
+            // the length otherwise. The popped element is not modelled (the dump
+            // prints no elements), so no payload is recorded: a `Some` payload read
+            // downstream is unknown, never a fabricated element.
+            let empty = smt::eq_const(len, 0);
+            let nonempty = smt::not(empty);
+            env.set_discriminant(
+                dest.local,
+                Val::Sym(
+                    smt::ite(
+                        nonempty,
+                        smt::word(intrinsics::SOME_TAG, 1),
+                        smt::word(intrinsics::NONE_TAG, 1),
+                    ),
+                    Sign::Unsigned,
+                ),
+            );
+            env.vec_len
+                .insert(l, smt::ite(nonempty, smt::sub(len, smt::word(1, USIZE_WIDTH)), len));
             Ok(Vec::new())
         }
     }
@@ -8435,11 +8480,8 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             if dest.proj.is_empty() {
                 if let Operand::Copy(q) | Operand::Move(q) = o {
                     if q.proj.iter().any(|p| matches!(p, Proj::Downcast(_))) {
-                        if let Some(e) = env.slice_elem_ref.get(&q.local).copied() {
+                        if let Some(e) = env.slice_elem_ref.get(&q.local).cloned() {
                             env.slice_elem_ref.insert(dest.local, e);
-                        }
-                        if let Some(e) = env.slice_elem_cond.get(&q.local).copied() {
-                            env.slice_elem_cond.insert(dest.local, e);
                         }
                     }
                 }

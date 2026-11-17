@@ -174,6 +174,9 @@ pub const POW_MAX_WIDTH: u8 = 8;
 /// lives. rustc numbers `None` 0 and `Some` 1.
 pub const SOME_TAG: u64 = 1;
 
+/// The discriminant of the `None` variant. The complement of [`SOME_TAG`].
+pub const NONE_TAG: u64 = 0;
+
 /// The discriminant of the `Ok` variant, where a modelled `Result` payload lives.
 /// rustc numbers `Ok` 0 and `Err` 1 -- the opposite of `Option`'s numbering, which
 /// is why the executor reads the payload variant off the method rather than
@@ -617,6 +620,13 @@ pub enum VecMethod {
     Push,
     /// `Vec::len(&self) -> usize` -> the current length.
     Len,
+    /// `Vec::is_empty(&self) -> bool` -> the length is zero.
+    IsEmpty,
+    /// `Vec::pop(&mut self) -> Option<T>` -> the length decreases by one when it
+    /// is non-zero. The *popped element* is not modelled (the dump prints no
+    /// elements), so the `Some` payload stays unknown while the tag and the new
+    /// length are exact.
+    Pop,
 }
 
 /// A method on a `for`-loop range.
@@ -1226,6 +1236,8 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             "new" => return Some(Intrinsic::VecMethod(VecMethod::New)),
             "push" => return Some(Intrinsic::VecMethod(VecMethod::Push)),
             "len" => return Some(Intrinsic::VecMethod(VecMethod::Len)),
+            "is_empty" => return Some(Intrinsic::VecMethod(VecMethod::IsEmpty)),
+            "pop" => return Some(Intrinsic::VecMethod(VecMethod::Pop)),
             _ => {}
         }
     }

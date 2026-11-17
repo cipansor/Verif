@@ -6492,6 +6492,14 @@ fn option_or_and_are_total_and_select_the_right_operand() {
         "or_slices_selects_the_receiver_tripwire",
         "and_slices_selects_the_argument",
         "and_slices_selects_the_argument_tripwire",
+        "chained_or_selects_the_first",
+        "chained_or_selects_the_first_cannot_prove_this",
+        "and_with_a_conditional_argument",
+        "and_with_a_conditional_argument_cannot_prove_this",
+        "signed_or_element_is_signed",
+        "signed_or_element_is_signed_cannot_prove_this",
+        "signed_or_element_divides_signed",
+        "signed_or_element_divides_signed_cannot_prove_this",
     ];
     let Some(report) = verify_realistic(&names) else {
         return;
@@ -6509,6 +6517,10 @@ fn option_or_and_are_total_and_select_the_right_operand() {
         "constructed_some_or_none",
         "or_slices_selects_the_receiver",
         "and_slices_selects_the_argument",
+        "chained_or_selects_the_first",
+        "and_with_a_conditional_argument",
+        "signed_or_element_is_signed",
+        "signed_or_element_divides_signed",
     ] {
         let o = outcome(&report, name);
         assert!(o.is_verified(), "`{name}` must verify, got: {o}");
@@ -6523,6 +6535,10 @@ fn option_or_and_are_total_and_select_the_right_operand() {
         "constructed_none_or_some_tripwire",
         "or_slices_selects_the_receiver_tripwire",
         "and_slices_selects_the_argument_tripwire",
+        "chained_or_selects_the_first_cannot_prove_this",
+        "and_with_a_conditional_argument_cannot_prove_this",
+        "signed_or_element_is_signed_cannot_prove_this",
+        "signed_or_element_divides_signed_cannot_prove_this",
     ] {
         // A *refutation*, not merely "not verified": a swap of the two operands
         // must produce a counterexample, and a skip would not be evidence.
@@ -6843,12 +6859,72 @@ fn add(v: &mut Vec<u8>, x: u8) { v.push(x); }
 /// requires: true
 /// ensures: ret == 0
 pub fn arg_len_refused(v: &Vec<u8>) -> usize { v.len() }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn is_empty_new_ok() -> u8 { Vec::<u8>::new().is_empty() as u8 }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn is_empty_new_bad() -> u8 { Vec::<u8>::new().is_empty() as u8 }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn not_empty_after_push_ok() -> u8 { let mut v = Vec::<u8>::new(); v.push(1); v.is_empty() as u8 }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn not_empty_after_push_bad() -> u8 { let mut v = Vec::<u8>::new(); v.push(1); v.is_empty() as u8 }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn pop_then_len_ok() -> usize { let mut v = Vec::<u8>::new(); v.push(1); v.pop(); v.len() }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn pop_then_len_bad() -> usize { let mut v = Vec::<u8>::new(); v.push(1); v.pop(); v.len() }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn pop_empty_is_none_ok() -> u8 { let mut v = Vec::<u8>::new(); v.pop().is_none() as u8 }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn pop_empty_is_none_bad() -> u8 { let mut v = Vec::<u8>::new(); v.pop().is_none() as u8 }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn pop_nonempty_is_some_ok() -> u8 { let mut v = Vec::<u8>::new(); v.push(9); v.pop().is_some() as u8 }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn pop_nonempty_is_some_bad() -> u8 { let mut v = Vec::<u8>::new(); v.push(9); v.pop().is_some() as u8 }
 "#;
-    for name in ["make_ok", "two_ok", "empty_ok", "helper_ok"] {
+    for name in [
+        "make_ok",
+        "two_ok",
+        "empty_ok",
+        "helper_ok",
+        "is_empty_new_ok",
+        "not_empty_after_push_ok",
+        "pop_then_len_ok",
+        "pop_empty_is_none_ok",
+        "pop_nonempty_is_some_ok",
+    ] {
         let Some(o) = verify_src(name, src) else { return };
         assert!(o.is_verified(), "`{name}` must verify; got: {o}");
     }
-    for name in ["make_bad", "two_bad", "empty_bad", "helper_bad"] {
+    for name in [
+        "make_bad",
+        "two_bad",
+        "empty_bad",
+        "helper_bad",
+        "is_empty_new_bad",
+        "not_empty_after_push_bad",
+        "pop_then_len_bad",
+        "pop_empty_is_none_bad",
+        "pop_nonempty_is_some_bad",
+    ] {
         let Some(o) = verify_src(name, src) else { return };
         assert!(
             matches!(o, FnOutcome::Failed { .. }),
