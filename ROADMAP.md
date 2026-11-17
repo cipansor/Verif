@@ -27,6 +27,27 @@ not shaped for the tool. `realistic.rs` is a regression corpus (about a third of
 it is adversarial fixtures), so its high percentage does not measure coverage of
 ordinary code. Phase 1 is defined on `everyday.rs`.
 
+**The three functions that remain `incomplete`** are each blocked by a distinct,
+confirmed-hard limitation — measured, not assumed. None is a bug, and none is a
+small change:
+
+- `div_unwrap` (`n.checked_div(d).unwrap()`, `ret <= n`) needs the **u32 divider**,
+  whose BDD is exponential at 32 bits. The same query is still undecided after
+  ~186 s with `MAX_APPLY_STEPS` raised 32× (to `1 << 24`) and after 5.7 s with the
+  SAT conflict budget raised to 20 000 000 — so it is an engine wall (C7), not a
+  budget knob. `n / d` at `u32` is equally undecided, which is the same fact.
+- `sum_iter` (`v.iter().sum()`) is **not verifiable at all**: an unbounded slice
+  sum can overflow, so the honest verdict for a total postcondition is a panic,
+  not `verified` — a bare `a + b` under `requires: true` fails the same way. The
+  `incomplete` is the unmodelled `iter`/`sum` (C10); modelling them would move the
+  entry to `FAILED`, never to `verified`, and so would not change this score.
+- `tri` (`s += i` over `0..=n`, `n <= 100`, `ret <= 5050`) needs an **inductive**
+  loop invariant, and the invariant that is inductive for a running sum is
+  *nonlinear* (`s <= i(i+1)/2`). `s <= 5050` is not inductive (from `s == 5050`
+  and `i == 100` the sum is `5150`), which is why the loop reports a spurious
+  panic rather than a missing contract. This is C12 (the contract language's
+  expressiveness), not a frontend gap.
+
 ---
 
 ## Phase 1 — everyday Rust (P0)
@@ -740,6 +761,18 @@ keeps growing.
     hanging. A per-function time budget is what would turn that ~4 s into a
     reported `incomplete` the caller can act on.
 
+    *The `u32` **divider** is a wall, not a budget knob* — the concrete blocker on
+    `everyday.rs`'s `div_unwrap` (`n.checked_div(d).unwrap()`). Measured on the
+    release build: `n / d` at `u32` is undecided after **~186 s** with
+    `MAX_APPLY_STEPS` raised 32× (to `1 << 24`), and still undecided after 5.7 s
+    with `MAX_CONFLICTS` raised to 20 000 000 (the SAT fallback cannot decide it
+    either). So the restoring divider's BDD at 32 bits is exponential and no
+    budget reaches it; `div_unwrap`, `plain_div` and a guarded `u32` `/` all fail
+    identically. The `u8`/`u16` cases decide (`div_u8` verifies in 0.57 s,
+    `div_u16` is undecided at 0.32 s and is the next width the diagram cannot
+    hold). The fix is word-level preprocessing (the approach above), not a raised
+    cap.
+
 
 ### Trust tracking (A1, tracked from Phase 1)
 
@@ -803,6 +836,13 @@ Exit: one real `no_std` crate with a dependency verified end to end with
   - Exit: a closure-taking function (`v.iter().map(|x| …).sum()`) decided for a
     monomorphised instance.
   - Move: **build**.
+  - Note on `everyday.rs`'s `sum_iter` (`v.iter().sum()`): modelling `iter`/`sum`
+    would decide the *path*, but the entry would become `FAILED`, not `verified` —
+    an unbounded slice sum can overflow, so the honest verdict for its total
+    postcondition is a panic (a bare `a + b` under `requires: true` fails the same
+    way). So `sum_iter` is not a target that moves the `everyday.rs` *score*; it is
+    a shape whose modelling would show a real panic. Worth doing, but it is not a
+    route to 21/21.
 - **C11. Heap containers.** · P1 · in progress · Kani, Verus (`Seq`), Creusot
   - Gap: `Vec`, `String`, `Box`, symbolic-length slices. Evidence: `make`
     incomplete.
@@ -835,6 +875,15 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     `wp::writes`.
   - Exit: a contract with a `forall i < n: a[i] <= m` verified.
   - Move: **build** (the `old` sub-item is done).
+  - The concrete blocker on `everyday.rs`'s `tri` (`s += i` over `0..=n`): the
+    loop needs an **inductive** invariant, and the invariant that is inductive for
+    a running sum is *nonlinear* (`s <= i(i+1)/2`), which the expression language
+    has no multiplication in a loop-invariant position to express. The *linear*
+    candidate that does exist — `s <= i` — is rejected (`unknown name i`: the
+    `for`-loop element is a `debug` binding not live at the header, see C3), and
+    the constant bound `s <= 5050` is not inductive, so the loop reports a spurious
+    panic. Inferring the invariant is a separate, larger item than the language
+    extension; both are recorded here rather than under C3.
 - **C13. Rust's own contract attributes as input.** · P1 · todo · the `contracts`
     crate
   - Approach: read `#[core::contracts::requires/ensures]`
