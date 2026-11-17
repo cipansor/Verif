@@ -16,11 +16,11 @@ A PR that closes an item updates its status here in the same PR.
 The corpus scoreboard, re-measured on this branch. Each row is a command whose
 output decides the number, so the table is a measurement rather than a claim:
 
-| Corpus | Command | Verified / decided |
+| Corpus | Command | Verified / total |
 |---|---|---|
 | `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 18 / 33 |
-| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 569 / 1041 |
-| `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **17 / 21 (81%)** |
+| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 583 / 1065 |
+| `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **18 / 21 (86%)** |
 
 `everyday.rs` is the honest one: ordinary Rust written by an external reviewer,
 not shaped for the tool. `realistic.rs` is a regression corpus (about a third of
@@ -31,8 +31,9 @@ ordinary code. Phase 1 is defined on `everyday.rs`.
 
 ## Phase 1 — everyday Rust (P0)
 
-Exit: `everyday.rs` at least **80% decided** (17 of 21), and four weeks in a row
-with no new false proof while the independent corpus keeps growing.
+Exit: `everyday.rs` at least **80% decided** (17 of 21 — **met**, at 18 of 21),
+and four weeks in a row with no new false proof while the independent corpus
+keeps growing.
 
 ### The Rust edition (E items)
 
@@ -790,12 +791,25 @@ Exit: one real `no_std` crate with a dependency verified end to end with
   - Exit: a closure-taking function (`v.iter().map(|x| …).sum()`) decided for a
     monomorphised instance.
   - Move: **build**.
-- **C11. Heap containers.** · P1 · todo · Kani, Verus (`Seq`), Creusot
+- **C11. Heap containers.** · P1 · in progress · Kani, Verus (`Seq`), Creusot
   - Gap: `Vec`, `String`, `Box`, symbolic-length slices. Evidence: `make`
     incomplete.
   - Approach: a bounded *sequence* model (length plus element array, from `mem`),
     exposed through contracts for `Vec::{new, push, pop, len, get, index}`.
-  - Exit: `make` verified.
+  - Exit: `make` verified. **Met** — `make` verifies (18 of 21 in `everyday.rs`).
+  - Done: the **length** half. `Vec::{new, push, len}` are modelled from a
+    per-local length the executor tracks (`Env::vec_len`), since a `Vec`'s fields
+    (a heap pointer, a length, a capacity) are not printed by the dump. The
+    length is `usize` and `push` is `+ 1`, which cannot overflow at 64 bits, so it
+    is exact rather than saturating. `drop` of a `Vec<T>` is a no-op exactly when
+    `T` is glue-free (`Vec<u8>` yes, `Vec<String>` no). The length crosses a call
+    boundary in both directions (`&mut Vec<u8>` carry-in and write-back), so
+    `push_helper` verifies and its false twin is refuted; a `Vec` *argument*'s
+    length is never invented — `v.len()` on an unmodelled receiver is a refusal.
+    A user type spelled `Vec` in a local module is not the standard one (the
+    same-dump lookup answers its own body first, `classify` refuses `m::Vec`).
+  - Remaining: the **element** model (`get`/`index`, so a `push`ed value can be
+    read back), `pop`, `String`, `Box`, and symbolic-length slices.
   - Move: **build**.
 - **C12. A specification language that can say more.** · P1 · in progress · Verus,
   Creusot, Prusti, SPARK

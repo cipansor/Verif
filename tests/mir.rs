@@ -6706,6 +6706,77 @@ pub fn ref_written_then_symbolic(a: &mut [u8; 4], i: usize) -> u8 {
     );
 }
 
+/// The `Vec<T>` length model: `new`/`push`/`len` track a length the executor
+/// holds, so `make`-shaped code is decided rather than refused.
+///
+/// The element is *not* modelled (a `Vec`'s fields are not printed by the dump),
+/// so this pins the length and nothing else. Each true direction must verify and
+/// each false twin must be refuted -- a model that returned a constant, or that
+/// ignored the `push`, would prove the twin. The helper direction pins that the
+/// write reaches the caller through `&mut Vec<u8>`, and the argument direction
+/// pins that a length the run never set is *refused* rather than invented.
+#[test]
+fn a_vec_length_is_tracked_through_new_push_and_len() {
+    let src = r#"
+/// requires: true
+/// ensures: ret == 1
+pub fn make_ok(n: u8) -> usize { let mut v = Vec::new(); v.push(n); v.len() }
+
+/// requires: true
+/// ensures: ret == 2
+pub fn make_bad(n: u8) -> usize { let mut v = Vec::new(); v.push(n); v.len() }
+
+/// requires: true
+/// ensures: ret == 2
+pub fn two_ok(n: u8) -> usize { let mut v = Vec::new(); v.push(n); v.push(n); v.len() }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn two_bad(n: u8) -> usize { let mut v = Vec::new(); v.push(n); v.push(n); v.len() }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn empty_ok() -> usize { Vec::<u8>::new().len() }
+
+/// requires: true
+/// ensures: ret == 3
+pub fn empty_bad() -> usize { Vec::<u8>::new().len() }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn helper_ok(n: u8) -> usize { let mut v = Vec::new(); add(&mut v, n); v.len() }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn helper_bad(n: u8) -> usize { let mut v = Vec::new(); add(&mut v, n); v.len() }
+
+fn add(v: &mut Vec<u8>, x: u8) { v.push(x); }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn arg_len_refused(v: &Vec<u8>) -> usize { v.len() }
+"#;
+    for name in ["make_ok", "two_ok", "empty_ok", "helper_ok"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    for name in ["make_bad", "two_bad", "empty_bad", "helper_bad"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` claims a length the body never produces and must be refuted, \
+             not proved; got: {o}"
+        );
+    }
+    // A `Vec` argument's length is not a value the run holds, so a `len` on it is
+    // a refusal -- never an invented number.
+    let Some(o) = verify_src("arg_len_refused", src) else { return };
+    assert!(
+        !o.is_verified(),
+        "a `Vec` argument's length is unmodelled and must not verify; got: {o}"
+    );
+}
+
 /// A `&mut [u8]` slice write must reach the store the read consults.
 ///
 /// This is the gap the `&raw const (fake) (*_1)` parse closed. Before it, the

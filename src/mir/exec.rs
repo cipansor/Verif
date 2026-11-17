@@ -791,6 +791,13 @@ struct Env {
     /// [`crate::mir::parse::MirProgram::promoted_strs`] so `eval_rvalue` can read
     /// a `const NAME::promoted[0]` operand without the whole program in hand.
     promoted: BTreeMap<String, Vec<String>>,
+    /// The tracked length of a `Vec<T>` local, keyed by local.
+    ///
+    /// A `Vec`'s fields are not printed by the dump, so the only thing the model
+    /// can hold is the length `Vec::new`/`Vec::push` set and `Vec::len` reads.
+    /// The element type is not stored: no element operation is modelled, so
+    /// there is nothing to size.
+    vec_len: BTreeMap<u32, Var>,
 }
 
 /// A modelled value with a length and elements: a slice or an array.
@@ -873,6 +880,7 @@ impl Env {
             piece_sets: BTreeMap::new(),
             tmpl_bytes: BTreeMap::new(),
             promoted: BTreeMap::new(),
+            vec_len: BTreeMap::new(),
         }
     }
 
@@ -1955,6 +1963,10 @@ impl Env {
         self.strs.remove(&local);
         self.piece_sets.remove(&local);
         self.tmpl_bytes.remove(&local);
+        // A `Vec` local overwritten as a whole place is no longer the value the
+        // length was tracking, so the length is dropped rather than kept: a
+        // `v = other_vec` must not leave the old length readable.
+        self.vec_len.remove(&local);
         if let Some(s) = self.indexed.get_mut(&local) {
             s.elems.clear();
             // The seeded elements are gone, so a later read must not find them.
@@ -5358,6 +5370,75 @@ fn slice_element(
     Ok(Vec::new())
 }
 
+/// The element type of a `Vec<T>`, from its printed name.
+///
+/// rustc prints the type as `std::vec::Vec<u8>` (or `alloc::vec::Vec<u8>`, or a
+/// bare `Vec<u8>`), so the element is the balanced `<…>` group. `None` for a
+/// name that is not a `Vec`, or one whose arguments cannot be read.
+fn vec_elem_ty(name: &str) -> Option<Ty> {
+    let bare = name.rsplit("::").next().unwrap_or(name);
+    if bare.split('<').next() != Some("Vec") {
+        return None;
+    }
+    crate::mir::spec::angle_inner(name).map(Ty::parse)
+}
+
+/// The `Vec<T>` length model: `new` sets the length to zero, `push` adds one,
+/// `len` reads it.
+///
+/// A `Vec`'s fields (a heap pointer, a length, a capacity) are not printed by
+/// the dump, so the length is all the model holds (see `Env::vec_len`).
+/// `new`/`push`/`len` are the calls the corpus uses; every other `Vec` method
+/// stays unmodelled rather than being guessed.
+///
+/// The receiver of `push`/`len` is a reference, so the length lives on the
+/// *referent* local -- `pointee` follows `&mut v`/`&v` to the storage the caller
+/// owns, which is the same local `new` wrote. A receiver whose length the run
+/// never set (a `Vec` argument, or one built by an unmodelled call) is refused,
+/// never given an invented number.
+fn vec_method(
+    name: &str,
+    kind: intrinsics::VecMethod,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+) -> Result<Vec<Obligation>, String> {
+    use intrinsics::VecMethod;
+    // The storage the receiver names, following one reference. `new` is the
+    // exception: it is an associated function with no receiver, so its length is
+    // written to the destination.
+    let receiver = |env: &Env| -> Result<u32, String> {
+        match args.first() {
+            Some(Operand::Copy(p)) | Some(Operand::Move(p)) => Ok(env.pointee(p).local),
+            _ => Err(format!("unmodelled receiver for `{name}`")),
+        }
+    };
+    match kind {
+        VecMethod::New => {
+            env.vec_len.insert(dest.local, smt::word(0, USIZE_WIDTH));
+            Ok(Vec::new())
+        }
+        VecMethod::Push => {
+            let l = receiver(env)?;
+            let Some(len) = env.vec_len.get(&l).copied() else {
+                return Err(format!("`{name}` on a receiver whose length is not modelled"));
+            };
+            // The length is a `usize` and `+ 1` cannot overflow at 64 bits for any
+            // vector a program can build, so this is exact rather than saturating.
+            env.vec_len.insert(l, smt::add(len, smt::word(1, USIZE_WIDTH)));
+            Ok(Vec::new())
+        }
+        VecMethod::Len => {
+            let l = receiver(env)?;
+            let Some(len) = env.vec_len.get(&l).copied() else {
+                return Err(format!("`{name}` on a receiver whose length is not modelled"));
+            };
+            env.set(dest, Val::Sym(len, Sign::Unsigned));
+            Ok(Vec::new())
+        }
+    }
+}
+
 
 /// Answer `Try::branch`, the first call of the `?` desugaring.
 ///
@@ -5611,6 +5692,7 @@ fn try_intrinsic(
                 | intrinsics::Intrinsic::Range(_)
                 | intrinsics::Intrinsic::TryBranch
                 | intrinsics::Intrinsic::FromResidual
+                | intrinsics::Intrinsic::VecMethod(_)
         );
     if !name.contains("<impl") && !trait_method {
         return None;
@@ -5649,6 +5731,13 @@ fn try_intrinsic(
     // width for every operand).
     if let intrinsics::Intrinsic::Conversion(kind) = op {
         return Some(convert(name, kind, args, dest, env).map(|()| Vec::new()));
+    }
+    // The `Vec` methods. They read a length the executor tracks, not a bit-vector
+    // operand, so they are answered before the generic operand read below -- a
+    // `Vec` receiver has no width to read, and `Vec::new()` has *no* argument at
+    // all, so it must run before the `args.first()?` that the operand read needs.
+    if let intrinsics::Intrinsic::VecMethod(kind) = op {
+        return Some(vec_method(name, kind, args, dest, env));
     }
     let cur = &prog.fns[func];
     // The operand width, from the first argument's declared type. It is not the
@@ -6226,6 +6315,13 @@ fn seed_callee_env(
             if let Some(store) = caller_env.indexed.get(&sl).cloned() {
                 env.indexed.insert(l, store);
             }
+            // A `Vec` argument's tracked length, carried in for the same reason
+            // the element store is: a helper that reads `v.len()` through its
+            // argument (`&Vec<u8>`) must see the caller's length. Without this the
+            // callee read `Unknown` and its contract was unreadable.
+            if let Some(len) = caller_env.vec_len.get(&sl).copied() {
+                env.vec_len.insert(l, len);
+            }
             for ((l0, f), v) in caller_env.fields.iter() {
                 if *l0 == sl {
                     env.fields.insert((l, *f), *v);
@@ -6779,6 +6875,16 @@ where
                         if rest.is_empty() {
                             if let Some(s) = st.env.indexed.get(cal) {
                                 env.indexed.insert(cl, s.clone());
+                            }
+                        }
+                        // A `Vec` length the callee changed through a reference
+                        // (`push(&mut v)`). Only a *whole-local* target: a sub-place
+                        // target (`&mut v.len()`) is not a shape a `Vec` length is
+                        // ever handed over as, and re-keying an unrepresentable
+                        // length would invent a key.
+                        if rest.is_empty() {
+                            if let Some(len) = st.env.vec_len.get(cal).copied() {
+                                env.vec_len.insert(cl, len);
                             }
                         }
                         // A whole-referent write (`*v = x`). The whole place was
@@ -7647,7 +7753,16 @@ fn drop_is_noop(ty: &Ty) -> bool {
         Ty::Tuple(ts) => ts.iter().all(drop_is_noop),
         Ty::Array(inner, _) => drop_is_noop(inner),
         Ty::Slice(inner) => drop_is_noop(inner),
-        Ty::Other(_) => false,
+        // A `Vec<T>` is glue-free exactly when `T` is: the container's own
+        // destructor only runs `T`'s, so a `Vec<u8>` runs nothing observable. The
+        // `T` is read from the printed name; a `T` that is itself an unmodelled
+        // type (`Ty::Other`) is *not* glue-free by this test, which is the
+        // conservative direction -- it is refused by the `has_field_glue` check
+        // rather than assumed to be a no-op.
+        Ty::Other(name) => match vec_elem_ty(name) {
+            Some(elem) => drop_is_noop(&elem),
+            None => false,
+        },
     }
 }
 
@@ -10337,8 +10452,14 @@ fn count_via_helper(_1: u8) -> u8 {
         assert!(drop_is_noop(&Ty::Tuple(vec![Ty::U8, Ty::Bool])));
         // A nominal type is not known glue-free from the dump, so it is *not* a
         // no-op -- it is resolved to a destructor or refused.
-        assert!(!drop_is_noop(&Ty::Other("Vec<u8>".into())));
         assert!(!drop_is_noop(&Ty::Other("Guard".into())));
+        // A `Vec<T>` is glue-free exactly when its element is: the container's own
+        // destructor only runs `T`'s, so `Vec<u8>` runs nothing observable while a
+        // `Vec<Guard>` (a nominal element) does not.
+        assert!(drop_is_noop(&Ty::Other("Vec<u8>".into())));
+        assert!(drop_is_noop(&Ty::Other("std::vec::Vec<u8>".into())));
+        assert!(!drop_is_noop(&Ty::Other("Vec<Guard>".into())));
+        assert!(!drop_is_noop(&Ty::Other("Vec<String>".into())));
         // A tuple/array with a nominal leaf inherits the nominal's glue.
         assert!(!drop_is_noop(&Ty::Array(Box::new(Ty::Other("Guard".into())), 2)));
         assert!(!drop_is_noop(&Ty::Tuple(vec![Ty::U8, Ty::Other("String".into())])));

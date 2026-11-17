@@ -9947,3 +9947,45 @@ over a structure the program can make cyclic needs the cycle set threaded throug
 it, and the fix is to decide what the cycle contributes rather than to cut it.
 
 
+
+## A `Vec`'s length is a model of its own, and it must not be invented
+
+The review's C11 exit criterion was one line: "`make` verified". `make` is
+`Vec::new(); v.push(n); v.len()`, and every call was "unmodelled function
+`Vec::<u8>::new`", so the whole file lost three functions to the container. The
+length half is now modelled (`Env::vec_len`, a per-local length the executor
+tracks; `Vec::{new, push, len}`).
+
+Four things are worth keeping, because each is a way the model could have been
+wrong rather than incomplete:
+
+- **A `Vec`'s fields are not in the dump.** rustc prints the local as
+  `std::vec::Vec<u8>` and never its pointer/length/capacity, so the model holds
+  the *length* and nothing else. That is enough for `make`, and it is stated
+  rather than implied: an element read stays unmodelled.
+- **`push` is `+ 1` at `usize`, which is exact.** A `Vec` cannot hold `2^64`
+  elements, so `len + 1` never wraps; saturating would be a weaker claim for no
+  reason.
+- **The receiver is a reference, so the length lives on the referent.** `push`/`len`
+  take `&mut self`/`&self`; `pointee` follows one reference to the storage the
+  caller owns -- the same local `new` wrote. A receiver whose length the run never
+  set (a `Vec` *argument*, or one built by an unmodelled call) is a **refusal**,
+  never an invented number: `v.len()` on an argument is `incomplete`, not a proof
+  of some arbitrary length.
+- **The length crosses a call boundary.** The `&mut Vec<u8>` carry-in lets a
+  helper read the caller's length, and the write-back lets `push(&mut v)` reach the
+  caller. Without both, `push_helper` refutes a true contract; the false twin pins
+  that the write is *seen* rather than the model returning a constant.
+
+`drop` of a `Vec<T>` is a no-op exactly when `T` is glue-free (`Vec<u8>` yes,
+`Vec<String>` no), which is the same rule the aggregate cases already follow. The
+teeth are a mutation: making `push` a no-op (keeping the length) turns
+`make_ok`/`two_ok` red and leaves the false twins refuted, so the test observes the
+length the `push` produces, not merely that the function decides.
+
+Two collision guards matter. A user type spelled `Vec` in a local module
+(`m::Vec`) is not the standard one: `classify` refuses a path that is neither
+`vec::Vec` nor a bare `Vec::` head, and the same-dump lookup answers a local body
+first regardless. And `Vec::<u8>::len` is **not** read as a slice length -- the
+slice path is matched on `core::slice::<impl [T]>`, so the two lengths (a slice's
+symbolic input, a `Vec`'s tracked model) cannot be confused.

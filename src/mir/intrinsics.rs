@@ -349,6 +349,19 @@ pub enum Intrinsic {
     /// than reading an arbitrary element -- the same rule a `s[i]` subscript
     /// follows. A literal index (`get(0)`) is exact.
     SliceGet,
+    /// A method on a `Vec<T>`: `new`, `push` or `len`.
+    ///
+    /// A `Vec` has no bit-vector value (its fields -- a heap pointer, a length
+    /// and a capacity -- are not printed by the dump), so the model is a
+    /// *length* the executor holds per local, tracked exactly through the three
+    /// calls the corpus uses. `new` sets it to `0`, `push` adds one, and `len`
+    /// reads it. The element is not modelled, so any call whose result depends on
+    /// the elements (`pop`, `get`, indexing, `is_empty` on a container whose
+    /// length is not a length) is refused rather than guessed.
+    ///
+    /// The *path* is checked (see [`names_vec_impl`]) so a user type spelled
+    /// `Vec` is refused, and the same-dump lookup answers a real body first.
+    VecMethod(VecMethod),
     /// `iN::abs_diff`: the absolute difference of two operands, as the type.
     ///
     /// Its result is *unsigned* even on a signed type -- `i8::abs_diff(-128, 127)`
@@ -586,6 +599,24 @@ pub enum Intrinsic {
     /// mirror of [`Intrinsic::TryBranch`]: the residual's failure tag and payload
     /// become the result enum's. `eval` returns `None` for it.
     FromResidual,
+}
+
+/// A method on a `Vec<T>`.
+///
+/// The model is a *length* the executor tracks per local, not the elements: the
+/// dump prints a `Vec` as an opaque `std::vec::Vec<T>` local with no fields, so
+/// there is nothing else to read. `new` and `push` are the only writers and `len`
+/// the only reader, which is exactly the surface `make` uses. A method whose
+/// result depends on the *elements* (indexing, `pop`, `get`, `first`) is not in
+/// this set and stays unmodelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecMethod {
+    /// `Vec::new()` -> an empty vector, length `0`.
+    New,
+    /// `Vec::push(&mut self, value)` -> appends one element, length `+ 1`.
+    Push,
+    /// `Vec::len(&self) -> usize` -> the current length.
+    Len,
 }
 
 /// A method on a `for`-loop range.
@@ -1156,6 +1187,19 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             return Some(Intrinsic::SliceGet);
         }
     }
+    // `Vec::new`/`push`/`len`. Like the slice shapes these read the receiver's
+    // own state (a length the executor tracks) rather than a bit-vector operand,
+    // so the executor answers them; `eval` returns `None`. The *path* is checked
+    // (see `names_vec_impl`) so a user type spelled `Vec` is refused, and the
+    // same-dump lookup still answers a real body before the model.
+    if names_vec_impl(name) {
+        match short {
+            "new" => return Some(Intrinsic::VecMethod(VecMethod::New)),
+            "push" => return Some(Intrinsic::VecMethod(VecMethod::Push)),
+            "len" => return Some(Intrinsic::VecMethod(VecMethod::Len)),
+            _ => {}
+        }
+    }
     // The standard library's `Option`/`Result` methods. Like the slice shapes
     // these read the receiver's own state rather than a bit-vector operand -- the
     // tag and the payload -- so the executor answers them from its
@@ -1556,6 +1600,24 @@ pub fn names_slice_impl(name: &str) -> bool {
     name.contains("slice::<impl [")
 }
 
+/// True when a call names an inherent method on the standard library's `Vec`.
+///
+/// `new`/`push`/`len` are spelled on many types, so the *path* is checked:
+/// rustc prints a `Vec` method as `Vec::<u8>::new` or `alloc::vec::Vec::<u8>::push`,
+/// naming the `vec` module or starting with the bare `Vec::` (the shortened
+/// spelling rustc uses when nothing shadows it). A user type spelled `Vec` in a
+/// local module is `m::Vec::<u8>::new`, which has neither, and is refused. The
+/// standard library's `Vec` is the only thing rustc prints with `vec::Vec` or a
+/// leading `Vec::`, because a user cannot define items inside `alloc`/`std`.
+///
+/// A `String`/`str` also spell `len`, and a slice's `len` is handled separately
+/// (`names_slice_impl`); those paths do not contain `vec::` and do not start with
+/// `Vec::`, so they fall through and stay unmodelled rather than being answered
+/// with a `Vec` length they do not have.
+pub fn names_vec_impl(name: &str) -> bool {
+    name.contains("vec::Vec") || name.starts_with("Vec::")
+}
+
 /// True when a call names an inherent method on the standard library's `Option`.
 ///
 /// `unwrap`, `unwrap_or`, `is_some` and `is_none` are spelled the same on a user
@@ -1758,6 +1820,13 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         | Intrinsic::SliceIsEmpty
         | Intrinsic::SliceFirst
         | Intrinsic::SliceGet => true,
+        // The `Vec` methods. Like the slice shapes they read a length the
+        // executor tracks rather than an operand term, so there is no width or
+        // sign to check here; `eval` never sees them and the executor answers
+        // them from its store (or refuses a receiver whose length it does not
+        // hold). Total here so an `is_modelled` probe does not report them
+        // unmodelled.
+        Intrinsic::VecMethod(_) => true,
         // The `Option` methods. They read the receiver's tag and payload, which
         // live in the executor's stores rather than in an operand term, so there is
         // no width or sign to check here -- `eval` never sees them and the
@@ -1979,6 +2048,12 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
     ) {
         return None;
     }
+    // The `Vec` methods read the length the *executor* tracks, not an operand
+    // term, so `eval` has nothing to compute for them. The executor answers them
+    // (see `vec_method`).
+    if matches!(op, Intrinsic::VecMethod(_)) {
+        return None;
+    }
     // The `Option` methods read the receiver's tag and payload from the executor's
     // stores, not from an operand term, so `eval` has nothing to compute for them
     // either. The executor answers them (see `enum_method`).
@@ -2022,6 +2097,11 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         // the early return above keeps them from reaching here.
         Intrinsic::Range(_) => {
             unreachable!("range methods are answered from the struct field store")
+        }
+        // Answered by the executor's `vec_method` from the length store; the early
+        // return above keeps them from reaching here.
+        Intrinsic::VecMethod(_) => {
+            unreachable!("Vec methods are answered from the length store")
         }
         // Answered by the executor's `try_branch`/`from_residual` from the enum
         // stores; the early return above keeps them from reaching here.
@@ -5642,11 +5722,20 @@ mod tests {
         assert_eq!(classify("is_negative"), Some(Intrinsic::Bool(BoolKind::Negative)));
         assert_eq!(classify("is_positive"), Some(Intrinsic::Bool(BoolKind::Positive)));
         // The slice shapes are matched on the *path*, so a `Vec`'s `len` is not
-        // read as a slice length.
+        // read as a slice length -- it is its own length model instead.
         assert_eq!(classify("core::slice::<impl [u8]>::len"), Some(Intrinsic::SliceLen));
         assert_eq!(classify("core::slice::<impl [u8]>::is_empty"), Some(Intrinsic::SliceIsEmpty));
-        assert!(classify("alloc::vec::Vec<u8>::len").is_none());
-        assert!(classify("Vec::<u8>::len").is_none());
+        // A `Vec`'s methods are their own model, not a slice's length: the two
+        // lengths are different variables. `new`/`push`/`len` are the modelled
+        // surface; `str::len` is neither and stays refused.
+        assert_eq!(classify("alloc::vec::Vec<u8>::len"), Some(Intrinsic::VecMethod(VecMethod::Len)));
+        assert_eq!(classify("Vec::<u8>::len"), Some(Intrinsic::VecMethod(VecMethod::Len)));
+        assert_eq!(classify("Vec::<u8>::new"), Some(Intrinsic::VecMethod(VecMethod::New)));
+        assert_eq!(classify("Vec::<u8>::push"), Some(Intrinsic::VecMethod(VecMethod::Push)));
+        // A user type spelled `Vec` in a local module is not the standard one.
+        assert!(classify("m::Vec::<u8>::len").is_none());
+        // `String`/`str` also spell `len` and have neither `vec::Vec` nor a bare
+        // `Vec::` head, so they are not answered by the `Vec` model.
         assert!(classify("str::len").is_none());
         // `abs_diff` and the rotations are matched by their exact tail, so a
         // longer name that merely starts the same way is refused rather than read
