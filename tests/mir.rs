@@ -5096,6 +5096,8 @@ fn a_loop_havocs_what_it_writes_through() {
         "for_loop_invariant_cannot_prove_this",
         "while_writes_through_ref_holds",
         "while_writes_through_ref_cannot_prove_this",
+        "ref_arg_written_in_a_loop_holds",
+        "ref_arg_written_in_a_loop_cannot_prove_this",
     ];
     let Some(report) = verify_realistic(&names) else { return };
     let outcome = |name: &str| {
@@ -5107,7 +5109,11 @@ fn a_loop_havocs_what_it_writes_through() {
             .1
             .clone()
     };
-    for holds in ["for_loop_invariant_holds", "while_writes_through_ref_holds"] {
+    for holds in [
+        "for_loop_invariant_holds",
+        "while_writes_through_ref_holds",
+        "ref_arg_written_in_a_loop_holds",
+    ] {
         assert!(
             outcome(holds).is_verified(),
             "`{holds}` establishes its postcondition and must verify, got: {}",
@@ -5117,6 +5123,7 @@ fn a_loop_havocs_what_it_writes_through() {
     for twin in [
         "for_loop_invariant_cannot_prove_this",
         "while_writes_through_ref_cannot_prove_this",
+        "ref_arg_written_in_a_loop_cannot_prove_this",
     ] {
         match outcome(twin) {
             FnOutcome::Failed { kind, .. } => assert!(

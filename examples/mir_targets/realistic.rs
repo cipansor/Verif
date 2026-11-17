@@ -704,6 +704,37 @@ pub fn while_writes_through_ref_cannot_prove_this() -> u8 {
     x
 }
 
+/// A `&mut u8` *argument* written inside a loop. `Ty::Ref` is modelled as its
+/// referent, so the argument's value is seeded at the referent's width -- but its
+/// `width()` is `None`, so the header havoc skipped it and the referent kept its
+/// entry value. The exit guard then folded and a false postcondition came back
+/// `Verified` (`w_false` is the twin). The relational invariant is what makes the
+/// true direction inductive and the panic (`x += 1` at `x == 255`) unprovable.
+/// requires: x == 0
+/// invariant: x == i && i <= 3
+/// ensures: ret <= 3
+pub fn ref_arg_written_in_a_loop_holds(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 {
+        *x += 1;
+        i += 1;
+    }
+    *x
+}
+
+/// The false twin: the referent is written three times, so `ret == 0` is false.
+/// requires: x == 0
+/// invariant: x == i && i <= 3
+/// ensures: ret == 0
+pub fn ref_arg_written_in_a_loop_cannot_prove_this(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 {
+        *x += 1;
+        i += 1;
+    }
+    *x
+}
+
 // ---------------------------------------------------------------------------
 // `core::num` intrinsics: modelled directly rather than through their bodies.
 //

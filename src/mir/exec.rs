@@ -4403,7 +4403,15 @@ fn advance(
     }
     for &l in &havoc {
         if let Some(ty) = cur.ty_of(l) {
-            if let Some(w) = ty.width() {
+            // A reference local's value *is* its referent's (`Ty::Ref` is modelled
+            // as the referent), so it is havoced at the referent's width -- the
+            // width it was seeded at. Reading `ty.width()` on the `Ty::Ref` itself
+            // gives `None`, which sent a written-through reference argument to the
+            // aggregate branch and left its referent at the entry value: the exit
+            // guard then folded and a false postcondition was `Verified` (`w_false`
+            // below). A `&mut u8` argument is the commonest shape of this.
+            let inner = ty.referent();
+            if let Some(w) = inner.width() {
                 // `var`, not `var_named`: a fresh variable is the point. A named
                 // one would return the very variable being replaced, and the
                 // havoc would be a no-op.
@@ -4412,7 +4420,7 @@ fn advance(
                 } else {
                     // A havoced local is a fresh *input* of the same type, so it
                     // keeps the type's sign.
-                    Val::Sym(smt::var(w), Sign::of(ty))
+                    Val::Sym(smt::var(w), Sign::of(inner))
                 };
                 st.env.locals.insert(l, fresh);
             } else {
