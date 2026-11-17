@@ -621,6 +621,11 @@ impl std::fmt::Display for MirReport {
 // Environment
 // ---------------------------------------------------------------------------
 
+/// A slice element named by the `(slice local, index)` pair its `&T` points at.
+type ElemRef = (u32, u64);
+/// A slice element chosen by a tag: `(cond, then, else)`.
+type CondElemRef = (Pred, ElemRef, ElemRef);
+
 /// Local-to-symbolic environment, with side maps for aggregate parts.
 #[derive(Clone, Debug)]
 struct Env {
@@ -746,7 +751,16 @@ struct Env {
     /// read names), so the payload is not a fresh value the slice never holds. A
     /// reference this store has no entry for is read as `Unknown` by the deref,
     /// which is the honest answer rather than a wrong element.
-    slice_elem_ref: BTreeMap<u32, (u32, u64)>,
+    slice_elem_ref: BTreeMap<u32, ElemRef>,
+    /// The *conditional* form of `slice_elem_ref`: an `Option<&T>` whose element
+    /// identity is one of two sources by a tag.
+    ///
+    /// `a.first().or(b.first())` returns `a`'s element on `Some` and `b`'s on
+    /// `None`, so a single `(slice, index)` pair cannot name it. The entry is
+    /// `(cond, then, else)`: `cond` selects, and `then`/`else` are the two
+    /// element identities. `Env::get` reads it into an `ite` over the two element
+    /// words, so the deref is exact rather than unknown.
+    slice_elem_cond: BTreeMap<u32, CondElemRef>,
     /// The program's enum layouts, so a variant *construction* constant
     /// (`Mode::Idle`) resolves to its discriminant.
     ///
@@ -872,6 +886,7 @@ impl Env {
             arg_source: BTreeMap::new(),
             indexed: BTreeMap::new(),
             slice_elem_ref: BTreeMap::new(),
+            slice_elem_cond: BTreeMap::new(),
             whole_writes: BTreeSet::new(),
             enums: BTreeMap::new(),
             consts: BTreeMap::new(),
@@ -1619,6 +1634,27 @@ impl Env {
                                     .map(|v| Val::Sym(*v, sign))
                                     .unwrap_or(Val::Unknown);
                             }
+                        }
+                        // The *conditional* identity: `a.first().or(b.first())` is
+                        // `a`'s element on `Some` and `b`'s on `None`, so the value
+                        // is an `ite` over the two element words -- exact, rather
+                        // than unknown.
+                        if let Some((cond, then, els)) = self.slice_elem_cond.get(&p.local).copied()
+                        {
+                            let read = |(sl, k): (u32, u64)| -> Option<Val> {
+                                let s = self.indexed.get(&sl)?;
+                                if s.poisoned {
+                                    return Some(Val::Unknown);
+                                }
+                                let sign = Sign::of_bool(s.elem_signed);
+                                s.elems.get(&k).map(|v| Val::Sym(*v, sign))
+                            };
+                            return match (read(then), read(els)) {
+                                (Some(Val::Sym(a, _)), Some(Val::Sym(b, _))) => {
+                                    Val::Sym(smt::ite(cond, a, b), Sign::Unsigned)
+                                }
+                                _ => Val::Unknown,
+                            };
                         }
                     }
                     if i != 0 || !self.deref_ok.contains_key(&p.local) {
@@ -5110,7 +5146,11 @@ fn enum_method(
     // the model reports no obligation -- a false proof. The error type is read from
     // the receiver's own type (`Result<T, E>`), and a type whose glue this tool
     // cannot establish is refused rather than assumed harmless.
-    if let OptionMethod::UnwrapOr = kind {
+    //
+    // `unwrap_or_default` consumes the same receiver and destroys the same error on
+    // the `Err` branch, so it is guarded identically -- excluding it was a false
+    // proof for a `Result<u8, Boom>` whose `Boom` destructor panics.
+    if let OptionMethod::UnwrapOr | OptionMethod::UnwrapOrDefault = kind {
         if intrinsics::names_result_impl(name) {
             if let Some(err) = receiver_error_type(cur, &opt) {
                 match has_drop_glue(prog, callees.structs(), &err) {
@@ -5269,11 +5309,13 @@ fn enum_method(
             // of the `switchInt` that consumes the result finds an unbound payload.
             // The receiver's own payload, and the argument's tag/payload. The
             // argument is an `Option` by value, so its parts live on its local.
-            let Some((Val::Sym(recv_payload, recv_sign), recv_w)) =
-                env.payloads.get(&(opt.local, payload_variant)).copied()
-            else {
-                return Err(format!("`{name}` on a receiver whose payload is not modelled"));
-            };
+            //
+            // A payload is required only when the operand can be `Some` on some
+            // path. A *constructed* `None` records no payload; when its tag is a
+            // known non-`Some` discriminant the payload is absent and irrelevant,
+            // exactly as the `ok`/`err` conversions handle it. A symbolic tag
+            // still requires the payload, because a fabricated value there would
+            // be one the operand never holds.
             let arg_opt = match args.get(1).and_then(|d| match d {
                 Operand::Copy(p) | Operand::Move(p) => Some(env.pointee(p)),
                 _ => None,
@@ -5284,34 +5326,87 @@ fn enum_method(
             let Some(Val::Sym(arg_tag, _)) = env.discriminants.get(&arg_opt.local).copied() else {
                 return Err(format!("`{name}` on an argument whose enum state is not modelled"));
             };
-            let Some((Val::Sym(arg_payload, arg_sign), arg_w)) =
-                env.payloads.get(&(arg_opt.local, payload_variant)).copied()
-            else {
-                return Err(format!("`{name}` on an argument whose payload is not modelled"));
-            };
-            // `is_some(tag)` is `tag == Some`.
+            let recv_payload =
+                payload_if_some(env, opt.local, tag, payload_variant, "a receiver", name)?;
+            let arg_payload =
+                payload_if_some(env, arg_opt.local, arg_tag, payload_variant, "an argument", name)?;
+            // The two tags can come from *different* origins -- a seeded enum
+            // argument's tag is one bit (`bind_enum`), a `checked_*` result's tag
+            // is the operand's width -- so they are normalised to a common width
+            // before the `ite`, or the branches mismatch and the query is refused
+            // as ill-formed.
+            let common_w = smt::bits(tag).max(smt::bits(arg_tag));
+            let tag = smt::truncate(tag, common_w);
+            let arg_tag = smt::truncate(arg_tag, common_w);
             let is_some = smt::eq_const(tag, payload_variant);
-            let (result_tag, result_payload, result_sign, result_w) = match kind {
-                OptionMethod::Or => (
-                    smt::ite(is_some, tag, arg_tag),
-                    smt::ite(is_some, recv_payload, arg_payload),
-                    recv_sign,
-                    recv_w,
-                ),
-                _ => (
-                    smt::ite(is_some, arg_tag, tag),
-                    smt::ite(is_some, arg_payload, recv_payload),
-                    arg_sign,
-                    arg_w,
-                ),
+            let (result_tag, result_payload) = match kind {
+                // `or` is `Option<T>` on both sides, so the two payloads have the
+                // same type: the receiver's on `Some`, the argument's on `None`. An
+                // absent payload (a known `None` operand) needs no `ite` -- the
+                // other operand is the whole result.
+                OptionMethod::Or => {
+                    let payload = match (recv_payload, arg_payload) {
+                        (Some((r, rs, rw)), Some((a, _, _))) => {
+                            Some((smt::ite(is_some, r, a), rs, rw))
+                        }
+                        (Some((r, rs, rw)), None) => Some((r, rs, rw)),
+                        (None, Some((a, as_, aw))) => Some((a, as_, aw)),
+                        (None, None) => None,
+                    };
+                    (smt::ite(is_some, tag, arg_tag), payload)
+                }
+                // `and` is `Option<T>::and<U> -> Option<U>`: on `Some` the result is
+                // the *argument* (`Option<U>`), and on `None` it is `None`, whose
+                // payload is never read. So the result's payload is the argument's
+                // unconditionally -- `ite`-ing it with the receiver's `T` payload
+                // would demand equal widths for two unrelated types.
+                _ => (smt::ite(is_some, arg_tag, tag), arg_payload),
             };
             env.set_discriminant(dest.local, Val::Sym(result_tag, Sign::Unsigned));
-            env.set_payload(
-                dest.local,
-                payload_variant,
-                Val::Sym(result_payload, result_sign),
-                result_w,
-            );
+            if let Some((payload, sign, w)) = result_payload {
+                env.set_payload(dest.local, payload_variant, Val::Sym(payload, sign), w);
+            }
+            // Carry the selected reference's *element identity*. `slice::first`/`get`
+            // produce an `Option<&T>` whose payload names a slice element through
+            // `slice_elem_ref`, and a later `*` deref reads it. The combinators must
+            // pass it on, or the deref is unknown.
+            env.slice_elem_ref.remove(&dest.local);
+            env.slice_elem_cond.remove(&dest.local);
+            match kind {
+                // `and` returns the argument on `Some` and `None` otherwise, so the
+                // argument's identity always applies -- the `None` path never reads
+                // it.
+                OptionMethod::And => {
+                    if let Some(e) = env.slice_elem_ref.get(&arg_opt.local).copied() {
+                        env.slice_elem_ref.insert(dest.local, e);
+                    }
+                }
+                // `or` returns one of the two, so the identity is conditional. A
+                // receiver whose tag is a known `Some` selects the receiver's
+                // element, a known `None` the argument's, and an unknown tag records
+                // the *conditional* identity (`cond` selects between the two), which
+                // `Env::get` reads as an `ite` over the two element words.
+                _ => {
+                    let r = env.slice_elem_ref.get(&opt.local).copied();
+                    let a = env.slice_elem_ref.get(&arg_opt.local).copied();
+                    match (smt::evaluate(tag, |_| None), r, a) {
+                        (Some(v), Some(e), _) if v == payload_variant => {
+                            env.slice_elem_ref.insert(dest.local, e);
+                        }
+                        (Some(_), _, Some(e)) => {
+                            env.slice_elem_ref.insert(dest.local, e);
+                        }
+                        (None, Some(then), Some(els)) if then != els => {
+                            env.slice_elem_cond
+                                .insert(dest.local, (smt::eq_const(tag, payload_variant), then, els));
+                        }
+                        (None, Some(e), _) | (None, _, Some(e)) => {
+                            env.slice_elem_ref.insert(dest.local, e);
+                        }
+                        _ => {}
+                    }
+                }
+            }
             Vec::new()
         }
         // `unwrap`/`unwrap_or` read the payload, which `checked_*` recorded
@@ -5372,6 +5467,12 @@ fn enum_method(
                 // `Some` element -- no path reaches the deref without it.
                 if let Some(e) = env.slice_elem_ref.get(&opt.local).copied() {
                     env.slice_elem_ref.insert(dest.local, e);
+                }
+                // The conditional identity (`or`) travels with the payload too: the
+                // `None` path is where `unwrap` panics, so the `Some` element is
+                // exactly the one the payload names.
+                if let Some(e) = env.slice_elem_cond.get(&opt.local).copied() {
+                    env.slice_elem_cond.insert(dest.local, e);
                 }
                 // `unwrap`/`expect` **panic** on the failure variant. The failure
                 // is `tag == failure`, a reachable-failure obligation of the same
@@ -8147,6 +8248,39 @@ fn receiver_some_type(f: &MirFn, p: &Place) -> Option<Ty> {
     Some(Ty::parse(inner.trim()))
 }
 
+/// An operand's `Some` payload, or `None` when the operand's tag is a *known*
+/// non-`Some` discriminant (a constructed `None`).
+///
+/// A payload is required only when the operand can be `Some` on some path. A
+/// constructed `None` records no payload, and its absence is not a modelling
+/// failure -- the result's tag is already known, so the missing payload is never
+/// read. A *symbolic* tag still requires the payload: a fabricated value there
+/// would be one the operand never holds, so the shape is refused.
+///
+/// `whose` names the operand ("a receiver"/"an argument") and `name` the method,
+/// so the refusal names what could not be read.
+fn payload_if_some(
+    env: &Env,
+    local: u32,
+    tag: Var,
+    payload_variant: u64,
+    whose: &str,
+    name: &str,
+) -> Result<Option<(Var, Sign, u8)>, String> {
+    match env.payloads.get(&(local, payload_variant)).copied() {
+        Some((Val::Sym(payload, sign), w)) => Ok(Some((payload, sign, w))),
+        Some(_) => Err(format!("`{name}` on {whose} whose payload is not a value")),
+        None => match smt::evaluate(tag, |_| None) {
+            // A known tag that is not the payload variant: the operand is `None`
+            // on every path, so there is no payload to carry.
+            Some(v) if v != payload_variant => Ok(None),
+            // A symbolic tag, or a known `Some` tag with no payload recorded: the
+            // payload may be read, so it must be modelled.
+            _ => Err(format!("`{name}` on {whose} whose payload is not modelled")),
+        },
+    }
+}
+
 /// The declared type of an operand, for the enum-method glue checks.
 fn operand_ty(f: &MirFn, o: &Operand) -> Option<Ty> {
     match o {
@@ -8303,6 +8437,9 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
                     if q.proj.iter().any(|p| matches!(p, Proj::Downcast(_))) {
                         if let Some(e) = env.slice_elem_ref.get(&q.local).copied() {
                             env.slice_elem_ref.insert(dest.local, e);
+                        }
+                        if let Some(e) = env.slice_elem_cond.get(&q.local).copied() {
+                            env.slice_elem_cond.insert(dest.local, e);
                         }
                     }
                 }

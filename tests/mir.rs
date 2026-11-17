@@ -6462,6 +6462,12 @@ fn the_option_result_conversions_handle_constructed_variants_and_grouping() {
 /// The drop-glue rule is shared with `ok`/`err`: `or` drops the argument's payload
 /// on the `Some` path and `and` drops the receiver's, so a `T` whose destructor is
 /// not modelled is refused rather than read as glue-free.
+///
+/// The *operand shapes* are pinned separately: a `checked_*` receiver's tag is the
+/// arithmetic width while a seeded `Option` argument's is one bit, so the tags must
+/// be normalised; `Option<T>::and<U>` returns `Option<U>`, so the receiver's
+/// payload must never be `ite`-d with the argument's; and a constructed `None`
+/// records no payload, so its absence must not refuse the call.
 #[test]
 fn option_or_and_are_total_and_select_the_right_operand() {
     let names = [
@@ -6473,6 +6479,19 @@ fn option_or_and_are_total_and_select_the_right_operand() {
         "and_some_is_the_argument_tripwire",
         "and_none_is_the_receiver",
         "and_none_is_the_receiver_tripwire",
+        "or_mixed_tag_widths_is_none",
+        "or_mixed_tag_widths_tripwire",
+        "or_mixed_tag_widths_none_is_argument",
+        "and_different_payload_widths",
+        "and_different_payload_widths_tripwire",
+        "and_none_receiver_decides",
+        "constructed_none_or_some",
+        "constructed_some_or_none",
+        "constructed_none_or_some_tripwire",
+        "or_slices_selects_the_receiver",
+        "or_slices_selects_the_receiver_tripwire",
+        "and_slices_selects_the_argument",
+        "and_slices_selects_the_argument_tripwire",
     ];
     let Some(report) = verify_realistic(&names) else {
         return;
@@ -6482,6 +6501,14 @@ fn option_or_and_are_total_and_select_the_right_operand() {
         "or_none_is_the_argument",
         "and_some_is_the_argument",
         "and_none_is_the_receiver",
+        "or_mixed_tag_widths_is_none",
+        "or_mixed_tag_widths_none_is_argument",
+        "and_different_payload_widths",
+        "and_none_receiver_decides",
+        "constructed_none_or_some",
+        "constructed_some_or_none",
+        "or_slices_selects_the_receiver",
+        "and_slices_selects_the_argument",
     ] {
         let o = outcome(&report, name);
         assert!(o.is_verified(), "`{name}` must verify, got: {o}");
@@ -6491,6 +6518,11 @@ fn option_or_and_are_total_and_select_the_right_operand() {
         "or_none_is_the_argument_tripwire",
         "and_some_is_the_argument_tripwire",
         "and_none_is_the_receiver_tripwire",
+        "or_mixed_tag_widths_tripwire",
+        "and_different_payload_widths_tripwire",
+        "constructed_none_or_some_tripwire",
+        "or_slices_selects_the_receiver_tripwire",
+        "and_slices_selects_the_argument_tripwire",
     ] {
         // A *refutation*, not merely "not verified": a swap of the two operands
         // must produce a counterexample, and a skip would not be evidence.
@@ -11928,6 +11960,50 @@ fn the_drop_fixtures_decide_and_the_false_ones_are_refuted() {
     match outcome(&report, "string_drop_is_refused") {
         FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. } => {}
         other => panic!("a `String` drop must be refused, got: {other}"),
+    }
+}
+
+/// A combinator that *destroys* its unused operand must respect that operand's
+/// drop glue, or it is a false proof.
+///
+/// `Result::unwrap_or_default` consumes the receiver and destroys the error value
+/// on the `Err` branch. The model checked only that the payload and the default
+/// were scalar words, so a `Result<u8, Boom>` whose `Boom` destructor panics was
+/// reported panic-free -- while a real call unwinds. The same holds for
+/// `unwrap_or`, `or`, and `and`, which drop the operand they do not return. Each
+/// is now refused when the dropped type's glue is not representable, which is the
+/// honest answer rather than an assumed no-op.
+#[test]
+fn a_combinator_that_destroys_a_value_respects_its_drop_glue() {
+    let src = r#"
+pub struct Boom;
+impl Drop for Boom {
+    fn drop(&mut self) {
+        panic!("boom");
+    }
+}
+
+/// requires: true
+/// ensures: ret <= 255
+pub fn boom_default(r: Result<u8, Boom>) -> u8 {
+    r.unwrap_or_default()
+}
+
+/// requires: true
+/// ensures: ret <= 255
+pub fn boom_or(r: Result<u8, Boom>) -> u8 {
+    r.unwrap_or(7)
+}
+"#;
+    for name in ["boom_default", "boom_or"] {
+        let Some(o) = verify_src(name, src) else { return };
+        match o {
+            FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. } => {}
+            other => panic!(
+                "`{name}` destroys a `Boom` whose destructor panics and must be refused, \
+                 got: {other} -- a `verified` here is a false proof"
+            ),
+        }
     }
 }
 

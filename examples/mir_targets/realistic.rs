@@ -3489,6 +3489,132 @@ pub fn and_none_is_the_receiver_tripwire(x: Option<u8>, y: Option<u8>) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// `or`/`and` operand *shapes* the first cut refused. Each is a valid program
+// whose tags or payloads come from different origins, so the model must
+// normalise rather than demand identical widths.
+
+/// A `checked_*` receiver's tag is the arithmetic operand's width (`u8` -> eight
+/// bits), while a seeded `Option` argument's tag is one bit. The two must be
+/// normalised to a common width before the `ite`, or the query is ill-formed.
+/// requires: n < 255
+/// ensures: ret == false
+pub fn or_mixed_tag_widths_is_none(n: u8, y: Option<u8>) -> bool {
+    n.checked_add(1).or(y).is_none()
+}
+
+/// The false twin: `n < 255` makes `checked_add` `Some`, so `or` is the receiver
+/// and `is_none()` is false -- a model that read the argument's tag would prove
+/// this.
+/// requires: n < 255
+/// ensures: ret == true
+pub fn or_mixed_tag_widths_tripwire(n: u8, y: Option<u8>) -> bool {
+    n.checked_add(1).or(y).is_none()
+}
+
+/// The other side of the mixed-tag pair: `n == 255` overflows `checked_add` to
+/// `None`, so `or` is the argument (`Some`).
+/// requires: n == 255 && y.is_some()
+/// ensures: ret == true
+pub fn or_mixed_tag_widths_none_is_argument(n: u8, y: Option<u8>) -> bool {
+    n.checked_add(1).or(y).is_some()
+}
+
+/// `Option<T>::and<U>` returns `Option<U>`: `Some(x).and(y)` is `y`, so the
+/// receiver's 8-bit payload never becomes the result. An `ite` over the two would
+/// demand equal widths for unrelated types.
+/// requires: x.is_some() && y.is_some()
+/// ensures: ret == true
+pub fn and_different_payload_widths(x: Option<u8>, y: Option<u16>) -> bool {
+    x.and(y).is_some()
+}
+
+/// The false twin: `x` and `y` both `Some`, so `and` is `Some` -- a model that
+/// read the receiver's payload or refused the width mismatch would prove this.
+/// requires: x.is_some() && y.is_some()
+/// ensures: ret == false
+pub fn and_different_payload_widths_tripwire(x: Option<u8>, y: Option<u16>) -> bool {
+    x.and(y).is_some()
+}
+
+/// The receiver's `None` decides `and`: `None.and(y)` is `None` whatever `y` is.
+/// requires: x.is_none() && y.is_some()
+/// ensures: ret == false
+pub fn and_none_receiver_decides(x: Option<u8>, y: Option<u16>) -> bool {
+    x.and(y).is_some()
+}
+
+/// A *constructed* `None` records no payload, and its absence is not a failure:
+/// `None::<u8>.or(Some(9))` is the argument.
+/// requires: true
+/// ensures: ret == true
+pub fn constructed_none_or_some() -> bool {
+    None::<u8>.or(Some(9)).is_some()
+}
+
+/// The mirror: `Some(7).or(None)` is the receiver.
+/// requires: true
+/// ensures: ret == true
+pub fn constructed_some_or_none() -> bool {
+    Some(7u8).or(None).is_some()
+}
+
+/// The false twin of `constructed_none_or_some`: a `None` receiver with no
+/// payload must still select the argument, so `is_none()` is false.
+/// requires: true
+/// ensures: ret == true
+pub fn constructed_none_or_some_tripwire() -> bool {
+    None::<u8>.or(Some(9)).is_none()
+}
+
+/// `a.first().or(b.first())` selects between two *slice elements*, so the
+/// reference identity is conditional: `a`'s element on `Some`, `b`'s on `None`.
+/// The deref must read the selected element, which needs the conditional
+/// identity carried through the combinator.
+/// requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9
+/// ensures: ret == 5
+pub fn or_slices_selects_the_receiver(a: &[u8], b: &[u8]) -> u8 {
+    *a.first().or(b.first()).unwrap()
+}
+
+/// The false twin: the selected element is `a[0] == 5`, not `b[0] == 9`.
+/// requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9
+/// ensures: ret == 9
+pub fn or_slices_selects_the_receiver_tripwire(a: &[u8], b: &[u8]) -> u8 {
+    *a.first().or(b.first()).unwrap()
+}
+
+/// `and` returns the argument on `Some`, so the deref is `b`'s element.
+/// requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9
+/// ensures: ret == 9
+pub fn and_slices_selects_the_argument(a: &[u8], b: &[u8]) -> u8 {
+    *a.first().and(b.first()).unwrap()
+}
+
+/// The false twin: `and` is not the receiver's element.
+/// requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9
+/// ensures: ret == 5
+pub fn and_slices_selects_the_argument_tripwire(a: &[u8], b: &[u8]) -> u8 {
+    *a.first().and(b.first()).unwrap()
+}
+
+/// `Result::unwrap_or_default` destroys the error on the `Err` branch, so a
+/// `Result<u8, Boom>` whose `Boom` destructor panics must be *refused*, not
+/// reported panic-free. The `Boom` type is defined here so the glue check reads
+/// its destructor.
+pub struct Boom;
+impl Drop for Boom {
+    fn drop(&mut self) {
+        panic!("boom");
+    }
+}
+
+/// requires: true
+/// ensures: ret <= 255
+pub fn unwrap_or_default_boom(r: Result<u8, Boom>) -> u8 {
+    r.unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
 // Conversions whose source variant is *constructed*, not seeded. A locally
 // constructed `None`/`Err`/`Ok` records only the payload that variant carries,
 // so the inactive variant has no payload to move. The conversion must still
