@@ -7238,15 +7238,24 @@ pub fn mk() -> Vec<u8> { Vec::new() }
 /// ensures: ret == 0
 pub fn returned_ok() -> usize { let v = mk(); v.len() }
 "#;
-    // The user `Vec`'s destructor panics, so the function must not be proved.
-    // A refusal is the sound answer (the destructor body's `panic!` is not
-    // modelled as a value), and a refutation is also fine -- only `verified` is a
-    // false proof.
+    // The user `Vec`'s destructor panics, so the function must be *refused*.
+    // The assertion is `Incomplete`, not merely `!is_verified()`: a `!is_verified`
+    // check also passes on `Failed`, so it cannot tell a refusal (the honest
+    // answer, since the destructor's `panic!` has no value) from a spurious
+    // refutation of the `ensures: true` claim -- the same weakness the invariant
+    // tripwire was fixed for. Measured, the drop of a user `Vec` whose fields are
+    // not modelled is `Incomplete`; pinning it makes a regression to `Failed`
+    // visible rather than silently passing.
     let Some(o) = verify_src("user_vec_drop_panics", src) else { return };
-    assert!(
-        !o.is_verified(),
-        "a user `Vec` whose `Drop` panics must not verify; got: {o}"
-    );
+    match o {
+        FnOutcome::Incomplete { .. } => {}
+        other => panic!(
+            "a user `Vec` whose `Drop` panics must be refused as `Incomplete` \
+             (the destructor's `panic!` is not modelled as a value), got: {other} -- \
+             a `verified` here is a false proof and a `Failed` would be a spurious \
+             refutation of `ensures: true`"
+        ),
+    }
 
     // The loop twin must be *refuted* on its postcondition, not merely refused:
     // a refusal also satisfies "not verified" and would check nothing.
@@ -12295,11 +12304,16 @@ pub fn boom_or(r: Result<u8, Boom>) -> u8 {
 "#;
     for name in ["boom_default", "boom_or"] {
         let Some(o) = verify_src(name, src) else { return };
+        // Pinned as `Incomplete`, not `Incomplete | Skipped`: the contracts here
+        // (`ret <= 255`) are readable, so a `Skipped` would mean the contract
+        // stopped being read -- a different defect that this check should not
+        // silently accept. Measured, both are `Incomplete` (the destructor's glue
+        // is not representable), so the exact kind is the honest pin.
         match o {
-            FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. } => {}
+            FnOutcome::Incomplete { .. } => {}
             other => panic!(
-                "`{name}` destroys a `Boom` whose destructor panics and must be refused, \
-                 got: {other} -- a `verified` here is a false proof"
+                "`{name}` destroys a `Boom` whose destructor panics and must be refused \
+                 as `Incomplete`, got: {other} -- a `verified` here is a false proof"
             ),
         }
     }
