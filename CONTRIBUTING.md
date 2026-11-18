@@ -130,6 +130,21 @@ above it, because `^0.1.0` accepts `0.1.1` but not `0.2.0`:
 Adding a public function is a **minor** bump. Maintainers tag and publish; a
 contributor does not need a crates.io token.
 
+### Where the release notes come from
+
+There is no `CHANGELOG.md` on purpose, and it is not a gap. The release notes are
+generated from git at release time: `scripts/publish.py --tag <crate>-v<version>
+--notes` prints the commit subjects that touched *that* crate since its previous
+tag (scoped by pathspec, so the sibling's commits do not appear in the parent's
+notes and vice versa), and `.github/workflows/release.yml` passes that text to
+`gh release create`. A hand-maintained changelog would be a second copy of the
+same facts, and a second copy is exactly the kind that goes stale silently — the
+defect this repository refuses everywhere else. So the policy is: **write the
+commit subject as the changelog line**, because that is what a reader will see.
+`python3 scripts/publish.py --tag <crate>-v<version> --notes` prints the notes
+for a tag without publishing anything, if you want to check the wording before
+tagging.
+
 ## Reporting a bug
 
 Open an issue with the input that triggers it, what you expected, and what

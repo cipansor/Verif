@@ -27,6 +27,14 @@ heading, drop every character that is not a letter, a digit, a space, an
 underscore or a hyphen, then turn each space into a hyphen. Duplicate headings
 get `-1`, `-2`, ... suffixes in document order, which is what GitHub does.
 
+It also checks the README's hand-drawn file tree (`check_tree`): every entry the
+tree *names* must exist at the directory its indentation points at. The tree is a
+prose mirror of the filesystem, and a prose mirror of `ls` is the kind of second
+copy that goes stale silently -- a file is renamed and the block still reads as
+mechanical. It caught an `examples/probe.rs` that no longer existed and a module
+list missing four entries. A file the tree omits is not an error (the tree is a
+curated map, not a listing); a file the tree *names* and that is absent is.
+
 Usage: python3 scripts/check_doc_links.py [markdown ...]
 With no arguments it checks every top-level `*.md`, README first.
 """
@@ -42,6 +50,16 @@ ROOT = Path(__file__).resolve().parent.parent
 LINK = re.compile(r"\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 FENCE = re.compile(r"^\s*(```|~~~)")
+
+# A line of the README's hand-drawn file tree: an optional run of ancestor
+# columns (`│   ` or `    `, four characters each), a `├── `/`└── ` connector,
+# then a bare name and an optional description. The name is the first
+# whitespace-delimited token (so a description may contain anything, including
+# `/`), and a trailing `/` marks a directory. The description is consumed but not
+# used, so the `$` anchor still holds on a line that carries one.
+TREE_LINE = re.compile(
+    r"^(?P<prefix>(?:[│ ]   )*)(?:├── |└── )(?P<name>[^\s]+)(?:\s+.*)?$"
+)
 
 
 def anchor_of(heading: str) -> str:
@@ -185,6 +203,70 @@ def check(path: Path) -> list[str]:
     return errors
 
 
+def check_tree(path: Path) -> list[str]:
+    """Fail if the README's hand-drawn file tree names a file that is not there.
+
+    The tree is prose that mirrors `ls`, and a prose mirror of the filesystem is
+    the kind of second copy that goes stale silently: a file is added or renamed,
+    nothing reads the block, and it stays wrong. A stale tree is not cosmetic --
+    it lists an example that no longer exists (so the documented `cargo run
+    --example` fails) or omits a module, and a reader trusts it precisely because
+    it looks mechanical.
+
+    Only the *existence* of each named entry is checked, against the directory its
+    indentation points at: the check is `(parent / name).exists()`. A file the
+    tree forgets to list is not an error -- the tree is a curated map, not an
+    exhaustive listing -- but a file the tree *names* and that is absent is the
+    defect this catches, and it is the one that misleads.
+
+    Only `README.md` carries the tree; other documents are skipped.
+    """
+    if path.name != "README.md":
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    # Find the tree: the fenced block that contains a `├── ` line.
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == "```" and any(
+            "├── " in l for l in lines[i + 1 : i + 3]
+        ):
+            start = i + 1
+            break
+    if start is None:
+        return []  # no tree block; nothing to check
+    errors: list[str] = []
+    # A stack of (indent-depth, directory Path) the current line lives under.
+    # The root `.` is depth 0; each `│   `/`    ` column is one level deeper.
+    stack: list[tuple[int, Path]] = [(-1, ROOT)]
+    for offset, raw in enumerate(lines[start:]):
+        lineno = start + offset + 1
+        if raw.strip() == "```":
+            break
+        if raw.strip() == ".":
+            stack = [(-1, ROOT)]
+            continue
+        m = TREE_LINE.match(raw)
+        if not m:
+            continue
+        depth = len(m.group("prefix")) // 4
+        name = m.group("name")
+        is_dir = name.endswith("/")
+        name = name.rstrip("/")
+        # Pop to this line's parent.
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+        parent = stack[-1][1] if stack else ROOT
+        entry = parent / name
+        if not entry.exists():
+            errors.append(
+                f"{path}:{lineno}: the tree names '{name}' under "
+                f"'{parent.relative_to(ROOT) or '.'}', which does not exist"
+            )
+        if is_dir:
+            stack.append((depth, entry))
+    return errors
+
+
 def default_paths() -> list[Path]:
     """Every top-level Markdown document, README first.
 
@@ -204,6 +286,7 @@ def main(argv: list[str]) -> int:
             problems.append(f"{p}: file to check does not exist")
             continue
         problems.extend(check(p))
+        problems.extend(check_tree(p))
     if problems:
         print("check_doc_links: broken links", file=sys.stderr)
         for e in problems:
