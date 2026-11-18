@@ -52,3 +52,42 @@ fn readme_install_uses_the_published_crate() {
         "Installation must name the published `verif-arithmetic` sibling"
     );
 }
+
+/// The "same function, two ways" example must be real code, not prose.
+///
+/// The README's two-shape section shows one function verified at build time (from
+/// `build.rs`) and the same function verified on the target. The on-target snippet
+/// is the one a reader copies into their own crate, so it is compiled and executed
+/// here: the proof must discharge, and the function must compute what the contract
+/// says. A snippet that no longer compiles -- or that no longer proves -- is the
+/// documentation lying, which is exactly what this file exists to catch.
+#[test]
+fn readme_two_ways_on_target_snippet_proves_and_computes() {
+    use verif::prelude::*;
+
+    // The README's "verified on the target" `clamp100`, verbatim.
+    fn clamp100(n: u32) -> u32 {
+        let ok = verif::smt::with_fresh(|| {
+            let x = var(32);
+            let clamped = verif::smt::ite(x.gt_val(100), verif::smt::word(100, 32), x);
+            clamped.le_val(100).prove().is_proved()
+        });
+        assert!(ok, "clamp100's bound did not discharge");
+        if n > 100 { 100 } else { n }
+    }
+
+    assert_eq!(clamp100(0), 0);
+    assert_eq!(clamp100(100), 100);
+    assert_eq!(clamp100(101), 100);
+    assert_eq!(clamp100(u32::MAX), 100);
+
+    // The bound the snippet proves is falsifiable: a wrong one must be refuted, so
+    // the assert above is a real discharge rather than a tautology.
+    let refuted = verif::smt::with_fresh(|| {
+        let x = var(32);
+        verif::smt::ite(x.gt_val(100), verif::smt::word(100, 32), x)
+            .lt_val(50)
+            .prove()
+    });
+    assert!(!refuted.is_proved(), "a false bound must not be proved");
+}
