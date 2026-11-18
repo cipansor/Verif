@@ -1042,24 +1042,19 @@ Exit: one real `no_std` crate with a dependency verified end to end with
 
 ### Usability (U items, Phase 2 subset)
 
-- **U1. Publish to crates.io, or stop saying `cargo add verif`.** · P1 · done
-  (the honest half) · —
+- **U1. Publish to crates.io.** · P1 · done · —
   - Gap: the README's Installation section said `cargo add verif`, but the crates
-    are not on crates.io (the API answers "does not exist"). The packaging work is
-    done (`scripts/publish.py`, `scripts/check_package.sh`, a tag-driven
-    `.github/workflows/release.yml`), so what remains is the human step: create the
+    were not on crates.io. The packaging work (`scripts/publish.py`,
+    `scripts/check_package.sh`, a tag-driven `.github/workflows/release.yml`) was
+    already in place; what remained was the human step: create the
     `CARGO_REGISTRY_TOKEN` secret and push a `verif-arithmetic-v0.1.0` tag, then
     `verif-v0.1.0`.
-  - Fix: the README's Installation section now depends on the git repository by tag
-    (`verif = { git = "https://github.com/cipansor/verif", tag = "verif-v0.1.0" }`),
-    with a note that the crates are not on the registry yet. That is the "or"
-    branch of the exit criterion, so it is met without the human upload step, and
-    it stops the README claiming a command that fails. The dependency snippets are
-    pinned by `readme_install_is_a_git_dependency_until_published` in
-    `tests/readme.rs`, so publishing later is a deliberate edit to that test rather
-    than silent drift.
-  - Exit: `cargo add verif` works, or the README points at a git dependency. ✅
-    (the second).
+  - Fix: both crates are published at `0.1.0`, and the README's Installation
+    section depends on the registry (`verif = "0.1"`) rather than on a git tag.
+    The dependency snippets are pinned by `readme_install_uses_the_published_crate`
+    in `tests/readme.rs`, so a regression back to a git source is a failing test
+    rather than silent drift.
+  - Exit: `cargo add verif` works. ✅
   - Move: **build**.
 - **U2. `cargo verif`.** · P1 · todo · Kani (`cargo kani`)
   - Exit: `cargo verif --format json|sarif` plus a GitHub Action that annotates a

@@ -21,16 +21,16 @@ fn readme_flagship_example_proves_a_bound() {
     assert!(proved);
 }
 
-/// The Installation section must not tell a reader to run a command that fails.
+/// The Installation section must tell a reader to depend on the published crate.
 ///
-/// The crates are packaged and release-ready but not on crates.io (the registry
-/// answers "does not exist"), so the README depends on the git repository by tag
-/// and says so. This pins the *shape* of that instruction: it must be a git
-/// dependency and must carry the "not on crates.io" note. When the crates are
-/// published, this test is the deliberate edit that flips it -- the failure is the
+/// Both crates are on crates.io, so the README depends on `verif = "0.1"` rather
+/// than on the git repository. This pins the *shape* of that instruction: a
+/// version requirement, no git source, and the `verif-arithmetic` sibling named
+/// as the published crate it is. If a release ever has to fall back to a git
+/// dependency, this is the deliberate edit that flips it -- the failure is the
 /// reminder, not a surprise.
 #[test]
-fn readme_install_is_a_git_dependency_until_published() {
+fn readme_install_uses_the_published_crate() {
     let readme = include_str!("../README.md");
     let install = readme
         .split("## Installation")
@@ -40,15 +40,15 @@ fn readme_install_is_a_git_dependency_until_published() {
         .next()
         .expect("the Installation section must end at the next heading");
     assert!(
-        install.contains("Not on crates.io yet"),
-        "Installation must say the crates are not published; got:\n{install}"
+        install.contains("verif = \"0.1\""),
+        "Installation must depend on the published `verif = \"0.1\"`; got:\n{install}"
     );
     assert!(
-        install.contains("git = \"https://github.com/cipansor/verif\""),
-        "Installation must point at the git repository until the crates are published"
+        !install.contains("git = \"https://github.com/cipansor/verif\""),
+        "Installation must not fall back to a git dependency once the crate is published"
     );
     assert!(
-        !install.contains("cargo add verif"),
-        "Installation must not advertise `cargo add verif` while the crate is unpublished"
+        install.contains("https://crates.io/crates/verif-arithmetic"),
+        "Installation must name the published `verif-arithmetic` sibling"
     );
 }
