@@ -421,12 +421,20 @@ jobs:
   # moment, because an upload cannot be undone. This job packages both crates and
   # dry-runs the publish in dependency order.
   #
-  # `verif` depends on `verif-arithmetic` by path, and `cargo publish` resolves
-  # that against the registry, so the parent's dry-run is *expected* to be blocked
-  # until the sibling is on crates.io. `scripts/publish.py` reports that as
-  # "blocked, waiting on ..." and exits 0, so this job distinguishes "the sibling
-  # is not published yet" (normal before the first release) from "the manifest is
-  # broken" (a failure). No `--strict` here, for the same reason.
+  # `cargo publish` resolves the parent's `verif-arithmetic` dependency against
+  # the registry, so the parent's dry-run verdict is a fact about what the
+  # registry holds at that moment, not about this tree. `scripts/publish.py`
+  # keeps the two apart: a dependency this repository owns but the registry
+  # cannot resolve is reported as *blocked* and exits 0 -- the sibling's version
+  # is uploaded before its dependent's, on every release, so that is release
+  # ordering and not a manifest fault -- while a manifest that is genuinely
+  # broken (a typo'd dependency name, a missing `readme`, an unpackageable
+  # crate) is *failed* and turns the job red. So the dry-run step below is the
+  # gate on the manifest. The strict run after it is informational: it escalates
+  # *blocked* to a non-zero exit, and whether a crate is blocked is a fact about
+  # the registry rather than about the commit under test, so it is surfaced as a
+  # notice rather than enforced. The maintainer runs `--strict` by hand as the
+  # pre-upload check.
   package:
     name: package (dry-run publish, in dependency order)
     runs-on: ubuntu-latest
@@ -444,20 +452,25 @@ jobs:
         run: sh scripts/check_package.sh
 
       # `cargo package` on the sibling, which has no in-repo dependency, must
-      # succeed outright -- there is nothing for it to wait on. The parent is
-      # allowed to be blocked, and `publish.py` says which of the two happened.
+      # succeed outright -- there is nothing for it to wait on. The parent's
+      # verdict is a fact about the registry: `publish.py` exits 0 when the only
+      # problem is an unresolvable sibling dependency (the dependency is uploaded
+      # before its dependent, on every release) and non-zero when a manifest is
+      # genuinely broken. So this step is a gate on the manifest, not on registry
+      # state, and it prints each crate's verdict either way.
       - name: Dry-run the publish, in dependency order
         run: python3 scripts/publish.py
 
-      # The `--strict` run is what a maintainer runs after publishing the sibling:
-      # it turns "blocked on a dependency" into a failure. It is expected to fail
-      # here only while the sibling is unpublished, so it is not a gate; it is
-      # reported, not enforced.
-      - name: Report whether the parent is publishable yet
+      # The maintainer's pre-upload check, surfaced as a notice rather than
+      # enforced: `--strict` exits non-zero while a crate is *blocked*, and
+      # whether it is blocked is a fact about what the registry can resolve for
+      # the required version, not about the commit under test. Reporting it keeps
+      # the signal without making a red job out of release ordering.
+      - name: Report the strict publish verdict
         run: |
           if python3 scripts/publish.py --strict >/dev/null 2>&1; then
-            echo "Both crates are publishable now."
+            echo "The strict publish check passes: every crate is publishable."
           else
-            echo "::notice::The parent is blocked until verif-arithmetic is on crates.io."
-            echo "This is the expected state before the first release of the sibling."
+            echo "::notice::The strict publish check reports a crate as blocked on its sibling version."
+            echo "That is release ordering (a dependency is uploaded before its dependent), not a manifest fault."
           fi

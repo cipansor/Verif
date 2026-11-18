@@ -62,11 +62,11 @@ Done in one commit. The traps, so a future rename does not repeat them:
 
 ## Publishing to crates.io
 
-The repository is arranged so both crates can be published, and the checks that
-make that true are separate from the ones that make the *code* correct. A crate
-that builds and passes all eighteen gates can still be unpublishable, and the
-failure only surfaces at `cargo publish` — the worst moment, because an upload
-cannot be undone.
+Both crates are published at `0.1.0`. The repository is arranged so they stay
+publishable, and the checks that make that true are separate from the ones that
+make the *code* correct. A crate that builds and passes all eighteen gates can
+still be unpublishable, and the failure only surfaces at `cargo publish` — the
+worst moment, because an upload cannot be undone.
 
 - **The crates version independently.** No `[workspace.package] version`, no
   `version.workspace = true`. A shared version re-versions both crates at once,
@@ -77,10 +77,13 @@ cannot be undone.
   cannot say which of two crates it means. `.github/workflows/release.yml`
   refuses one rather than interpreting it.
 - **`verif` cannot be packaged until `verif-arithmetic` is on crates.io.**
-  `cargo publish` resolves a `path` dependency against the registry. The two
-  error shapes are `no matching package named ...` (first release) and
-  `failed to select a version for the requirement ...` (a later release, when an
-  older version exists). Both mean "publish the sibling first".
+  `cargo publish` resolves a `path` dependency against the registry. Both crates
+  are published now, so the dry-run resolves the parent's dependency and reports
+  it *ready*; the rule still governs every later release, where a version bump of
+  the sibling has to land on the registry first. The two error shapes are
+  `no matching package named ...` (no version of the sibling at all) and
+  `failed to select a version for the requirement ...` (an older version exists,
+  the new one does not). Both mean "publish the sibling first".
   `scripts/publish.py` derives the order from the manifests and reports the
   second as *blocked*, not *broken*.
 - **`verif`'s directory is the repository root**, so `dirty_by_crate` in
