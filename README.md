@@ -58,6 +58,7 @@ all obligations discharged
 - [The idea in one paragraph](#the-idea-in-one-paragraph)
 - [The three ways this crate proves something](#the-three-ways-this-crate-proves-something)
 - [What is in the box](#what-is-in-the-box)
+- [Two ways to use the verifier: at build time, or on the target](#two-ways-to-use-the-verifier-at-build-time-or-on-the-target)
 - [Building and testing](#building-and-testing)
 - [Layout](#layout)
 
@@ -2634,8 +2635,10 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   │                   the teeth, and the degenerate-implementation check
 │   ├── ferrocene/      gate 3: builds both crates with the qualified compiler for
 │   │                   `thumbv7em-none-eabihf` (skipped, reported, if absent)
-│   └── build-verify/   gate 18: the Kani/Verus shape -- verify from `build.rs`
-│                       and prove the artifact carries no prover (scratch crate)
+│   ├── build-verify/   gate 18: the Kani/Verus shape -- verify from `build.rs`
+│   │                   and prove the artifact carries no prover (scratch crate)
+│   └── shape-bench/    the measured table in "Two ways to use the verifier":
+│                       build-time vs on-target cost, on a scratch crate
 └── scripts/
     ├── gate.sh              every gate in one command, failing loudly
     ├── test-count.sh        the exact passing-test count, only when all pass
@@ -2703,7 +2706,7 @@ untrack a file that is already in the index), the `unsafe` surface must stay at 
 blocks `SECURITY.md` names, each with a `// SAFETY:` justification (a count in prose is a
 claim like any other, and this one is security-relevant), and the build-time path must
 verify at compile time while leaving the prover out of the artifact (see
-[Verification at build time](#verification-at-build-time-the-kaniverus-shape) below).
+[Two ways to use the verifier](#two-ways-to-use-the-verifier-at-build-time-or-on-the-target) below).
 
 ### The third oracle: rustc's own MIR, against the parser
 
@@ -3003,16 +3006,20 @@ no test harness, so its verdict tests run on the host instead, under
 
 [Ferrocene]: https://ferrocene.dev/
 
-### Verification at build time: the Kani/Verus shape
+## Two ways to use the verifier: at build time, or on the target
 
-The claim above — the prover is *in* the artifact — is one of two shapes this crate can
-take, and the other one is worth stating plainly because it is what Kani and Verus
-actually do, and what a size-constrained safety build usually wants: **verify while the
-crate is built, and ship none of the verifier.**
+The claim above — the prover is *in* the artifact — is one of **two shapes** this crate can
+take, and the choice is real. The first is what Kani and Verus do and what a
+size-constrained safety build usually wants; the second is the crate's own headline.
 
-It costs nothing to reach, because the `mir` frontend is already `std`-only host tooling.
+Both are reachable from the same dependency. What changes is *where* the obligation is
+discharged and *what* the shipped artifact carries.
+
+### Shape A — verify at build time (the Kani/Verus shape)
+
 Put `verif` in `[build-dependencies]`, call the frontend from `build.rs`, and fail the
-build when an outcome is not `Verified`:
+build when an outcome is not `Verified`. The `mir` frontend is already `std`-only host
+tooling, so there is nothing else to wire up:
 
 ```rust,ignore
 // build.rs
@@ -3035,21 +3042,11 @@ once:
 
 * **The verification happens at compile time.** A false contract is a build error naming
   the broken obligation and its witness, exactly as it is under Kani or Verus. Nothing is
-  checked at runtime, so nothing can be skipped in a release build.
-* **The artifact is zero-cost.** Measured on this repository, `release`, `x86_64`:
-  a baseline binary is 447 728 bytes; with `verif` as a build dependency the crate's own
-  rlib is ~5 KB and carries **zero** `verif` symbols; with the prover *called* from the
-  crate's own code the same program is 5 746 640 bytes and carries 26 `verif::smt`
-  symbols. The difference is whether the obligation was discharged before or after the code
-  shipped.
-
-Both shapes are real, and the choice is a trade-off rather than a verdict. Build-time
-verification buys the zero-cost artifact and pays with a host-side `rustc` (the frontend
-shells out to `--emit=mir`, so it needs a toolchain at build time and is not `no_std`).
-The embedded engine buys a proof that can run *where Z3 cannot* — `examples/bare_metal.rs`
-compiles the decision procedure for `thumbv7em-none-eabihf` — and pays with binary size.
-Neither is a substitute for the other; a flight build might use the first to keep the
-artifact small and the second for an on-target re-check of a critical invariant.
+  checked at runtime, so nothing can be skipped in a release build. (There is no separate
+  "build-time vs compile-time" mode: verifying from `build.rs` *is* verifying at compile
+  time. The real second mode is the one below.)
+* **The artifact is zero-cost.** With `verif` as a build dependency the crate's own binary
+  carries **zero** `verif` symbols — see the measured table below.
 
 This is gate 18 of `scripts/gate.sh`, run by `tools/build-verify/run.sh` on a scratch crate
 it creates and removes. It is a gate rather than a paragraph because "zero cost" and
@@ -3058,6 +3055,130 @@ asserted: the script requires a good contract to build *and* the verifier to rep
 `verified` (a build script that silently did nothing would otherwise pass), a broken
 contract to fail the build on its named obligation, and the resulting rlib to carry no
 prover symbols.
+
+### Shape B — verify on the target (the prover in the artifact)
+
+Add `verif` as an ordinary dependency and call the engine from your own code. Now the
+decision procedure *is* in the binary and the obligation is discharged **at run time**, on
+the machine that runs the program — which is the point: a proof that can run where Z3
+cannot. `examples/bare_metal.rs` is the extreme case: `#![no_std]`, no `main`, the
+decision procedure compiled for `thumbv7em-none-eabihf` and built by Ferrocene.
+
+The `smt` engine needs no `std` and no allocator (the default build is `no_std`), so this
+shape works on an MCU. It is **not** zero-cost: you ship the engine, and you pay for it in
+binary size and in the time the proofs take when they run.
+
+### The same function, two ways
+
+One function, one contract; the difference is only *when* the obligation is discharged.
+The contract is written once, as a doc comment, and read by the MIR frontend:
+
+```rust
+// The function under verification. The contract is a doc comment, because a MIR
+// dump carries no attributes.
+/// requires: n <= 1_000_000
+/// ensures: ret <= 100
+pub fn clamp100(n: u32) -> u32 {
+    if n > 100 { 100 } else { n }
+}
+```
+
+The contract is a doc comment rather than an attribute for a reason the
+[contracts-are-doc-comments](#contracts-are-doc-comments-and-that-is-forced) section
+gives: rustc's MIR dump carries no attributes, so the frontend reads the contract
+from the *source text* and the body from MIR.
+
+**Verified at build time** — nothing about the function changes; the proof lives in
+`build.rs` and runs while the crate is compiled. A false contract stops the build, and the
+shipped binary contains none of the prover:
+
+```rust,ignore
+// build.rs — the verifier, as a build script
+fn main() {
+    println!("cargo:rerun-if-changed=src/lib.rs");
+    let report = verif::mir::verify::verify_file_with("rustc", "src/lib.rs".as_ref(), &[])
+        .expect("the MIR frontend could not read the source");
+    for (name, outcome) in &report.outcomes {
+        assert!(outcome.is_verified(), "verif: {name} is not verified: {outcome}");
+    }
+}
+```
+
+**Verified on the target** — the same bound is discharged by the engine compiled into the
+binary, at the moment the function runs. The engine is `no_std`, so this compiles for bare
+metal; it is the shape `examples/bare_metal.rs` demonstrates:
+
+```rust
+use verif::prelude::*;
+
+/// The same function, with the same bound, checked at run time instead of at build time.
+pub fn clamp100(n: u32) -> u32 {
+    let ok = verif::smt::with_fresh(|| {
+        let x = var(32);
+        // the clamped result is always <= 100, for every x
+        let clamped = verif::smt::ite(x.gt_val(100), verif::smt::word(100, 32), x);
+        clamped.le_val(100).prove().is_proved()
+    });
+    assert!(ok, "clamp100's bound did not discharge");
+    if n > 100 { 100 } else { n }
+}
+```
+
+The two are not interchangeable. The build-time shape proves the contract *of the code you
+shipped*, once, and costs nothing at run time; the on-target shape can prove a property of
+*values the program has right now*, on hardware where no solver process can run, and pays
+for the engine. A flight build might use the first to keep the artifact small and the
+second for an on-target re-check of a critical invariant.
+
+### What each shape costs
+
+Three crates share one business function and one driver — the `clamp100` above, exercised
+in a loop — so the only difference between the rows is how verification is attached.
+`no_verif` is the baseline, `build_verif` puts `verif` in `[build-dependencies]`,
+`runtime_verif` calls the engine from `main`. Measured on `x86_64`, `release`, rustc 1.100,
+four cores; regenerate with `sh tools/shape-bench/run.sh`:
+
+| | no verif | verif (build) | verif (runtime) |
+|---|---|---|---|
+| **compile** wall time | 0.15 s | 3.2 s | 11.7 s |
+| **compile** CPU time | 0.16 s | 4.9 s | 35.1 s |
+| **compile** peak RSS (build tree) | 96 MB | 439 MB | 506 MB |
+| **binary size** | 438 312 B | 438 328 B | 5 778 592 B |
+| **run** wall time (median of 7) | 4.4 ms | 4.4 ms | 5.8 ms |
+| **run** CPU time | 3.4 ms | 3.4 ms | 4.8 ms |
+| **run** peak RSS | 5.5 MB | 5.5 MB | 5.6 MB |
+| `verif` symbols in the binary | 0 | **0** | 46 |
+| where verification happens | — | compile time | run time |
+
+Reading the table honestly:
+
+* **Build-time verification is zero-cost in the artifact, not in the build.** The binary is
+  byte-for-byte the baseline (438 312 → 438 328 B, zero `verif` symbols) and the run-time
+  figures are identical. The price is paid at compile time: a host-side `rustc` runs the
+  MIR frontend and the decision procedure, so the cold build goes from 0.15 s to 3.2 s and
+  the build tree's peak RSS rises to ~440 MB (that peak is one `rustc` compiling the
+  `verif` crate, not the prover's own arena).
+* **On-target verification costs size and a little run time.** The engine adds ~5.3 MB
+  (≈13×) to the binary and ~1.4 ms to the run — that ~1.4 ms is one 16-bit obligation
+  being discharged by the embedded engine. The engine's per-proof cost is roughly
+  **14 µs** for the small obligation above, measured in-process over 1000 repetitions; a
+  wide multiplier past the BDD wall is `Unknown` rather than slow, as the scaling notes
+  elsewhere say.
+* **A dependency you never call is also zero-cost** — dead-code elimination leaves a
+  437 760-byte binary with zero `verif` symbols. But that is the linker dropping an unused
+  library, not a proof: nothing was verified.
+* **The compile figures are not a like-for-like profile comparison.** Cargo compiles
+  build-dependencies with the `build-override` profile, which defaults to `opt-level = 0`,
+  while a normal dependency is compiled at the release profile's `opt-level = 3`. So the
+  3.2 s row is "what a user gets by default", not "build-dependencies are inherently
+  cheaper": set `[profile.release.build-override] opt-level = 3` and the build-time row's
+  wall time rises to ≈11.7 s, matching the run-time row. The engine is the same work
+  either way; only its optimisation level differs.
+
+The numbers are a measurement, not a guarantee; `tools/shape-bench/run.sh` prints them on
+your machine. The *properties* — verification at build time, and no prover in the
+artifact — are what gate 18 asserts, because a cost figure moves with the machine and a
+property does not.
 
 ## Documentation
 

@@ -7579,6 +7579,42 @@ every assertion -- the failure was cosmetic -- but a gate that prints a stray er
 going green trains a reader to ignore its output. Backticks (and `$(...)`) inside an
 unquoted heredoc are code, not prose.
 
+**The full cost table, and the profile trap that makes the build row look cheap.**
+`tools/shape-bench/run.sh` builds three crates that share one function and one driver, so
+the only variable is how verification is attached. Measured `x86_64`, `release`, rustc
+1.100, four cores:
+
+| | no verif | verif (build-dep) | verif (runtime) |
+|---|---|---|---|
+| compile wall | 0.15 s | 3.2 s | 11.7 s |
+| compile CPU | 0.16 s | 4.9 s | 35.1 s |
+| compile peak RSS | 96 MB | 439 MB | 506 MB |
+| binary | 438 312 B | 438 328 B | 5 778 592 B |
+| run wall (median/7) | 4.4 ms | 4.4 ms | 5.8 ms |
+| `verif` symbols | 0 | **0** | 46 |
+
+The row that misleads is `verif (build-dep)` at 3.2 s: cargo compiles a
+*build-dependency* with the `build-override` profile, which defaults to `opt-level = 0`,
+while a normal dependency gets the release profile's `opt-level = 3`. Verified by
+counting `-C opt-level=` in `cargo build --release -v` -- the build-dep crate showed
+**two** `opt-level=3` invocations (its own lib and bin) and the runtime crate showed
+**four** (verif, verif-arithmetic, lib, bin). Set
+`[profile.release.build-override] opt-level = 3` and the build-dep wall time rises to
+~11.7 s, matching the runtime crate: the work is the same, only its optimisation level
+differs. So the honest statement is "build-time verification costs one optimised compile
+of the engine", not "build-dependencies are inherently cheaper".
+
+Two smaller measurements worth keeping, both from the same harness. A dependency that is
+linked but *never called* is also zero-cost (437 760 B binary, 0 `verif` symbols) -- but
+that is the linker dropping an unused library, not a proof. And the engine's *per-proof*
+cost, isolated in-process over 1000 repetitions, is **14 µs** for a 16-bit obligation; the
+process-level delta (1.4 ms) is dominated by starting the process and running the loop
+around the proof.
+
+The README's table is a measurement and moves with the machine; `tools/shape-bench/run.sh`
+reprints it. The *properties* -- verification at build time, and no prover in the artifact
+-- stay pinned by gate 18, because a cost figure is not a property.
+
 ## The MIR frontend: own text parser, `rustc_public` as the oracle only
 
 A recurring question is why the frontend parses rustc's *textual* `--emit=mir` dump
