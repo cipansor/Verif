@@ -15,3 +15,10 @@ target/
 # refuses a dirty crate -- the release would fail on a file no one wrote on
 # purpose. Ignored here so a cache can never be mistaken for a source change.
 __pycache__/
+
+# Agent memory. It lives at the repository root, so for `verif` (whose crate
+# directory *is* the root) it is both a root-directory change that makes
+# `cargo publish` refuse a dirty crate and, without this, an untracked file that
+# `cargo package` would sweep into the `.crate`. It is per-workspace tooling,
+# never part of the crate, and it can name other projects.
+.openhands/

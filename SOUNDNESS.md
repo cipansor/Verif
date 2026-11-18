@@ -148,7 +148,7 @@ stating so a reader does not mistake a gap for completeness:
 ## The rate, and the exit criterion
 
 The review's data (2025-11-04 … 2025-11-12) counted at least eleven false proofs;
-the tables above record fifty-two wrong verdicts across 2026-10-24 … 2026-11-18,
+the tables above record fifty-seven wrong verdicts across 2026-10-24 … 2026-11-18,
 which is the same order of magnitude and the same pattern — most found by a
 differential oracle or a hand probe, not by a unit test written after the fact.
 The densest cluster is the contract reader (rows 1–9, 2026-10-29 … 2026-11-02),

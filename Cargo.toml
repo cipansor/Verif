@@ -27,7 +27,12 @@ categories = ["no-std", "embedded", "development-tools::testing"]
 # next to the source they compiled, and a `git add -A` used to sweep them in. They are
 # untracked now (and gate 15 fails if they come back), but a `cargo package` from a dirty
 # tree would still sweep them into the `.crate`, so they are excluded by name here too.
-exclude = ["*.rlib", "target/", ".sweep/"]
+#
+# `.openhands/` is agent memory at the repository root. `verif`'s crate directory *is* the
+# root, so the directory is inside the crate and `cargo package` would otherwise include it
+# (it is also in `.gitignore`, but an ignore rule is not a guarantee against a future
+# `git add -A`, and this crate ships to a registry).
+exclude = ["*.rlib", "target/", ".sweep/", ".openhands/"]
 
 [dependencies]
 # The only dependency, and it is a sibling in this repository, not a registry

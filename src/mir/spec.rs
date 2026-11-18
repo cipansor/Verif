@@ -8055,7 +8055,7 @@ pub fn arg_vars(f: &crate::mir::parse::MirFn) -> BTreeMap<String, Var> {
 /// An implementation inherits its trait's declaration contract, and the two
 /// signatures may name their parameters differently:
 ///
-/// ```ignore
+/// ```text
 /// trait T { /// ensures: ret == a
 ///            fn f(&self, a: u8, b: u8) -> u8; }
 /// impl T for S { fn f(&self, b: u8, a: u8) -> u8 { a } }   // `a` is the 2nd arg

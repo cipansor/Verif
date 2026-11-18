@@ -2229,21 +2229,31 @@ passes). The fix threads the incoming depth through the base case, so each round
 one level. When two grammars call each other, the depth has to decrease along the *cycle*,
 not just along each grammar's own edges -- a base case that hardcodes a depth is the trap.
 
-## A file tree in the docs is a claim about the filesystem, and nothing checks it
+## A file tree in the docs is a claim about the filesystem, and now a check
 
 The README's "Layout" section drew `verif/` as a tree. It had drifted from the
 filesystem in three ways at once: `src/lib.rs` was missing, `tests/sym.rs` was missing,
 `examples/report_probe.rs` was missing, and the `examples/` and `scripts/` blocks were
 *drawn* as if each were the last child of the root (two `└──` siblings), so the tree was
-also malformed as a tree. Nothing in the build reads the block, so it stayed wrong across
+also malformed as a tree. Nothing in the build read the block, so it stayed wrong across
 several commits that each added or renamed a file.
 
 A prose tree is a hand-maintained mirror of `ls`, which is exactly the kind of second copy
-that goes stale silently -- the same defect class as a stale test count. The fix here was
-manual, but the durable check is one command: extract the names from the block and diff
-them against the directories. It caught the last two omissions in seconds. When a document
-restates something the code already knows, make the check mechanical or accept that it will
-drift; do not fix it by hand and assume it stays fixed.
+that goes stale silently -- the same defect class as a stale test count. The first fix was
+manual; it drifted again, and a later audit found the tree naming an `examples/probe.rs`
+that no longer existed (so the documented `cargo run --example probe` failed), a `src/mir/`
+module list missing four entries, and the whole `verif-arithmetic/` crate absent. The
+lesson had been written down and the drift happened anyway, which is what "fix it by hand
+and assume it stays fixed" costs.
+
+The durable check is now mechanical: `scripts/check_doc_links.py` (gate 15) also runs
+`check_tree`, which parses the tree block, tracks the directory each line sits under by its
+indentation, and fails when the tree *names* an entry that is not on disk. It checks
+existence only -- a file the tree omits is not an error, because the tree is a curated map,
+not an exhaustive listing -- but a file the tree names and that is absent is exactly the
+defect that misleads, and it is now a gate failure rather than a thing someone has to
+notice. Teeth were confirmed the only way that counts: pointing a line at a missing file
+fails the gate with the file named.
 
 ## `ignore` on a doc example is an example that was never compiled
 
@@ -2258,6 +2268,15 @@ Both were made real doctests (the count went 8 passed + 2 ignored -> 10 passed +
 and the gate's test count 247 -> 249). When you write ```` ```ignore ````, ask which
 mechanism would notice if the code stopped being true. If the answer is "none", it is not a
 doc example, it is prose in a code block.
+
+A third instance is the mirror of the first two, and the label is the whole point. The
+`ArgRename` doc in `src/mir/spec.rs` shows a trait/impl pair whose `///` contract lines are
+*inside* the snippet, so the block is not valid Rust and cannot be a doctest no matter how
+it is written. It was marked ```` ```ignore ````, which reads as "a test, deliberately
+skipped" and leaves a reader to wonder what is broken. It is now ```` ```text ````, which
+says what it is -- an illustration, not a compiled example -- so a reader is not invited to
+look for the failure that made someone add `ignore`. Choose the label that states the
+intent: `rust` to compile it, `ignore` never, `text` when it is prose in a code block.
 
 ## A bucket named "agreement" that z3 was never asked to fill
 
@@ -2616,9 +2635,9 @@ of this feature *claimed* to have broken the wall and had not.
    "success" and the unsoundness were the same event. Differential tests against
    brute-force enumeration (`tests/sat_engine.rs`) are what separated them.
 
-2. **The wall is where `Unknown` appears, and it is printed, not remembered.** After the
-   solver was made sound the wall came back. Run `cargo run --release --features std
-   --example probe` for the table. The honest result: adder equivalence now settles at 64
+2. **The wall is where `Unknown` appears, and it is measured, not remembered.** After the
+   solver was made sound the wall came back. The honest result, from the scaling probe that
+   was run for it (a throwaway example, since deleted): adder equivalence now settles at 64
    bits (`Unknown` with the fallback disabled, `Valid` with it); wide *multiplier*
    equivalence is out of reach at both engines' budgets.
 

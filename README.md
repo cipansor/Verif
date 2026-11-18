@@ -1917,17 +1917,18 @@ is on, and the pattern binding modes are the strict ones. Since 1.85 is exactly 
 release that stabilised the edition, the floor and the edition are the same
 decision — there is no version that takes one without the other.
 
-The floor is a *lower* bound, not a pin. Everything here builds on the current
-stable (1.99 at the time of writing), and the MIR frontend runs on that same
+The floor is a *lower* bound, not a pin. Everything here builds on current
+stable (1.100 at the time of writing), and the MIR frontend runs on that same
 stable `rustc`: `--emit=mir` is a stable flag, checked here down to 1.85, so no
 part of the product needs a nightly. Only two *oracles* do — `tools/mir-oracle`
 links `rustc_public` and the `rustc-dev` component, and Kani tracks a nightly —
 and an oracle is a test tool that never enters the dependency tree. The
-toolchains the oracles pin are newer still and move independently: Verus tracks
-stable (`channel = "1.99.1"`), Kani tracks a nightly, and Ferrocene — the
-qualified compiler, which is the one whose ceiling could matter for a safety
-build — is currently downstream of Rust 1.96, comfortably above 1.85. So no
-oracle forces the floor down, and none is held back by it.
+oracles' own toolchains move independently and are all newer: Verus pins the
+compiler version its driver reports (CI installs exactly that toolchain), Kani
+tracks a nightly, and Ferrocene — the qualified compiler, which is the one whose
+ceiling could matter for a safety build — is currently downstream of Rust 1.96,
+comfortably above 1.85. So no oracle forces the floor down, and none is held
+back by it.
 
 The MSRV is deliberately *not* raised to follow them. A `no_std` crate that ships
 into a bare-metal safety build is the one place a high floor costs something real:
@@ -2395,16 +2396,25 @@ says "I could not decide" is worth more than one that guesses.
    behind the `std` feature. The engine it uses is the embedded one, but the
    frontend that feeds it is a development tool, not something that ships on a
    microcontroller.
-5. **A `for` loop is not modelled.** `for x in 0..n` lowers to `IntoIterator::into_iter`
-   and a `Iterator::next(&mut range)` call, and neither is in the model, so the
-   function is reported `incomplete` rather than proved. The same holds for any
-   iterator chain (`fold`, `map`, `sum`) and for a `for` over a slice or array. A
-   `while` loop carrying an `invariant:` and a `variant:` is the supported way to
-   state the same iteration, and it is *more* precise, not less: the measure gives
-   total correctness, where an unwound `for` gives a bounded check. The frontend
-   says which call it could not model (`call to unmodelled function <… as
-   IntoIterator>::into_iter`), so the gap is visible in the report rather than
-   silent.
+5. **A `for` loop over a *range* is modelled; a `for` over a *slice or array*, and an
+   iterator chain, are not.** `for i in 0..n` / `for i in 0..=n` desugars to
+   `Range`/`RangeInclusive` construction, `IntoIterator::into_iter` and
+   `Iterator::next(&mut range)`, and all of those *are* in the model (with `core`'s
+   `forward_overflowing` boundary reproduced exactly), so the loop decides through the
+   same machinery a `while` loop uses — `for i in 0..=n { s += i }` verifies under a
+   `requires:` that bounds `n` (or an `unwind:` bound), and a body decided by an
+   *inductive* `invariant:` verifies with one. What is *not* modelled is `for x in xs`
+   over a slice or array (it lowers to `<&[u8] as IntoIterator>::into_iter`, which is a
+   different impl) and any iterator chain (`fold`, `map`, `sum`, `.iter()`); those are
+   reported `incomplete` with the unmodelled call named, so the gap is visible rather
+   than silent. Two things are worth knowing about the range form: an `invariant:` that
+   *names* the loop element (`s <= i`) is refused as `unknown name i`, because the
+   element is a `debug` binding that is genuinely not live at the loop header — write
+   the invariant over the loop's *carried* state (`s <= 5050`) — and the invariant must
+   be *inductive* (`s <= 5050` over a body doing `s += i` is not; `s = i.min(5050)` is).
+   A `while` loop carrying an `invariant:` and a `variant:` remains the way to state an
+   iteration the `for` desugaring does not cover, and it is *more* precise, not less: the
+   measure gives total correctness, where an unwound `for` gives a bounded check.
 
 ## What this is *not* — read this before trusting a green test
 
@@ -2464,8 +2474,9 @@ Honesty matters more than a nice README, so:
    The SAT engine is exact but not fast, so it runs under a conflict budget and
    answers `Unknown` when it expires — a verifier that hangs is worse than one
    that declines. The gain is real but specific: `add_comm` at 64 bits is
-   `Unknown` from the BDD engine alone and `Valid` with the fallback
-   (`examples/probe.rs` prints the table). Multiplication equality stays out of
+   `Unknown` from the BDD engine alone and `Valid` with the fallback (the
+   measurement is recorded in `AGENTS.md`, "A fallback engine is only worth its
+   weight if the wall actually moves"). Multiplication equality stays out of
    reach at both engines' budgets; that is the honest state.
    The trade made here is still *no external process, no allocator,
    deterministic memory*. The SAT arena is a `static` in BSS, sized at compile
@@ -2510,17 +2521,23 @@ is instantaneous while a 12-bit multiplier equality is not.
 ```
 .
 ├── Cargo.toml          the crate manifest (`no_std`, zero dependencies)
-├── Cargo.lock          committed, and a single package: the dependency set is empty
+├── Cargo.lock          committed: two packages (this crate and its sibling), and no
+│                       external dependency at all
 ├── README.md           this file
 ├── ROADMAP.md          the open work: one item per gap, with exit criteria
 ├── SOUNDNESS.md        the ledger of every false proof fixed, with its fixture
 ├── AGENTS.md           notes for agents, including the traps that cost the most time
-├── LICENSE             Apache-2.0
+├── CONTRIBUTING.md     how to build, test, and add a gate
 ├── SECURITY.md         how to report a vulnerability (GitHub private advisories)
+├── LICENSE             Apache-2.0
+├── NOTICE              third-party attribution (oracles and comparisons only)
 ├── .github/
+│   ├── FUNDING.yml
 │   └── workflows/
-│       └── ci.yml      the gates, plus Kani, Verus, Lean, Coq, the MIR oracle
-│                       and the comparison fixtures as jobs
+│       ├── ci.yml      the gates, plus Kani, Verus, Lean, Coq, the MIR oracle,
+│       │               the comparison fixtures, packaging hygiene and the
+│       │               publish dry-run as jobs
+│       └── release.yml tag-driven release: one crate per tag, in dependency order
 ├── src/
 │   ├── lib.rs          crate root: module map, prelude, the three proof routes
 │   ├── smt.rs          the decision procedure (the heart of the crate)
@@ -2542,10 +2559,22 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   └── mir/            the real-Rust frontend (`std` only)
 │       ├── parse.rs    rustc's textual MIR -> a small IR, failing closed
 │       ├── exec.rs     symbolic execution of that IR, with a frame stack for calls
-│       ├── intrinsics.rs  the `checked_*`/`saturating_*`/`wrapping_*` model
+│       ├── intrinsics.rs  the `core` model: `checked_*`/`saturating_*`/`wrapping_*`,
+│       │                  the bit counts, `Range`/`Iterator::next`, `?`, ...
 │       ├── shape.rs    per-function summary the rustc_public oracle compares
 │       ├── spec.rs     contract scanner + the small contract-expression grammar
 │       └── verify.rs   driver: emit MIR, extract contracts, discharge, report
+├── verif-arithmetic/   the sibling crate, re-exported as `verif::arith` (its own
+│   │                   `LICENSE`/`README`/`NOTICE`, because a `.crate` needs them)
+│   ├── src/
+│   │   ├── lib.rs      the module map and the `no_std`/no-`unsafe` claim
+│   │   ├── checked.rs  checked/saturating/wrapping integer ops, proved by enumeration
+│   │   ├── bounded.rs  `Bounded<MIN, MAX>`, a refinement type whose invariant holds
+│   │   ├── fixed.rs    Q16.16 fixed point, with its truncate-toward-zero contract
+│   │   └── prove.rs    the enumeration prover (`ENUM_BUDGET`) the proofs run under
+│   └── tests/
+│       ├── proofs.rs   the proofs, executed
+│       └── readme.rs   the sibling README's example, pinned
 ├── tests/
 │   ├── smoke.rs        the engine proves real identities
 │   ├── kernel.rs       the proof kernel, including a compile-fail case
@@ -2558,16 +2587,23 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   ├── call.rs         modular verification, every positive with its control
 │   ├── loopdiff.rs     verifier vs exhaustive execution, loops and claims included
 │   ├── modular_differential.rs  generated callers, verified then executed
+│   ├── divmod.rs       the divider the MIR frontend needs, vs Rust's own `/` and `%`
+│   ├── mul.rs          the constant-multiply arm, through `prove` not `evaluate`
+│   ├── shift.rs        the barrel shifter, vs Rust's own `<<` and `>>`
+│   ├── signed.rs       signed arithmetic: `slt`, `sdiv`, sign-extend, overflow
+│   ├── op_differential.rs  `evaluate` vs `blast`, per operator, both operand shapes
+│   ├── oracle.rs       the reference oracle (enumeration), checked before it is used
+│   ├── bang_literal_signedness.rs  `!x` in a contract: value vs predicate reading
 │   ├── mir.rs          real-Rust verification, with counterexamples replayed
 │   │                   against the compiled functions
-│   └── divmod.rs       the divider the MIR frontend needs, vs Rust's own `/` and `%`
+│   ├── readme.rs       the README's examples, pinned so they cannot rot
+│   └── soundness.rs    every fixture the SOUNDNESS.md ledger names must exist
 ├── examples/
 │   ├── flight_control.rs  a realistic actuator path, all obligations discharged
 │   ├── pipeline.rs        program -> conditions -> proofs -> SMT-LIB2
 │   ├── memory.rs          read/store, the frame condition, and a fill loop
 │   ├── contracts.rs       procedures verified once, calls reasoned about by contract
 │   ├── report_probe.rs    a report's verdict must not depend on the arena it is read in
-│   ├── probe.rs           the scaling wall, printed as a table
 │   ├── z3diff.rs          differential harness: engine vs z3 on the exported text
 │   │                      (needs z3-solver; a development tool, not a dependency)
 │   ├── kanidiff.rs        differential harness: engine vs Kani on compiled Rust
@@ -2583,6 +2619,8 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   ├── support/           the IR the engine harnesses share, so they check the
 │   │                      same formulas rather than two drifting corpora
 │   ├── mir_demo.rs        verifies real Rust read from MIR, end to end
+│   ├── mir_coverage.rs    the coverage scoreboard: how much real Rust is decided
+│   │                      (the number `ROADMAP.md` scores its corpora with)
 │   ├── comparison_check.rs  gate 13's driver: asserts each comparison fixture's
 │   │                      per-function outcome and obligation kind, not a count
 │   ├── comparison/        the same three functions proved seven ways, plus
@@ -2598,11 +2636,17 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   │                   its own workspace, and never a dependency of `verif`.
 │   ├── comparison/     gate 13: re-runs the comparison fixtures -- the contracts,
 │   │                   the teeth, and the degenerate-implementation check
+│   ├── ferrocene/      gate 3: builds both crates with the qualified compiler for
+│   │                   `thumbv7em-none-eabihf` (skipped, reported, if absent)
 │   └── build-verify/   gate 18: the Kani/Verus shape -- verify from `build.rs`
 │                       and prove the artifact carries no prover (scratch crate)
 └── scripts/
-    ├── gate.sh            every gate in one command, failing loudly
-    └── test-count.sh      the exact passing-test count, only when all pass
+    ├── gate.sh              every gate in one command, failing loudly
+    ├── test-count.sh        the exact passing-test count, only when all pass
+    ├── check_package.sh     packaging hygiene: manifests, LICENSE/README/NOTICE
+    ├── check_doc_links.py   every internal anchor and relative file link resolves
+    ├── check_actions_pinned.py  every GitHub Action `uses:` is pinned to a SHA
+    └── publish.py           publish order, dry-run, tag/checkout checks, notes
 ```
 
 ## Building and testing
@@ -2611,7 +2655,10 @@ is instantaneous while a 12-bit multiplier equality is not.
 # Everything, in one command that fails loudly on the first gate that does not hold
 scripts/gate.sh
 
-# Host, with the thread-local arena and the full test suite
+# Host, with the thread-local arena and the full test suite.
+# The `--features std` is required: the default feature set is empty (`no_std`),
+# and the tests need the thread-local arena, so a plain `cargo test` does not
+# compile the test harness.
 cargo test --features std
 
 # Lint both halves -- `--features std` alone never compiles the `no_std` items
@@ -2677,7 +2724,7 @@ byte-identical (the typed one omits `copy` qualifiers and nests `scope` blocks),
 comparing text would fail on cosmetics and prove nothing. The oracle lives in
 `tools/mir-oracle`, outside the workspace, so the nightly and the `rustc_private` feature
 never touch a crate that must build on stable with zero dependencies; the dependency arrow
-points one way, from the oracle to `verif`. Gate 9 of `scripts/gate.sh` runs it, and the
+points one way, from the oracle to `verif`. Gate 10 of `scripts/gate.sh` runs it, and the
 `mir-oracle` CI job makes it a hard gate.
 
 ### Four more oracles, for the engine instead of the exporter

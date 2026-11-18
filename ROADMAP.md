@@ -19,8 +19,15 @@ output decides the number, so the table is a measurement rather than a claim:
 | Corpus | Command | Verified / total |
 |---|---|---|
 | `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 18 / 33 |
-| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 611 / 1119 |
+| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 630 / 1148 |
 | `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **18 / 21 (86%)** |
+
+This table is the *current* measurement and is the only number to quote. The
+`N of M` figures inside the per-item progress notes below are the value *at the
+moment that item landed* -- each was the running total when it was written, and
+they are kept as a history of how the corpus grew rather than as the present
+state. Re-run the command above rather than reading a note for the current
+number.
 
 `everyday.rs` is the honest one: ordinary Rust written by an external reviewer,
 not shaped for the tool. `realistic.rs` is a regression corpus (about a third of
