@@ -115,7 +115,9 @@ EOF
 
 # A fourth driver: the engine's in-process per-proof cost, which is what the
 # README quotes for "one obligation". A single process, 1000 repetitions, so the
-# figure is the proof and not process start-up.
+# figure is the proof and not process start-up. A discharge that *fails* is a
+# hard error, not a cost: averaging a false `prove()` into the figure would
+# report a number for an obligation that did not discharge.
 cat > "$WORK/perproof_main.rs" <<'EOF'
 use verif::prelude::*;
 use std::time::Instant;
@@ -128,14 +130,15 @@ fn main() {
             clamped.le_val(100).prove().is_proved()
         })
     };
-    for _ in 0..100 { std::hint::black_box(prove()); }
+    // Warm up (prime the caches) so the timed loop is steady-state, then time.
+    for _ in 0..100 {
+        assert!(prove(), "the benchmark obligation did not discharge");
+    }
     let n = 1000u32;
     let t = Instant::now();
-    let mut acc = 0u32;
     for _ in 0..n {
-        if prove() { acc += 1; }
+        assert!(prove(), "the benchmark obligation did not discharge");
     }
-    std::hint::black_box(acc);
     let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
     println!("{us:.2}");
 }
@@ -271,7 +274,12 @@ if ! ( cd "$WORK/perproof" && cargo build --release >/dev/null 2>&1 ); then
   echo "shape-bench: the per-proof crate did not build" >&2
   exit 1
 fi
-us=$("$WORK/perproof/target/release/bench_perproof")
+# The driver asserts every discharge; a non-zero exit means the obligation did
+# not hold, and printing a cost for it would be a number for a proof that failed.
+if ! us=$("$WORK/perproof/target/release/bench_perproof"); then
+  echo "shape-bench: the benchmark obligation did not discharge" >&2
+  exit 1
+fi
 printf 'in-process, 1000 repetitions: %s us/proof\n' "$us"
 
 echo

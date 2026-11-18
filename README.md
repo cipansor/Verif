@@ -3135,7 +3135,7 @@ second for an on-target re-check of a critical invariant.
 
 ### What each shape costs
 
-Three crates share one business function and one driver — the `clamp100` above, exercised
+Four crates share one business function and one driver — the `clamp100` above, exercised
 in a loop — so the only difference between the rows is how verification is attached.
 `no_verif` is the baseline, `build_verif` puts `verif` in `[build-dependencies]`,
 `runtime_verif` calls the engine from `main` and discharges the `clamp100` bound at run
