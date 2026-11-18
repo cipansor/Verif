@@ -7580,36 +7580,73 @@ going green trains a reader to ignore its output. Backticks (and `$(...)`) insid
 unquoted heredoc are code, not prose.
 
 **The full cost table, and the profile trap that makes the build row look cheap.**
-`tools/shape-bench/run.sh` builds three crates that share one function and one driver, so
-the only variable is how verification is attached. Measured `x86_64`, `release`, rustc
-1.100, four cores:
+`tools/shape-bench/run.sh` builds four crates that share one function and one driver, so
+the only variable is how verification is attached (`no_verif`, `build_verif`,
+`runtime_verif`, and `unused_verif` -- the engine linked but never called). Measured
+`x86_64`, `release`, rustc 1.100, four cores:
 
-| | no verif | verif (build-dep) | verif (runtime) |
-|---|---|---|---|
-| compile wall | 0.15 s | 3.2 s | 11.7 s |
-| compile CPU | 0.16 s | 4.9 s | 35.1 s |
-| compile peak RSS | 96 MB | 439 MB | 506 MB |
-| binary | 438 312 B | 438 328 B | 5 778 592 B |
-| run wall (median/7) | 4.4 ms | 4.4 ms | 5.8 ms |
-| `verif` symbols | 0 | **0** | 46 |
+| | no verif | verif (build-dep) | verif (runtime) | verif (unused) |
+|---|---|---|---|---|
+| compile wall | 0.16 s | 3.4 s | 12.9 s | 12.7 s |
+| compile CPU | 0.17 s | 5.1 s | 34.9 s | 35.1 s |
+| compile peak RSS | 96 MB | 433 MB | 502 MB | 508 MB |
+| binary | 438 312 B | 438 328 B | 5 775 256 B | 438 336 B |
+| run wall (median/7) | 3.1 ms | 3.2 ms | 4.6 ms | 3.2 ms |
+| run peak RSS | 2.1 MB | 2.1 MB | 5.6 MB | 2.1 MB |
+| `verif` symbols | 0 | **0** | 42 | 0 |
 
-The row that misleads is `verif (build-dep)` at 3.2 s: cargo compiles a
+The row that misleads is `verif (build-dep)` at 3.4 s: cargo compiles a
 *build-dependency* with the `build-override` profile, which defaults to `opt-level = 0`,
 while a normal dependency gets the release profile's `opt-level = 3`. Verified by
 counting `-C opt-level=` in `cargo build --release -v` -- the build-dep crate showed
 **two** `opt-level=3` invocations (its own lib and bin) and the runtime crate showed
 **four** (verif, verif-arithmetic, lib, bin). Set
 `[profile.release.build-override] opt-level = 3` and the build-dep wall time rises to
-~11.7 s, matching the runtime crate: the work is the same, only its optimisation level
+~12.9 s, matching the runtime crate: the work is the same, only its optimisation level
 differs. So the honest statement is "build-time verification costs one optimised compile
 of the engine", not "build-dependencies are inherently cheaper".
 
+**Two measurement traps this table set, both found by review, and both worth keeping.**
+They are the reason the figures above differ from the first version of this table.
+
+1. **The runtime workload proved a tautology.** The on-target driver built
+   `var(16)` and proved `x.lt_val(65536) || x.ge_val(65536)`. On a 16-bit variable those
+   are `lt`/`ge` against a constant *at* the maximum, so both fold to a constant before the
+   solver sees them and the predicate is `true` with no symbolic input at all -- it
+   discharged nothing and the reported per-proof cost (14 µs) was the harness. The driver
+   now builds the *real* obligation the shared function's contract names,
+   `ite(x > 100, 100, x) <= 100` at 32 bits, which is ~**290 µs** per proof in-process.
+   The general rule the crate already states applies to a *benchmark* too: a proof whose
+   operands are all constants is decided without the engine, so it cannot measure it. Read
+   the term the driver builds, and check it is the one the table's prose names.
+2. **A `fork`-based harness inflates a short measurement.** The first harness used Python's
+   `os.wait4` and reported `ru_maxrss`. That value is the child's resident high-water mark
+   *since the fork*, and `fork` copies the parent's page tables, so Python's own ~5 MB RSS
+   is a floor under every figure. It is invisible on a build (a `rustc` peaks at ~500 MB,
+   so the floor vanishes) and dominant on a run (a benchmark binary peaks at ~2 MB): the
+   same `no_verif` run reports **5.5 MB** through Python and **2.1 MB** through a native
+   launcher. The harness is now `tools/shape-bench/measurer.rs`, which reads
+   `/proc/<pid>/status:VmHWM` -- the measured process's *own* high-water mark, replaced by
+   `exec`, so the launcher's RSS cannot leak in. It also uses `getrusage(RUSAGE_CHILDREN)`
+   rather than `/proc/self/stat`'s `cutime`, because the latter is in 10 ms clock ticks and
+   reports `0.0000` for a 3 ms run.
+
+A third trap in the launcher itself, because it is the kind that returns a *plausible wrong
+number* rather than an error. The tree walk first read `/proc/<pid>/task/<pid>/children` --
+the **main thread's** children -- and `cargo` spawns `rustc` from a *worker thread*, so that
+file is empty and the walk saw only `cargo`: it reported a 34 MB compile peak where the
+true peak was 521 MB. The launcher now finds the tree by scanning `/proc` for each pid's
+parent, which is thread-agnostic. The lesson is the one the crate keeps meeting: a wrong
+number is worse than no number, and the way to catch it is to cross-check the metric
+against a second method (here, `wait4`'s `ru_maxrss` on a *cold* build, which the two agree
+on to within a megabyte) rather than to trust the first reading.
+
 Two smaller measurements worth keeping, both from the same harness. A dependency that is
-linked but *never called* is also zero-cost (437 760 B binary, 0 `verif` symbols) -- but
+linked but *never called* is also zero-cost (438 336 B binary, 0 `verif` symbols) -- but
 that is the linker dropping an unused library, not a proof. And the engine's *per-proof*
-cost, isolated in-process over 1000 repetitions, is **14 µs** for a 16-bit obligation; the
-process-level delta (1.4 ms) is dominated by starting the process and running the loop
-around the proof.
+cost, isolated in-process over 1000 repetitions, is **~290 µs** for the 32-bit `clamp100`
+bound; the process-level delta (1.5 ms) is dominated by starting the process and running
+the loop around the proof.
 
 The README's table is a measurement and moves with the machine; `tools/shape-bench/run.sh`
 reprints it. The *properties* -- verification at build time, and no prover in the artifact

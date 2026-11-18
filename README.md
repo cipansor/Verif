@@ -2638,7 +2638,10 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   ├── build-verify/   gate 18: the Kani/Verus shape -- verify from `build.rs`
 │   │                   and prove the artifact carries no prover (scratch crate)
 │   └── shape-bench/    the measured table in "Two ways to use the verifier":
-│                       build-time vs on-target cost, on a scratch crate
+│                       `run.sh` builds four crates (build-time vs on-target
+│                       vs unused) on scratch copies, and `measurer.rs` is the
+│                       native launcher that reads each process's own `VmHWM`
+│                       rather than a `fork` harness's inflated `ru_maxrss`
 └── scripts/
     ├── gate.sh              every gate in one command, failing loudly
     ├── test-count.sh        the exact passing-test count, only when all pass
@@ -3135,45 +3138,60 @@ second for an on-target re-check of a critical invariant.
 Three crates share one business function and one driver — the `clamp100` above, exercised
 in a loop — so the only difference between the rows is how verification is attached.
 `no_verif` is the baseline, `build_verif` puts `verif` in `[build-dependencies]`,
-`runtime_verif` calls the engine from `main`. Measured on `x86_64`, `release`, rustc 1.100,
-four cores; regenerate with `sh tools/shape-bench/run.sh`:
+`runtime_verif` calls the engine from `main` and discharges the `clamp100` bound at run
+time, and `unused_verif` links the engine but never calls it. Measured on `x86_64`,
+`release`, rustc 1.100, four cores; regenerate with `sh tools/shape-bench/run.sh`:
 
-| | no verif | verif (build) | verif (runtime) |
-|---|---|---|---|
-| **compile** wall time | 0.15 s | 3.2 s | 11.7 s |
-| **compile** CPU time | 0.16 s | 4.9 s | 35.1 s |
-| **compile** peak RSS (build tree) | 96 MB | 439 MB | 506 MB |
-| **binary size** | 438 312 B | 438 328 B | 5 778 592 B |
-| **run** wall time (median of 7) | 4.4 ms | 4.4 ms | 5.8 ms |
-| **run** CPU time | 3.4 ms | 3.4 ms | 4.8 ms |
-| **run** peak RSS | 5.5 MB | 5.5 MB | 5.6 MB |
-| `verif` symbols in the binary | 0 | **0** | 46 |
-| where verification happens | — | compile time | run time |
+| | no verif | verif (build) | verif (runtime) | verif (unused) |
+|---|---|---|---|---|
+| **compile** wall time | 0.16 s | 3.4 s | 12.9 s | 12.7 s |
+| **compile** CPU time | 0.17 s | 5.1 s | 34.9 s | 35.1 s |
+| **compile** peak RSS (build tree) | 96 MB | 433 MB | 502 MB | 508 MB |
+| **binary size** | 438 312 B | 438 328 B | 5 775 256 B | 438 336 B |
+| **run** wall time (median of 7) | 3.1 ms | 3.2 ms | 4.6 ms | 3.2 ms |
+| **run** CPU time | 3.0 ms | 3.0 ms | 4.5 ms | 2.9 ms |
+| **run** peak RSS | 2.1 MB | 2.1 MB | 5.6 MB | 2.1 MB |
+| `verif` symbols in the binary | 0 | **0** | 42 | 0 |
+| where verification happens | — | compile time | run time | nowhere |
 
 Reading the table honestly:
 
-* **Build-time verification is zero-cost in the artifact, not in the build.** The binary is
-  byte-for-byte the baseline (438 312 → 438 328 B, zero `verif` symbols) and the run-time
-  figures are identical. The price is paid at compile time: a host-side `rustc` runs the
-  MIR frontend and the decision procedure, so the cold build goes from 0.15 s to 3.2 s and
-  the build tree's peak RSS rises to ~440 MB (that peak is one `rustc` compiling the
-  `verif` crate, not the prover's own arena).
+* **Build-time verification is zero-cost in the artifact, not in the build.** The binary
+  is the baseline to within 16 bytes (438 312 → 438 328 B; the residue is the crate name in
+  the embedded metadata — `bench_build_verif` is longer than `bench_no_verif`, so the two
+  are not byte-identical, but the prover leaves no code) and carries zero `verif` symbols,
+  and the run-time figures are identical. The price is paid at compile time: a host-side
+  `rustc` runs the MIR frontend and the decision procedure, so the cold build goes from
+  0.16 s to 3.4 s and the build tree's peak RSS rises to ~433 MB (that peak is one `rustc`
+  compiling the `verif` crate, not the prover's own arena).
 * **On-target verification costs size and a little run time.** The engine adds ~5.3 MB
-  (≈13×) to the binary and ~1.4 ms to the run — that ~1.4 ms is one 16-bit obligation
-  being discharged by the embedded engine. The engine's per-proof cost is roughly
-  **14 µs** for the small obligation above, measured in-process over 1000 repetitions; a
-  wide multiplier past the BDD wall is `Unknown` rather than slow, as the scaling notes
-  elsewhere say.
+  (≈13×) to the binary and ~1.5 ms to the run. The ~1.5 ms is one obligation being
+  discharged by the embedded engine — the real `clamp100` bound
+  `ite(x > 100, 100, x) <= 100` at 32 bits, not a tautology. Measured in-process over
+  1000 repetitions, the engine's per-proof cost for that obligation is **~290 µs**; a wide
+  multiplier past the BDD wall is `Unknown` rather than slow, as the scaling notes
+  elsewhere say. (An earlier version of this table quoted ~14 µs, but that proof was
+  `x < 65536 || x >= 65536` on a 16-bit variable — a predicate that folds to `true` before
+  the solver sees it, so it measured the harness, not the engine.)
 * **A dependency you never call is also zero-cost** — dead-code elimination leaves a
-  437 760-byte binary with zero `verif` symbols. But that is the linker dropping an unused
+  438 336-byte binary with zero `verif` symbols. But that is the linker dropping an unused
   library, not a proof: nothing was verified.
 * **The compile figures are not a like-for-like profile comparison.** Cargo compiles
   build-dependencies with the `build-override` profile, which defaults to `opt-level = 0`,
   while a normal dependency is compiled at the release profile's `opt-level = 3`. So the
-  3.2 s row is "what a user gets by default", not "build-dependencies are inherently
+  3.4 s row is "what a user gets by default", not "build-dependencies are inherently
   cheaper": set `[profile.release.build-override] opt-level = 3` and the build-time row's
-  wall time rises to ≈11.7 s, matching the run-time row. The engine is the same work
+  wall time rises to ≈12.9 s, matching the run-time row. The engine is the same work
   either way; only its optimisation level differs.
+
+The RSS figures are read from `/proc/<pid>/status:VmHWM` by
+`tools/shape-bench/measurer.rs`, the native launcher this table's numbers come from. A
+`fork`-based harness (Python's `os.wait4`) reports `ru_maxrss`, which is the child's
+resident high-water mark *since the fork* — so the launcher's own RSS becomes a floor
+under every measurement. That floor is invisible on a build (a `rustc` peaks at ~500 MB)
+and dominant on a run (a benchmark binary peaks at ~2 MB): the same `no_verif` run
+reports 2.1 MB through the native launcher and 5.5 MB through a Python fork, because
+5.5 MB is Python's own RSS. The launcher's header records the full reasoning.
 
 The numbers are a measurement, not a guarantee; `tools/shape-bench/run.sh` prints them on
 your machine. The *properties* — verification at build time, and no prover in the
