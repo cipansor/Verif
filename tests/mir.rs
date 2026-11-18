@@ -6706,6 +6706,7 @@ fn slice_last_is_an_element_and_array_last_is_exact() {
         "slice_last_after_write_is_seen",
         "slice_last_after_write_is_seen_cannot_prove_this",
         "slice_last_is_kept_when_another_index_is_written",
+        "slice_last_read_before_a_write_is_not_kept_cannot_prove_this",
     ];
     let Some(report) = verify_realistic(&names) else {
         return;
@@ -6728,6 +6729,12 @@ fn slice_last_is_an_element_and_array_last_is_exact() {
     // A model that left the sentinel alone would prove the twin -- the false proof
     // this pair exists to pin.
     assert_refuted(&report, "slice_last_after_write_is_seen_cannot_prove_this");
+    // The read-before/write/read-after shape at the length where the write reaches
+    // `last()`. This is the review's exact example: both reads must not be the same
+    // variable. The `len == 2` fixture above keeps `last()` across the write, so it
+    // stays green whether or not the sentinel is refreshed; only this one refutes a
+    // model that left the sentinel alone.
+    assert_refuted(&report, "slice_last_read_before_a_write_is_not_kept_cannot_prove_this");
 }
 
 /// `u8::from(bool)` -- the one conversion the integer model would otherwise refuse.

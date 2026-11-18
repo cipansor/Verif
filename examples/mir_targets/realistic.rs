@@ -12946,6 +12946,21 @@ pub fn slice_last_is_kept_when_another_index_is_written(xs: &mut [u8]) -> bool {
     before == *xs.last().unwrap()
 }
 
+/// The discriminating twin of the fixture above: at length 1 the write *does*
+/// reach `last()`, so a read taken before it and a read taken after it differ and
+/// their equality is false. A model that left the sentinel at its pre-write value
+/// -- so that both reads returned the same variable -- would *prove* this. The
+/// `len == 2` fixture above cannot catch that: it keeps `last()` on both reads, so
+/// it stays green whether or not the sentinel is refreshed, and it is the `len == 1`
+/// direction that has teeth.
+/// requires: xs.len() == 1
+/// ensures: ret == true
+pub fn slice_last_read_before_a_write_is_not_kept_cannot_prove_this(xs: &mut [u8]) -> bool {
+    let before = *xs.last().unwrap();
+    xs[0] = 1;
+    before == *xs.last().unwrap()
+}
+
 /// `u8::from(bool)` is the zero-extension of the one-bit value: `false` -> 0,
 /// `true` -> 1. A `bool` has no integer width, so this is the one conversion the
 /// integer model would otherwise refuse.
