@@ -22,8 +22,13 @@ Repository-level notes for agents working in this workspace.
   carry its own), `NOTICE` (third-party attribution — SPARK, z3, Kani, Verus,
   Lean, Coq, Ferrocene and the rest, each of which is an oracle or a comparison,
   never a dependency), `SECURITY.md` (soundness bugs are the vulnerability class
-  that matters in a verifier), `CONTRIBUTING.md`, `README.md` (the long-form
-  document, and the crate's page on crates.io), and `AGENTS.md` (this file).
+  that matters in a verifier), `CONTRIBUTING.md`, `ROADMAP.md` (the *single source
+  for open work* — one item per gap with a priority, a measurable exit criterion,
+  the competitor whose gap it closes, the closing move, and a status), `README.md`
+  (the long-form document, and the crate's page on crates.io), and `AGENTS.md`
+  (this file). This file records what was *learned*; `ROADMAP.md` records what is
+  *left*. When a "Stage N" or "Next stage" section below is finished, its remaining
+  work moves to `ROADMAP.md` rather than living here.
 
 ## Renaming the crate: `discharge` → `verif`
 
@@ -3054,6 +3059,30 @@ Three smaller traps fell out of the same work, each a place where a plausible re
   downcast place did not parse. Checking the place form first fixes it — the same shape of
   ordering bug as the earlier `const ... as ...` case, in the opposite direction.
 
+**A `match` arm guard reads its payload through a borrow of a downcast place — a third
+instance of the same ordering bug.** `Msg::Data(n) if n < 10` lowers to
+`_4 = &((_1 as Data).0: u8); _6 = copy (*_4); _5 = Lt(move _6, const 10_u8)`. The rvalue
+contains the word ` as ` *inside its parentheses*, and `parse_rvalue` checked for a cast
+before a reference, so it split the borrow at that ` as `, read it as a cast of the
+unparseable string `&((_1`, and produced a cast of `Unknown`. `_4` therefore got no
+address, `copy (*_4)` read `Unknown`, and the `switchInt` on the guard's `bool` was
+reported "unmodelled switch discriminant" — the *guard's* payload read was the thing that
+failed, not the switch, which is what made the message point at the wrong construct. The
+reference arm now runs before the cast arm; a real cast cannot be mis-taken for a
+reference, because `&…` is not a place, so the reorder is safe in the direction that
+matters. Pinned by `mir::parse::tests::a_borrow_of_an_enum_payload_is_a_ref_not_a_cast`
+(unit, no toolchain needed) and `tests/mir.rs::a_match_guard_reads_its_payload_through_a_borrow`
+(the corpus pair `guarded_match_reads_its_payload` / `guarded_match_tripwire`). Coverage:
+`everyday.rs` 9/21 → **10/21** (`next_mode`, C5's own evidence function, now decides),
+`realistic.rs` 398/737 → **399/739**; `scripts/test-count.sh` 874 → **876** passed, 0 failed.
+
+The recurring shape, worth stating once: **`parse_rvalue`'s arms are ordered, and an
+arm's pattern can appear inside another arm's string.** ` as ` lives inside a downcast
+*place* (both the `copy ((_2 as Some).0)` form and the `&((_1 as Data).0: u8)` form), and
+`const ` lives inside a cast constant. Each ordering fix so far has been found by a shape
+whose rvalue contained another arm's keyword; when a new rvalue form is added, check it
+against the arms above it, not only against the arms below.
+
 **The oracle is Rust itself, enumerated.** The model claims to implement `core`'s definition,
 so the unit tests in `src/mir/intrinsics.rs` compare against the real `u8::checked_add` and
 its family over *all* of `u8` and all of `i8` — 65536 pairs per case, cheap because the term is
@@ -3069,13 +3098,26 @@ themselves in the `detail` column — an unreadable `requires` (`c.lo <= c.hi`, 
 and a tuple-returning `ensures` (`ret.0 <= a`). Those are the next gaps, and they are parser
 gaps rather than engine ones, which the scoreboard says without being asked.
 
-## A product is widened to `2w == 32`, and `pow`'s fold keeps its own tighter bound
+## A product is widened to `2w == 64`, and `pow`'s fold keeps its own tighter bound
 
 The `Mul` arm of `intrinsics::failure` widens the operands to `2w` and multiplies there, because
-overflow needs the *exact* product and `2w` bits hold it. That widening was capped at
-`2w == 16`, so a `u16` `saturating_mul`/`checked_mul` was refused outright — every contract over
-one reported "past what the model covers" and none could be settled. The cap is `2w == 32` now
-(`MUL_MAX_WIDTH = 16`), and the width that was refused is decided.
+overflow needs the *exact* product and `2w` bits hold it. The cap was `2w == 16` first, so a
+`u16` `saturating_mul`/`checked_mul` was refused outright — every contract over one reported
+"past what the model covers" and none could be settled. Raising `MUL_MAX_WIDTH` to `16` made the
+`2w == 32` cap, and that width decided. The bound is `32` now (`2w == 64`), which decides the
+whole `u32` product surface; `64` is where it stops, because `2w == 128` cannot be held at all.
+
+**The two halves of a product cost very different things, and the bound is set where the cheap
+half reaches.** The *value* families (`wrapping_*`) build no predicate — a `wrapping_mul` is a
+plain `w`-bit multiply, which the BDD holds at `u32` in milliseconds — so raising the bound from
+16 to 32 admitted `u32::wrapping_mul` and `hash_step` (the flagship `u32` example,
+`h.wrapping_mul(31).wrapping_add(b as u32)`) went from `incomplete` to `verified` in 0.00s. The
+*widened* `2w == 64` product is built only where a family needs the failure predicate: a constant
+multiplier folds the obligation without blasting the multiply (`x.saturating_mul(3)` verifies in
+0.01s), and a fully symbolic one answers `Unknown` after ~5s rather than hanging. The bound is
+`32` and not `64` because a `u64` product's predicate is refused (`wide == w`, since `2w == 128`
+clamps to 64) and a `u64` `wrapping_mul` is past the BDD wall regardless — measured `incomplete`
+in 0.01s.
 
 **The division form was tried here first and is worse.** The plain-`*` path uses
 `y != 0 && x > MAX / y` (see the section above), and it is the *right* predicate there because
@@ -3096,13 +3138,24 @@ refusal at 8 bits is immediate. An answer that cannot be reached is not worth pa
 test `pow_is_modelled_only_where_a_product_is` pins the separation so a later change cannot
 collapse the two constants quietly.
 
-The teeth are a unit test and a corpus pair. `a_u16_product_is_modelled_and_exact` sweeps the
-boundary neighbourhood of a `u16` product against `core`'s own `checked_mul`/`saturating_mul`,
-so the widened test is pinned as *exact* at the new width and not merely reachable. In the
-corpus, `u16_product_guarded` must verify and `u16_product_unguarded_tripwire` — the same body
-under a guard that does not rule out overflow — must still be refuted; a bound raised without
-the refutation would be a model that proves the wrong thing, which is worse than one that
-declines.
+The teeth are unit tests and corpus pairs. `a_u16_product_is_modelled_and_exact` and
+`a_u32_product_is_modelled_and_exact` sweep the boundary neighbourhood of a product against
+`core`'s own `checked_mul`/`saturating_mul`, so the widened test is pinned as *exact* at each
+width and not merely reachable; the `u32` sweep includes `65536 * 65536` (exactly `2^32`, one
+past `MAX`) so an off-by-one fencepost fails. In the corpus, `u16_product_guarded` and
+`u32_wrapping_product`/`u32_saturating_product` must verify while their `*_tripwire` twins — the
+same body under a guard that does not rule out the claim — must be refuted; a bound raised
+without the refutation would be a model that proves the wrong thing, which is worse than one
+that declines.
+
+**What is still open, and it is the *speed* half rather than the coverage half.** A `u32`
+multiply-overflow guard at full width — the saturation idiom
+`if b != 0 && a > u32::MAX / b { u32::MAX } else { a * b }`, and a plain `a * b` under a guard —
+reports `incomplete` after ~4s. The plain-`*` path's exact-division form at `u32` is past the
+diagram budget, so the query is *bounded* rather than decided; a per-function time budget would
+report it promptly instead of waiting the ~4s out. `clamp_std` (`x.max(lo).min(hi)`) verifies in
+9.8s, likewise the latency half of C7 rather than a coverage gap.
+
 
 ## An inlined call must restore the caller's loop cut, or the caller unwinds a loop it had cut
 
@@ -3536,6 +3589,57 @@ write poisons the field, so the postcondition is unreadable),
 `array_write_then_symbolic_read`, `mut_ref_array_write_then_symbolic_read`,
 `generated_name_shadows_argument` and `struct_reassign_then_field_read`.
 
+### `slice::first`/`get` return a *place*, so the payload is a reference, not a value
+
+Modelling `slice::first` and `slice::get` (C6) turned on one shape the earlier
+`core` models never met: their result is `Option<&T>`, so the payload is a
+*reference* to a slice element, and the code that consumes it dereferences —
+`*xs.first().unwrap()` lowers to `_3 = first(_1); _2 = unwrap(_3); _0 = copy (*_2)`.
+Two things follow, and both are the honest direction rather than a convenience:
+
+- **The payload is the slice's own element variable.** The model records
+  `(slice local, index)` in `Env::slice_elem_ref` and writes the `Option`'s payload
+  as the same `xs[k]` variable a subscript read names, so `*xs.first().unwrap()`
+  and `xs[0]` are *one* term by construction. Writing a fresh variable there would
+  make the two disagree, and `ensures: ret == xs[0]` would fail for a body that
+  clearly returns it.
+- **The deref reads through the store, before the `deref_ok` gate.** `Env::get`'s
+  `Proj::Deref` arm refuses a deref of a local that is not a recorded reference
+  argument, which is what keeps a field-that-is-a-reference from being read as its
+  owner's referent. A `first`/`get` reference is a local a *call* produced, not an
+  argument, so the store is consulted first and the `deref_ok` gate is left for the
+  argument case it was written for. `unwrap` carries the element to its
+  destination, so the read works whether the caller dereferences the `Option`'s
+  payload directly or through an intermediate `let`.
+- **The `match` desugaring is a *second* read path, and it had to be taught the
+  same thing.** `match xs.first() { Some(v) => *v, None => 0 }` does not call
+  `unwrap`; it reads the payload through a downcast temp (`_4 = copy ((_2 as
+  Some).0: &u8)`) and dereferences *that*. The `unwrap` arm alone left every
+  `match` form `incomplete` in both directions, which is a coverage gap and not a
+  soundness one -- but a `match` on the `Option` is at least as common as an
+  `unwrap`, so the `Rvalue::Use` arm now propagates the entry onto the downcast
+  destination. One rule, two spellings, and the fixtures pin both.
+
+**The tag is a predicate, and that is the point.** `first` is `Some` exactly when
+the slice is non-empty (`len != 0`), and `get(k)` exactly when `k < len`
+(`len > k`, not `len >= k` — the predicate is the other way round, and getting it
+backwards made every `get(0)` on a non-empty slice report a `None`-unwrap panic
+until the fixtures caught it). Because the tag is an `ite` over that predicate and
+not a constant, the `unwrap`'s panic obligation is real: `get(1)` past the end
+*is* refuted with a panic witness, which a model that wrote `Some` unconditionally
+would have missed. `get`'s index must be a *constant* — a slice's length is
+symbolic, so a symbolic index has no finite domain, and reading "some element"
+would make `xs[i]` a different value per read, which is a wrong proof rather than a
+missing one. The *generic* `first_or<T>` is not this shape at all: its element type
+has no width and its length is never seeded, so it stays refused until generics
+(C10) land — which is why the ROADMAP note that `first`/`get` were "blocked on
+monomorphisation" was wrong for a concrete `&[u8]`.
+
+Seven fixtures are in `realistic.rs` (four true, two tripwires, one panic) and
+`tests/mir.rs::slice_first_and_get_reach_the_slices_own_element` pins all six
+directions; the test was confirmed to have teeth by neutralising the
+`slice_elem_ref` lookup, which turns the true direction `incomplete`.
+
 ## A call boundary is a real boundary: what crosses it and what must not
 
 Four soundness holes and two completeness holes lived at the same place — the
@@ -3639,6 +3743,11 @@ test that only checked the signed case would pass again the moment the rule went
 back to a single default.
 
 ## Next stage: the signedness work is a *rule*, so let the engine state it
+
+> The open work from every "Next stage" / "Stage N" section in this file is now
+> tracked in [`ROADMAP.md`](ROADMAP.md), which is the single source for what is
+> left. This section is kept as the *record* of the reasoning; check `ROADMAP.md`
+> for the current status of each item.
 
 Both false proofs fixed in this round were the same bug wearing different
 clothes. A value operation silently dropped the signedness of its operand:
@@ -4090,7 +4199,14 @@ executor builds for a `Not` rvalue, so a bit count of a written `!x` and a bit c
 of the complement cannot disagree. `is_power_of_two` is modelled too, and it is the
 one shape whose *return type* is `bool`: the model produces a `Pred` and the executor
 writes a `Val::Bool`, which is what the `if` that consumes it branches on. It is
-unsigned-only, because `core` has no such method on the signed types. The
+unsigned-only, because `core` has no such method on the signed types. The sign
+predicates `is_negative`/`is_positive` are modelled the same way and are `core`'s
+own definition read *signed* (`x < 0`, `x > 0`); they exist only on the signed
+types, and the signedness is the whole content, because `i8::MIN` (`0x80`) is the
+largest unsigned byte, so an unsigned reading of the top bit would call it positive.
+Each is checked exhaustively over `i8`/`i16` against Rust's own methods
+(`the_sign_predicates_agree_with_rust`), with `i8::MIN` named as the point an
+unsigned reading gets wrong. The
 mixed-signedness additions — `wrapping_add_signed`, `saturating_add_signed`,
 `checked_add_signed`, `overflowing_add_signed` and their `_unsigned` counterparts —
 are modelled too, as `Intrinsic::MixedAdd(Family)`: their two operands have
@@ -4192,8 +4308,19 @@ is the one an addend-signedness swap refutes.
 by design, because they panic on a zero divisor and modelling them as total would
 hide that panic; `overflowing_div`/`overflowing_rem` join them for the same reason.
 `pow` and the mixed-signedness additions are now modelled, so neither is a reachable
-gap. `rotate_*`, `abs_diff` and the `next_multiple_of`/`div_*` helpers remain reachable
-and unmodelled. The bit-count proofs do **not** go in `verif-arithmetic`: their oracle here is Rust's own method, checked
+gap. `rotate_*` and `abs_diff` were gaps when this was written and are modelled now
+(see C6 in `ROADMAP.md`), and so are the remaining total value methods -- `signum`,
+`reverse_bits`, `swap_bytes`, `to_be`/`to_le`, the ASCII case conversions and
+`is_multiple_of` -- plus the Euclidean pair (`div_euclid`/`rem_euclid`) and
+`div_ceil`, which are value-and-panic pairs because each panics on a zero divisor.
+Three facts cost time here and are worth keeping: `swap_bytes` is a rotation by
+`w/2` *bits*, not `w/2 * 8` (the differential test caught the first cut);
+`div_euclid` adjusts the truncating quotient *away* from zero when the remainder is
+negative, which is the opposite of the natural reading (also caught by the test);
+and `core` has no `to_ne` *value* method, only `to_ne_bytes`, so the byte-order
+model has two variants and not three. The `next_multiple_of`/`div_*` helpers and
+the `_bytes` byte-order forms (which return an array, not an integer) remain
+reachable and unmodelled. The bit-count proofs do **not** go in `verif-arithmetic`: their oracle here is Rust's own method, checked
 exhaustively over the whole operand domain, which is a stronger oracle than a
 small-domain enumeration would be. A third engine with less coverage is not a proof,
 so the split the roadmap proposed is not made.
@@ -6422,6 +6549,75 @@ oracle and false of the crate and its MIR frontend. When a comment states a tool
 requirement, check it against a second toolchain before trusting it; a wrong comment here is the
 kind of thing that gets copied into a downstream build script and never questioned again.
 
+**A second toolchain-shaped spelling: the `for`-loop range projection.** The same rule
+found the next one. rustc prints the `for`-loop desugaring's `as`-projection with the
+type *qualified* on current stable and *unqualified* on 1.85:
+
+```text
+1.99:  <std::ops::RangeInclusive<u32> as IntoIterator>::into_iter
+1.85:  <RangeInclusive<u32> as IntoIterator>::into_iter
+```
+
+`names_range` required an `ops::` segment, so on the MSRV the type segment was
+`RangeInclusive<u32>`, the predicate returned `false`, `classify` fell through, and
+*every `for` loop over a range* was `incomplete: call to unmodelled function
+<RangeInclusive<u32> as IntoIterator>::into_iter`. It was green on 1.99, so the only
+thing that could see it was gate 14 -- the MSRV run -- and it did: four `tests/mir.rs`
+cases (`a_signed_inclusive_range_stops_at_its_boundary`, `an_empty_inclusive_range_stays_empty`,
+`a_loop_without_a_contract_names_the_missing_contract`, `the_for_loop_range_desugaring_is_modelled`)
+were red on 1.85 and green on 1.99, exactly the shape the `Len`/`PtrMetadata` defect had.
+The predicate now accepts the unqualified `as`-projection form too
+(`name.starts_with("<RangeInclusive<") || name.starts_with("<Range<")`), pinned by
+`the_for_loop_range_names_classify_in_both_toolchain_spellings`, which asserts both
+spellings classify and that a user `m::RangeInclusive` is still refused.
+
+The lesson is the one this section already states, made concrete a second time: a
+predicate that keys on a *printed spelling* is a claim about a toolchain, and the only
+way to know the claim holds is to run the second toolchain. The MSRV gate is not
+ceremony around `cargo check` -- it runs the frontend's whole suite against the floor
+rustc, which is what turns "supports 1.85" from a build into a behaviour.
+
+**The unqualified spelling is also a name a user type can carry, so the range model
+was made trait-aware -- and a review of that change found a *different*, pre-existing
+false proof.** Accepting `<RangeInclusive<u32> as …>` accepts an *unqualified* type
+name, and a user can write `struct Range<T>`. So the two `Iterator` methods are now
+matched on the *trait* as well as the type (`names_std_range_trait`): `into_iter` only
+for the standard library's `IntoIterator`, `next` only for `Iterator`. A user
+`struct Range<T>` with a custom `into_iter` (`<Range<u8> as a::Custom>::into_iter`) is
+refused, which is what the reviewer's report asked for.
+
+Probing that shape turned up the real bug, and it was **not** the range model. The
+reviewer's literal example -- a default `into_iter` that *panics* -- is already
+**refuted** on the unmodified tree (`resolve_callee` finds the default body and inlines
+it, so the panic is found). But the reviewer's *mechanism* is real: a trait **default
+body** that calls a helper through `Self`:
+
+```rust
+pub trait T: Copy {
+    fn go(mut self) -> Self where Self: Sized { self.set(42); self }
+    fn set(&mut self, x: u8) { let _ = x; }        // default: a no-op
+}
+impl T for P { fn set(&mut self, x: u8) { self.v = x; } }   // the real one
+```
+
+The call inside `go` prints as `<Self as T>::set`. `call_type` gives `Self`, which no
+`impl` candidate matches, so the search fell through to the *default-body* branch and
+inlined the no-op `set` -- and a caller's `ensures: ret == 1` was **proved** against a
+body whose real result is `42`. A false proof, **pre-existing** (it reproduces with the
+`names_range` change stashed), and independent of the range model (it reproduces with
+the model disabled entirely). `resolve_callee` now refuses a `Self` receiver outright:
+resolving it would need the concrete `Self` the enclosing call was made with, which the
+resolver does not carry, and answering it with the default is exactly the false proof.
+The shape is a *refusal* now -- a lost proof, not a wrong one -- which is the honest
+direction. Pinned by `a_user_type_named_range_is_not_answered_by_the_range_model` (the
+range spoof, the `Self`-receiver false proof, and a positive control that a real `for`
+loop still verifies); teeth confirmed by reverting the guard, which restores `verified`.
+
+The general lesson, and it is the one this file keeps meeting: **when a report names a
+mechanism, reproduce the mechanism, not the example.** The reported example was already
+sound; the mechanism it described was a real hole one shape over, in a resolver the
+report did not name. The probe is what separated the two.
+
 ## A tuple struct is a struct too: its fields are numbered by position
 
 `struct_head` recognised only a *braced* body, so `pub struct Pair(pub u8, pub u8)`
@@ -6540,6 +6736,44 @@ rules that had to land together or the nested store would be unsound:
 std --all-targets -- -D warnings` clean; `scripts/gate.sh` green (bare-metal build,
 zero-dependency and no_std gates included). Gate green; zero dependencies and `no_std`
 untouched.
+
+## A scalar reference argument's name is its *final* value; `old(name)` is its entry value
+
+`Ty::Ref` is modelled as its referent, so a `&mut u16` argument's name in a contract
+denotes the `u16` it addresses -- one word, the same one the body's `*c` reads and
+writes. The first cut of C9 bound that name to the argument's *entry* value (the same
+`arg_vars` map every by-value argument uses). That was a **false proof**: with
+`requires: c == 0` / `ensures: c == 0` on `*c = 5`, the postcondition's `c` still named
+the input, so the contract held and the function was reported `verified` for a body
+that leaves 5.
+
+The fix has two halves, and the second is the one that makes two-state specs possible:
+
+- **A bare name in an `ensures` is the value at *return*.** The executor collects the
+  final value of every reference-to-scalar argument at the root `return`
+  (`ref_final`) and the `post` closure rebinds that argument's name to it, so the
+  postcondition is checked against what the body left there. A by-value argument is
+  *not* rebound: the body cannot write it, so its final value *is* its entry value and
+  a second binding would be the same word.
+- **`old(name)` reaches the entry value.** The entry bindings are handed to the parser
+  as `old_args`, a map only `eval_ensures` fills. `old(c)` on a name with no entry
+  value is **refused**, not silently read as the name itself -- so `old` on a by-value
+  argument does not become a second spelling of the same thing. The lookup is gated on
+  a following `(`, so an argument literally *named* `old` still resolves.
+
+`*c` is accepted as the explicit spelling of the referent `c` already denotes: the two
+are one binding, because a contract is this crate's own language rather than a compiled
+program. So the roadmap's exit shape, `fn bump(c: &mut u16)` with
+`ensures: *c == old(*c) + 1`, now verifies, and its caller verifies through the inlined
+body (`bump_scalar_ref_star` and `a_scalar_ref_caller` in `realistic.rs`).
+
+The signed case is pinned by `signed_scalar_ref` (`&mut i16`, `ensures: c < 0`): an
+unsigned reading would call `-1` the largest value, so the postcondition would be
+refuted -- `verified` is the evidence the referent's sign was read. The false
+directions are the teeth: `a_stale_scalar_ref_cannot_prove_this` (`ensures: c == old(c)`)
+and `a_scalar_ref_write_cannot_prove_this` (`ensures: c == 0` on `*c = 5`) must both be
+**refuted**, and each *verifies* under the pre-fix binding, which is what makes them
+regression tests rather than happy-path assertions.
 
 ## A helper's write through a `&mut` argument died with the callee's frame
 
@@ -8096,6 +8330,40 @@ Corpus coverage `examples/mir_targets/realistic.rs` **349 → 353** verified ove
 local `from` is not consulted at all. No new SMT primitives were needed: `sign_extend` and
 `truncate` already existed.
 
+### The comparison traits: the same exception, with a by-reference receiver
+
+`PartialEq::eq`/`ne` and `PartialOrd::lt`/`le`/`gt`/`ge` are the six comparison
+operators in their *trait-method* spelling, so a call prints as `<u8 as
+PartialOrd>::lt` — no `core::num::<impl …>` path — and they are admitted by exactly
+the same exception as `Ord::min`/`max` and `From`/`Into`: `classify` accepts the
+name only when the trait path is the standard library's (`names_cmp_trait`) and the
+tail belongs to the trait it names (`eq`/`ne` are `PartialEq`'s, the four orderings
+`PartialOrd`'s — the crossed pairing is never emitted and is refused), the
+executor's `<impl` guard gains `is_cmp_callee`, and the caller's same-dump lookup
+answers a crate-root trait before the model.
+
+Two things are specific to these shapes and both are traps:
+
+- **Both operands are `&self`/`&other`, so the executor must follow *two*
+  references, not one.** The receiver goes through the existing `pointee` step (the
+  `is_ascii_*` receivers already do), but the *second* operand is also a reference,
+  and the generic operand read returns `Unknown` for a pointer. The `args.get(1)`
+  arm now follows the referent for a `Cmp` call, the same step as the receiver.
+- **The value is the operator's comparison, not a second implementation of it.**
+  `cmp_pred` builds `smt::eq`/`slt`/`ult`/… — the exact terms the operators build —
+  so a method call and its operator spelling cannot disagree. The sign picks the
+  ordering: an unsigned reading of `i8::MIN < 1` is wrong because `0x80` is the
+  largest unsigned byte, which is why the differential test walks both
+  signednesses against the operators themselves (the oracle is the operator, not
+  the method, or it would just reproduce the model's reading).
+
+The local-trait hazard is pinned in both directions, as for `Ord`: `cmp_shim::PartialOrd`
+(a module-qualified local trait) is refused by the path, and its fixture
+`local_partial_ord_lt_is_answered_by_its_body` verifies only from the body's constant
+while `local_partial_ord_lt_is_not_the_model_tripwire` refutes only if the body — not
+the model — answered. The crate-root collision (`trait PartialOrd` at the crate root,
+which prints bare) is closed by the same-dump lookup, checked by probe.
+
 ### The owner-type gap this work surfaced, and how it was closed
 
 While checking the local-trait case, a probe found a **false proof that predated this
@@ -8685,3 +8953,1114 @@ The pattern in four of the six is the same: a value was *available* and the wron
 one was used, or a case was folded into a neighbour that shares its shape. The two
 false proofs are the receiver-in-the-slot-list and the empty-return-type cases --
 both places where "read what is there" quietly became "assume what is not".
+
+## `assert!` was a dropped path, not a check -- and the shape behind it
+
+The sixth review fixed the trait-contract route. This one came from asking a
+different question: *what ordinary Rust does the frontend still refuse?* A probe
+of a dozen idioms found the answer was `assert!`, the most common safety guard in
+the language.
+
+`assert!(x <= 200)` lowers to a `switchInt` that routes the *failing* case into
+
+```
+_3 = core::panicking::panic(const "assertion failed: x <= 200") -> unwind continue;
+```
+
+There is no `[return: bbN]` arm, because the call never returns. The parser looked
+only for the `[return:` shape, so the terminator came back
+`Term::Unknown("missing")`, the block's path was reported unmodelled, and the whole
+function was `Incomplete`. Nothing was *wrong* -- but nothing was checked either,
+and a verifier that silently skips the guards you wrote is worse than one that
+refuses loudly.
+
+**The fix is the sound direction, and it is the same shape as `wp`'s
+`DivergentCall`.** A construct that cuts a path off must be *recorded*, because
+everything downstream of it is vacuously true -- the lesson this file already
+carries three times (`Assume(false)`, an unsatisfiable precondition, a
+never-returning call). So the diverging call becomes a **panic obligation**: the
+query is `path`, "is this call reachable", discharged by `Unsat`, exactly the
+polarity of an `assert` terminator. The `switchInt` that routes into the call
+already carries `!guard` in its path, so the query is really about the guard. An
+`assert!` under a precondition that implies it is `Verified`; without one it is
+`Failed` with the counterexample that fires it (`x = 224` for `x <= 200`), and the
+report names the assertion from the message the dump passes (a string literal, or
+the pieces of the `core::fmt` chain in edition 2024).
+
+Two details that were not obvious:
+
+* **A user function returning `!` lowers the same way** -- `_3 = die() -> unwind
+  continue`, no return arm. The model treats it identically, so
+  `if x == 0 { die(); }` is a failure at `x == 0` and is proved unreachable under
+  `requires: x != 0`. This is why the obligation kind is `DivergingCall`, not
+  `Panic`: only some of these are panics, and calling `die` a panic would be a
+  small lie in the report.
+* **The `assert` *terminator* and the `assert!` *macro* are different lowerings.**
+  The overflow checks rustc emits are `Term::Assert`, which already assumed the
+  guard on the fall-through. The macro is a `switchInt` plus a diverging call, so
+  the assumption had to be made by the branch, not by the call -- the guard lives
+  in the *other* arm's path. `an_assert_guard_is_assumed_by_the_code_after_it`
+  pins it: without the assumption `x + 1` after `assert!(x <= 200)` reports a
+  possible overflow.
+
+The tests are a matched pair, because a fix for a dropped path is exactly the kind
+that can flip into a blanket failure: one pins the proof, one pins the refutation.
+
+### The oracle's own argument list was the first thing the new cases caught
+
+Adding a `panic!` to the regression corpus made gate 10 fail:
+
+```
+panic_guarded:
+  text : 3 blocks, panics []
+  typed: 4 blocks, panics []
+```
+
+The parser was right. The *oracle* was comparing two different compilations of one
+file: `emit_mir` passed `--crate-type=lib --emit=mir` and **no edition**, so rustc's
+default applied -- and the default is 2015, not the 2024 the crate itself is on --
+while the typed side pinned `--edition 2021`. `panic!("literal")` lowers to a single
+diverging call, `core::panicking::panic(const "…")`, under 2015; under 2021 or 2024
+it lowers to `Arguments::from_str(…) -> [return: bb2, …]` plus
+`std::rt::panic_fmt(…)`, one extra basic block. The oracle's comment claimed its
+argument list "mirrors what the text emitter passes" -- it did not, and nothing had
+exercised the difference until a `panic!` with a literal entered a corpus the oracle
+checks.
+
+This is the failure mode the oracle exists to prevent, one level up: a comparison
+between two things that are not the same thing is not evidence, and it is worse
+than no comparison because it reports a disagreement that cannot be acted on.
+
+The fix pins the edition to **2024** on *both* sides rather than leaving either to
+rustc's default. Pinning only one side is what caused the bug; leaving both
+implicit would have made the tool's behaviour depend on which compiler's default it
+happened to run under, which is exactly the kind of hidden input this crate refuses
+elsewhere. 2024 is the crate's own edition (`Cargo.toml`), it is what the test
+suite's `unsafe extern "C"` fixtures already require, and it compiles both corpora
+clean on the MSRV (1.85) and on stable (1.99) -- checked, not assumed. The only
+difference between the two compilations now is text versus typed IR.
+
+The lesson is the same one this file keeps recording, in a new place: a harness
+that *asserts* a property it does not itself establish will eventually assert it
+about itself. The oracle's check of the parser was sound; the oracle's own inputs
+were not held to the standard it held the parser to.
+
+### What the same probe found and did *not* fix
+
+A `for` loop is still refused, and now says so in the known gaps: `for x in 0..n`
+lowers to `IntoIterator::into_iter` and `Iterator::next(&mut range)`. `next` is the
+harder half -- it is a trait method that *writes through* its `&mut` argument, so
+modelling it needs the `&mut` write-back the crate does not have (a reference
+argument is refused for that reason). A `while` loop with `invariant:`/`variant:`
+states the same iteration and is strictly stronger: the measure gives total
+correctness where an unwound `for` gives a bounded check. The gap is documented
+rather than papered over, and the report names the unmodelled call so it is visible
+rather than silent.
+
+## Recovering an edition-2024 `panic!` message: `core::fmt` is a two-spelling chain
+
+The diverging-call fix above made `panic!` *checked*. It did not make it
+*readable*: the report named the panic from a string literal operand, and edition
+2024 has no such operand. `panic!("zero")` under 2024 lowers to
+
+```
+_4 = Arguments::<'_>::from_str(const "zero") -> [return: bb2, unwind continue];
+_3 = std::rt::panic_fmt(move _4) -> unwind continue;
+```
+
+so the message is a *local* the chain built, not an argument. Reading it needs a
+small model of `core::fmt`, and the model is where the two toolchains the gate
+runs diverge.
+
+**Four spellings, and the gate runs two of them.** The builders are:
+
+| Spelling | Toolchain | Message source |
+| --- | --- | --- |
+| `Arguments::from_str(const "…")` | both | the literal, one piece |
+| `Arguments::new_const::<P>(&PIECES)` | 1.85 (MSRV) | a promoted `&[&str; P]`, no arguments |
+| `Arguments::new_v1::<P, A>(&PIECES, &ARGS)` | 1.85 (MSRV) | the same promoted array, `A` arguments |
+| `Arguments::new::<LEN, A>(const b"…", &ARGS)` | stable (1.99) | one encoded byte template |
+
+The last two are the same source text compiled by two compilers, so a model that
+answers only one of them is a model that is green on one toolchain and
+`Incomplete` on the other -- which is exactly what the MSRV run reported while
+stable was green. Both are answered.
+
+**Three details that are not obvious, and each cost a round trip.**
+
+* **The promoted array is not reachable by walking a body.** The pieces live in a
+  `const f::promoted[0]: &[&str; 1] = { … }` item printed *outside* any function,
+  and the call passes `&_4` where `_4 = const f::promoted[0]`. The executor never
+  walks that item, so the pieces are collected at parse time, next to the other
+  `const` items, into `MirProgram::promoted_strs` -- the one place in this frontend
+  where a fact is read from the dump rather than from the function's own body, and
+  it is read from the *same* dump so the two cannot drift.
+* **A whole-place write forgets the destination's parts.** The pieces are recorded
+  on the local the reference was assigned to, and the obvious place to record them
+  -- inside `eval_rvalue` -- is wrong: the `set` that follows calls `forget_parts`,
+  which clears `piece_sets` (it must, or a stale read of an overwritten local would
+  be a *wrong* message). The record therefore happens in the `Stmt::Assign` arm
+  *after* `set`, which is the only ordering that survives.
+* **The byte template arrives through a local too.** On stable the template is
+  `_9 = const b"\x04bad \xc0\x00"` and then `new::<7, 1>(move _9, …)`, so it is
+  kept raw in `tmpl_bytes` and decoded by the consuming call -- the decode needs
+  the argument count, which only the call has.
+
+**The placeholder count is the argument count, not the piece count.** This is the
+one that produced a wrong *message* rather than a missing one.
+`panic!("{} tail", x)` prints `["", " tail"]` with **one** argument, so a join that
+put a `{}` in every gap would report `{} tail{}` for a message with one
+placeholder -- a message that is not the one in the source, which is worse than
+naming none. `join_format_pieces(pieces, args)` therefore takes the count from the
+generic list (`new_v1::<P, A>` -> `A`, `new::<LEN, A>` -> `A`, `new_const` -> 0)
+and appends the surplus placeholders after the last piece. `generic_arg` refuses a
+missing or non-numeric item rather than guessing, so a printer change surfaces as
+"unmodelled", not as a wrong message.
+
+**The guard is the destination's type, not the callee's name.** `new_const` and
+friends are printed *unqualified* (`Arguments::<'_>::new_const::<1>`), so a name
+cannot tell `core`'s builder from a local function called `new`; the destination
+type `std::fmt::Arguments<'_>` can, and no other call has it. The consumer
+(`std::rt::panic_fmt`) *is* qualified, so its guard is on the name. Both
+directions of a misjudgement are a refusal: a local `new` is left to its own body,
+and an unknown `core::fmt` call stays "unmodelled".
+
+The tests are a matched pair again, and they run under whichever toolchain
+`VERIF_RUSTC` names -- so the 1.85 `new_v1`/promoted-array spelling and the stable
+`new::<LEN, A>` byte-template spelling are both exercised by the gate's two
+toolchains rather than by one machine's luck.
+
+**A name must never be reported as its type arguments.** `panic!("{}", x)` has no
+literal piece at all -- there is nothing to recover -- so the report falls back to
+the callee's name, and the naive `name.rsplit("::").next()` gave `<u8>` for
+`panic_display::<u8>` / `panic_cold_display::<u8>`. That is the mangled path the
+message recovery exists to avoid, just reached from the other side. The fallback
+now goes through the same generic-stripping helper the `core::fmt` dispatch uses,
+so it reads `panic_display`, and `unreachable!()` / `todo!()` -- which *do* pass a
+literal, `"internal error: entered unreachable code"` / `"not yet implemented"` --
+keep naming the text the programmer wrote. The three are pinned together so a
+change aimed at the formatted case cannot quietly regress the plain one.
+
+One more fail-closed turn: the `panic_fmt` consumer used to record an *empty*
+message when its argument was not a local it knew, which would print `panic: ` with
+nothing after it. It now refuses, so the report names the call it could not model
+instead of showing a blank message.
+
+## A toolchain-shaped report, and a gate the edition work broke
+
+Two CI-only failures on the diverging-call branch, both invisible to a green local
+gate run, and both the same lesson: the *environment* is part of what a claim is
+about, so a gate that names one toolchain has not checked the other.
+
+**The panic message was read from the dump, and a nightly stopped printing it.**
+`unreachable!()`, `todo!()`, `unimplemented!()` and a message-less `panic!()` used to
+lower to `core::panicking::panic(const "…")` with the text as a literal, and
+`panic_message` read that literal. A recent nightly lowers each to a dedicated
+`core::panicking::{unreachable,todo,unimplemented,panic}_default_msg()` callee that
+takes **no** literal, so the report fell back to the callee's name
+(`panic: unreachable_default_msg`) and `a_literal_panic_macro_names_its_message`
+failed -- on the nightly CI names, and on nothing else. The fix spells the canonical
+text for those four tails, so the message is the same string stable prints. Reading
+it from the compiler would make a *report* depend on the compiler version, which is a
+claim the toolchain half-decides; the text is the same on both, so it is written down.
+An unrecognised name still falls back to the callee, which is the honest answer.
+
+**The edition work broke the comparison gate, and only on a machine with no
+`Cargo.toml` above the fixture.** Resolving the edition instead of pinning 2024 is
+right -- a verdict under the wrong edition is about a program nobody built -- but the
+degenerate fixtures in `examples/comparison_check.rs` were written as loose `.rs`
+files in `$TMPDIR`, with no manifest above them and no `VERIF_EDITION`, so the
+frontend now refused them ("no Rust edition for /tmp/…"). It passed locally only
+because the earlier gate runs had left `VERIF_EDITION` exported in that shell. The
+fix gives each scratch fixture its own temp *crate directory* with a `Cargo.toml`
+(`edition = "2021"`), which is what a real program has and which exercises the
+manifest-resolution path rather than the override. The removal became
+`remove_dir_all` on the parent.
+
+Both are pinned by the gate's own two compilers now: `scripts/gate.sh` runs the MIR
+suite under the compiler on `PATH` *and* under the MSRV, and CI runs it under a
+nightly, so a dump-shape change on any of the three fails in the run that introduces
+it. The general rule the pair teaches: a test that names one toolchain checks one
+toolchain, and "it passed locally" is a claim about the local compiler, not about
+the program.
+
+## Four review findings on the edition and label work
+
+A review of the diverging-call branch raised four items. Two were live defects in
+this branch, one was already fixed by an earlier commit in the same branch, and one
+was a test/scoreboard mismatch. Each is recorded because the *reason* recurs.
+
+**A package that omits `edition` is Cargo's 2015 default, not an error.**
+`resolve_edition` refuses a file with no edition anywhere, which is right for a
+*loose* `.rs` -- it has no crate edition to infer. But Cargo assigns edition 2015 to
+a `[package]` that does not state one, so the same refusal also rejected a valid
+2015 package: verification stopped before `rustc` ran. The two are different
+questions, and `edition_from_manifest` now answers them differently: a manifest that
+declares a `[package]` with no `edition` key resolves to 2015 (`declares_package` is
+the tell), while a loose file and a manifest with no `[package]` (a virtual
+workspace) still yield no edition. The refusal is kept exactly where it belongs.
+
+**A label must name the event that happens.** A reachable call to a user function
+returning `!` -- `die() -> ! { loop {} }` -- is a reachable *failure*, but the
+failure is a non-terminating loop, not a panic. The report said `panic: die`, naming
+an event that never occurs. `Divergence::of` already distinguished `exit`/`abort`
+from `panic`; an unrecognised `!`-returning callee is now labelled `diverges`. The
+general rule: when a report prints a *reason*, the reason has to be the thing that
+happened, not the nearest category. This was fixed earlier in the branch (`af12de8`,
+"Label a diverging call by its kind"), and the review was against the pre-fix head --
+worth checking a finding against the current head before acting on it.
+
+**A scoreboard and a regression floor must count the same thing.** The corpus test
+counted `Verified | Failed` as "decided" while `mir_coverage` counts only
+`Verified`. A corpus function that flipped from verified to refuted would keep the
+test's number and lower the printed one -- the floor and the scoreboard would
+disagree about the same run. The test now counts `Verified` only, like the
+scoreboard, and asserts *separately* that no function in this corpus of ordinary
+Rust is refuted. The rule is the one the crate keeps meeting: a count that folds two
+outcomes together cannot tell them apart, and the difference is exactly what the
+check exists to see.
+
+**A frontend behaviour change is a README change.** The edition resolution (E2) is
+new user-facing behaviour -- a loose file now needs `VERIF_EDITION`, and a package's
+edition comes from its manifest -- and the README's "what is read from where" table
+did not mention it. The table gained an `edition` row and a paragraph on the
+precedence and the loose-file override, which is what `CONTRIBUTING.md` asks for
+when behaviour changes.
+
+## A `drop` is a terminator, and the dump does not say which kind it is
+
+C1 modelled `drop(_x)`, the terminator rustc emits for a local whose type has drop
+glue. Three findings, and the middle one is the soundness boundary.
+
+**It is a terminator the parser was reading as a call.** `drop(_2) -> [return: bb1,
+unwind continue]` prints with the same `-> [return:` shape as a call, so the call
+arm claimed it: the line has no ` = ` destination, so `parse_call_head` returned
+`None`, and the arm's fallback turned the whole line into `Unknown` -- reported as
+"unmodelled terminator", dropping the path. Every RAII local lowers to a `drop`, so
+any function holding a `Vec`, a `String`, a lock guard or a user `Drop` was
+`incomplete` for a reason that had nothing to do with its contract. (A `drop(` branch
+existed before but was dead: the call arm above it matched first, because the line
+contains ` -> [return:`.) The arm has to come *before* the call arm, and
+`successors` has to know the terminator has a normal successor (`vec![*target]`), or
+the path dies at the `drop` instead of continuing. It is a **refusal** at HEAD, not
+a false proof -- confirmed by running the unmodified tree on a `Drop` whose
+destructor panics (`incomplete`, "unmodelled terminator") -- so C1 closes a lost
+proof, not a soundness hole.
+
+**A glue-free `drop` is a no-op, but rustc never emits one -- so the no-op arm is
+defensive, not the common case.** The tempting framing (and the ROADMAP's first
+draft) was "a scalar no-op subset, the common case". Measured over `realistic.rs`,
+**0 of 6** `drop` terms are glue-free: rustc emits no `drop` at all for an integer,
+an array of integers, or a plain struct with no destructor. So the no-op branch
+cannot be exercised through the frontend, and a test that claims to exercise it is
+vacuous -- the check lives in a unit test on `drop_is_noop` instead. The arm is
+kept because the alternative to a no-op is a refusal, and refusing `drop(_2)` for a
+glue-free type would lose a proof; it is correctness insurance, not coverage.
+
+**A container and a struct holding a user destructor are the same line.** The
+review's suggestion was "a std container is a no-op that changes no scalar state".
+That is **unsound**. The MIR probe: `fn g(w: Wrapper)` with `struct Wrapper { v:
+Vec<u8> }` and `fn f()` with `struct Outer { i: Inner }` where `Inner: Drop` both
+lower to the *same* `drop(_2) -> [return: bb1, unwind continue]`. The dump carries
+the dropped local's type, not its drop glue, so it cannot tell a `Vec` from a struct
+wrapping a `Vec<PanicOnDrop>`. Treating the container as a no-op would prove a
+function panic-free whose destructor panics. So a container is **refused**
+(`drop of `std::string::String` is not modelled`), which is a lost proof, never a
+false one.
+
+The three cases the executor takes, then: **no drop glue** -> no-op (defensive);
+**a user `impl Drop`** -> execute its body through the inliner the method path uses
+(`self` is `&mut T`, so the dropped place is the argument and the `by_ref` copy-back
+carries the destructor's writes); **anything else** -> refuse. The user-`Drop` path
+is what makes the review's exit criterion pass: `destructor_panic_cannot_prove_this`
+is refuted with witness `v = 16` (the destructor's own assert fires), and its
+guarded twin verifies.
+
+Two smaller traps. The inliner's env-seeding was extracted into `seed_callee_env`
+so the `drop` path and the call path share it -- a second copy would be a second
+chance to forget one of the seven stores a reference argument carries in. And
+`drop_destructor` resolves the impl by its *owner* (the `impl at FILE:L:C` location,
+like a method contract), matching the type's bare name: two same-named types in
+different modules that both `Drop` are an ambiguity, and the resolver refuses rather
+than guessing one (probed: `m::Guard` and `n::Guard` both `Drop` -> `incomplete`).
+
+The parser side is pinned by `parses_a_drop_terminator`; the executor's three cases
+by the `tests/mir.rs` Drop tests and the `realistic.rs` fixtures; the no-op table by
+`a_glue_free_type_has_a_noop_drop` (which can run without a compiler). The
+`rustc_public` oracle agrees (862 of 881 on `realistic.rs`, 0 differ), which is what
+confirms the parser reads the terminator's real shape.
+
+## A `for`-loop invariant is over the loop's *carried* state, not the element
+
+The `for i in a..b` desugaring is modelled (`RangeInclusive::new`/`Range::new`,
+`into_iter`, `next`), so a `for` loop decides through the existing loop machinery.
+Two facts about the loop variable cost time to rediscover, and both are in the MIR:
+
+- **`i` is a scoped `debug` binding, not a `local_names` entry.** rustc prints
+  `scope 3 { debug i => _9; }` and `_9` is assigned only *inside* the loop body
+  (`_9 = copy ((_6 as Some).0)` in the `Some` arm of the `next` match). So at the
+  loop *header* `_9` has no value: an `invariant: s <= i` is refused as
+  `unknown name i`, and the refusal is *correct*. Resolving the name would read a
+  variable the header state does not contain -- a wrong value, not a missing one.
+  A `for`-loop invariant must be written over the state the loop *carries*
+  (`s <= 5050`), which is exactly what the header havocs and the invariant is
+  quantified over.
+- **`next(&mut range)` mutates the range in place.** The `&mut` is followed with
+  `pointee` to the range local, so the `start`/`end`/`exhausted` fields `new` wrote
+  are the ones `next` advances -- and the advance is what makes the loop progress,
+  so a `variant:` can be proved against it. The inclusive range's `exhausted` flag
+  is set from `forward_overflowing`, so `for i in 0..=u8::MAX` marks itself
+  exhausted rather than looping forever; reproducing that boundary exactly is what
+  keeps a range loop from being a wrong proof.
+
+## An unbounded loop is a *missing contract*, and the message must say so
+
+`DEFAULT_UNWIND` stops a loop with no `invariant:` and no `unwind:` bound, and the
+path is reported incomplete. That is honest, but the message read like a frontend
+gap. It now names the remedy: "this is a missing loop contract, not an unmodelled
+construct: declare `invariant:` or `unwind:` to decide it". The distinction
+matters because the two incompletenesses mean opposite things to a reader -- one
+says "the tool does not understand this", the other says "you did not tell the
+tool what to prove" -- and a `for` loop over a range is now the second, not the
+first.
+
+## The three "failures" on this branch were all environmental
+
+Three tests appeared to fail and none was a code defect:
+
+- `counterexamples_really_panic` and `the_min_constant_is_the_top_bit` fail under
+  `cargo test --release` because the test profile turns overflow checks *off*, so
+  a body the engine says panics does not. The documented command is
+  `cargo test --features std` (debug).
+- `a_package_that_omits_an_edition_is_verified_as_2015` fails when
+  `VERIF_EDITION=2024` is exported in the shell -- the env override outranks the
+  manifest, by design. `env -u VERIF_EDITION cargo test --features std` is green.
+  This is the same ambient-variable trap the edition gate's comment already
+  names; a "failure" that survives only in one shell is the variable, not the code.
+
+## The PR #8 review, and what the fixes had in common
+
+Nine findings from an adversarial review on upstream PR #8, all in the MIR
+frontend, each reproduced before being fixed:
+
+- **Drop glue is a *path*, not a flag.** A struct whose field has its own `Drop`
+  ran the outer destructor and stopped, so a panicking field destructor was never
+  seen and the function was a false `Verified`. The fix is to *refuse* the shape
+  when a field's glue is unmodelled, not to assume it is fine.
+- **A bound counts the thing the caller means.** `unwind: N` counted raw block
+  entries, so a loop running exactly `N` iterations was rejected (the last entry
+  evaluates the guard and exits) and a loop-free helper called twice tripped it.
+  The counter now counts *latch traversals* -- one per iteration -- via a
+  per-function latch set. The general shape: a budget's unit must match the
+  quantity the user is reasoning about.
+- **A `for` desugaring is not the only thing with a bound.** The same accounting
+  bug applied to a call, so the fix is in the shared counter, not the loop arm.
+- **A quoted TOML key is a key.** `"edition" = "2024"` read as *absent* and the
+  2015 default applied -- a verification of a different edition from the one the
+  crate builds under. `workspace = "../ws"` pointing outside the ancestor chain
+  was not resolved either.
+- **A width rule is about the *value*, not the range.** `Rotate` was admitted at
+  every width up to 64, but `n mod w` is a reduction only for a power-of-two `w`;
+  a non-power-of-two width would be a wrong value. The rule is now `w` a power of
+  two, and it was a *false-proof* class, not a refusal.
+
+## The range and layout review round (PR #8 follow-up)
+
+A second pass over the same review found six more items, this time in the range
+model and the struct layout the drop-glue check reads. Two were *false proofs*
+(a wrong value that decided), the rest lost proofs or wrong verdicts. Each was
+reproduced against real `rustc` output before being fixed.
+
+- **R1: a signed inclusive range's overflow flag tested the *unsigned* `MIN`.**
+  `RangeInclusive::next` marks itself exhausted when `start + 1` overflows, and
+  the flag was `succ == 0`. That is the unsigned rule; on a signed range `MAX + 1`
+  wraps to `MIN` (`1 << (w-1)`), not zero, so the flag never fired: `127i8..=127i8`
+  kept yielding past `127` into `-128`, `-127`, … until the `unwind:` bound. A
+  *true* contract became a bound failure. The flag is now
+  `succ == (1 << (w-1))` for a signed range. The tell is the same one the
+  `MIN`-is-not-zero note records for the contract reader: a boundary test written
+  as "wrapped to zero" is the unsigned half of a two-sided rule.
+
+- **R4: `next` advanced an empty range.** The advance (`start := start + 1`) was
+  unguarded, so an empty `255u8..=254u8` had its `start` wrapped to `0` and the
+  *second* `next` returned `Some(0)` — an element Rust never yields. Rust's
+  `Iterator::next` leaves the range unchanged on `None`, so the advance is now
+  guarded by `!empty`. The exclusive twin (`255u8..255u8`) had the same hole.
+
+  Both were validated the way this crate validates a value model: a differential
+  oracle. 23 ranges at the `u8`/`i8` boundaries (every combination of `MIN`, `MAX`
+  and `0`) were counted against a compiled `rustc` execution, and the model agreed
+  on all 23. The oracle is what makes the fix evidence rather than a claim.
+
+- **R2/R3: the unwind bound counted one latch, not the loop.** The counter was
+  keyed by the source block holding the back edge. A loop body that reaches its
+  header from two latches — an `if` whose arms both loop, or two `continue`s — had
+  each counted separately, so the *combined* trip count could exceed a declared
+  `unwind:` while neither latch's own count did: a two-iteration loop verified
+  under `unwind: 1`. A `switchInt` block also reset the count on every arm it took,
+  which is exactly where a `while` header (whose guard is a `switchInt`) hid the
+  bug — a `for` loop's header does not end in a `switchInt`, which is why the
+  earlier fixture passed. The counter is now keyed by the loop *header* (merging
+  the latches of one loop), the switch reset is removed, and `unwind: N` means `N`
+  iterations of the loop however the body reaches the back edge. The general
+  shape, again: **a budget's unit must match the quantity the caller reasons
+  about**, and "which block is the latch" is not that quantity — "which loop" is.
+
+- **R5: the struct layout was keyed by the bare name.** `m::Outer` and `n::Outer`
+  collided in the layout table, so the drop-glue check read whichever was recorded
+  last. When that one is glue-free, a field with a panicking destructor vanishes
+  and the function is a **false `Verified`** — the worst direction. Layouts are now
+  keyed by the module-qualified source path (`m::Outer`), with a bare key
+  back-inserted at the end *only* when the bare name is unique crate-wide; two
+  modules sharing a name make the bare lookup miss, so the glue check reports the
+  shape unmodelled rather than reading the wrong layout. A miss is a refusal, which
+  is the honest answer when the dump's `drop(_1)` names a type two layouts claim.
+
+- **R6: a unit struct was not a struct.** `struct Guard;` was not read as a struct
+  at all, so the drop-glue check saw an unknown type and refused the function — a
+  lost proof for one of the commonest shapes in Rust (a zero-sized marker type with
+  a `Drop` impl). A unit struct now has a zero-field layout, so its `Drop` body is
+  the only glue, and a panicking one is a real obligation. The name reader also had
+  to stop at `;`, or the trailing semicolon rode into the name and the lookup
+  missed.
+
+- **A test that failed only because of the environment.** The `VERIF_EDITION`
+  override is process-global and a deliberate *override* (it is what the edition
+  matrix uses to force a file under another edition), so it wins over the
+  manifest — which is why `a_package_that_omits_an_edition_is_verified_as_2015`
+  failed in a shell that had it exported. The test now guards on it exactly as its
+  sibling unit test already did, so the suite's verdict does not depend on the
+  caller's environment. The same shape as the "a skipped test still reports `ok`"
+  note: a test whose result depends on ambient state is not a check.
+
+**Evidence.** `scripts/test-count.sh` **914 passed / 0 failed** (was 909);
+`tests/mir.rs` **318 passed / 0 failed** in debug with a nightly `rustc`; the
+corpus is unchanged (`realistic.rs` 429 of 797, `everyday.rs` 16 of 21 — no
+verdict moved); `cargo clippy --workspace --features std --all-targets` and
+`cargo clippy --no-default-features --lib` both clean; zero dependencies and
+`no_std` untouched.
+
+## A ledger of false proofs, and the test that keeps it from going stale
+
+The PR review's top trust item (A1) was to *track the false-proof rate*: keep a
+`SOUNDNESS.md` listing every false proof with its date, root-cause class and
+fixture, and pause feature work on any layer that produced one in the last two
+weeks. The data behind it is real -- the review counted eleven false proofs fixed
+in the nine days to 2025-11-12, and this session's own log records twenty-one
+wrong verdicts in the MIR frontend across 2026-11-12 … 2026-11-16. At that rate a
+`verified` is evidence that a check *ran*, not yet that it is trustworthy alone.
+
+`SOUNDNESS.md` is now that ledger. The MIR-frontend table has a row per defect:
+the symptom, the class (false proof / false refutation / lost proof / wrong
+verdict), the **fixture** that fails if the fix is undone, and the date. A
+following section records the engine, vacuity and handle classes from `AGENTS.md`
+(a limit that truncates instead of reporting, five instances; vacuity, four; a
+proof object with no lifetime, two; the unbounded kernel rule; the printer; the
+`Fixed` value bugs) so the ledger covers the whole stack rather than only the
+frontend.
+
+The lesson this file keeps teaching is that **a document is a claim, and a claim
+needs a check**. A ledger row naming a fixture is exactly the kind of second copy
+that goes stale silently: rename `a_radix_literal_is_read_at_its_radix` and the
+row still *reads* as evidence while pointing at nothing. So `tests/soundness.rs`
+extracts the fixture column from the markdown, pulls every backticked snake_case
+identifier out of it, and requires each to be a `fn` declared under `tests/` or
+`src/`. It also asserts the four classes are defined (a row in an undefined class
+is unclassifiable) and that at least eighteen fixture names were checked, so the
+test cannot pass vacuously by finding no rows. Teeth were confirmed the only way
+that counts: pointing one row at `a_radix_literal_that_does_not_exist` fails the
+test with the fixture named.
+
+Two smaller points. The ledger names the *class* per row on purpose, because the
+clusters are the finding -- rows 1–9 of the MIR table are all the contract
+reader's value/width model, rows 10–13 are all name resolution, rows 14–17 are all
+a write or a path that was dropped -- and a fix that addresses one shape and not
+its siblings is the recurring cause. And the exit criterion is a *clock*, not a
+count: "four consecutive weeks with no new false proof", which restarts on the
+most recent row (2026-11-16). Until it clears, the README says a `verified` means
+a check ran, and every verdict carries the obligation it discharged.
+
+`SOUNDNESS.md` and `tests/soundness.rs` are the A1 increment; `ROADMAP.md` marks
+A1 done, and the README's layout and link sections name the new file.
+
+## The soundness ledger needed commits and dates, and the test that reads them
+
+The A1 increment added `SOUNDNESS.md` (the false-proof ledger) and a test that the
+fixtures it names exist. Reviewing it found four holes, all the same shape: the
+ledger *read* as evidence without *being* evidence, and the test could not tell.
+
+**The ledger omitted the historical defects.** The engine and imperative
+incidents were grouped as class summaries ("a limit that truncates, five
+instances"), and the review's eleven earlier false proofs appeared only as a
+count. That leaves those layers out of the two-week pause and makes the four-week
+clock unverifiable, because a summary has no date to compute from. The fix is a
+second table — rows 28–43, one per instance, with a fixture, a commit and a date —
+so "when did the engine last produce a false proof" is a lookup (2026-11-16, the
+unwind-bound miscount) rather than a guess. The class summaries survive as
+the *clusters* paragraph, which is the finding; the rows are the evidence.
+
+**A follow-up review found the ledger was still over-claiming, and row 22 was the
+proof.** The prose said "the review's eleven earlier false proofs are rows 22–35",
+but row 22 cited `a_declared_frame_longer_than_the_cap_is_refused` — which tests an
+*oversized declared* frame (the havoc-buffer cap), not the *under-declared* frame
+the row's symptom names. The matching regression is
+`under_declaring_the_frame_is_rejected` (`1b64205`). The wrong fixture came from
+the same place the earlier ones did: I read `AGENTS.md`'s prose and picked the
+test it *mentioned*, instead of the test that *fails on the unfixed code*. Two
+more rows had the same defect (row 36 named a MIR fixture for the wp-layer
+`DivergentCall`; the wp test is `a_call_to_a_never_returning_proc_is_not_total`).
+Worse, the claim itself was false: the review named **seven** commits
+(`08a6065`, `d6a4690`, `dd1ca69`, `b7769c1`, `e4543d0`, `496e416`, `653a340`) and
+the ledger's MIR table was missing five of their false proofs entirely. The fix
+is to *verify each row's fixture against the commit that introduced it* — `git log
+--all -S"fn <fixture>"` and check the cited hash appears — and to add the missing
+rows (the MIR table grew to 27, the engine table to 16). The lesson is the one the
+review's own finding states: **a row's symptom and its fixture must be the same
+defect**, and "the commit introduced the fixture" is not enough — the fixture must
+be the one that *fails* when that specific fix is reverted. The mechanical check
+in `tests/soundness.rs` now also asserts the two tables' row counts, so a row that
+silently vanishes is a failure.
+
+
+**The MIR row dates were all wrong.** Every row said `2026-11-13` (the date the
+ledger was written, not the date of the fix). The real dates came from
+`git log --all -S"fn <fixture>"` — and the `--all` matters: the crate was
+`discharge` until 2026-10-30 and its directory was `discharge/` until the move to
+the repository root (`3797cf2`, 2026-10-27), so a fixture whose commit predates
+the move is invisible to `git log -S` on the current path. The oldest MIR row is
+2026-10-29, not 2026-11-13; the densest cluster (rows 1–9) is 2026-10-29 …
+2026-11-02. Recovering this needed `git fetch --unshallow` — the workspace clone
+was shallow, and `git log -S` over a shallow history returns the boundary commit
+(`57325da`) for *every* pre-boundary query, which reads as "all fixed on the same
+day". That is the trap: a shallow clone makes a history question answer with a
+plausible wrong answer, not an error.
+
+**The edition row's fixture was prose.** Row 21 named "the E4 matrix and the 2021
+`extern "C"` fixture" — no backticked identifier, so the extractor found nothing
+there and the 18-name minimum still passed if either edition test vanished. Both
+are now named: `a_2021_only_file_is_verified_under_its_own_edition` and
+`every_edition_compiles_the_corpus_to_the_same_verdicts`.
+
+**The test promised a date check it did not make, and accepted helpers.** The
+module doc said it pinned that the newest date is not in the future; no test read
+a date. And `declared_fns` accepted *any* `fn` of the right name — so removing a
+test while a same-named helper survived left the check green. Both are fixed:
+`fns_in` distinguishes a `#[test] fn` from a plain `fn` (and a non-test match is a
+failure), and `no_ledger_date_is_in_the_future` parses each row's date and
+compares it to today's UTC date, computed in-process (a civil-from-days
+conversion, so no dependency). A cell may also name its file (`` `tests/call.rs` ``),
+which pins the test to that file — a fixture that moved files fails.
+
+Each new guard was checked by breaking it: pointing a fixture at the wrong file
+fails with the file named, naming a non-test helper (`report_source_hint`) fails
+with "not a `#[test]`", a future date fails with "in the future (today is …)", a
+missing commit fails with "exactly one commit", and deleting the engine table
+fails the row-count floor.
+
+The general lesson is the one this file keeps finding: **a document is a claim,
+and every field of it needs a reader.** The commit column was added to make A1
+computable; the test reads it. The date column was added for the clock; the test
+reads it. The fixture column was there from the start; the test now reads it as a
+*test*, not merely a name. A column nothing reads is the same as no column.
+
+## A method's *membership* and its *value* are two facts, and each has its own trap
+
+The `C6` work keeps finding the same shape in two directions, and both are worth
+naming because they are easy to reintroduce.
+
+**Membership: a shape exists on more types than the first spelling suggests.**
+`div_euclid`/`rem_euclid` were modelled on the *signed* types only, on the
+reasoning that "the unsigned spelling is the plain `/` and `%`" -- which is true
+and is *why* they should be modelled, not why they should be refused. On an
+unsigned receiver the remainder is never negative, so the Euclidean and
+truncating forms coincide: the Euclidean quotient is the plain `udiv` and the
+remainder the plain `urem`. The sign is the *whole* difference, so the model
+picks the plain unsigned divider for an unsigned receiver and the adjusted signed
+one otherwise. The trap is reading "this method is only interesting on the signed
+types" as "this method does not exist on the unsigned ones" -- the two are
+different claims, and `is_modelled` is where the difference lives.
+
+**Value: a family that expresses overflow as a value can share a name with one
+that panics.** The four `pow` families (`wrapping_pow`, `saturating_pow`,
+`checked_pow`, `overflowing_pow`) express overflow as a value, so they are
+`Intrinsic::Pow(family)`. The plain `iN::pow` **panics** on overflow and has no
+family-prefixed spelling to fall back on, so it is its own shape,
+`Intrinsic::PowPanic`, producing a reachable-panic obligation rather than a
+value. A model that wrapped or clamped it would *hide the panic* -- the one thing
+this frontend must never do. The fixtures pin the polarity by *kind* (the failure
+must be a `panic` whose message names `pow`, not a postcondition and not some
+later divide), so a value-only assertion cannot pass on the wrong model.
+
+Both were pinned the same way the rest of `C6` is: a differential unit test over
+the whole `u8`/`i8` domain against Rust's own method, and a corpus true/tripwire
+pair whose tripwire is exactly the value a plausible wrong model computes (the
+signed adjustment `% + 3`, the wrapped product). The corpus-wide
+`no_cannot_prove_entry_is_ever_verified` sweep holds the tripwires too.
+
+## The `?` operator: two calls, two enum stores, and one boundary left refused
+
+`expr?` is modelled, and the desugaring has three steps the model has to agree on
+(the dump, `--crate-type=lib`):
+
+```text
+_2 = <Result<u8, u8> as Try>::branch(copy _1) -> [return: bb1, unwind continue];
+_3 = discriminant(_2);
+switchInt(move _3) -> [0: bb3, 1: bb4, otherwise: bb2];      // Continue=0, Break=1
+_0 = <Result<u8, u8> as FromResidual<Result<!, u8>>>::from_residual(copy _4) -> …;
+```
+
+Two modelled calls (`Intrinsic::TryBranch` / `Intrinsic::FromResidual`), both
+answered from the executor's enum stores the way the `Option` methods are:
+
+* **`branch`** writes the `ControlFlow`'s tag (`Continue` iff the receiver is on
+  its *success* variant: `Ok` = 0, `Some` = 1) and both payloads -- the success
+  value under `Continue`, the error value under `Break`. The `(_2 as
+  Continue).0` / `(_2 as Break).0` downcasts then resolve through
+  `variant_index`'s new `Continue`/`Break` numbering. A locally constructed
+  `Ok`/`Err`/`None` receiver has a *known* tag, so the branch is decided
+  statically by `smt::evaluate`.
+* **`from_residual`** re-wraps the residual for the *return* enum. The residual's
+  own tag is not stored: it is fixed by the receiver type (`Err` for a `Result`,
+  `None` for an `Option`), so storing it would be a constant the caller could
+  never see differ. The return enum is read from the call's *self type*
+  (`<Result<u8, u16> as FromResidual<…>>`), which is also where the error's
+  conversion comes from: `Result<u8, u8>` into a function returning
+  `Result<u8, u16>` widens the residual through `From`, so the value is
+  *converted*, not copied. A model that copied it refutes the true `ret.Err == 200`
+  -- pinned by `result_try_widens_the_error` and its `_cannot_prove_this` twin.
+
+Two things are worth keeping:
+
+* **The residual tag is not the `ControlFlow` tag.** `Break` is `ControlFlow`'s
+  discriminant `1`; the error's *variant* number in the receiver (`Err` = 1,
+  `None` = 1) happens to coincide for `Result`/`Option` but is a different fact,
+  and `from_residual` needs the *return* enum's numbering, not the receiver's. A
+  cross-error-type `?` (`Result<u8, u8>` -> `Result<u8, u16>`) is the case that
+  separates them.
+* **A nested `?` is refused, not guessed.** `Result<Result<u8, u8>, u8>` has a
+  `ControlFlow` whose *payload* is itself an enum, and the chain's element is an
+  aggregate rather than a word -- so `branch` reports "a receiver whose payload is
+  not modelled" and the function is `incomplete`. That is the honest boundary: the
+  inner payload has no single bit-vector value, and inventing one would be a wrong
+  value rather than a missing one.
+
+Nineteen fixtures in `realistic.rs` cover both families, both paths, the three
+known-tag receivers, a chained pair (`r?; s?`), a two-branch pair, and the
+cross-error-type pair; each has its `_cannot_prove_this` twin, so the corpus-wide
+`no_cannot_prove_entry_is_ever_verified` invariant holds them too. The model was
+checked for teeth by neutering the `TryBranch` classification: the test then fails
+on the first `verified` assertion.
+
+## A modelled call whose result is an enum, not a value
+
+Every modelled `core` method so far produced a *value* -- a word, a `bool`, an
+`Option`'s discriminant/payload pair, or the `(value, flag)` tuple of the
+`overflowing_*` family -- so the executor could always be handed one term to write
+to the destination local. `Ord::cmp` is the first whose result is a **three-variant
+enum with no payload**, `core::cmp::Ordering`, and the difference is where the
+answer has to be written: the *discriminant* store, not the value store.
+
+Three things make it a distinct shape rather than a `min`/`max` variant:
+
+- **The discriminants are signed.** `Less` is `-1`, `Equal` `0`, `Greater` `1`, read
+  at the enum's own `i8` discriminant width. A `switchInt` on `discriminant(_)`
+  compares against rustc's arm constants, and `Less` prints as the eight-bit pattern
+  `255`. So the tag is built from the *pattern* (`(-1i64 as u64) & 0xff`), because
+  `smt::word` refuses a value outside the width -- the same "a literal is a claim
+  about a width" rule that governs the contract reader, here on the executor side.
+- **The tag's width is the enum's, not the destination's.** The dump declares an
+  `Ordering` local as `isize` (`dest_w == 64`), but the discriminant is an `i8`, and
+  a tag built at 64 bits would not equal the 8-bit arm constants. The width comes
+  from the enum's discriminants, exactly as for a seeded or constructed enum tag.
+- **The value is the sign of `x - y`, built from the comparisons the `PartialOrd`
+  operators already build.** `ite(slt(x, y), Less, ite(sgt(x, y), Greater, Equal))`
+  -- no subtraction, so nothing can wrap, and a method call cannot disagree with
+  `x < y`. Both operands are `&Self`, so the executor follows *both* references to
+  their referents (the receiver through the existing `pointee` step, the second
+  through the same one).
+
+The guard is `is_ord_callee`, the same narrow rule `min`/`max`/`clamp` use: the
+standard library's `Ord` path and a primitive self type. A foreign trait of the
+same name (`m::Ord`, `MyOrd`, `ord_shim::Ord`) is refused by `classify`, and a
+crate-root trait that prints bare is answered by the same-dump lookup first -- so
+the model is a *fallback*, never an override of a real body. The operand's sign is a
+*refusal* when it cannot be read: ordering `i8::MIN` unsigned places it above every
+other value, a wrong ordering rather than a weaker proof.
+
+What is *not* modelled, and the reason is worth stating: a *locally constructed*
+`Ordering` (`_0 = Greater` in a `cmp` body) resolves through `variant_index`, which
+knows `Option`/`Result`/`ControlFlow` but not `Ordering`. So a local trait's `cmp`
+body is `incomplete` even though a `core` `Ord::cmp` call decides. That is a
+`variant_index` gap -- the same "a standard enum has a fixed numbering no source
+declares" problem `Option`/`Result` already solved -- and belongs with the
+enum-construction work, not with the `cmp` model. Adding `Ordering` to
+`variant_index` without also teaching the *contract* reader its variants would
+introduce a name the two sides disagree about, which is the false-proof direction,
+so the two must land together.
+
+## A test oracle must not call a method newer than the MSRV floor
+
+The C6 work modelled methods that are *unstable* on the 1.85 floor: `is_multiple_of`
+(`unsigned_is_multiple_of`), `cast_signed`/`cast_unsigned` (`integer_sign_cast`) and the
+signed `midpoint` (`num_midpoint_signed`). The *model* never calls them -- it is a term
+built from primitives -- but the exhaustive differential *oracles* did, and the MSRV gate
+(step 13, `cargo +1.85 check --all-targets`) compiles the test code too. So four
+`E0658: use of unstable library feature` errors landed in `src/mir/intrinsics.rs`'s
+`#[cfg(test)]` module, the `gates` job went red, and the failure was **invisible to a local
+`scripts/gate.sh` run** on a container whose toolchain is stable 1.99+ (the features are
+stable there).
+
+The fix is to write each oracle as the *definition* the method documents, which is stable at
+every toolchain:
+
+- `a.is_multiple_of(b)` → `if b == 0 { a == 0 } else { a % b == 0 }` (`core`'s own
+  definition of the `b == 0` corner);
+- `s.cast_unsigned() as u8` → `s as u8`, and `u.cast_signed() as u8` → `u as i8 as u8`
+  (a same-width reinterpretation *is* the `as` cast);
+- `(x as u8).midpoint(y as u8)` → `((x as u16 + y as u16) / 2) as u8`, and the signed form
+  → `((x as i32 + y as i32) / 2) as i8` (the truncating average computed in a wider type).
+
+The two lessons. First, **the oracle is test code the gate compiles**, so an oracle written
+against a newer toolchain's convenience method is a gate failure that no local run on a
+newer stable reproduces -- the MSRV job is the only thing that sees it, and only when CI runs
+it. Second, a replacement oracle must be *checked* against the method it replaces before it
+is trusted: the four substitutes were each walked over the whole `u8`/`i8` domain against the
+real method on stable 1.100, so the oracle did not silently change what it asserts. The
+`is_multiple_of` case is the one worth stating: the naive `a % b == 0` alone would *panic* at
+`b == 0`, so the `b == 0` guard is the definition, not a defensive extra.
+
+This is the same class the "gate that skips can hide a test that fails" note describes, in
+the other direction: a gate that *runs* on a newer toolchain than it claims to support hides
+a build break that the floor sees.
+
+## An MSRV-only lowering difference: the promoted `panic!` constant's name
+
+The `RUSTC_BOOTSTRAP` fix above let the corpus compile on 1.85, but one MSRV failure
+remained, and it was not a compile error -- it was a *verdict*: the tripwire
+`user_range_into_iter_is_not_the_model_cannot_prove_this` came back `incomplete` with
+`call to unmodelled function Arguments::<'_>::new_const::<1>`. The same entry refutes
+(`FAILED`) on current stable. Two independent differences between the toolchains caused it,
+and each is a general trap.
+
+**1. A `panic!("literal")` lowers through a *promoted* constant on 1.85.** Current stable
+prints `_3 = Arguments::<'_>::from_str(const "…")` -- one literal. 1.85 prints
+`_4 = const NAME::promoted[0]; _3 = Arguments::<'_>::new_const::<1>(copy _4)`, where the
+format pieces live in a `const NAME::promoted[0]: &[&str; 1] = { … }` item printed *outside*
+any function. The frontend already collected those items (that is what `promoted_strs` is
+for), so this half was a *lookup* problem, not a modelling one.
+
+**2. A promoted constant's *definition* and its *use* are spelled differently on 1.85.**
+Inside a trait default body, the definition is
+`const a::Custom::into_iter::promoted[0]: …`, but the use is
+`_4 = const <Self as range_shim::a::Custom>::into_iter::promoted[0]`. An exact-name lookup
+misses, so the pieces are never found and the `new_const` call is unmodelled. Two bugs hid in
+the use spelling, and both had to be fixed:
+
+* **`split_once(": ")` cut the *definition* name short** when the name carries an
+  `<impl at FILE:L:C: L:C>` marker -- the marker's own `: ` is the first one. The split is now
+  on the *last* `: ` before the type.
+* **`t.find(" as ")` misread the *use* as a cast.** The `<Self as Trait>` projection contains
+  ` as `, and the cast arm (which must run before the `const ` arm, for the
+  `const 3_i32 as u32 (IntToInt)` case) matched the projection's ` as ` and read the whole
+  operand as a cast of the string `const <Self`. The search is now `find_top_level_as`, which
+  skips `<…>`/`(…)` nesting, so a projection's ` as ` is invisible and a real cast is still
+  found.
+
+The reconciliation is `lookup_promoted`: after the exact match, a use whose tail is
+`promoted[N]` is matched to a definition with the same tail and an *owner* that is a
+`::`-aligned suffix of the use's owner (the `<T as Trait>` projection on the use side, the
+qualifier on the definition side). Comparing owners rather than the last segment is what keeps
+two sibling traits of the same method (`a::Custom` and `b::Custom`, each with its own
+`into_iter`) from answering for one another -- the corpus carries exactly that pair, and a
+last-segment match would let one trait's message resolve for the other.
+
+The lesson generalises past this printer change: **a toolchain that lowers the same source to
+a different *shape* is not a compile break, it is a coverage break.** The MSRV gate is the only
+place that sees it, and it sees it as a *verdict* difference, not an error -- which is why gate
+14 runs the frontend's own suite against the floor rather than merely compiling it. The
+`#![feature(…)]` header plus `RUSTC_BOOTSTRAP` is what makes the corpus *compile* on 1.85; the
+promoted-const reconciliation is what makes its *verdicts* agree across the floor.
+
+## The loop cut must havoc what the loop writes *through*, not what it names
+
+A `for` loop with an `invariant:` verified a false postcondition. The invariant was
+`i <= n`-shaped, the body advanced the iterator, and the loop's exit edge was
+*pruned as unsatisfiable* before the postcondition was ever checked. The tell is
+that the loop obligations themselves were fine -- `LoopInvariantInit` and
+`LoopInvariantPreserve` both came back `Valid` -- so the verdict looked healthy
+while the function's own postcondition was never reached.
+
+Two things were wrong, and both are the same mistake: **the havoc set named the
+locals the loop *syntactically* writes, but the header state depends on the locals
+it *effectively* writes.**
+
+- **A write through a reference.** `let p = &mut x; *p += 1` lowers to
+  `(*_2) = ...`, whose syntactic destination is the reference local `_2`, not `x`.
+  `loop_writes` collected `_2`; the havoc replaced `_2`, and `x` kept the value it
+  had at entry. `resolve` does not help here -- it rewrites an *explicit* `*_2`
+  projection, and the havoc was called with a bare local. `pointee` is the one-level
+  value step that follows `_2` to `_1`, and the havoc now uses it.
+- **A widthless local.** The iterator is a `RangeInclusive<u32>`, a struct, so
+  `Ty::width()` is `None` and its value lives in the *parts* stores, not in
+  `locals`. The havoc's `if let Some(w) = ty.width()` therefore skipped it
+  entirely, and the range's `start`/`end`/`exhausted` fields kept their entry
+  values. The fix replaces each part with a fresh value (`Env::havoc_parts`): a
+  word part gets a fresh variable of its own width and sign, so a model that reads
+  it -- `RangeInclusive::next` reads `start`/`end` -- still resolves, while a part
+  the store cannot re-randomise is dropped to `Unknown`.
+
+Both are *over*-approximations, which is the safe direction: havocing a local the
+loop never writes loses information, never soundness. The consequence is visible
+in the probes -- a loop that writes through a reference now refutes a `true`
+contract that names the entry-time value, because the header is an arbitrary
+state, which is exactly the reading the invariant rule asks for.
+
+The general shape, and the one to carry forward: **an invariant is a claim about
+*every* state the header can be reached in, so the havoc set must be closed under
+the loop's *effects*, not its syntax.** A reference is an effect on its referent; an
+aggregate is an effect on its parts. The rule is the mirror of the `writes` frame
+rule for calls -- derive the real frame from what the code *does*, and the
+syntactic destination is only the first approximation of it.
+
+The `tri_invariant` fixture had been passing *because of* the bug: its invariant
+was `s <= 5050` over a body doing `s += i`, which is **not inductive** (from
+`s == 5050` and `i == 100` the sum is `5150`). It verified only because the exit
+edge was pruned. The fixture now uses an inductive invariant (`s = i.min(5050)`)
+and a `tri_invariant_cannot_prove_this` tripwire is asserted to be refuted -- the
+standing rule that a new shape is not "supported" until a tripwire fails.
+
+### The havoc must size a local the way it was seeded, not by its declared type
+
+The same havoc had a third miss, one level down: it read `ty.width()` on the local's
+*declared* type. For a scalar local that is the seeded width, but for a **reference**
+it is not -- `Ty::Ref(inner)` has `width() == None`, and the frontend models a
+reference *as its referent*, so a `&mut u8` argument's value is seeded at the
+referent's width (8) and lives in `locals`. Reading `width()` on the `Ty::Ref`
+returned `None`, sent the local to the aggregate branch, and left the referent at
+the value it held at entry. The exit guard then folded, the exit edge was pruned,
+and a false postcondition was `Verified`:
+
+```rust
+/// requires: x == 0
+/// invariant: x == i && i <= 3
+/// ensures: ret == 0          // false: the loop increments `*x` three times
+pub fn w_false(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 { *x += 1; i += 1; }
+    *x                       // returns 3
+}
+```
+
+The fix sizes the havoc by `ty.referent()` -- the same one-level collapse
+`Ty::referent` already performs for seeding -- so a written-through reference
+argument is havoced like the scalar it holds. A `&mut u8` is the commonest shape,
+and a `&mut u8` argument written in a loop is exactly the shape an induction over
+a reference-carrying function needs.
+
+The general rule this completes: **havoc a local at the width and sign it was
+*seeded* at, which for a reference is its referent's.** `width()` answers "is this
+a bit-vector type", not "how wide is the value this local holds", and the two differ
+for a reference. It is the same distinction the seeding loop already makes
+(`decl.referent()`), so the two now agree by construction rather than by the
+havoc happening to be called on scalars only.
+
+### The havoc must follow a call's write-through, not only its destination
+
+The same set had a fourth miss, and this one is the frame rule the crate already
+states for calls: **a call writes through its reference arguments.** `loop_writes`
+collected a `Term::Call`'s *destination* local -- the fix for a counter advanced by
+`i = i.wrapping_add(1)` -- but a call like `bump(x)` writes `x` (the caller local),
+and its *destination* is `bump`'s return local, a different local entirely. So the
+write-through was invisible:
+
+```rust
+/// requires: x == 0
+/// invariant: x == i && i <= 3
+/// ensures: ret == 0          // false: `bump` runs three times
+pub fn call_in_loop_false(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 { bump_once(x); i += 1; }   // bump_once(c: &mut u8) { *c += 1; *c }
+    *x                          // returns 3
+}
+```
+
+`x` kept its entry value, the exit guard folded, and the false postcondition was
+`Verified`. The fix folds the callee's own write set back onto the arguments the
+call passed: `loop_writes` now takes `prog`, resolves each callee through
+`resolve_callee` (the inliner's rule, so a `core` intrinsic and an ambiguous tail
+both contribute nothing), and for every local the callee writes that is one of its
+`arg_locals`, marks the caller local the corresponding argument names. Recursion is
+bounded by the same `visited` set that bounds the block walk.
+
+This is the loop-havoc twin of the call-frame rule (`writes` in `wp.rs`): a call's
+frame is derived from what the callee *does*, mapped through the actuals, not from
+the call's syntax. The syntactic destination of a call is only the first
+approximation of its effect, exactly as the syntactic destination of `*p = v` is.
+Both misses came from reading the syntax; the fix is to read the effect, which is
+the direction the frame rule already documents.
+
+### A promoted constant's projected use must name its own method
+
+A promoted constant's *definition* is keyed by its full path
+(`Custom::aaa::promoted[0]`), but a trait default's *use* is spelled with the
+`<Self as Trait>` projection (`<Self as Custom>::zzz::promoted[0]`), which the exact
+lookup misses. The fallback reconciled the two by owner and promotion index -- and
+discarded the method segment. Two defaults on one trait each own a `promoted[0]`, so
+`lookup_promoted` returned whichever the map iterated first, and the report named a
+panic message the caller never reached (`"from aaa"` for a call into `zzz`).
+
+The method segment is the missing key: the use's qualifier ends in the method
+(`zzz`), the definition's owner is its qualifier minus that segment, and both must
+match. A definition that still has no unique method match (two impls of the same
+method on one trait) is *refused* rather than answered with one of them, because
+either could be the one the use names. This is the same "refuse an ambiguous match,
+do not pick one" rule the callee resolver follows, applied to the promoted table.
+The shape only appears on the MSRV (1.85), which promotes a `panic!` message to a
+constant and prints the use with the projection; current stable inlines it, so the
+bug was invisible on the toolchain the crate is developed against -- the same
+"toolchain-shaped" class the CTFE brace-block finding named.
+
+### Interprocedural write-set discovery needs its own cycle guard
+
+Following a resolved callee to find what it writes *through a reference* is a walk
+over the call graph, and the block-visit set that bounds the walk within one
+function cannot bound a cycle *between* invocations. A loop calling a
+self-recursive function (`while i < 3 { s = count_down(n); i += 1 }`) therefore
+followed `count_down`'s self-call forever and overflowed the stack -- a crash, not
+a refusal, and one that reaches a function with *no* reference argument, because
+the recursion happens before the argument filter.
+
+The walk now carries the set of functions on the call stack (`visiting`) alongside
+the per-function block set. On a cycle it does not skip the callee -- that would
+drop reference writes propagated around the cycle, which is the unsound direction
+-- but includes the call's *reference arguments* directly: a callee can only affect
+caller storage through a reference, so those are exactly the caller locals a cycle
+could reach. A recursive callee with no reference contributes nothing and the walk
+terminates; one with a reference has it havoced. This is the same shape as the
+inliner's `by_value_indexed`/`by_ref` split: a reference shares storage across the
+boundary, a by-value argument does not.
+
+The general rule, alongside the earlier "a bound on one resource is not a bound on
+the others": a guard that stops a *syntactic* cycle (a block revisiting itself) is
+not a guard against a *semantic* one (a function calling itself). Each recursion
+over a structure the program can make cyclic needs the cycle set threaded through
+it, and the fix is to decide what the cycle contributes rather than to cut it.
+
+
+
+## A `Vec`'s length is a model of its own, and it must not be invented
+
+The review's C11 exit criterion was one line: "`make` verified". `make` is
+`Vec::new(); v.push(n); v.len()`, and every call was "unmodelled function
+`Vec::<u8>::new`", so the whole file lost three functions to the container. The
+length half is now modelled (`Env::vec_len`, a per-local length the executor
+tracks; `Vec::{new, push, len}`).
+
+Four things are worth keeping, because each is a way the model could have been
+wrong rather than incomplete:
+
+- **A `Vec`'s fields are not in the dump.** rustc prints the local as
+  `std::vec::Vec<u8>` and never its pointer/length/capacity, so the model holds
+  the *length* and nothing else. That is enough for `make`, and it is stated
+  rather than implied: an element read stays unmodelled.
+- **`push` is `+ 1` at `usize`, which is exact.** A `Vec` cannot hold `2^64`
+  elements, so `len + 1` never wraps; saturating would be a weaker claim for no
+  reason.
+- **The receiver is a reference, so the length lives on the referent.** `push`/`len`
+  take `&mut self`/`&self`; `pointee` follows one reference to the storage the
+  caller owns -- the same local `new` wrote. A receiver whose length the run never
+  set (a `Vec` *argument*, or one built by an unmodelled call) is a **refusal**,
+  never an invented number: `v.len()` on an argument is `incomplete`, not a proof
+  of some arbitrary length.
+- **The length crosses a call boundary.** The `&mut Vec<u8>` carry-in lets a
+  helper read the caller's length, and the write-back lets `push(&mut v)` reach the
+  caller. Without both, `push_helper` refutes a true contract; the false twin pins
+  that the write is *seen* rather than the model returning a constant.
+
+`drop` of a `Vec<T>` is a no-op exactly when `T` is glue-free (`Vec<u8>` yes,
+`Vec<String>` no), which is the same rule the aggregate cases already follow. The
+teeth are a mutation: making `push` a no-op (keeping the length) turns
+`make_ok`/`two_ok` red and leaves the false twins refuted, so the test observes the
+length the `push` produces, not merely that the function decides.
+
+Two collision guards matter. A user type spelled `Vec` in a local module
+(`m::Vec`) is not the standard one: `classify` refuses a path that is neither
+`vec::Vec` nor a bare `Vec::` head, and the same-dump lookup answers a local body
+first regardless. And `Vec::<u8>::len` is **not** read as a slice length -- the
+slice path is matched on `core::slice::<impl [T]>`, so the two lengths (a slice's
+symbolic input, a `Vec`'s tracked model) cannot be confused.
+
+## A primitive name a user type can shadow: bind the primitive only when nothing declares it
+
+Adding `str::len`/`is_empty` bound a `&str` argument's symbolic length in the
+contract binder. That is right for the *primitive* `str`, and wrong for a user
+type that shadows the name: Rust lets a crate write `pub struct str { .. }`, and
+rustc prints a crate-root type by its **bare** name, so `&str` in the dump means
+either one. The binder's early `if name == "str"` therefore bound a field-less
+type over the user's struct, and a contract naming `s.value` came back `skipped:
+unknown field`. An AI review caught it as a regression in the commit that added
+the feature.
+
+The fix is precedence, not a special case: the primitive is meant only when no
+declared layout names `str`, so the guard is
+`name == "str" && struct_lookup(structs, name).is_none()`. A user `str` then falls
+through to the struct branch and its fields bind.
+
+This is the same rule the enum path already follows -- a *declared* layout wins
+over the reader's built-in knowledge of a standard type (`Shadow { Some, None }`
+is not `Option`). The general shape: when the reader recognises a name by
+spelling (a primitive, a standard container, a prelude enum), and a user can
+write that same spelling, the *declaration* is consulted first. A spelling-based
+test alone is a false match, and here the false match was a silent drop of a
+field binding.
+
+Pinned by `a_user_type_named_str_is_not_the_primitive_str`, which asserts **both**
+directions (the user field resolves and refutes a fixed value; the primitive
+length is still a symbolic input), so a fix that simply refused every `str`
+argument fails it. Teeth checked by reverting the guard.
+
+The `String` half is deliberate and stays a refusal: a `String`'s own type is
+`alloc::string::String`, so a `s.len()` on one goes through a deref to a `&str`
+local the binder never saw. That is an honest gap, not the shadowing bug.
+
+## A stale review is not evidence the code is fixed -- reproduce every finding
+
+A review round listed six code findings. Five named bugs the previous `Vec` round
+had already fixed (`vec_elem_ty` full-path identity, `havoc_parts` clearing
+`vec_len`, `collect_writes` cycle awareness, `copy_parts` moving `vec_len`,
+`lookup_promoted`'s method key). Only one was live, and it was a regression the
+commit under review had just introduced.
+
+The lesson is the order of work: reproduce *each* finding against the reviewer's
+own example at HEAD before acting, and record the command's output. Acting on the
+five already-fixed ones would have re-done finished work; dismissing the batch as
+"stale" would have shipped the live regression. The two mistakes look identical
+from the outside and only the reproduction tells them apart. The reply to the
+review says which five were already fixed and *how* it was checked, rather than
+just "addressed".
+
+A related trap on the other side: a finding that names a *test* can be stale too.
+`walk`'s contract, `bump_n`'s contract, the left-shift pair and the unnamed-witness
+assertion were all already corrected -- re-reading each one is what distinguished
+"already fixed" from "still open", and two of them were fixed by an *earlier*
+round that the review had not seen.
+
+A *later* round made the same point at larger scale: twelve findings (six severe,
+six non-severe), every one naming a symbol that no longer exists at HEAD --
+`slice_elem_cond`, the flat element-identity representation the `ElemId` commit
+(617a958) had already replaced. The tell was mechanical: `grep slice_elem_cond`
+returned nothing, so the findings were written against a revision before that
+commit. Each was still reproduced against the reviewer's own shape at HEAD
+(`a.first().or(b.first()).or(c.first())`, a user `m::Vec`, a `Vec` moved by
+`let w = v`, `unwrap_or_default` on `Result<_, Boom>`, a mutually recursive pair
+called from a loop), and all twelve came back already fixed -- the positives
+`verified`, the false twins `Failed` with a witness. Naming a symbol that does not
+exist is the cheapest staleness signal there is; grep for it first.
+
+The one *live* blocker in that round was not in the findings at all: clippy 1.100
+promotes `too_many_arguments` to an error under `-D warnings`, so gate 1 was red
+on the rollover toolchain over `fold_const_arith` (eight scalars). It reproduces on
+the unmodified tree (`git stash` and re-run), which is what makes it a rollover and
+not a regression. A review of *findings* is not a review of the *gate*; run the gate
+on the toolchain the reviewer names, or the build stays red behind twelve green
+"already fixed" replies.

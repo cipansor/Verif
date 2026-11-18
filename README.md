@@ -86,6 +86,8 @@ all obligations discharged
 - [A truncated witness has to say so](#a-truncated-witness-has-to-say-so)
 - [A negative answer has to say what it swept](#a-negative-answer-has-to-say-what-it-swept)
 - [An unreachable precondition is not a proof](#an-unreachable-precondition-is-not-a-proof)
+- [A diverging call is a checked panic, not a dropped line](#a-diverging-call-is-a-checked-panic-not-a-dropped-line)
+- [A `drop` is a terminator with a real successor](#a-drop-is-a-terminator-with-a-real-successor)
 - [A bound must be wider than the address, or "all cells" is vacuous](#a-bound-must-be-wider-than-the-address-or-all-cells-is-vacuous)
 - [The memory family, positive side](#the-memory-family-positive-side)
 - [The differential harness now covers memory](#the-differential-harness-now-covers-memory)
@@ -106,26 +108,33 @@ all obligations discharged
 - [Documentation](#documentation)
 - [License](#license)
 
+**The open work** lives in [`ROADMAP.md`](ROADMAP.md) — one item per gap, each with
+a priority, a measurable exit criterion, the competitor whose gap it closes, the
+closing move (build / bridge / won't do), and a status. A PR that closes an item
+updates its status there.
+
 ---
 
 ## Installation
 
-```console
-$ cargo add verif
-```
-
-Or, in `Cargo.toml`:
+> **Not on crates.io yet.** The two crates are packaged and release-ready
+> (`scripts/publish.py`, a tag-driven release workflow), but the registry upload is
+> a human step that has not run, so a `cargo add` of the crate would fail. Depend on
+> the git repository until it is published:
 
 ```toml
 [dependencies]
-verif = "0.1"
+verif = { git = "https://github.com/cipansor/verif", tag = "verif-v0.1.0" }
 
 # The host-side tools (the MIR frontend, the file-backed helpers) need `std`.
 # The engine itself does not: the default build is `no_std` and links `core`
 # and nothing else, which is what a bare-metal safety build wants.
 [dev-dependencies]
-verif = { version = "0.1", features = ["std"] }
+verif = { git = "https://github.com/cipansor/verif", tag = "verif-v0.1.0", features = ["std"] }
 ```
+
+Once the crates are published, the same dependencies read `verif = "0.1"` and
+`verif = { version = "0.1", features = ["std"] }`.
 
 The crate has **no dependencies**, so there is nothing else to add and nothing
 from crates.io in your artifact's supply chain. The proved integer primitives
@@ -1357,24 +1366,27 @@ rate_limit       verified (5 obligation(s), 2 panic(s) ruled out)
 sat_add          verified (4 obligation(s), 2 panic(s) ruled out)
 sat_sub          verified (1 obligation(s), 1 panic(s) ruled out)
 shift_const      verified (1 obligation(s), 1 panic(s) ruled out)
-shift_left       FAILED: panic: attempt to shift left by `{}`, which would overflow — v2:u16 = 16
+shift_left       FAILED: panic: attempt to shift left by `{}`, which would overflow — n = 16
 sat_shift        verified (1 obligation(s), 1 panic(s) ruled out)
 sat_mul          verified (3 obligation(s), 3 panic(s) ruled out)
-unchecked_add    FAILED: panic: attempt to compute `{} + {}`, which would overflow — v1:u16 = 32768, v2:u16 = 32768
-unchecked_sub    FAILED: panic: attempt to compute `{} - {}`, which would overflow — v1:u16 = 0, v2:u16 = 32768
-unchecked_div    FAILED: panic: attempt to divide `{}` by zero — v2:u32 = 0
-unchecked_mul    FAILED: panic: attempt to compute `{} * {}`, which would overflow — v1:u8 = 128, v2:u8 = 128
-off_by_one_guard FAILED: postcondition — v1:u16 = 32768, v2:u16 = 32768
+unchecked_add    FAILED: panic: attempt to compute `{} + {}`, which would overflow — a = 32768, b = 32768
+unchecked_sub    FAILED: panic: attempt to compute `{} - {}`, which would overflow — a = 0, b = 32768
+unchecked_div    FAILED: panic: attempt to divide `{}` by zero — d = 0
+unchecked_mul    FAILED: panic: attempt to compute `{} * {}`, which would overflow — a = 128, b = 128
+off_by_one_guard FAILED: postcondition — a = 32768, b = 32768
 clamp_signed     verified (3 obligation(s), 0 panic(s) ruled out)
 checked_div_signed verified (3 obligation(s), 2 panic(s) ruled out)
-unchecked_div_signed FAILED: panic: attempt to divide `{}` by zero — v2:u16 = 0
-signed_add_misguarded FAILED: panic: attempt to compute `{} + {}`, which would overflow — v1:u8 = 128, v2:u8 = 128
+unchecked_div_signed FAILED: panic: attempt to divide `{}` by zero — b = 0
+signed_add_misguarded FAILED: panic: attempt to compute `{} + {}`, which would overflow — a = 128, b = 128
 signed_add_guarded verified (2 obligation(s), 1 panic(s) ruled out)
 signed_mul_guarded verified (2 obligation(s), 1 panic(s) ruled out)
-signed_mul_negative FAILED: panic: attempt to compute `{} * {}`, which would overflow — v1:u8 = 128, v2:u8 = 128
+signed_mul_negative FAILED: panic: attempt to compute `{} * {}`, which would overflow — a = 128, b = 128
 checked_neg      verified (2 obligation(s), 1 panic(s) ruled out)
+assert_guarded   verified (1 obligation(s), 0 panic(s) ruled out)
+assert_misguarded FAILED: panic: assertion failed: n <= 100 — n = 128
+panic_guarded    verified (1 obligation(s), 0 panic(s) ruled out)
 
-verified=12 failed=9 incomplete=0
+verified=14 failed=10 incomplete=0
 All expectations met.
 ```
 
@@ -1383,6 +1395,12 @@ Rust with no annotations of any kind. The counterexample `32768 + 32768` is read
 off the MIR, and `tests/mir.rs` feeds exactly that pair back into the compiled
 function and requires the panic. That is the property worth having: the witness is
 checked against `rustc`'s own code generator, not against another model.
+
+The witness is rendered with the **source names** `rustc` recorded in its `debug`
+bindings — `a = 32768`, `n = 16`, `d = 0` — rather than internal local indices. A
+variable with no source name (a temporary, a promoted constant) keeps its
+`v{index}:u{width}` spelling, so naming is a readability improvement and never a
+loss.
 
 ### Contracts are doc comments, and that is forced
 
@@ -1760,6 +1778,97 @@ casting *to* one, both report the function as skipped. This is a refusal, not a
 crash — a width the engine cannot hold is decided before any width-taking
 constructor runs.
 
+### A diverging call is a checked panic, not a dropped line
+
+`assert!`, `debug_assert!`, `panic!`, `unreachable!`, `todo!`, `unwrap`, and the
+bounds and slice checks `rustc` inserts all lower the same way: a call into
+`core::panicking` (or a user function returning `!`) with **no `[return: bbN]`
+arm**, because the call never returns.
+
+```rust,ignore
+/// requires: x <= 200
+/// ensures: ret == 1
+pub fn f(x: u8) -> u8 { assert!(x <= 200); 1 }
+```
+
+The parser recognised only the `[return:` shape, so this terminator came back
+`Unknown("missing")`, the path was reported unmodelled, and the whole function was
+`Incomplete`. The most ordinary safety guard in Rust was never checked at all —
+`f` above was not proved, it was *skipped*, and a caller reading "incomplete" for
+an `assert` would be right to distrust the tool.
+
+The two call shapes are now read separately, and the diverging one becomes a
+**panic obligation** rather than a silent drop:
+
+* the obligation is `path`, "is this call reachable", discharged by `Unsat` — the
+  same polarity as the `assert` terminator, and for the same reason. The `switchInt`
+  that routes into the call already carries `!guard` in its path, so the query is
+  really about the guard;
+* the fall-through of a *non*-diverging `assert` terminator still assumes the
+  guard, so code after an `assert!` may rely on it;
+* the report names the failure from the string literal the dump passes, so an
+  unproved `assert!(x <= 200)` reads `panic: assertion failed: x <= 200` with the
+  counterexample that fires it, instead of a mangled callee path. Edition 2024 does
+  not pass a literal for a *formatted* message — `panic!("bad {}", x)` builds an
+  `Arguments` through `core::fmt` — so those pieces are recovered from that chain,
+  with the placeholder count taken from the call's own argument count
+  (`Arguments::new_v1::<P, A>`) rather than guessed from the pieces.
+
+This is the sound direction, and it is the same shape as the `DivergentCall`
+finding in `wp` — a construct that cuts a path off must be *recorded*, because
+everything downstream of it is vacuously true. The teeth are a matched pair:
+`an_assert_is_checked_and_discharged_under_its_precondition` pins the proof, and
+`an_unproved_assert_is_refuted_with_a_counterexample` pins the refutation. A user
+function returning `!` is treated the same way, so `if x == 0 { die(); }` is a
+failure at `x == 0` and is proved unreachable under `requires: x != 0`.
+
+`a_formatted_panic_message_is_recovered_from_the_fmt_chain` pins the message
+recovery on whichever toolchain `VERIF_RUSTC` names — the `new_v1`/promoted-array
+spelling on the MSRV and the `new::<LEN, A>` byte-template spelling on stable — and
+`a_literal_panic_macro_names_its_message` pins that `unreachable!()` and `todo!()`,
+which pass a literal, still name the text the programmer wrote. A name is never
+reported as its type arguments: `panic!("{}", x)` has no literal piece at all, so it
+falls back to the callee's name read through its generics (`panic_display`, not
+`<u8>`).
+
+### A `drop` is a terminator with a real successor
+
+`drop(_x)` is the terminator `rustc` emits for a local whose type has drop glue, and
+it prints with the same `-> [return: bbN, unwind continue]` shape as a call. So the
+call arm claimed it, and because a `drop` line has no ` = ` destination,
+`parse_call_head` returned `None` and the arm's fallback turned the whole line into
+`Unknown` — reported as "unmodelled terminator", dropping the path. Every RAII local
+lowers to a `drop`, so a function holding a `Vec`, a `String`, a lock guard or a user
+`Drop` was `incomplete` for a reason that had nothing to do with its contract. It has
+its own parser arm now, and `successors` knows the terminator has a normal successor,
+so the path continues past it. (The old code had a `drop(` branch too, but it was
+dead: the call arm above it matched first, because the line contains ` -> [return:`.)
+
+Three cases, and the middle one is the soundness boundary:
+
+* a type with **no drop glue** runs nothing, so the terminator is a no-op. rustc
+  emits no `drop` for such a type, so this arm is *defensive* — measured over
+  `realistic.rs`, 0 of 6 `drop` terms are glue-free — and its check lives in a unit
+  test rather than in a corpus fixture that could not exercise it;
+* a **user `impl Drop`** has a body in the dump, so it is executed through the same
+  inliner a method call uses. The destructor's `self` is `&mut T`, so the dropped
+  place is the argument and the `by_ref` copy-back carries the destructor's writes
+  back to the caller. A destructor that panics is therefore a real obligation:
+  `destructor_panic_cannot_prove_this` is refuted with the witness that fires the
+  destructor's own `assert`, and its guarded twin verifies;
+* **anything else** — a `Vec`, a `String`, a `Box`, a `MutexGuard`, or a generic `T`
+  whose glue the dump does not spell — is **refused**, never assumed to be a no-op.
+  This is the one place the review's first suggestion ("a std container is a no-op
+  that changes no scalar state") was unsound: the dump cannot tell a `Vec` from a
+  struct holding a user-`Drop` field, because both print the same `drop(_x)` line, so
+  treating the container as a no-op would prove a function panic-free whose destructor
+  panics. A refusal is a lost proof, never a false one.
+
+The parser side is pinned by `parses_a_drop_terminator`; the executor's three cases by
+the `tests/mir.rs` Drop tests and the `realistic.rs` fixtures; the no-op table by
+`a_glue_free_type_has_a_noop_drop`, which needs no compiler. The `rustc_public` oracle
+agrees on the parser's reading of the terminator's real shape.
+
 ### What is read from where, and why
 
 | Part | Source | Reason |
@@ -1767,6 +1876,26 @@ constructor runs.
 | the body | `rustc --emit=mir` | the real lowering, including the checks `rustc` inserts |
 | the contract | the source text | MIR carries no attributes or doc comments |
 | the compiler | `VERIF_RUSTC`, else `rustc` | `--emit=mir` is stable, so the `rustc` on `PATH` is enough; the variable exists to point the frontend at a *different* compiler without disturbing cargo's own |
+| the edition | `MirOptions::edition`, else `VERIF_EDITION`, else the nearest `Cargo.toml` | the edition changes the lowering, so a verdict is only meaningful under the edition the crate is built with |
+
+The edition is resolved in that order, and it is never *guessed*: the first match
+wins, and a value that is set but not one of `2015`/`2018`/`2021`/`2024` is an
+error rather than a silent fallback. A file that lives in a crate takes the
+edition from the nearest `Cargo.toml`'s `package.edition` (resolving
+`edition.workspace = true` against the workspace root), and a `[package]` that
+omits the key resolves to **2015**, which is Cargo's own default for a package
+that does not state one. Only a *loose* file -- one with no manifest above it --
+has no crate edition to infer, and it must be given one:
+
+```bash
+# A loose file has no Cargo.toml, so name the edition explicitly.
+VERIF_EDITION=2021 VERIF_RUSTC="$(rustup which rustc)" \
+  cargo run --features std --example mir_coverage -- /tmp/probe.rs
+```
+
+A program calls the frontend directly through `MirOptions { edition: Some(..) }`,
+which takes precedence over both; the environment variable is for the examples and
+the tests, which have no options struct to fill in.
 
 The five differential oracles (z3, Kani, Lean, Coq, Verus) all build their terms
 with `smt::` calls, so they start *below* the contract reader. That left the reader
@@ -1864,7 +1993,10 @@ refused. `src/mir/intrinsics.rs` holds the model:
 
 - `wrapping_*` is the plain operator, because the plain operator already takes the
   result modulo `2^w`. The term is the *same term* `a + b` produces, not a second
-  definition that could drift from it.
+  definition that could drift from it. A `wrapping_mul` needs no overflow test, so
+  it is admitted up to `MUL_MAX_WIDTH` (`32`) rather than stopping where the widened
+  product does; a `u32` `wrapping_mul` is a plain 32-bit multiply and settles in
+  milliseconds.
 - `saturating_*` is `ite(fails, bound, plain)`, where `fails` is the very predicate
   rustc's own `assert` reads and `bound` is the sign of the overflow. A function
   written with `saturating_add` and one written with a hand-rolled guard are decided
@@ -1882,11 +2014,49 @@ refused. `src/mir/intrinsics.rs` holds the model:
   `count_zeros` is `count_ones(!x)` and a fix to one half cannot leave the other
   behind. `!x` is spelled the way the executor spells it, so the model's `!x` and
   the body's `!x` are the same term.
-- `is_power_of_two` is the one modelled shape whose *return type* is `bool`, so it
-  is the one that produces a predicate rather than a bit-vector. The executor
-  writes it as a `bool`, which is what the `if` that consumes it branches on; a
-  one-bit word there would leave the local readable only as a word. It is
-  unsigned-only, matching `core`.
+- `is_power_of_two` is a modelled shape whose *return type* is `bool`, so it
+  produces a predicate rather than a bit-vector. The executor writes it as a
+  `bool`, which is what the `if` that consumes it branches on; a one-bit word
+  there would leave the local readable only as a word. It is unsigned-only,
+  matching `core`.
+- `is_negative`/`is_positive` are `bool` predicates too, and the model is
+  `core`'s own definition: `x < 0` and `x > 0` read *signed*. They exist only on
+  the signed types, and the signedness is the whole content — `i8::MIN` (`0x80`)
+  is the *largest* unsigned byte, so an unsigned reading of the top bit would call
+  it positive. Each is checked exhaustively against Rust's own method over `i8`
+  and `i16`, with `i8::MIN` named as the point an unsigned reading gets wrong.
+- The ten `is_ascii_*` class tests (`is_ascii_digit`, `is_ascii_alphabetic`,
+  `is_ascii_alphanumeric`, `is_ascii_uppercase`, `is_ascii_lowercase`,
+  `is_ascii_hexdigit`, `is_ascii_whitespace`, `is_ascii_punctuation`,
+  `is_ascii_control`, `is_ascii`) are `bool` predicates too, and each is `core`'s
+  own range test on the byte (`is_ascii_digit` is `b'0'..=b'9'`, `is_ascii` is
+  `b < 128`, whitespace is the five `core` names — vertical tab excluded). They
+  are the first modelled methods whose receiver is `&self`, so the operand is the
+  *referent* of a reference the body materialises (`_3 = &_1`): the executor
+  follows the reference for these shapes and only these. Each is checked
+  exhaustively against Rust's own `u8` method, so the boundaries cannot drift from
+  the standard library's.
+- `slice::len` and `slice::is_empty` are modelled from the slice's length
+  variable — the same symbolic input the frontend already binds for the bounds
+  checks — so a contract's `s.len()` and the body's `PtrMetadata(_1)` are one
+  number. They are matched on the *path* (`core::slice::<impl [T]>::len`), so a
+  `Vec::len` or `str::len` is not mistaken for a slice length; and the receiver's
+  length has to be one the frontend holds, so a receiver it did not bind is
+  refused rather than given an invented number.
+- `slice::first` and `slice::get` are modelled for a *concrete* slice. They return
+  `Option<&T>`, so the payload is a *place*, not a value, and the model writes the
+  `Option`'s tag as a *predicate* — `len == 0` for `first`, `k >= len` for `get(k)`
+  — which is what makes the `unwrap` that usually follows carry a real panic
+  obligation rather than an assumed `Some`. The payload is the slice's *own*
+  element variable, the same one `xs[k]` names, so `*xs.first().unwrap()` and
+  `xs[0]` agree by construction; the returned reference's deref (`*_2`) reads
+  through a dedicated `Env::slice_elem_ref` store, and both `unwrap` and the
+  `match` desugaring (which reads the payload through a downcast temp) carry the
+  element to their destination, so the two spellings decide alike. `get`'s index
+  must be a *constant*: a slice's length is symbolic, so a symbolic index has no
+  finite domain and reading "some element" would be a wrong proof, not a missing
+  one. The *generic* `first_or<T>` is not this shape — it needs monomorphisation —
+  so it stays refused.
 - `Ord::min` and `Ord::max` are the two modelled *trait* methods, so a dump spells
   a call `<u8 as Ord>::min` (or `<i8 as std::cmp::Ord>::max` with `std` in scope)
   rather than a `core::num::<impl …>` inherent path. The model is one `ite` over
@@ -1912,6 +2082,112 @@ refused. `src/mir/intrinsics.rs` holds the model:
   unknown. The trait path must be exactly `From`/`Into`, `core::convert::…` or
   `std::convert::…` — none of which a user can define — so a local `From` in a
   module is refused by name.
+- The inherent `iN::abs` and the trait `Ord::clamp` are the first modelled methods
+  whose failure is a **panic**, so the model carries *two* channels — the value and
+  a `fails` predicate — and the executor turns the predicate into a panic
+  obligation beside the value. The value is defined at every input (the wrapped
+  absolute value, the clamp expression), and the predicate is where `core`'s own
+  `assert` fires: `abs` fails exactly at `MIN`, and `clamp` fails exactly at
+  `lo > hi`. An out-of-range `x` is *not* a clamp panic — clamping it is the whole
+  point — and reading it as one made a true corpus function fail until the probe
+  corpus caught it. `abs` takes its sign from the operand (`Abs` joins the
+  sign-reading arms), and `clamp`'s comparisons are the type's own, so a signed
+  clamp reads `i8::MIN` as below `0`. Both are refused on a non-primitive self
+  type, and `clamp` is admitted only under the standard library's `Ord` path, the
+  same rule `min`/`max` follow.
+- The inherent `iN::unsigned_abs` is the same magnitude as `abs` read as the
+  *unsigned* type (`i8::unsigned_abs(-128)` is `128u8`), so it reuses the same
+  `0 - x`/`x` `ite` — but it is *total* where `abs` panics: at `MIN` the
+  truncating subtraction is exactly the magnitude, which is the very bit pattern
+  the signed `abs` cannot represent. It is therefore a plain value with no
+  failure predicate, labelled unsigned on the way out so `128` is not read back as
+  `-128`. The pair is what makes `abs`'s panic meaningful: one call fails at `MIN`
+  and its sibling does not.
+- `iN::abs_diff` and `iN::rotate_left`/`rotate_right` are total, so they are plain
+  values rather than a value-and-panic pair. `abs_diff`'s result is the *unsigned*
+  magnitude even on a signed type — `i8::abs_diff(-128, 127)` is `255u8` — so the
+  model widens both operands by their *own* sign to `w + 1` bits, subtracts there,
+  and takes the absolute value with a *signed* sign test: the `w + 1`-bit range is
+  exactly a signed one, so an unsigned difference `0 - 1` is read as `-1`, not as
+  `255`. The rotations reduce the amount modulo the width the way `core` does — a
+  rotation by the width is the identity and by `w + 1` is by `1` — and because a
+  modelled width is a power of two the reduction is one `and` and no divider. Both
+  are checked exhaustively over `u8`/`i8` against Rust's own methods, so the
+  rotation's wrap cannot drift from the standard library's.
+- The remaining total `core` value methods are modelled as plain values, each
+  checked exhaustively against Rust's own method over the whole `u8`/`i8` domain:
+  `signum` (`-1`/`0`/`1`, signed-only, so `i8::MIN`'s top bit is read as a sign
+  rather than the largest unsigned byte); `cast_unsigned`/`cast_signed` (the
+  same-width signedness re-interpretation: the value is the operand *unchanged*,
+  and only the result *type* differs, so it is the one shape whose result sign is
+  the opposite of the operand's — read from the call's destination type, not
+  derived from the operand, which is what a later comparison or division then
+  consults); `reverse_bits` (a shift-OR fold, both
+  signednesses); `swap_bytes` (a rotation by `w/2` bits — the byte reversal, not a
+  rotation by `w/2 * 8`); `to_be`/`to_le` (a byte swap or the identity according to
+  the *target's* endianness, read from `cfg!(target_endian)` rather than guessed;
+  `core` has no `to_ne` value method, only `to_ne_bytes`); the ASCII case
+  conversions `to_ascii_uppercase`/`to_ascii_lowercase` (`u8`-only, a range test
+  over `b'a'..=b'z'`/`b'A'..=b'Z'`); and `is_multiple_of` (unsigned-only, `a % b ==
+  0` with `b == 0` defined as `a == 0`, so the `b != 0` guard and the `|| a == 0`
+  disjunct both carry). The `_bytes` forms of the byte orders return an array, not
+  an integer, so they are left unmodelled rather than written as a word.
+- `iN::div_euclid`/`rem_euclid` and `uN::div_ceil` are the division shapes that are
+  *not* the truncating `/`/`%`. Each has a value *and* a panic predicate, because
+  each panics on a zero divisor (and `div_euclid`/`rem_euclid` also on `MIN / -1`,
+  the same predicate `checked_div` reports) — modelling them as total would hide a
+  panic. The Euclidean quotient is `a / b` adjusted *the other way* when the
+  truncating remainder is negative (`q - 1` for a positive divisor, `q + 1` for a
+  negative one; `-7.div_euclid(3)` is `-3`, not `-2`), the Euclidean remainder is
+  `a % b + |b|` when negative, and `div_ceil` is `a / b` rounded up. They are
+  signed-only (`div_euclid`/`rem_euclid`) or unsigned-only (`div_ceil`) and bounded
+  at `DIV_MAX_WIDTH`, like every divider-backed model. Each is checked against
+  Rust's own method at every input the call does not panic on, with the panic
+  predicate compared at *every* input.
+- `iN::midpoint`, `iN::next_multiple_of` (and its `checked_` counterpart),
+  `iN::ilog2`/`ilog10` and the
+  `next_power_of_two` pair are the rounding and magnitude helpers. `midpoint` is
+  total and computed without a sum at the operand width — `(a & b) + ((a ^ b) >> 1)`,
+  plus a `+1` correction for the signed case when the result is negative and
+  `(a ^ b)` is odd, which is the truncation toward zero `core` documents (`-5` and
+  `-2` mid at `-3`, not the floor `-4`). `next_multiple_of` is unsigned-only and
+  value-and-panic (`a + (b - a % b) % b`, panicking on a zero divisor or an
+  overflow), and `checked_next_multiple_of` is the same value and condition as an
+  `Option` (`None` exactly where the plain call would panic, so its tag is a term
+  and no panic obligation is emitted). `ilog2`/`ilog10` exist on both signednesses,
+  are value-and-panic (a
+  non-positive argument panics), and return a `u32` whatever the operand's type;
+  `checked_ilog2`/`checked_ilog10` are the same value as an `Option`, `None` exactly
+  where the plain form panics, with the same `u32` payload.
+  `next_power_of_two` (unsigned-only) and its `checked_` counterpart are the
+  rounding sibling of `is_power_of_two`: the classic smear-and-add (`p = x - 1`,
+  forced to `0` for `x <= 1`; `p |= p >> 1; p |= p >> 2; …`; `p + 1`), which is
+  total at `w` bits — the plain form panics where the result does not fit
+  (`x > 2^(w-1)`) and the `checked_` form returns `None` there. Each is checked
+  exhaustively against Rust's own method (the `next_power_of_two` pair at 1/4/8/16
+  bits, with the oracle computed at the *model's* width).
+- `Option`'s `unwrap`, `unwrap_or`, `expect`, `is_some` and `is_none`, and
+  `Result`'s `is_ok`, `is_err`, `unwrap` and `unwrap_or`, are the first modelled
+  calls that read an *enum* rather than a bit-vector operand: the receiver's tag
+  and payload, which the model's own `checked_*` family writes (`checked_add` on a
+  `u8` writes the tag and payload of an `Option<u8>`) and which a contract-bound
+  `Option`/`Result` argument also fills. `unwrap`/`expect` return the payload and
+  report a **panic** on the failure variant, the same reachable-failure obligation
+  `abs` and `clamp` carry, so the idiom `if x.is_some() { x.unwrap() }` verifies
+  with the panic ruled out; `unwrap_or(default)` is *total* — the payload on the
+  success variant, the default on the failure one — and the predicates are the tag
+  tested against the success/failure discriminant. The receiver is `self` for the
+  value methods and `&self` for the predicates, so the executor follows the
+  reference either way. The two families are one shape: `Option` puts the payload
+  on `Some` (tag `1`) and `is_some` tests that tag, `Result` puts it on `Ok` (tag
+  `0`) and `is_ok` tests *that* tag, so a single executor arm answers both with the
+  payload variant read off the method name. They are matched on the
+  `option::Option`/`result::Result` path rustc prints, so a user type spelled
+  `Option`/`Result` is refused, and a same-dump body wins the lookup first. This
+  closes the `checked_add(..).unwrap_or(u32::MAX)` and `checked_div(..).unwrap()`
+  idioms, whose `Option` handling was the gap — the remaining `div_unwrap`
+  incompleteness is the *divider* wall (`n / d <= n` at `u32`), not the `Option`,
+  and the same body decides at `u8`.
 - A *local* method that shares an intrinsic's name is answered by its own body,
   never by the model. rustc prints a trait impl's call as `<u8 as Trait>::m` but
   its definition as `<impl at …>::m`, so the names never match; the model is only
@@ -2015,13 +2291,27 @@ The frontend refuses far more than it accepts, and every refusal is reported:
   form: a guard written as this predicate cancels against the obligation's assert at
   every width, while a bare multiply the engine has to reason about from scratch can
   run out of budget and report `incomplete`.
+- **A `core::num` product whose overflow test needs a widened `2w`-bit multiply past
+  `u32`.** The `checked_*`/`saturating_*`/`overflowing_*` families need the exact
+  product to test overflow, which is built by widening the operands to `2w` — the
+  BDD scaling wall. `MUL_MAX_WIDTH` is `32`, so a `u32` product's predicate is built
+  (a 64-bit multiply) while a `u64` one is refused (`2w == 128` cannot be held) and
+  reported "past what the model covers". The *value* families (`wrapping_*`) need no
+  widened product at all — they are a plain `w`-bit multiply — so they are admitted
+  up to the same bound and a `u32` `wrapping_mul` (the shape `hash_step` uses) now
+  decides, while a `u64` one is past the wall regardless. The refusal is the honest
+  answer: the path stays unknown rather than being proved from a truncated product.
 - **`core::num` operations other than the modelled families.** `checked_*`,
   `saturating_*` and `wrapping_*` for `add`/`sub`/`mul`/`div`/`rem` and the
   bitwise ops are computed from their operands (see below), as are the unary
   `neg`/`abs` in all four families, the six bit counts (`count_ones`,
   `count_zeros`, `leading_zeros`, `leading_ones`, `trailing_zeros`,
-  `trailing_ones`), the `bool` predicate `is_power_of_two`, the `Ord::min`/`Ord::max`
-  trait methods, the widening `From::from`/`Into::into` conversions, the
+  `trailing_ones`), the `bool` predicates `is_power_of_two`,
+  `is_negative`/`is_positive` and the ten
+  `is_ascii_*` class tests, the `slice::len`/`is_empty` length queries, the
+  `Ord::min`/`Ord::max`
+  trait methods, the `abs_diff` and `rotate_left`/`rotate_right` methods, the
+  widening `From::from`/`Into::into` conversions, the
   mixed-signedness
   additions (`wrapping_add_signed`, `saturating_add_signed`, `checked_add_signed`,
   `overflowing_add_signed` and their `_unsigned` counterparts) and the `pow`
@@ -2105,6 +2395,16 @@ says "I could not decide" is worth more than one that guesses.
    behind the `std` feature. The engine it uses is the embedded one, but the
    frontend that feeds it is a development tool, not something that ships on a
    microcontroller.
+5. **A `for` loop is not modelled.** `for x in 0..n` lowers to `IntoIterator::into_iter`
+   and a `Iterator::next(&mut range)` call, and neither is in the model, so the
+   function is reported `incomplete` rather than proved. The same holds for any
+   iterator chain (`fold`, `map`, `sum`) and for a `for` over a slice or array. A
+   `while` loop carrying an `invariant:` and a `variant:` is the supported way to
+   state the same iteration, and it is *more* precise, not less: the measure gives
+   total correctness, where an unwound `for` gives a bounded check. The frontend
+   says which call it could not model (`call to unmodelled function <… as
+   IntoIterator>::into_iter`), so the gap is visible in the report rather than
+   silent.
 
 ## What this is *not* — read this before trusting a green test
 
@@ -2212,6 +2512,8 @@ is instantaneous while a 12-bit multiplier equality is not.
 ├── Cargo.toml          the crate manifest (`no_std`, zero dependencies)
 ├── Cargo.lock          committed, and a single package: the dependency set is empty
 ├── README.md           this file
+├── ROADMAP.md          the open work: one item per gap, with exit criteria
+├── SOUNDNESS.md        the ledger of every false proof fixed, with its fixture
 ├── AGENTS.md           notes for agents, including the traps that cost the most time
 ├── LICENSE             Apache-2.0
 ├── SECURITY.md         how to report a vulnerability (GitHub private advisories)
@@ -2286,7 +2588,10 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   ├── comparison/        the same three functions proved seven ways, plus
 │   │                      Ferrocene as the qualified compiler (see its README)
 │   └── mir_targets/
-│       └── actuator.rs    the Rust under verification; imports no `verif`
+│       ├── actuator.rs    the Rust under verification; imports no `verif`
+│       ├── realistic.rs   the large regression corpus (adversarial fixtures included)
+│       └── everyday.rs    the independent corpus: ordinary Rust, not shaped for
+│                          the tool; Phase 1 in `ROADMAP.md` is scored on it
 ├── tools/
 │   ├── mir-oracle/     the `rustc_public` oracle: checks the text-MIR frontend
 │   │                   against rustc's own typed MIR. Nightly + `rustc-dev`,
@@ -2722,8 +3027,14 @@ prover symbols.
   makes and the check that backs it. The [Contents](#contents) list at the top
   groups those sections.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the ground rules and the gates.
+- [`ROADMAP.md`](ROADMAP.md) is the single source for open work: each item carries
+  a priority, a measurable exit criterion, the competitor whose gap it closes, the
+  closing move (build / bridge / won't do), and a status.
 - [`SECURITY.md`](SECURITY.md) covers reporting a **soundness bug** — a false
   `Valid` — which is the vulnerability class that matters in a verifier.
+- [`SOUNDNESS.md`](SOUNDNESS.md) is the ledger of every false proof and wrong
+  verdict the project has found, each with the fixture that fails if the fix is
+  undone; `tests/soundness.rs` checks the fixtures still exist.
 - [`AGENTS.md`](AGENTS.md) is the engineering log: why each decision was made,
   including the ones that were reversed.
 

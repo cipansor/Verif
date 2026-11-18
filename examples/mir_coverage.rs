@@ -10,10 +10,10 @@
 //! whatever it finds. The remainder it does not decide are the *next* gaps, and
 //! each one names itself in the `detail` column rather than being summarised.
 //!
-//! Run it with a nightly named, or it says so and stops:
+//! Run it with a compiler named, or it falls back to `rustc` on `PATH`:
 //!
 //! ```console
-//! $ VERIF_RUSTC=$(rustup which --toolchain nightly rustc) \
+//! $ VERIF_RUSTC="$(rustup which rustc)" \
 //!     cargo run --features std --example mir_coverage
 //! function             outcome      detail
 //! halve_guarded        verified     2 obl, 1 panic
@@ -46,13 +46,18 @@ fn main() {
     let src = PathBuf::from(&target);
     let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
 
-    let mir = match verify::emit_mir_with(&rustc, &src) {
+    let (mir, edition) = match verify::emit_mir_with_opts(&rustc, &src, &verify::MirOptions::default())
+    {
         Ok(m) => m,
         Err(e) => {
             // "the tool could not run" must never look like "the code is wrong",
-            // so this is a distinct message and a distinct exit.
+            // so this is a distinct message and a distinct exit. The error already
+            // names the compiler, the edition that was used and the reason (a
+            // missing edition, a compiler error), so it is printed as it stands
+            // rather than followed by a hint that would send the reader after the
+            // wrong toolchain -- `--emit=mir` is stable, and an edition error is
+            // not a toolchain problem.
             eprintln!("mir_coverage: could not get MIR from {}: {e}", src.display());
-            eprintln!("mir_coverage: set VERIF_RUSTC to a nightly `rustc`");
             std::process::exit(2);
         }
     };
@@ -75,6 +80,7 @@ fn main() {
     names.sort();
     names.dedup();
 
+    println!("# {target} ({edition})");
     println!("{:<22} {:<12} {:>9}  detail", "function", "outcome", "elapsed");
     let mut decided = 0usize;
     // With a filter, hand the *whole* requested name to the driver once. The list

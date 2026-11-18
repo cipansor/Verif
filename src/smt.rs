@@ -185,13 +185,7 @@ impl Cex {
     /// truncated before reaching it. Check [`Cex::is_complete`] to tell those apart; a
     /// `None` from an incomplete model is not evidence that the variable is unconstrained.
     pub fn value_of(&self, var: u32) -> Option<u64> {
-        for i in 0..self.n as usize {
-            let (v, _w, val) = self.assignments[i];
-            if v == var {
-                return Some(val);
-            }
-        }
-        None
+        self.assignments[..self.n as usize].iter().find(|a| a.0 == var).map(|a| a.2)
     }
 
     /// Number of variables reported.
@@ -202,6 +196,51 @@ impl Cex {
     /// True when no variable was mentioned.
     pub fn is_empty(&self) -> bool {
         self.n == 0
+    }
+
+    /// Render the model with source names, e.g. `x = 224, y = 0`.
+    ///
+    /// `names` maps a variable index to the source name the MIR `debug` binding
+    /// recorded for its local. An index with no name -- a temporary, a promoted
+    /// constant, a variable the frontend created for an aggregate part -- falls
+    /// back to `v{index}:u{width}`, so the rendering is always at least as
+    /// readable as the plain `Display` output and never less.
+    ///
+    /// The type of `names` is a slice of pairs rather than a map because the
+    /// engine is `no_std` and allocation-free: the caller owns the table and this
+    /// is a lookup, not an allocation.
+    ///
+    /// `std`-only, like its one caller: the MIR frontend that renders reports is
+    /// behind the `std` feature, so this method is too rather than dragging an
+    /// allocator into the bare-metal build.
+    #[cfg(feature = "std")]
+    pub fn render_named(&self, names: &[(&str, u32)]) -> String {
+        // The write into a `String` cannot fail, so the `fmt::Result` is ignored
+        // rather than threaded back.
+        let mut out = String::new();
+        let _ = self.fmt_named(&mut out, names);
+        out
+    }
+
+    /// The one rendering behind both [`fmt::Display`] (which passes no names) and
+    /// [`Self::render_named`], so the fallback spelling and the truncation marker
+    /// cannot drift between the two.
+    fn fmt_named<W: fmt::Write>(&self, w: &mut W, names: &[(&str, u32)]) -> fmt::Result {
+        for (i, (v, w_, val)) in self.assignments[..self.n as usize].iter().enumerate() {
+            if i > 0 {
+                w.write_str(", ")?;
+            }
+            match names.iter().find(|(_, idx)| idx == v) {
+                Some((name, _)) => write!(w, "{name} = {val}")?,
+                None => write!(w, "v{v}:u{w_} = {val}")?,
+            }
+        }
+        if !self.is_complete() {
+            // Say so in the rendering, not only in the API: a truncated witness printed
+            // as if complete is the failure mode this flag exists to prevent.
+            write!(w, " … {}/{} shown (TRUNCATED)", self.n, self.total)?;
+        }
+        Ok(())
     }
 
     /// True when every variable the model touched is present.
@@ -222,19 +261,9 @@ impl Cex {
 
 impl fmt::Display for Cex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for i in 0..self.n as usize {
-            let (v, w, val) = self.assignments[i];
-            if i > 0 {
-                write!(f, ", ")?;
-            }
-            write!(f, "v{}:u{} = {}", v, w, val)?;
-        }
-        if !self.is_complete() {
-            // Say so in the rendering, not only in the API: a truncated witness printed
-            // as if complete is the failure mode this flag exists to prevent.
-            write!(f, " … {}/{} shown (TRUNCATED)", self.n, self.total)?;
-        }
-        Ok(())
+        // No name table: the unnamed spelling is the fallback inside `fmt_named`,
+        // so there is one rendering rather than two that can drift.
+        self.fmt_named(f, &[])
     }
 }
 
@@ -826,8 +855,8 @@ impl Ctx {
 
     /// Forget every binding and start a new substitution epoch.
     fn clear_subst(&mut self) {
-        for i in 0..MAX_VARS {
-            self.subst_val[i] = NO_SUBST;
+        for v in self.subst_val.iter_mut() {
+            *v = NO_SUBST;
         }
         self.bump_epoch();
     }
@@ -842,8 +871,8 @@ impl Ctx {
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             // The counter wrapped, so the stamps are meaningless: clear them.
-            for i in 0..CAP {
-                self.subst_epoch[i] = 0;
+            for e in self.subst_epoch.iter_mut() {
+                *e = 0;
             }
             self.epoch = 1;
         }
@@ -1001,8 +1030,7 @@ impl Ctx {
     /// `Cex::is_complete` means the same thing on both paths.
     pub(crate) fn cex_from_sat(&self, val: impl Fn(u32) -> Option<bool>) -> Cex {
         let mut cex = Cex { assignments: [(0, 0, 0); MAX_CEX], n: 0, total: 0 };
-        for idx in 0..self.n_vars {
-            let w = self.var_width[idx];
+        for (idx, &w) in self.var_width[..self.n_vars].iter().enumerate() {
             let mut bits = 0u64;
             let mut touched = false;
             for bit in 0..w as u32 {

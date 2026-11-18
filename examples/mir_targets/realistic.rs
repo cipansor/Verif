@@ -52,6 +52,13 @@
 //! function, so a change that adds it moves exactly one row from `incomplete`
 //! to `verified`.
 
+// Some modelled shapes (`cast_unsigned`/`cast_signed`, `is_multiple_of`, the signed
+// `midpoint`) are unstable library features on the MSRV floor (1.85), so this corpus
+// needs the feature gate to compile there. `rustc` only honours the gate on a
+// bootstrap or a nightly, so `mir::verify` sets `RUSTC_BOOTSTRAP=1` for a source
+// that declares one -- see `emit_mir_with_opts`. The gate is inert on current
+// stable, where those methods are already stable.
+#![feature(integer_sign_cast, unsigned_is_multiple_of, num_midpoint_signed)]
 #![allow(dead_code, clippy::all)]
 
 // ---------------------------------------------------------------------------
@@ -120,6 +127,243 @@ pub fn pick_from(c: &Config, v: u8) -> u8 {
 /// ensures: ret == xs[0]
 pub fn first_of(xs: &[u8]) -> u8 {
     xs[0]
+}
+
+/// The same element reached through `slice::first`, which returns `Option<&u8>`.
+/// The payload is the slice's own element variable -- the same one `xs[0]` names
+/// -- so this proves the method and the subscript agree.
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 5
+pub fn first_method(xs: &[u8]) -> u8 {
+    *xs.first().unwrap()
+}
+
+/// The false direction: the method's element is the slice's element, not a fresh
+/// value, so a claim about a *different* element fails.
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 6
+pub fn first_method_tripwire(xs: &[u8]) -> u8 {
+    *xs.first().unwrap()
+}
+
+/// `first` is `None` exactly when the slice is empty, so `is_none` is the same
+/// predicate `is_empty` is.
+/// requires: xs.len() == 0
+/// ensures: ret
+pub fn first_method_is_none_when_empty(xs: &[u8]) -> bool {
+    xs.first().is_none()
+}
+
+/// `slice::get(k)` with a constant index: `Some(xs[k])` when `k < len`, `None`
+/// otherwise, and the element is the slice's own `xs[k]`.
+/// requires: xs.len() > 1 && xs[1] == 7
+/// ensures: ret == 7
+pub fn get_method(xs: &[u8]) -> u8 {
+    *xs.get(1).unwrap()
+}
+
+/// The false direction for `get`: a claim about the wrong element fails.
+/// requires: xs.len() > 1 && xs[1] == 7
+/// ensures: ret == 8
+pub fn get_method_tripwire(xs: &[u8]) -> u8 {
+    *xs.get(1).unwrap()
+}
+
+/// `get` past the end is `None`, so `unwrap` panics -- and the panic is a real
+/// obligation, not a silent `Some`.
+/// requires: xs.len() > 0
+/// ensures: ret == 7
+pub fn get_method_out_of_range_panics(xs: &[u8]) -> u8 {
+    *xs.get(1).unwrap()
+}
+
+/// The `match` form of `first`, as opposed to the `unwrap` form: the desugaring
+/// reads the payload through a downcast temp (`_4 = copy ((_2 as Some).0)`) and
+/// dereferences *that*, so the element reference has to be carried onto the temp.
+/// A model that only answered `unwrap` would leave this `incomplete` in both
+/// directions -- which is a coverage gap, since a `match` on the `Option` is at
+/// least as common as an `unwrap`.
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 5
+pub fn first_match_reads_the_element(xs: &[u8]) -> u8 {
+    match xs.first() {
+        Some(v) => *v,
+        None => 0,
+    }
+}
+
+/// The false direction for the `match` form: a claim about a different element
+/// fails, which only happens if the downcast temp names the slice's own element.
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 6
+pub fn first_match_tripwire(xs: &[u8]) -> u8 {
+    match xs.first() {
+        Some(v) => *v,
+        None => 0,
+    }
+}
+
+/// The empty case takes the `None` arm, so `first`'s tag is the same predicate
+/// the `match` switches on.
+/// requires: xs.len() == 0
+/// ensures: ret == 0
+pub fn first_match_empty_takes_none(xs: &[u8]) -> u8 {
+    match xs.first() {
+        Some(v) => *v,
+        None => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `Option<&T>::copied()` / `cloned()`: the everyday `v.first().copied()` idiom.
+//
+// The model stores a `&T` payload as the value it addresses, so `copied`'s result
+// payload is the receiver's -- `v.first().copied()` and `*v.first().unwrap()` name
+// one word. Only the tag passes through; a model that dropped the tag, or produced
+// a fresh payload, proves a tripwire.
+
+/// `xs.first().copied()` is the slice's own element 0, reached without a deref.
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 5
+pub fn copied_first_is_the_element(xs: &[u8]) -> u8 {
+    xs.first().copied().unwrap()
+}
+
+/// The false direction: the copied value is the element, not a fresh one.
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 6
+pub fn copied_first_tripwire(xs: &[u8]) -> u8 {
+    xs.first().copied().unwrap()
+}
+
+/// `get(k).copied()` names `xs[k]`, so the subscript and the method agree.
+/// requires: xs.len() > 1 && xs[1] == 7
+/// ensures: ret == 7
+pub fn copied_get_is_the_element(xs: &[u8]) -> u8 {
+    xs.get(1).copied().unwrap()
+}
+
+/// The false direction for `get`'s `copied` form.
+/// requires: xs.len() > 1 && xs[1] == 7
+/// ensures: ret == 8
+pub fn copied_get_tripwire(xs: &[u8]) -> u8 {
+    xs.get(1).copied().unwrap()
+}
+
+/// `copied` keeps the receiver's tag, so on an empty slice `unwrap_or` takes the
+/// default -- a model that fixed the tag to `Some` would panic here.
+/// requires: xs.len() == 0
+/// ensures: ret == 0
+pub fn copied_empty_is_none(xs: &[u8]) -> u8 {
+    xs.first().copied().unwrap_or(0)
+}
+
+/// `cloned` is the same shape as `copied` for a `Copy` element.
+/// requires: xs.len() > 0 && xs[0] == 9
+/// ensures: ret == 9
+pub fn cloned_first_is_the_element(xs: &[u8]) -> u8 {
+    xs.first().cloned().unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// `char`: a 32-bit unsigned value, and the `is_ascii_*` predicates on it.
+//
+// A `char` is a Unicode scalar value, but the engine holds it at its 32-bit width
+// and leaves the range unconstrained -- an over-approximation, which is the sound
+// direction. The ASCII classes are exact at that width because every range they
+// test lies inside `0..=0x7f` and a value at or above `0x100` is outside all of
+// them, which is what `char::is_ascii_digit` means too (`'\u{130}'.is_ascii_digit()`
+// is `false` though its low byte is `'0'`).
+
+/// `c as u8` truncates the 32-bit value to its low byte: `'\u{1F600}'` is
+/// `0x1F600`, whose low byte is `0`.
+/// requires: c == '\u{1F600}'
+/// ensures: ret == 0
+pub fn char_as_byte(c: char) -> u8 {
+    c as u8
+}
+
+/// A `char` literal in a contract is its Unicode scalar value, so `'A'` is `65`.
+/// requires: c == 'A'
+/// ensures: ret == 65
+pub fn char_ord_of_a(c: char) -> u8 {
+    c as u8
+}
+
+/// `c.is_ascii_digit()` is true exactly for `'0'..='9'`.
+/// requires: c == '5'
+/// ensures: ret == 1
+pub fn char_digit_is_true(c: char) -> u8 {
+    c.is_ascii_digit() as u8
+}
+
+/// The false direction: `is_ascii_digit` is `0` for a non-digit, so a contract
+/// claiming `1` is refuted.
+/// requires: c == 'x'
+/// ensures: ret == 1
+pub fn char_digit_tripwire(c: char) -> u8 {
+    c.is_ascii_digit() as u8
+}
+
+/// A `char` whose *low byte* is `'0'` is still not an ASCII digit: the predicate
+/// is on the whole 32-bit value, not the byte. `'\u{130}'` is refuted for a claim
+/// of `1`, which a model that masked to eight bits would prove.
+/// requires: c == '\u{130}'
+/// ensures: ret == 1
+pub fn char_high_digit_tripwire(c: char) -> u8 {
+    c.is_ascii_digit() as u8
+}
+
+/// The high-`char` case read the *correct* way: it is not a digit.
+/// requires: c == '\u{130}'
+/// ensures: ret == 0
+pub fn char_high_is_not_digit(c: char) -> u8 {
+    c.is_ascii_digit() as u8
+}
+
+/// A whitespace escape in a contract is its scalar value: `'\n'` is `0x0a`.
+/// requires: c == '\n'
+/// ensures: ret == 1
+pub fn char_newline_is_whitespace(c: char) -> u8 {
+    c.is_ascii_whitespace() as u8
+}
+
+/// A Unicode escape names a scalar value directly.
+/// requires: c == '\u{1F600}'
+/// ensures: ret == 0
+pub fn char_emoji_not_alphabetic(c: char) -> u8 {
+    c.is_ascii_alphabetic() as u8
+}
+
+/// `char::MAX` is the Unicode scalar maximum `0x10FFFF`, not `2^32 - 1`.
+///
+/// A `char` is modelled at 32 bits so a `char` comparison is exact, but the value
+/// a *bound* names is a property of the type. Deriving it from the width made
+/// `c == char::MAX` a comparison against `0xffffffff`, so this body -- which is
+/// `true` for the only input the precondition admits -- was *refuted*, and the
+/// false twin below was *proved*: a comparison different from the one the program
+/// executes. The `char` bounds are now read from the type.
+/// requires: c == '\u{10ffff}'
+/// ensures: ret == true
+pub fn char_max_is_the_scalar_maximum(c: char) -> bool {
+    c == char::MAX
+}
+
+/// The false twin: `char::MAX` is `0x10FFFF`, so a claim that it is not the
+/// maximum is false at the only admitted input. A model that compared against
+/// `2^32 - 1` would prove this.
+/// requires: c == '\u{10ffff}'
+/// ensures: ret == false
+pub fn char_max_is_the_scalar_maximum_cannot_prove_this(c: char) -> bool {
+    c == char::MAX
+}
+
+/// `char::MIN` is `'\0'`, and a `char` has no signed bound, so the read must not
+/// fall back to the signed `1 << 31` either.
+/// requires: c == '\0'
+/// ensures: ret == true
+pub fn char_min_is_nul(c: char) -> bool {
+    c == char::MIN
 }
 
 /// A fixed-size array argument. Unlike a slice the length is a *type*
@@ -336,6 +580,73 @@ pub fn slice_unbounded_index_refused(xs: &[u8], i: usize) -> u8 {
     xs[i]
 }
 
+/// A *generic* slice's length is a value even though `T` has no width.
+///
+/// `&[T]` with `T` an unbound type parameter has no element width to model, but
+/// `v.len()` reads only the length, which is a `usize` input regardless of `T`.
+/// So the length is bound and the function decides; every *element* operation on
+/// the same receiver stays refused (see the entry below), which is the split that
+/// keeps the answer honest.
+/// requires: true
+/// ensures: ret == v.len()
+pub fn generic_slice_len<T: Copy>(v: &[T]) -> usize {
+    v.len()
+}
+
+/// `is_empty` is `len == 0`, so it needs the length and nothing about `T`.
+/// requires: true
+/// ensures: ret == (v.len() == 0)
+pub fn generic_slice_is_empty<T: Copy>(v: &[T]) -> bool {
+    v.is_empty()
+}
+
+/// The ordinary "first element or default" helper over a generic slice.
+///
+/// This is `everyday.rs`'s `first_or`: the `else` arm reads `v[0]`, whose width
+/// is unknown, but the *guard* is `is_empty`, which the length decides, so the
+/// bounds check on `v[0]` is discharged and the function decides. A contract that
+/// *names* the element would be unreadable (see the tripwire below); the shape
+/// that decides is the one whose postcondition does not, which is exactly the
+/// honest split.
+/// requires: true
+/// ensures: true
+pub fn generic_slice_first_or<T: Copy>(v: &[T], d: T) -> T {
+    if v.is_empty() {
+        d
+    } else {
+        v[0]
+    }
+}
+
+/// A generic slice's *element* has no width, so a contract about one is refused,
+/// never proved.
+///
+/// The body returns `v.len()`, and the contract claims `0` — false for any
+/// non-empty slice. `v.len()` is modelled (the length is a `usize`), so this is
+/// refuted rather than skipped; the point is that the *length* half of a generic
+/// slice is real and the verdict is not vacuous.
+/// requires: true
+/// ensures: ret == 0
+pub fn generic_slice_len_is_zero_cannot_prove_this<T: Copy>(v: &[T]) -> usize {
+    v.len()
+}
+
+/// A generic slice's element read is unmodelled, so a contract naming the result
+/// is unreadable rather than proved.
+///
+/// `ret == d` is false whenever the slice is non-empty, and this must never be
+/// reported `verified`. The element has no width, so the read is a missing value,
+/// which surfaces as a refusal — the honest direction.
+/// requires: true
+/// ensures: ret == d
+pub fn generic_slice_element_cannot_prove_this<T: Copy>(v: &[T], d: T) -> T {
+    if v.is_empty() {
+        d
+    } else {
+        v[0]
+    }
+}
+
 /// An array built in the body, so the elements are concrete rather than inputs.
 /// requires: true
 /// ensures: ret == 20
@@ -409,6 +720,14 @@ pub enum Msg { Ping, Data(u8), Stop }
 /// numbering by position would put the contract and the arm in disagreement.
 pub enum Gap { A, B = 3, C }
 
+/// An enum whose payload variant has *two* fields, for the payload-summary shape.
+///
+/// A contract's `ret.Pair` denotes the field the binder reads (`payload.first()`,
+/// field 0), so a construction `Pair(1, 2)` must make `ret.Pair` mean `1`. Writing
+/// every operand to the single-valued payload store left the *last* field, so
+/// `ret.Pair == 2` was *verified* against a field-0 value of `1`.
+pub enum Duo { Pair(u8, u8), Empty }
+
 /// A struct with *signed* fields, for the signed-comparison shapes.
 ///
 /// `Config`'s fields are `u8`, so a contract that needs `i8::MIN` cannot use it:
@@ -466,6 +785,261 @@ pub fn count_evens(n: u8) -> u8 {
         i += 1;
     }
     c
+}
+
+// ---------------------------------------------------------------------------
+// The loop cut havocs what the loop writes *through*, not what it names.
+//
+// A `for` loop advances its `RangeInclusive` through `&mut`, so the syntactic
+// destination is the reference and the aggregate has no bit width: neither the
+// referent nor the range's parts were havoced at the header. The exit guard then
+// folded to `false`, the exit edge was pruned as unreachable, and a false
+// postcondition was `Verified`. The pairs below pin both directions: the true
+// contract verifies, the false twin is refuted.
+// ---------------------------------------------------------------------------
+
+/// A `for` loop whose postcondition the loop actually establishes.
+/// requires: n <= 100
+/// invariant: s <= 5050
+/// ensures: ret <= 5050
+pub fn for_loop_invariant_holds(n: u32) -> u32 {
+    let mut s = 0;
+    for i in 0..=n {
+        s = i.min(5050);
+    }
+    s
+}
+
+/// The false twin: the same loop, a postcondition it does not establish. When the
+/// iterator state was not havoced this came back `Verified` -- the false proof.
+/// requires: n <= 100
+/// invariant: s <= 5050
+/// ensures: ret <= 3
+pub fn for_loop_invariant_cannot_prove_this(n: u32) -> u32 {
+    let mut s = 0;
+    for i in 0..=n {
+        s = i.min(5050);
+    }
+    s
+}
+
+/// A `while` loop that writes through a reference taken *before* the loop, so the
+/// referent must be havoced at the header. The invariant is a *relation* between
+/// the referent and the counter -- `x <= k` alone is never inductive for
+/// `x += 1` -- which is what makes it both preserved and enough for the exit.
+/// requires: true
+/// invariant: x == i && i <= 3
+/// ensures: ret <= 3
+pub fn while_writes_through_ref_holds() -> u8 {
+    let mut x = 0u8;
+    let p = &mut x;
+    let mut i = 0u8;
+    while i < 3 {
+        *p += 1;
+        i += 1;
+    }
+    x
+}
+
+/// The false twin for the reference write.
+/// requires: true
+/// invariant: x == i && i <= 3
+/// ensures: ret == 0
+pub fn while_writes_through_ref_cannot_prove_this() -> u8 {
+    let mut x = 0u8;
+    let p = &mut x;
+    let mut i = 0u8;
+    while i < 3 {
+        *p += 1;
+        i += 1;
+    }
+    x
+}
+
+/// A `&mut u8` *argument* written inside a loop. `Ty::Ref` is modelled as its
+/// referent, so the argument's value is seeded at the referent's width -- but its
+/// `width()` is `None`, so the header havoc skipped it and the referent kept its
+/// entry value. The exit guard then folded and a false postcondition came back
+/// `Verified` (`w_false` is the twin). The relational invariant is what makes the
+/// true direction inductive and the panic (`x += 1` at `x == 255`) unprovable.
+/// requires: x == 0
+/// invariant: x == i && i <= 3
+/// ensures: ret <= 3
+pub fn ref_arg_written_in_a_loop_holds(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 {
+        *x += 1;
+        i += 1;
+    }
+    *x
+}
+
+/// The false twin: the referent is written three times, so `ret == 0` is false.
+/// requires: x == 0
+/// invariant: x == i && i <= 3
+/// ensures: ret == 0
+pub fn ref_arg_written_in_a_loop_cannot_prove_this(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 {
+        *x += 1;
+        i += 1;
+    }
+    *x
+}
+
+/// A helper that writes through its `&mut` argument. Called in a loop, its write
+/// reaches the caller local `x`, so `x` must be in the loop's havoc set.
+/// requires: c == 0
+/// ensures: ret == c + 1
+pub fn bump_once(c: &mut u8) -> u8 {
+    *c += 1;
+    *c
+}
+
+/// A call in a loop whose *write-through* reaches `x`. Only the call's
+/// *destination* was collected by the havoc, so `x` kept its entry value, the exit
+/// guard folded, and `ensures: ret == 0` was `Verified` for a body returning 3.
+/// requires: x == 0
+/// invariant: x == i && i <= 3
+/// ensures: ret <= 3
+pub fn call_writes_through_in_a_loop_holds(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 {
+        bump_once(x);
+        i += 1;
+    }
+    *x
+}
+
+/// The false twin: `bump_once` runs three times, so `ret == 0` is false.
+/// requires: x == 0
+/// invariant: x == i && i <= 3
+/// ensures: ret == 0
+pub fn call_writes_through_in_a_loop_cannot_prove_this(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 {
+        bump_once(x);
+        i += 1;
+    }
+    *x
+}
+
+/// A loop calling a *self-recursive* function. The interprocedural write-set walk
+/// follows a resolved callee to find what it writes through a reference; without a
+/// call-cycle guard it followed `count_down`'s self-call forever and overflowed the
+/// stack, aborting the whole run -- even though `count_down` takes no reference and
+/// so cannot write anything of the caller's.
+/// requires: n <= 3
+/// decreases: n
+/// ensures: ret == n
+pub fn count_down(n: u8) -> u8 {
+    if n == 0 { 0 } else { count_down(n - 1) + 1 }
+}
+
+/// invariant: s <= 2 && i <= 3
+/// ensures: ret <= 2
+pub fn loop_calls_recursive() -> u8 {
+    let mut i = 0u8;
+    let mut s = 0u8;
+    while i < 3 {
+        s = count_down(2);
+        i += 1;
+    }
+    s
+}
+
+/// The false twin: `count_down(2)` is 2, so `ret == 0` is false.
+/// invariant: s <= 2 && i <= 3
+/// ensures: ret == 0
+pub fn loop_calls_recursive_cannot_prove_this() -> u8 {
+    let mut i = 0u8;
+    let mut s = 0u8;
+    while i < 3 {
+        s = count_down(2);
+        i += 1;
+    }
+    s
+}
+
+/// A loop calling a *mutually* recursive pair. `is_even`/`is_odd` call each other,
+/// so the write-set walk meets a two-function cycle, not just a self-call.
+/// requires: n <= 3
+/// decreases: n
+/// ensures: ret <= 1
+pub fn is_even(n: u8) -> u8 {
+    if n == 0 { 0 } else { is_odd(n - 1) }
+}
+
+/// requires: n <= 3
+/// decreases: n
+/// ensures: ret <= 1
+pub fn is_odd(n: u8) -> u8 {
+    if n == 0 { 1 } else { is_even(n - 1) }
+}
+
+/// invariant: s <= 1 && i <= 3
+/// ensures: ret <= 1
+pub fn loop_calls_mutual_recursive() -> u8 {
+    let mut i = 0u8;
+    let mut s = 0u8;
+    while i < 3 {
+        s = is_even(2);
+        i += 1;
+    }
+    s
+}
+
+/// The false twin: `is_even(2)` is 0, so `ret == 2` is false.
+/// invariant: s <= 1 && i <= 3
+/// ensures: ret == 2
+pub fn loop_calls_mutual_recursive_cannot_prove_this() -> u8 {
+    let mut i = 0u8;
+    let mut s = 0u8;
+    while i < 3 {
+        s = is_even(2);
+        i += 1;
+    }
+    s
+}
+
+/// A loop calling a *reference-carrying* self-recursive function. The call cycle
+/// is refused rather than followed, but the call's reference argument is included
+/// directly -- a callee can only affect caller storage through a reference -- so
+/// `x` is havoced. The false twin proves that: with the reference omitted, `*x`
+/// would keep its entry value `0` and `ret == 0` would be *proven*. The return is
+/// always `0` (the recursion counts the writes, it does not sum them), so the
+/// contract says so rather than claiming the measure.
+/// requires: true
+/// decreases: n
+/// ensures: ret == 0
+pub fn bump_n(n: u8, c: &mut u8) -> u8 {
+    if n == 0 { 0 } else { *c = c.wrapping_add(1); bump_n(n - 1, c) }
+}
+
+/// requires: x == 0
+/// invariant: i <= 3
+/// ensures: ret <= 255
+pub fn loop_calls_ref_recursive(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 {
+        bump_n(1, x);
+        i += 1;
+    }
+    *x
+}
+
+/// The false twin: `x` is written through the recursive callee, so `ret == 0` is
+/// false -- a model that dropped the reference from the havoc would prove it.
+/// requires: x == 0
+/// invariant: i <= 3
+/// ensures: ret == 0
+pub fn loop_calls_ref_recursive_cannot_prove_this(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 {
+        bump_n(1, x);
+        i += 1;
+    }
+    *x
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +1104,60 @@ pub fn u16_product_guarded(a: u16, b: u16) -> u16 {
 /// ensures: ret == a * b
 pub fn u16_product_unguarded_tripwire(a: u16, b: u16) -> u16 {
     a.saturating_mul(b)
+}
+
+/// The `u32` `wrapping_mul` — the shape `hash_step` needs, and the value half of
+/// the widened-product story.
+///
+/// The `wrapping_*` family builds no overflow predicate at all: it is a plain
+/// `w`-bit multiply, which the BDD holds at `u32` in milliseconds. Raising
+/// `MUL_MAX_WIDTH` from 16 to 32 is what admits it; at 16 every `u32`
+/// `wrapping_mul` reported "past what the model covers" and `hash_step` — the
+/// flagship `u32` example — was `incomplete`.
+///
+/// The argument is *pinned* and the postcondition names the exact product, which
+/// makes the fixture discriminating: `100000 * 31` is `3_100_000`, which fits
+/// neither an 8- nor a 16-bit result, so a model that wrapped at a narrower width
+/// would refute this rather than prove it.
+/// requires: h == 100000
+/// ensures: ret == 3100000
+pub fn u32_wrapping_product(h: u32) -> u32 {
+    h.wrapping_mul(31)
+}
+
+/// The tripwire for the fixture above: the same pinned argument under a
+/// postcondition that is false of the real product, so the obligation must fail.
+///
+/// `100000 * 31` is `3_100_000`, not `100000`. `tests/mir.rs` requires the
+/// failure; a frontend that verified this would be proving the wrong thing.
+/// requires: h == 100000
+/// ensures: ret == 100000
+pub fn u32_wrapping_product_tripwire(h: u32) -> u32 {
+    h.wrapping_mul(31)
+}
+
+/// A `u32` `saturating_mul` by a *constant*, so the widened failure predicate is
+/// built at `2w == 64` and the obligation settles by cancellation rather than by
+/// blasting the 64-bit multiplier.
+///
+/// `h <= 1000000` and `h.saturating_mul(3)` is at most `3_000_000`, well below
+/// `u32::MAX`, so the saturating product is the exact product and the bound holds.
+/// requires: h <= 1000000
+/// ensures: ret <= 3000000
+pub fn u32_saturating_product(h: u32) -> u32 {
+    h.saturating_mul(3)
+}
+
+/// The tripwire for the `u32` `saturating_mul`: the guard does not rule out the
+/// product reaching the bound, so the tighter postcondition must fail.
+///
+/// At `h == 1000000` the product is `3_000_000`, which is above `1_000_000`, so
+/// `ret <= 1000000` is false. `tests/mir.rs` requires the failure; a frontend that
+/// verified this would be proving the wrong thing about a saturating product.
+/// requires: h <= 1000000
+/// ensures: ret <= 1000000
+pub fn u32_saturating_product_tripwire(h: u32) -> u32 {
+    h.saturating_mul(3)
 }
 
 /// A comparison through `core::cmp::Ord` rather than the builtin operator.
@@ -1776,6 +2404,52 @@ pub fn enum_payload_tripwire(m: Msg) -> u8 {
     }
 }
 
+/// A `match` arm *guard* reads the payload through a borrow of a downcast place.
+///
+/// `Msg::Data(n) if n < 10` lowers to `_4 = &((_1 as Data).0: u8); _6 = copy
+/// (*_4); _5 = Lt(_6, 10)`, so the guard is decided by the payload the downcast
+/// names. The rvalue `&((_1 as Data).0: u8)` contains the word ` as ` inside its
+/// parentheses; a parser that checks for a cast before it checks for a reference
+/// splits it at that ` as `, the reference gets no address, and `copy (*_4)`
+/// reads `Unknown` -- so the `switchInt` on the guard's `bool` is "unmodelled
+/// switch discriminant". Modelling the borrow is what makes a guarded match
+/// decide, and it is the same reference the body's own `copy ((_1 as Data).0)`
+/// already used.
+///
+/// `ret <= m.Data`: the guarded arm returns the payload (which is at most
+/// itself) and the fall-through arm returns `10`, which a payload of ten or more
+/// still dominates. The contract holds for every payload, so a model that read
+/// the guard's payload as an unconstrained input would refute it.
+/// requires: m == Msg::Data
+/// ensures: ret <= m.Data
+pub fn guarded_match_reads_its_payload(m: Msg) -> u8 {
+    match m {
+        Msg::Data(n) if n < 10 => n,
+        Msg::Data(_) => 10,
+        Msg::Ping => 0,
+        Msg::Stop => 0,
+    }
+}
+
+/// The tripwire for a guarded match: the guard's *other* arm, claimed to be the
+/// one taken.
+///
+/// The same body, but the contract claims the return is always `10` -- the value
+/// the arm taken when the guard *fails*. For a payload below ten the guard holds
+/// and the arm returns the payload, so the contract is false and must be refuted
+/// with a witness naming the payload. A model that dropped the guard's payload
+/// read (or read it as zero) would take the same arm on every path and prove it.
+/// requires: m == Msg::Data
+/// ensures: ret == 10
+pub fn guarded_match_tripwire(m: Msg) -> u8 {
+    match m {
+        Msg::Data(n) if n < 10 => n,
+        Msg::Data(_) => 10,
+        Msg::Ping => 0,
+        Msg::Stop => 0,
+    }
+}
+
 /// A *locally constructed* variant has a known tag, so its `match` is decided
 /// rather than symbolic.
 ///
@@ -2038,6 +2712,1230 @@ pub fn option_arg_payload_tripwire(x: Option<u8>) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// The `Option` *methods*: `unwrap_or`, `unwrap`, `expect`, `is_some`, `is_none`.
+//
+// These are the first modelled calls that read an *enum* rather than a bit-vector
+// operand: the receiver's tag and payload, which the model's own `checked_*`
+// family writes and which a contract-bound `Option` argument also fills. The
+// receiver is `self` for the first three and `&self` for the two predicates, so
+// the executor follows the reference either way.
+
+/// `checked_add` then `unwrap_or(u32::MAX)`: the payload on `Some`, the maximum on
+/// the `None` (overflow) path. The contract is true for every input -- the sum is
+/// `>= a` when it does not overflow, and `u32::MAX >= a` always -- so it must
+/// VERIFY. This is the `checked_or_max` scoreboard entry's shape.
+/// requires: true
+/// ensures: ret >= a
+pub fn option_unwrap_or_fallback(a: u32, b: u32) -> u32 {
+    a.checked_add(b).unwrap_or(u32::MAX)
+}
+
+/// The tripwire: the fallback is not `u32::MAX` but `0`, so `ret >= a` fails
+/// whenever the sum overflows and `a > 0`. A model that returned the payload
+/// unconditionally, ignoring the tag, could prove this.
+/// requires: true
+/// ensures: ret >= a
+pub fn option_unwrap_or_fallback_tripwire(a: u32, b: u32) -> u32 {
+    a.checked_add(b).unwrap_or(0)
+}
+
+/// `is_some` on a checked add pinned to a successful add: the tag is `Some`, so
+/// `is_some()` is `true`. Pinning the inputs is what gives this teeth -- the
+/// contract language cannot call `checked_add`, so "the add succeeds" has to be a
+/// precondition rather than an expression.
+/// requires: a == 0 && b == 0
+/// ensures: ret == true
+pub fn option_is_some_true_on_some(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_some()
+}
+
+/// The tripwire: the same successful add, where `is_some()` is `true`, so
+/// `ret == false` is refutable. A model that read the tag as a constant `None`
+/// would prove this.
+/// requires: a == 0 && b == 0
+/// ensures: ret == false
+pub fn option_is_some_true_on_some_tripwire(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_some()
+}
+
+/// `is_some` on a checked add pinned to an *overflowing* add: the tag is `None`,
+/// so `is_some()` is `false`. This is the other tag, so the pair pins that the
+/// model reads the tag rather than returning a constant.
+/// requires: a == 255 && b == 1
+/// ensures: ret == false
+pub fn option_is_some_false_on_none(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_some()
+}
+
+/// The tripwire: the overflowing add gives `is_some() == false`, so `ret == true`
+/// is refutable.
+/// requires: a == 255 && b == 1
+/// ensures: ret == true
+pub fn option_is_some_false_on_none_tripwire(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_some()
+}
+
+/// `is_none` on a successful add: the tag is `Some`, so `is_none()` is `false`.
+/// `is_none` tests the tag against `0`, so a model that tested against `1` would
+/// return `true` here and prove the tripwire below.
+/// requires: a == 0 && b == 0
+/// ensures: ret == false
+pub fn option_is_none_false_on_some(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_none()
+}
+
+/// The tripwire: a successful add gives `is_none() == false`, so `ret == true` is
+/// refutable. A model that read `is_none` as `is_some` (testing tag `1`) would
+/// prove this.
+/// requires: a == 0 && b == 0
+/// ensures: ret == true
+pub fn option_is_none_false_on_some_tripwire(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_none()
+}
+
+/// `is_none` on an overflowing add: the tag is `None`, so `is_none()` is `true`.
+/// requires: a == 255 && b == 1
+/// ensures: ret == true
+pub fn option_is_none_true_on_none(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_none()
+}
+
+/// The tripwire: an overflowing add gives `is_none() == true`, so `ret == false`
+/// is refutable.
+/// requires: a == 255 && b == 1
+/// ensures: ret == false
+pub fn option_is_none_true_on_none_tripwire(a: u8, b: u8) -> bool {
+    a.checked_add(b).is_none()
+}
+
+/// `unwrap` on a checked add that the precondition proves cannot overflow, so the
+/// `None` panic is unreachable and the value is the sum. The contract must VERIFY,
+/// and the panic obligation must be *ruled out* (a `None` path is impossible).
+/// requires: a <= 100 && b <= 100
+/// ensures: ret == a + b
+pub fn option_unwrap_guarded(a: u8, b: u8) -> u8 {
+    a.checked_add(b).unwrap()
+}
+
+/// The panic tripwire: the same body with no guard, so the add *can* overflow and
+/// `unwrap` panics. The contract is true (it is a tautology) but the panic
+/// obligation must be refuted -- `a == 255, b == 1` reaches `None` and unwraps.
+/// requires: true
+/// ensures: true
+pub fn option_unwrap_unguarded(a: u8, b: u8) -> u8 {
+    a.checked_add(b).unwrap()
+}
+
+/// `expect` is `unwrap` with a message, so a guarded one verifies exactly as
+/// `option_unwrap_guarded` does.
+/// requires: a <= 100 && b <= 100
+/// ensures: ret == a + b
+pub fn option_expect_guarded(a: u8, b: u8) -> u8 {
+    a.checked_add(b).expect("overflow")
+}
+
+/// The idiom `if x.is_some() { x.unwrap() } else { 0 }`: the `is_some` tag test
+/// drives the branch, so the `unwrap` inside it is on a path where the tag is
+/// `Some` and the panic is unreachable. The contract is true for every input, so
+/// it must VERIFY with the panic ruled out -- which only happens if `is_some` and
+/// `unwrap` read the *same* tag.
+/// requires: true
+/// ensures: true
+pub fn option_is_some_guards_unwrap(x: Option<u8>) -> u8 {
+    if x.is_some() {
+        x.unwrap()
+    } else {
+        0
+    }
+}
+
+/// The `is_none` mirror of the guard: the `else` arm unwraps, on the path where
+/// `is_none` was false, so the tag is `Some` and the panic is unreachable. Must
+/// VERIFY.
+/// requires: true
+/// ensures: true
+pub fn option_is_none_guards_unwrap(x: Option<u8>) -> u8 {
+    if x.is_none() {
+        0
+    } else {
+        x.unwrap()
+    }
+}
+
+/// The guard tripwire: the same `is_some` guard, but the `else` arm unwraps
+/// instead -- on the path where the tag is `None`, so `unwrap` panics. The
+/// contract is a tautology but the panic obligation must be refuted, which is the
+/// evidence the guard and the unwrap are about the same tag.
+/// requires: true
+/// ensures: true
+pub fn option_guard_tripwire(x: Option<u8>) -> u8 {
+    if x.is_some() {
+        0
+    } else {
+        x.unwrap()
+    }
+}
+
+/// The `expect` panic tripwire, the same shape as `option_unwrap_unguarded`.
+/// requires: true
+/// ensures: true
+pub fn option_expect_unguarded(a: u8, b: u8) -> u8 {
+    a.checked_add(b).expect("overflow")
+}
+
+/// `unwrap_or` on a *contract-bound* `Option` argument: the payload on `Some`,
+/// the default on `None`. The receiver's tag and payload come from the argument
+/// seed, not from a modelled call, which is the other way the stores are filled.
+/// The contract holds on both arms: on `Some` the result is `x.Some` itself, on
+/// `None` it is `7`, and both are `<= x.Some || x.Some < 7` -- so it must VERIFY.
+/// requires: true
+/// ensures: ret == x.Some || ret == 7
+pub fn option_arg_unwrap_or(x: Option<u8>) -> u8 {
+    x.unwrap_or(7)
+}
+
+/// The tripwire: the default is `7`, so on the `None` path the result is `7`; the
+/// contract claims it is `x.Some` exactly, which the `None` path violates for
+/// every `x.Some != 7`. A model that ignored the tag and returned the payload
+/// unconditionally would prove this.
+/// requires: true
+/// ensures: ret == x.Some
+pub fn option_arg_unwrap_or_tripwire(x: Option<u8>) -> u8 {
+    x.unwrap_or(7)
+}
+
+/// `unwrap` on a contract-bound `Option` argument with no `is_some` guard, so the
+/// `None` path reaches `unwrap` and panics. The contract is a tautology but the
+/// panic obligation must be refuted -- the tag is a free input and `None` is
+/// reachable. (A *guarded* argument unwrap is deliberately not in the corpus: the
+/// contract language cannot name an `Option`'s tag, so "the caller passed `Some`"
+/// is not expressible, and pinning only `x.Some` leaves the tag free.)
+/// requires: true
+/// ensures: true
+pub fn option_arg_unwrap_unguarded(x: Option<u8>) -> u8 {
+    x.unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// The `Result` methods. The same shape as `Option`'s, with the payload on `Ok`
+// (tag 0) instead of `Some` (tag 1): `is_ok` tests the tag against `0`, `is_err`
+// against `1`, `unwrap`/`unwrap_or` read the `Ok` payload, and `unwrap` panics on
+// `Err`. One executor arm answers both families because the method name says which
+// variant carries the payload.
+
+/// `Result::is_ok` on a contract-bound `Result` argument: `true` on `Ok` and
+/// `false` on `Err`, so the contract holds on both arms.
+/// requires: true
+/// ensures: ret == true || ret == false
+pub fn result_is_ok(r: Result<u8, u16>) -> bool {
+    r.is_ok()
+}
+
+/// The tripwire: `is_ok` is `true` exactly on `Ok`, so `ret == false` is refutable
+/// with an `Ok` receiver. A model that tested the tag against `1` (the `Err` tag)
+/// would prove this.
+/// requires: true
+/// ensures: ret == false
+pub fn result_is_ok_tripwire(r: Result<u8, u16>) -> bool {
+    r.is_ok()
+}
+
+/// `Result::is_err` is the complement of `is_ok`, so it is `true` exactly on
+/// `Err`. The contract holds on both arms.
+/// requires: true
+/// ensures: ret == true || ret == false
+pub fn result_is_err(r: Result<u8, u16>) -> bool {
+    r.is_err()
+}
+
+/// The tripwire: `is_err` is `true` on `Err`, so `ret == false` is refutable with
+/// an `Err` receiver -- which is what separates `is_err` (tag `1`) from `is_ok`
+/// (tag `0`).
+/// requires: true
+/// ensures: ret == false
+pub fn result_is_err_tripwire(r: Result<u8, u16>) -> bool {
+    r.is_err()
+}
+
+/// `Result::unwrap_or(default)` on a contract-bound argument: the `Ok` payload on
+/// `Ok`, the default on `Err`. The contract holds on both arms.
+/// requires: true
+/// ensures: ret == r.Ok || ret == 7
+pub fn result_unwrap_or(r: Result<u8, u16>) -> u8 {
+    r.unwrap_or(7)
+}
+
+/// The tripwire: the default is `7`, so on the `Err` path the result is `7`; the
+/// contract claims it is the `Ok` payload exactly, which the `Err` path violates
+/// for every `r.Ok != 7`. A model that ignored the tag would prove this.
+/// requires: true
+/// ensures: ret == r.Ok
+pub fn result_unwrap_or_tripwire(r: Result<u8, u16>) -> u8 {
+    r.unwrap_or(7)
+}
+
+/// `Result::unwrap` with no guard, so the `Err` path panics. The contract is a
+/// tautology but the panic obligation must be refuted -- and the message must
+/// name `Err`, which is the evidence the model read the `Result` tag rather than
+/// the `Option` one.
+/// requires: true
+/// ensures: true
+pub fn result_unwrap_unguarded(r: Result<u8, u16>) -> u8 {
+    r.unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// An enum-returning function's contract: `ret.is_ok()` / `ret.is_some()` /
+// `ret.is_err()` / `ret.is_none()`.
+//
+// A function returning `Option`/`Result` has no single return *word* -- the value
+// is a payload plus a tag -- so a bare `ret <= n` is refused. The four methods are
+// the *discriminant* predicates: they read the return place's tag, which the
+// executor passes as the return word. The tag is a value on every path, so the
+// four are total.
+//
+// A bare *payload* read -- `ret.Ok`, `ret.Some`, `ret.Err`, `ret.Run` -- is
+// modelled too, and it is *guarded on the discriminant*: a payload exists only on
+// the variant's paths, so a clause naming one is checked as `tag == disc => clause`
+// and is vacuous on the other variant. Binding it with no guard would compare it on
+// every path, against a value it does not have -- a wrong value, not a weaker
+// proof. The pairs below pin that: the true one holds on the variant it names, and
+// the tripwire claims a value the payload cannot be.
+//
+// Each pair pins the method against the *right* discriminant: `is_ok`/`is_some`
+// test the success tag (`Ok` is 0, `Some` is 1) and `is_err`/`is_none` the failure
+// tag, so a model that swapped the two tags would prove the tripwires.
+
+/// `ret.is_some()` on a body that always returns `Some`, so the contract is true.
+/// The body reads the tag the executor passed, and the pair with the tripwire is
+/// what pins the success tag.
+/// requires: true
+/// ensures: ret.is_some()
+pub fn enum_ret_is_some(x: u8) -> Option<u8> {
+    Some(x)
+}
+
+/// The tripwire: the body is always `Some`, so `ret.is_none()` is refutable. A
+/// model that read `is_none` as the success tag (or the tag as a constant) would
+/// prove this.
+/// requires: true
+/// ensures: ret.is_none()
+pub fn enum_ret_is_some_tripwire(x: u8) -> Option<u8> {
+    Some(x)
+}
+
+/// `ret.is_none()` on a body that always returns `None`: the failure tag.
+/// requires: true
+/// ensures: ret.is_none()
+pub fn enum_ret_is_none() -> Option<u8> {
+    None
+}
+
+/// The tripwire: the body is always `None`, so `ret.is_some()` is refutable.
+/// requires: true
+/// ensures: ret.is_some()
+pub fn enum_ret_is_none_tripwire() -> Option<u8> {
+    None
+}
+
+/// `ret.is_ok()` on a body that always returns `Ok`: the `Ok` tag is 0, so a
+/// model that tested against `Some`'s tag 1 would refute this.
+/// requires: true
+/// ensures: ret.is_ok()
+pub fn enum_ret_is_ok(x: u8) -> Result<u8, u8> {
+    Ok(x)
+}
+
+/// The tripwire: the body is always `Ok`, so `ret.is_err()` is refutable.
+/// requires: true
+/// ensures: ret.is_err()
+pub fn enum_ret_is_ok_tripwire(x: u8) -> Result<u8, u8> {
+    Ok(x)
+}
+
+/// `ret.is_err()` on a body that always returns `Err`: the failure tag.
+/// requires: true
+/// ensures: ret.is_err()
+pub fn enum_ret_is_err(x: u8) -> Result<u8, u8> {
+    Err(x)
+}
+
+/// The tripwire: the body is always `Err`, so `ret.is_ok()` is refutable. This is
+/// the pair that separates the `Ok` tag (0) from the `Err` tag (1) on a *return*,
+/// exactly as `result_is_ok`/`result_is_err` do for an argument.
+/// requires: true
+/// ensures: ret.is_ok()
+pub fn enum_ret_is_err_tripwire(x: u8) -> Result<u8, u8> {
+    Err(x)
+}
+
+/// A contract that names *both* methods: `ret.is_ok() || ret.is_err()` is a
+/// tautology over the two tags, so it must verify. This is the evidence the two
+/// read the same tag at the two discriminants rather than one being constant.
+/// requires: true
+/// ensures: ret.is_ok() || ret.is_err()
+pub fn enum_ret_is_ok_or_err(x: u8) -> Result<u8, u8> {
+    Ok(x)
+}
+
+/// The tripwire: the body is always `Ok`, so `ret.is_ok() && ret.is_err()` is
+/// refutable -- the two methods are not the same predicate.
+/// requires: true
+/// ensures: ret.is_ok() && ret.is_err()
+pub fn enum_ret_is_ok_and_err_tripwire(x: u8) -> Result<u8, u8> {
+    Ok(x)
+}
+
+/// A *pass-through* return: the tag comes from an enum *argument*, so the contract
+/// reads the argument's tag, which the executor seeds. This is the shape a real
+/// function has when it forwards a `Result`.
+/// requires: true
+/// ensures: ret.is_ok() || ret.is_err()
+pub fn enum_ret_passthrough(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The tripwire for the pass-through: the tag is the argument's, so `ret.is_ok()`
+/// is refutable with an `Err` receiver -- a model that read the return tag as a
+/// constant would prove it.
+/// requires: true
+/// ensures: ret.is_ok()
+pub fn enum_ret_passthrough_tripwire(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// A `match` on the returned enum, so the body's own `switchInt` reads the same
+/// tag the contract does. The contract must hold on both arms.
+/// requires: true
+/// ensures: ret.is_ok() || ret.is_err()
+pub fn enum_ret_from_match(r: Result<u8, u8>) -> Result<u8, u8> {
+    match r {
+        Ok(v) => Ok(v),
+        Err(e) => Err(e),
+    }
+}
+
+/// The tripwire: the body preserves the argument's tag, so `ret.is_err()` alone is
+/// refutable with an `Ok` receiver.
+/// requires: true
+/// ensures: ret.is_err()
+pub fn enum_ret_from_match_tripwire(r: Result<u8, u8>) -> Result<u8, u8> {
+    match r {
+        Ok(v) => Ok(v),
+        Err(e) => Err(e),
+    }
+}
+
+// A bare payload read on the return: `ret.Ok`, `ret.Some`, `ret.Err`, `ret.Run`.
+// Each is *guarded on the discriminant* (see the section header), so the pair
+// below is a true clause on the variant it names and a tripwire claiming a value
+// the payload cannot be.
+
+/// `ret.Ok` on a `Result` pass-through under `r.Ok == 9`: the result is `r`, so
+/// the `Ok` payload is `9` on the `Ok` path. The body's `((_0 as Ok).0)` and the
+/// contract's `ret.Ok` are one variable, which is what makes this verify.
+/// requires: r.is_ok() && r.Ok == 9
+/// ensures: ret.Ok == 9
+pub fn ret_ok_payload(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The tripwire: the payload is `9`, so `ret.Ok == 8` is refutable. A model that
+/// bound the payload to a fresh unconstrained variable would prove this, and one
+/// that bound it with no discriminant guard would refute the true entry above.
+/// requires: r.is_ok() && r.Ok == 9
+/// ensures: ret.Ok == 8
+pub fn ret_ok_payload_tripwire(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// `ret.Some` on an `Option` pass-through under `x.Some == 9`.
+/// requires: x.is_some() && x.Some == 9
+/// ensures: ret.Some == 9
+pub fn ret_some_payload(x: Option<u8>) -> Option<u8> {
+    x
+}
+
+/// The tripwire for `ret.Some`.
+/// requires: x.is_some() && x.Some == 9
+/// ensures: ret.Some == 8
+pub fn ret_some_payload_tripwire(x: Option<u8>) -> Option<u8> {
+    x
+}
+
+/// `ret.Err`: the failure payload of a `Result`. The guard is on the `Err`
+/// discriminant, so under `r.Err == 7` the clause is checked on the `Err` path.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: ret.Err == 7
+pub fn ret_err_payload(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The tripwire for `ret.Err`: a model that tested the wrong discriminant, or
+/// bound the payload with no guard, would prove this.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: ret.Err == 8
+pub fn ret_err_payload_tripwire(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The guard is *load-bearing* here, and this is the fixture that shows it: the
+/// body reaches `Ok(9)` on one branch and `Err(5)` on the other, so the `Err` path
+/// has no `Ok` payload. The clause `ret.Ok == 9` is checked on the `Ok` path and is
+/// *vacuously* true on the `Err` path -- which is what verifies it. Drop the guard
+/// and the `Ok` payload is compared on the `Err` path too, against a value the
+/// variant does not have, and this is refuted.
+/// requires: true
+/// ensures: ret.Ok == 9
+pub fn ret_payload_guarded_vacuous(c: bool) -> Result<u8, u8> {
+    if c { Ok(9) } else { Err(5) }
+}
+
+/// The tripwire: the `Ok` payload is `9` on the `Ok` path, so `ret.Ok == 200` is
+/// refuted -- a model that bound the payload to a constant, or dropped the guard,
+/// would prove it.
+/// requires: true
+/// ensures: ret.Ok == 200
+pub fn ret_payload_guarded_vacuous_tripwire(c: bool) -> Result<u8, u8> {
+    if c { Ok(9) } else { Err(5) }
+}
+
+/// A *user* enum's payload is readable too: `ret.Data` on a `Msg` pass-through.
+/// The binding is gated on the layout, not on a success/failure pair, so an enum
+/// with neither `Ok` nor `Some` still has readable payloads.
+/// requires: m == Msg::Data && m.Data == 9
+/// ensures: ret.Data == 9
+pub fn ret_user_enum_payload(m: Msg) -> Msg {
+    m
+}
+
+/// The tripwire for a user enum's payload.
+/// requires: m == Msg::Data && m.Data == 9
+/// ensures: ret.Data == 8
+pub fn ret_user_enum_payload_tripwire(m: Msg) -> Msg {
+    m
+}
+
+/// A payload read on a *non-enum* return must refuse: `ret.Ok` on a `u8` names a
+/// variant the return type does not have. The contract is unreadable, so the
+/// function is skipped rather than checked against a fabricated payload.
+/// requires: true
+/// ensures: ret.Ok == 5
+pub fn ret_payload_on_non_enum(x: u8) -> u8 {
+    x
+}
+
+/// A *unit* variant has no payload to read, so `ret.None` is refused rather than
+/// bound to a fabricated value.
+/// requires: true
+/// ensures: ret.None == 5
+pub fn ret_payload_on_unit_variant(x: Option<u8>) -> Option<u8> {
+    x
+}
+
+/// A parenthesized comparison as an *operand* is a `bool` value: `ret == (x == 1)`
+/// is the natural spelling of a `bool`-returning function's postcondition. The body
+/// returns `x == 1`, so the two agree on every input.
+/// requires: true
+/// ensures: ret == (x == 1)
+pub fn bool_ret_is_comparison(x: u8) -> bool {
+    x == 1
+}
+
+/// The tripwire: the body returns `x == 1`, so `ret == (x == 2)` is false at `x == 1`.
+/// A reader that dropped the group -- or read it as a constant -- would prove this.
+/// requires: true
+/// ensures: ret == (x == 2)
+pub fn bool_ret_is_comparison_tripwire(x: u8) -> bool {
+    x == 1
+}
+
+/// The group may hold an arithmetic expression: `((x + 1) == 2)` is `x == 1`, which
+/// the body returns.
+/// requires: true
+/// ensures: ret == ((x + 1) == 2)
+pub fn bool_ret_grouped_arithmetic(x: u8) -> bool {
+    x == 1
+}
+
+/// A bare `bool` at the predicate position reads as the value itself: under
+/// `x == 1` the body returns `true`, so `ensures: ret` holds.
+/// requires: x == 1
+/// ensures: ret
+pub fn bool_ret_bare(x: u8) -> bool {
+    x == 1
+}
+
+/// The tripwire for a bare bool: `ret` is false at `x == 0`, so the unguarded claim
+/// is refuted. A reader that treated a bare one-bit word as always true would prove
+/// it.
+/// requires: true
+/// ensures: ret
+pub fn bool_ret_bare_tripwire(x: u8) -> bool {
+    x == 1
+}
+
+/// A negated bare bool: under `x != 1` the body returns `false`, so `!ret` holds.
+/// requires: x != 1
+/// ensures: !ret
+pub fn bool_ret_negated(x: u8) -> bool {
+    x == 1
+}
+
+/// A parenthesized conjunction of payload clauses must not collapse to a vacuous
+/// guard. `(ret.Ok == 9 && ret.Err == 8)` on a `Result` pass-through: the body
+/// returns `Err(7)`, so `ret.Ok` is unconstrained on the `Err` path and `ret.Err`
+/// is `7` there, making the conjunction false. Before the fix the group re-guarded
+/// both payloads with a combined `tag == 0 && tag == 1` -- unsatisfiable -- and the
+/// claim was *verified* on a body that refutes it.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: (ret.Ok == 9 && ret.Err == 8)
+pub fn grouped_payload_conjunction_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The true companion: a genuine *mixed-variant* conjunction that holds. The body
+/// passes `r` through under `requires: r.is_err() && r.Err == 7`, so on the `Err`
+/// path `ret.Err == 7` holds and `ret.Ok == 0` is vacuous (its variant is not
+/// taken). The group therefore verifies, and a fix that blanket-refused every
+/// mixed-variant group would *skip* it -- which is how this distinguishes
+/// preserved support from blanket rejection, where a single-variant control could
+/// not.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: (ret.Ok == 0 && ret.Err == 7)
+pub fn grouped_payload_conjunction_ok(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The ungrouped spelling of the same claim, which must agree with the grouped
+/// one: both refuted, so the fix cannot have changed only one reading.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: ret.Ok == 9 && ret.Err == 8
+pub fn ungrouped_payload_conjunction_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// A *negated* payload comparison must read the discriminant guard from
+/// *outside* the negation. `!(ret.Ok == 9)` on a pass-through under
+/// `requires: r.is_err() && r.Err == 7` holds: `ret.Ok` has no value on the `Err`
+/// path, so the clause is vacuously true there. Before the fix the guard was
+/// applied inside the `!` (`!(tag == 0 => payload == 9)`), which is *false* on the
+/// `Err` path, so this valid contract was refuted while the equivalent
+/// `ret.Ok != 9` verified.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: !(ret.Ok == 9)
+pub fn negated_payload_comparison(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The `!=` spelling of the same claim, which must agree with the negated `==`
+/// spelling: both verify.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: ret.Ok != 9
+pub fn negated_payload_comparison_inequality(r: Result<u8, u8>) -> Result<u8, u8> {
+    r
+}
+
+/// The tripwire: on an `Ok(9)` return `ret.Ok` *is* `9`, so both spellings of the
+/// negation are false. A fix that made every negated payload clause vacuous would
+/// pass the true pair above but fail this.
+/// requires: true
+/// ensures: !(ret.Ok == 9)
+pub fn negated_payload_comparison_cannot_prove_this() -> Result<u8, u8> {
+    Ok(9)
+}
+
+/// A negation spanning *two* variants has no single scope, so it is refused
+/// rather than given a contradictory guard. A skip, not a verdict.
+/// requires: true
+/// ensures: !(ret.Ok == 9 && ret.Err == 8)
+pub fn negated_payload_mixed_variant_is_refused() -> Result<u8, u8> {
+    Ok(9)
+}
+
+/// `ret.Pair` denotes the payload variant's *first* field: `Duo::Pair(1, 2)` makes
+/// it `1`. Before the fix the construction wrote every operand to the
+/// single-valued payload store, so the last field (`2`) won and this was refuted
+/// while `ret.Pair == 2` was *verified*.
+/// requires: true
+/// ensures: ret.Pair == 1
+pub fn duo_pair_first_field() -> Duo {
+    Duo::Pair(1, 2)
+}
+
+/// The tripwire: the second field is `2`, which is *not* what `ret.Pair` denotes,
+/// so this must be refuted. A model that left the last field in the payload store
+/// would prove it.
+/// requires: true
+/// ensures: ret.Pair == 2
+pub fn duo_pair_second_field_cannot_prove_this() -> Duo {
+    Duo::Pair(1, 2)
+}
+
+/// An argument named like the generated payload binding (`ret__v_Ok`) must not be
+/// shadowed by it: the contract compares `ret.Ok` with the *argument*, which is a
+/// real input, so it is refuted (the body returns `Ok(9)`, and the argument is
+/// unconstrained). Before the fix the binding overwrote the argument and the
+/// clause compared the payload with itself, so it was *verified*.
+/// requires: true
+/// ensures: ret.Ok == ret__v_Ok
+pub fn payload_binding_shadow_tripwire(ret__v_Ok: u8) -> Result<u8, u8> {
+    Ok(9)
+}
+
+/// A *non-enum* return must refuse the methods: `ret.is_ok()` on a `u8` names a
+/// tag that does not exist. This is the refusal, not a verdict -- the contract is
+/// unreadable, so the function is skipped rather than checked against a
+/// fabricated tag.
+/// requires: true
+/// ensures: ret.is_ok()
+pub fn enum_ret_method_on_non_enum(x: u8) -> u8 {
+    x
+}
+
+/// The same methods on an enum-typed *argument*: `r.is_ok()` in a `requires` reads
+/// the argument's tag, which the executor seeds. A precondition that names the tag
+/// is the shape a real function has when it dispatches on a `Result` before
+/// returning a value.
+/// requires: r.is_ok()
+/// ensures: ret == true
+pub fn enum_arg_is_ok_guarded(r: Result<u8, u8>) -> bool {
+    r.is_ok()
+}
+
+/// The tripwire: the precondition admits only `Ok`, so `r.is_ok()` is `true` and
+/// `ret == false` is refutable. A model that read the argument's tag as a constant,
+/// or tested the wrong discriminant, would prove this.
+/// requires: r.is_ok()
+/// ensures: ret == false
+pub fn enum_arg_is_ok_guarded_tripwire(r: Result<u8, u8>) -> bool {
+    r.is_ok()
+}
+
+/// `is_ok`/`is_err` on an argument read the two discriminants, so their disjunction
+/// is a tautology and must verify.
+/// requires: true
+/// ensures: r.is_ok() || r.is_err()
+pub fn enum_arg_is_ok_or_err(r: Result<u8, u8>) -> bool {
+    r.is_ok()
+}
+
+/// The tripwire: the conjunction is refutable, so the two read *different* tags.
+/// requires: true
+/// ensures: r.is_ok() && r.is_err()
+pub fn enum_arg_is_ok_and_err_tripwire(r: Result<u8, u8>) -> bool {
+    r.is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// `Option`↔`Result` conversions: `Option::ok_or`, `Result::ok`, `Result::err`.
+// Each is *total* for a scalar payload and moves one payload across the tag. The
+// result's tag is the receiver's reinterpreted (`Ok` and `Some` are discriminants
+// 0 and 1), and the moved payload is recorded under the discriminant the consuming
+// `switchInt` selects. `ok_or` is printed with a *method* turbofish
+// (`Option::<u8>::ok_or::<i32>`), so it also pins that the classifier finds the
+// method name past a `<…>` segment.
+
+/// `Option::ok_or`: `Some` becomes `Ok`, so the result is `Ok` exactly on the
+/// receiver's `Some`.
+/// requires: x.is_some()
+/// ensures: ret.is_ok()
+pub fn ok_or_some_is_ok(x: Option<u8>) -> Result<u8, u8> {
+    x.ok_or(0)
+}
+
+/// The tripwire: under `x.is_some()` the result is `Ok`, so `ret.is_err()` is
+/// refutable. A model that read the result tag as a constant, or tested the wrong
+/// discriminant, would prove it.
+/// requires: x.is_some()
+/// ensures: ret.is_err()
+pub fn ok_or_some_is_ok_tripwire(x: Option<u8>) -> Result<u8, u8> {
+    x.ok_or(0)
+}
+
+/// The other tag: under `x.is_none()` the result is `Err`.
+/// requires: x.is_none()
+/// ensures: ret.is_err()
+pub fn ok_or_none_is_err(x: Option<u8>) -> Result<u8, u8> {
+    x.ok_or(0)
+}
+
+/// The tripwire for the `None` branch.
+/// requires: x.is_none()
+/// ensures: ret.is_ok()
+pub fn ok_or_none_is_err_tripwire(x: Option<u8>) -> Result<u8, u8> {
+    x.ok_or(0)
+}
+
+/// `ok_or` *moves the payload*: under `x.Some == 9` the result's `Ok` payload is
+/// `9`. Reading it back through `unwrap` is the evidence the payload crossed the
+/// conversion, not just the tag.
+/// requires: x.is_some() && x.Some == 9
+/// ensures: ret == 9
+pub fn ok_or_moves_the_payload(x: Option<u8>) -> u8 {
+    x.ok_or(0).unwrap()
+}
+
+/// The tripwire: the payload is `9`, so a claim of `8` is refutable. A model that
+/// dropped the payload (leaving it unconstrained, or `0`) would prove this.
+/// requires: x.is_some() && x.Some == 9
+/// ensures: ret == 8
+pub fn ok_or_moves_the_payload_tripwire(x: Option<u8>) -> u8 {
+    x.ok_or(0).unwrap()
+}
+
+/// `Result::ok`: `Ok` becomes `Some`, so the result is `Some` exactly on the
+/// receiver's `Ok`.
+/// requires: r.is_ok()
+/// ensures: ret.is_some()
+pub fn ok_ok_is_some(r: Result<u8, u8>) -> Option<u8> {
+    r.ok()
+}
+
+/// The tripwire for the `Ok` branch.
+/// requires: r.is_ok()
+/// ensures: ret.is_none()
+pub fn ok_ok_is_some_tripwire(r: Result<u8, u8>) -> Option<u8> {
+    r.ok()
+}
+
+/// The other tag: under `r.is_err()` the result is `None`.
+/// requires: r.is_err()
+/// ensures: ret.is_none()
+pub fn ok_err_is_none(r: Result<u8, u8>) -> Option<u8> {
+    r.ok()
+}
+
+/// The tripwire for the `Err` branch.
+/// requires: r.is_err()
+/// ensures: ret.is_some()
+pub fn ok_err_is_none_tripwire(r: Result<u8, u8>) -> Option<u8> {
+    r.ok()
+}
+
+/// `ok` moves the `Ok` payload onto `Some`.
+/// requires: r.is_ok() && r.Ok == 9
+/// ensures: ret == 9
+pub fn ok_moves_the_payload(r: Result<u8, u8>) -> u8 {
+    r.ok().unwrap()
+}
+
+/// The tripwire: a model that dropped the payload would prove `8`.
+/// requires: r.is_ok() && r.Ok == 9
+/// ensures: ret == 8
+pub fn ok_moves_the_payload_tripwire(r: Result<u8, u8>) -> u8 {
+    r.ok().unwrap()
+}
+
+/// `Result::err`: `Err` becomes `Some`, so the result is `Some` exactly on the
+/// receiver's `Err` (the tag is *kept*, not inverted -- `err` is the mirror of
+/// `ok`, which inverts).
+/// requires: r.is_err()
+/// ensures: ret.is_some()
+pub fn err_err_is_some(r: Result<u8, u8>) -> Option<u8> {
+    r.err()
+}
+
+/// The tripwire for the `Err` branch of `err`: a model that inverted the tag (as
+/// `ok` does) would call `Err` `None` and prove this.
+/// requires: r.is_err()
+/// ensures: ret.is_none()
+pub fn err_err_is_some_tripwire(r: Result<u8, u8>) -> Option<u8> {
+    r.err()
+}
+
+/// The other tag: under `r.is_ok()` the result is `None`.
+/// requires: r.is_ok()
+/// ensures: ret.is_none()
+pub fn err_ok_is_none(r: Result<u8, u8>) -> Option<u8> {
+    r.err()
+}
+
+/// The tripwire for the `Ok` branch of `err`.
+/// requires: r.is_ok()
+/// ensures: ret.is_some()
+pub fn err_ok_is_none_tripwire(r: Result<u8, u8>) -> Option<u8> {
+    r.err()
+}
+
+/// `err` moves the `Err` payload onto `Some`.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: ret == 7
+pub fn err_moves_the_payload(r: Result<u8, u8>) -> u8 {
+    r.err().unwrap()
+}
+
+/// The tripwire: the payload is `7`, so a claim of `8` is refutable.
+/// requires: r.is_err() && r.Err == 7
+/// ensures: ret == 8
+pub fn err_moves_the_payload_tripwire(r: Result<u8, u8>) -> u8 {
+    r.err().unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// `Option::or` and `Option::and`: the two total, closure-free combinators.
+//
+// Each returns one of its two `Option`s by the receiver's tag, so the result tag
+// is an `ite` on that tag and both payloads are carried. `or` is the receiver on
+// `Some` and the argument on `None`; `and` is the mirror. A model that fixed the
+// result tag to a constant, or swapped the two payloads, proves a tripwire.
+
+/// `Some(x).or(y)` is the receiver, so the result's payload is `x`'s -- pinned by
+/// reading the result back through `unwrap` with the receiver's payload fixed.
+/// requires: x.is_some() && x.Some == 7
+/// ensures: ret == 7
+pub fn or_some_is_the_receiver(x: Option<u8>, y: Option<u8>) -> u8 {
+    x.or(y).unwrap()
+}
+
+/// The false twin: `or` on a `Some` receiver must not yield the *argument*'s
+/// payload.
+/// requires: x.is_some() && x.Some == 7 && y.Some == 8
+/// ensures: ret == 8
+pub fn or_some_is_the_receiver_tripwire(x: Option<u8>, y: Option<u8>) -> u8 {
+    x.or(y).unwrap()
+}
+
+/// `None.or(y)` is `y`: the result's payload is the argument's.
+/// requires: x.is_none() && y.is_some() && y.Some == 9
+/// ensures: ret == 9
+pub fn or_none_is_the_argument(x: Option<u8>, y: Option<u8>) -> u8 {
+    x.or(y).unwrap()
+}
+
+/// The false twin: `or` on a `None` receiver must not keep the receiver's tag
+/// (`None`), which would leave `unwrap` a value it does not have.
+/// requires: x.is_none() && y.is_some() && y.Some == 9
+/// ensures: ret == 8
+pub fn or_none_is_the_argument_tripwire(x: Option<u8>, y: Option<u8>) -> u8 {
+    x.or(y).unwrap()
+}
+
+/// `Some(x).and(y)` is `y`: the receiver's payload is dropped, the argument's
+/// returned.
+/// requires: x.is_some() && y.is_some() && y.Some == 9
+/// ensures: ret == 9
+pub fn and_some_is_the_argument(x: Option<u8>, y: Option<u8>) -> u8 {
+    x.and(y).unwrap()
+}
+
+/// The false twin: `and` on a `Some` receiver must not keep the receiver's value.
+/// requires: x.is_some() && x.Some == 7 && y.is_some() && y.Some == 9
+/// ensures: ret == 7
+pub fn and_some_is_the_argument_tripwire(x: Option<u8>, y: Option<u8>) -> u8 {
+    x.and(y).unwrap()
+}
+
+/// `None.and(y)` is `None` (the receiver), so the result is never `Some`.
+/// requires: x.is_none()
+/// ensures: ret == false
+pub fn and_none_is_the_receiver(x: Option<u8>, y: Option<u8>) -> bool {
+    x.and(y).is_some()
+}
+
+/// The false twin: `None.and(y)` must not become `y`.
+/// requires: x.is_none()
+/// ensures: ret == true
+pub fn and_none_is_the_receiver_tripwire(x: Option<u8>, y: Option<u8>) -> bool {
+    x.and(y).is_some()
+}
+
+// ---------------------------------------------------------------------------
+// `or`/`and` operand *shapes* the first cut refused. Each is a valid program
+// whose tags or payloads come from different origins, so the model must
+// normalise rather than demand identical widths.
+
+/// A `checked_*` receiver's tag is the arithmetic operand's width (`u8` -> eight
+/// bits), while a seeded `Option` argument's tag is one bit. The two must be
+/// normalised to a common width before the `ite`, or the query is ill-formed.
+/// requires: n < 255
+/// ensures: ret == false
+pub fn or_mixed_tag_widths_is_none(n: u8, y: Option<u8>) -> bool {
+    n.checked_add(1).or(y).is_none()
+}
+
+/// The false twin: `n < 255` makes `checked_add` `Some`, so `or` is the receiver
+/// and `is_none()` is false -- a model that read the argument's tag would prove
+/// this.
+/// requires: n < 255
+/// ensures: ret == true
+pub fn or_mixed_tag_widths_tripwire(n: u8, y: Option<u8>) -> bool {
+    n.checked_add(1).or(y).is_none()
+}
+
+/// The other side of the mixed-tag pair: `n == 255` overflows `checked_add` to
+/// `None`, so `or` is the argument (`Some`).
+/// requires: n == 255 && y.is_some()
+/// ensures: ret == true
+pub fn or_mixed_tag_widths_none_is_argument(n: u8, y: Option<u8>) -> bool {
+    n.checked_add(1).or(y).is_some()
+}
+
+/// `Option<T>::and<U>` returns `Option<U>`: `Some(x).and(y)` is `y`, so the
+/// receiver's 8-bit payload never becomes the result. An `ite` over the two would
+/// demand equal widths for unrelated types.
+/// requires: x.is_some() && y.is_some()
+/// ensures: ret == true
+pub fn and_different_payload_widths(x: Option<u8>, y: Option<u16>) -> bool {
+    x.and(y).is_some()
+}
+
+/// The false twin: `x` and `y` both `Some`, so `and` is `Some` -- a model that
+/// read the receiver's payload or refused the width mismatch would prove this.
+/// requires: x.is_some() && y.is_some()
+/// ensures: ret == false
+pub fn and_different_payload_widths_tripwire(x: Option<u8>, y: Option<u16>) -> bool {
+    x.and(y).is_some()
+}
+
+/// The receiver's `None` decides `and`: `None.and(y)` is `None` whatever `y` is.
+/// requires: x.is_none() && y.is_some()
+/// ensures: ret == false
+pub fn and_none_receiver_decides(x: Option<u8>, y: Option<u16>) -> bool {
+    x.and(y).is_some()
+}
+
+/// A *constructed* `None` records no payload, and its absence is not a failure:
+/// `None::<u8>.or(Some(9))` is the argument.
+/// requires: true
+/// ensures: ret == true
+pub fn constructed_none_or_some() -> bool {
+    None::<u8>.or(Some(9)).is_some()
+}
+
+/// The mirror: `Some(7).or(None)` is the receiver.
+/// requires: true
+/// ensures: ret == true
+pub fn constructed_some_or_none() -> bool {
+    Some(7u8).or(None).is_some()
+}
+
+/// The false twin of `constructed_none_or_some`: a `None` receiver with no
+/// payload must still select the argument, so `is_none()` is false.
+/// requires: true
+/// ensures: ret == true
+pub fn constructed_none_or_some_tripwire() -> bool {
+    None::<u8>.or(Some(9)).is_none()
+}
+
+/// `a.first().or(b.first())` selects between two *slice elements*, so the
+/// reference identity is conditional: `a`'s element on `Some`, `b`'s on `None`.
+/// The deref must read the selected element, which needs the conditional
+/// identity carried through the combinator.
+/// requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9
+/// ensures: ret == 5
+pub fn or_slices_selects_the_receiver(a: &[u8], b: &[u8]) -> u8 {
+    *a.first().or(b.first()).unwrap()
+}
+
+/// The false twin: the selected element is `a[0] == 5`, not `b[0] == 9`.
+/// requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9
+/// ensures: ret == 9
+pub fn or_slices_selects_the_receiver_tripwire(a: &[u8], b: &[u8]) -> u8 {
+    *a.first().or(b.first()).unwrap()
+}
+
+/// `and` returns the argument on `Some`, so the deref is `b`'s element.
+/// requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9
+/// ensures: ret == 9
+pub fn and_slices_selects_the_argument(a: &[u8], b: &[u8]) -> u8 {
+    *a.first().and(b.first()).unwrap()
+}
+
+/// The false twin: `and` is not the receiver's element.
+/// requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9
+/// ensures: ret == 5
+pub fn and_slices_selects_the_argument_tripwire(a: &[u8], b: &[u8]) -> u8 {
+    *a.first().and(b.first()).unwrap()
+}
+
+/// `Option<T>::and<U>` permits a *different* payload type, and the result's
+/// element is always the argument's. Building a `Select` over the receiver's
+/// (`u8`) and the argument's (`u16`) elements demanded equal widths for unrelated
+/// types and marked the query ill-formed, so the deref was `incomplete` even with
+/// both slices nonempty. Carrying the argument identity alone is both exact and
+/// width-safe.
+/// requires: a.len() > 0 && b.len() > 0 && b[0] == 9
+/// ensures: ret == 9
+pub fn and_different_width_deref(a: &[u8], b: &[u16]) -> u16 {
+    *a.first().and(b.first()).unwrap()
+}
+
+/// The false twin: the deref is `b[0] == 9`, never the receiver's `a[0]`.
+/// requires: a.len() > 0 && b.len() > 0 && a[0] == 3 && b[0] == 9
+/// ensures: ret == 3
+pub fn and_different_width_deref_tripwire(a: &[u8], b: &[u16]) -> u16 {
+    *a.first().and(b.first()).unwrap()
+}
+
+/// A scalar `Option` receiver with a slice-reference argument: the receiver
+/// carries no element identity at all, so the result identity is the argument's.
+/// The old code's `(None, Some(a))` arm only took the argument when the receiver
+/// tag proved it was not selected, which is `or`'s rule; `and` selects the
+/// *argument* on a `Some` receiver, so it must take it unconditionally.
+/// requires: x.is_some() && b.len() > 0 && b[0] == 9
+/// ensures: ret == 9
+pub fn and_scalar_receiver_ref_argument(x: Option<u8>, b: &[u8]) -> u8 {
+    *x.and(b.first()).unwrap()
+}
+
+/// The false twin: the receiver is a scalar, so the deref is always `b[0] == 9`.
+/// requires: x.is_some() && b.len() > 0 && b[0] == 9
+/// ensures: ret == 5
+pub fn and_scalar_receiver_ref_argument_tripwire(x: Option<u8>, b: &[u8]) -> u8 {
+    *x.and(b.first()).unwrap()
+}
+
+/// `Result::unwrap_or_default` destroys the error on the `Err` branch, so a
+/// `Result<u8, Boom>` whose `Boom` destructor panics must be *refused*, not
+/// reported panic-free. The `Boom` type is defined here so the glue check reads
+/// its destructor.
+pub struct Boom;
+impl Drop for Boom {
+    fn drop(&mut self) {
+        panic!("boom");
+    }
+}
+
+/// requires: true
+/// ensures: ret <= 255
+pub fn unwrap_or_default_boom(r: Result<u8, Boom>) -> u8 {
+    r.unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Conversions whose source variant is *constructed*, not seeded. A locally
+// constructed `None`/`Err`/`Ok` records only the payload that variant carries,
+// so the inactive variant has no payload to move. The conversion must still
+// produce the result: the missing payload is unreachable on the path (the tag is
+// a known discriminant), so it is left unbound rather than refused. The tag is
+// what these fixtures pin -- a `None::<u8>.ok_or(e)` is a known `Err`, and a
+// model that refused it (or invented an `Ok` payload) would not decide.
+
+/// `None::<u8>.ok_or(7)` is an `Err` -- a known tag, no `Some` payload needed.
+/// requires: true
+/// ensures: ret.is_err()
+pub fn constructed_none_ok_or_is_err() -> Result<u8, u8> {
+    None::<u8>.ok_or(7u8)
+}
+
+/// The tripwire: `None.ok_or` never produces an `Ok`, so claiming one refutes.
+/// requires: true
+/// ensures: ret.is_ok()
+pub fn constructed_none_ok_or_is_err_tripwire() -> Result<u8, u8> {
+    None::<u8>.ok_or(7u8)
+}
+
+/// `Err(e).ok()` is a `None` -- a known tag, no `Ok` payload needed.
+/// requires: true
+/// ensures: ret.is_none()
+pub fn constructed_err_ok_is_none(e: u8) -> Option<u8> {
+    Err::<u8, u8>(e).ok()
+}
+
+/// The tripwire for the constructed `Err`.
+/// requires: true
+/// ensures: ret.is_some()
+pub fn constructed_err_ok_is_none_tripwire(e: u8) -> Option<u8> {
+    Err::<u8, u8>(e).ok()
+}
+
+/// `Ok(x).err()` is a `None` -- the other constructed direction.
+/// requires: true
+/// ensures: ret.is_none()
+pub fn constructed_ok_err_is_none(x: u8) -> Option<u8> {
+    Ok::<u8, u8>(x).err()
+}
+
+/// The tripwire for the constructed `Ok`.
+/// requires: true
+/// ensures: ret.is_some()
+pub fn constructed_ok_err_is_none_tripwire(x: u8) -> Option<u8> {
+    Ok::<u8, u8>(x).err()
+}
+
+/// The constructed *payload-carrying* variant still moves its payload: a known
+/// `Ok` needs no `Err` payload, and its `Ok` payload survives onto `Some`.
+/// requires: true
+/// ensures: ret.is_some()
+pub fn constructed_ok_ok_is_some(x: u8) -> Option<u8> {
+    Ok::<u8, u8>(x).ok()
+}
+
+/// The tripwire for the constructed `Ok` payload-carrying direction.
+/// requires: true
+/// ensures: ret.is_none()
+pub fn constructed_ok_ok_is_some_tripwire(x: u8) -> Option<u8> {
+    Ok::<u8, u8>(x).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Grouping and negation of the enum discriminant predicates. `ret.is_ok()`
+// parses as a whole predicate, but `(ret.is_ok())` and `!ret.is_none()` were
+// routed into arithmetic because the grouping/negation lookaheads recognised
+// only comparators and boolean literals, so the contract was skipped. The
+// lookaheads now know the `base.method()` shape; whether the base really names
+// an enum is still decided when the predicate is parsed.
+
+/// A parenthesised enum predicate reads.
+/// requires: true
+/// ensures: (ret.is_some())
+pub fn grouped_enum_predicate(x: u8) -> Option<u8> {
+    Some(x)
+}
+
+/// The tripwire: a parenthesised claim that the result is `None` is refutable
+/// (the body always returns `Some`).
+/// requires: true
+/// ensures: (ret.is_none())
+pub fn grouped_enum_predicate_tripwire(x: u8) -> Option<u8> {
+    Some(x)
+}
+
+/// A negated enum predicate on the *argument* reads.
+/// requires: !(x.is_none())
+/// ensures: true
+pub fn negated_enum_predicate(x: Option<u8>) -> u8 {
+    x.unwrap_or(0)
+}
+
+/// The tripwire: `!(x.is_none())` is `x.is_some()`, so it does not say the
+/// payload is `0` (a `Some(1)` argument refutes it).
+/// requires: !(x.is_none())
+/// ensures: x.is_some() && x.Some == 0
+pub fn negated_enum_predicate_tripwire(x: Option<u8>) -> u8 {
+    x.unwrap_or(0)
+}
+
+/// A parenthesised enum predicate combines with `&&`.
+/// requires: true
+/// ensures: (ret.is_ok()) && ret.is_ok()
+pub fn grouped_enum_predicate_conjunction(x: u8) -> Result<u8, u8> {
+    Ok(x)
+}
+
+/// The tripwire for the conjunction: no result is both `Ok` and `Err`.
+/// requires: true
+/// ensures: (ret.is_ok()) && ret.is_err()
+pub fn grouped_enum_predicate_conjunction_tripwire(x: u8) -> Result<u8, u8> {
+    Ok(x)
+}
+
+/// A negated enum predicate on the *argument*, without parentheses.
+/// requires: !x.is_none()
+/// ensures: true
+pub fn bare_negated_enum_predicate(x: Option<u8>) -> u8 {
+    x.unwrap_or(0)
+}
+
+/// The tripwire for the bare negation.
+/// requires: !x.is_none()
+/// ensures: x.Some == 0
+pub fn bare_negated_enum_predicate_tripwire(x: Option<u8>) -> u8 {
+    x.unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // A cast in a *contract*: `x as u32`. The body has modelled `as` for a while
 // (it is what lets a narrow argument meet a wide return), but the contract
 // language had no cast at all, so any contract that related the two was
@@ -2268,6 +4166,56 @@ pub fn contract_wrapping_add_of_an_out_of_range_literal_is_refused(x: u8) -> u8 
 /// ensures: ret == 1.wrapping_add(2)
 pub fn contract_wrapping_add_on_an_untyped_receiver_is_refused(x: u8) -> u8 {
     x
+}
+
+/// `wrapping_shl`/`wrapping_shr` reduce the amount modulo the width, the same
+/// reduction a rotation does, so `1u8.wrapping_shl(8)` is `1` (`wrapping_shl(0)`)
+/// rather than the `0` a saturating shift would give. The amount is pinned to the
+/// width exactly, so this *verifies only under the reduction*: a model that
+/// saturated the amount (the engine's plain variable shift) would compute `0` and
+/// refute it. The twin below is the mirror -- it claims the saturated `0`, which
+/// only an unreduced model would prove.
+/// requires: x == 1 && n == 8
+/// ensures: ret == 1
+pub fn wrapping_shl_reduces_its_amount(x: u8, n: u32) -> u8 {
+    x.wrapping_shl(n)
+}
+
+/// The false twin: `1u8.wrapping_shl(8)` is `1`, not `0`. A model that did *not*
+/// reduce the amount -- the engine's own variable shift saturates `n >= w` to `0`
+/// -- would prove this, so the pair separates "the amount reduces" from "the
+/// amount saturates", which a `ret <= 255` bound could not.
+/// requires: x == 1 && n == 8
+/// ensures: ret == 0
+pub fn wrapping_shl_amount_is_not_saturated_tripwire(x: u8, n: u32) -> u8 {
+    x.wrapping_shl(n)
+}
+
+/// `wrapping_shr` is *arithmetic* on a signed receiver: `-8i8.wrapping_shr(1)` is
+/// `-4`, so a model that took the logical shift would refute this. This pins the
+/// *shift kind* (the amount `1` is below the width, so reduction is not involved).
+/// requires: x == -8 && n == 1
+/// ensures: ret == -4
+pub fn wrapping_shr_signed_is_arithmetic(x: i8, n: u32) -> i8 {
+    x.wrapping_shr(n)
+}
+
+/// The logical reading of the same call, which is the wrong one for a signed
+/// receiver: `-8i8.wrapping_shr(1)` is `-4` (`0xfc`), never `124` (`0x7c`).
+/// requires: x == -8 && n == 1
+/// ensures: ret == 124
+pub fn wrapping_shr_signed_is_not_logical_tripwire(x: i8, n: u32) -> i8 {
+    x.wrapping_shr(n)
+}
+
+/// The unsigned receiver is the logical shift: `128u8.wrapping_shr(9)` is `64`
+/// (`9` reduces to `1`), not a sign fill. This pins *both* the shift kind (a sign
+/// fill would give `192`) and the amount reduction (a saturating shift would give
+/// `0`), so a model that got either wrong fails it.
+/// requires: x == 128 && n == 9
+/// ensures: ret == 64
+pub fn wrapping_shr_unsigned_is_logical(x: u8, n: u32) -> u8 {
+    x.wrapping_shr(n)
 }
 
 /// Unary `-` binds *tighter* than `as` in Rust, so `-x as u8` is `(-x) as u8`,
@@ -3353,6 +5301,62 @@ pub fn is_power_of_two_branching_of_zero_tripwire(x: u8) -> u8 {
     }
 }
 
+/// `is_negative` is true for `i8::MIN`, whose bits (`0x80`) are the *largest*
+/// unsigned byte -- so an unsigned reading of the top bit would call it positive.
+/// This is the signedness pin: the model must compare signed, which is why the
+/// contract is satisfiable only under the signed reading.
+/// requires: x == i8::MIN
+/// ensures: ret == true
+pub fn is_negative_of_min(x: i8) -> bool {
+    x.is_negative()
+}
+
+/// The complement pin: `i8::MAX` is positive, so a model that read the top bit
+/// (clear here) as "not negative" and stopped would refute this. It is the pair
+/// to the `MIN` pin above, which alone could be passed by an unsigned `x != 0`.
+/// requires: x == i8::MAX
+/// ensures: ret == false
+pub fn is_negative_of_max(x: i8) -> bool {
+    x.is_negative()
+}
+
+/// The tripwire: zero is neither negative nor positive, so this false contract
+/// must be refuted. A model that used the *top bit* rather than a signed compare
+/// would prove it (bit 7 of `0` is clear).
+/// requires: x == 0
+/// ensures: ret == true
+pub fn is_negative_of_zero_tripwire(x: i8) -> bool {
+    x.is_negative()
+}
+
+/// `is_positive` is the strict `> 0`, so `i8::MAX` is positive.
+/// requires: x == i8::MAX
+/// ensures: ret == true
+pub fn is_positive_of_max(x: i8) -> bool {
+    x.is_positive()
+}
+
+/// The tripwire for `is_positive`: `-1` is negative, so this must be refuted. A
+/// model that answered `x != 0` would *prove* it.
+/// requires: x == -1
+/// ensures: ret == true
+pub fn is_positive_of_minus_one_tripwire(x: i8) -> bool {
+    x.is_positive()
+}
+
+/// The predicate is consumed by a branch, not only read in a postcondition, so a
+/// `Val::Bool` the `switchInt` could not read would leave the path unknown rather
+/// than take the right arm.
+/// requires: x == -1
+/// ensures: ret == 7
+pub fn is_negative_branching_takes_the_true_arm(x: i8) -> u8 {
+    if x.is_negative() {
+        7
+    } else {
+        9
+    }
+}
+
 /// `wrapping_add_signed` adds a signed addend to an unsigned self, and the result
 /// is the plain wrapped sum: `0u8 + (-1i8)` is `255`. This is the *value* pin --
 /// a model that refused the mixed shape, or read the addend as unsigned, would
@@ -3788,8 +5792,10 @@ pub fn overflowing_add_wrapped_value_below_operand_tripwire(x: u8, y: u8) -> (u8
 // All four families are modelled because `pow`'s failure is an *overflow*, and an
 // overflow is a value in every family: `wrapping_pow` wraps, `saturating_pow`
 // clamps, `checked_pow` returns `None` and `overflowing_pow` sets the flag. The
-// plain `pow`, which panics on overflow, is not modelled at all -- hiding that
-// panic is not something a proof may do.
+// plain `pow` is modelled too, as `Intrinsic::PowPanic`: its failure is a panic
+// (`assert!` on overflow), so it yields a reachable-panic obligation rather than a
+// value, and a model that wrapped or clamped instead of panicking would *hide* the
+// panic -- the one thing a proof may not do.
 //
 // Each shape carries one verifying contract and one tripwire, per the standing
 // rule.
@@ -3918,6 +5924,44 @@ pub fn wrapping_pow_zero_exponent_is_one(x: u8) -> u8 {
 /// ensures: ret == 1
 pub fn wrapping_pow_one_exponent_is_one_tripwire(x: u8) -> u8 {
     x.wrapping_pow(1)
+}
+
+/// The plain `pow`: `3^5` is `243`, in range, so no panic. The contract names the
+/// exact power, so a model that read the wrong number of exponent bits shows as a
+/// wrong value rather than a wrong panic.
+/// requires: true
+/// ensures: ret == 243
+pub fn plain_pow_three_to_five_is_243() -> u8 {
+    3u8.pow(5)
+}
+
+/// The tripwire: `2^8` overflows a `u8`, so the plain `pow` *panics* rather than
+/// wrapping to `0`. The claim that the value is `0` is false on every path -- the
+/// only live path panics -- so it must be refuted (by the panic, not by a wrapped
+/// value).
+/// requires: true
+/// ensures: ret == 0
+pub fn plain_pow_two_to_eight_would_panic_tripwire() -> u8 {
+    2u8.pow(8)
+}
+
+/// The panic-freedom control: `2^7` is `128`, exactly in range, so `2u8.pow(7)`
+/// cannot panic and the panic obligation must be discharged.
+/// requires: true
+/// ensures: ret == 128
+pub fn plain_pow_two_to_seven_does_not_panic() -> u8 {
+    2u8.pow(7)
+}
+
+/// The panic is *reachable*, not vacuous: a symbolic base in a range that admits
+/// overflow, with the constant exponent `8` that a `u8` cannot hold for any base
+/// `>= 2`. This is the fixture that pins the panic polarity -- a model that
+/// treated the plain `pow` as total would prove this panic-free, which is the
+/// false proof the shape exists to prevent. It must FAIL on the panic obligation.
+/// requires: a >= 2
+/// ensures: true
+pub fn plain_pow_panic_is_reachable(a: u8) -> u8 {
+    a.pow(8)
 }
 
 
@@ -5610,6 +7654,48 @@ pub fn an_invariant_false_on_entry_cannot_prove_this(n: u8) -> u8 {
 pub fn an_invariant_not_preserved_cannot_prove_this(n: u8) -> u8 {
     let mut i = 0u8;
     while i < n { i += 1; }
+    i
+}
+
+/// A loop counter is a *variable*, so its arithmetic is not a constant
+/// expression.
+///
+/// The invariant is evaluated in the loop-head state, where `i` is bound to the
+/// value it holds on entry. `i - 1` then has two constant operands when the entry
+/// value is a constant, and the fold read it as the *written* expression and
+/// refused it as an unsigned underflow -- even though Rust never range-checks a
+/// variable's arithmetic as a constant expression. The counter's entry value is a
+/// coincidence of the state, not a literal in the source.
+/// requires: n <= 100
+/// invariant: i - 1 <= n
+/// ensures: ret <= 101
+pub fn an_invariant_subtracts_from_a_counter(n: u32) -> u32 {
+    let mut i = 1u32;
+    while i <= n { i += 1; }
+    i
+}
+
+/// The false twin: the same body, and the invariant no longer implies the
+/// postcondition, so it must not verify. This is the evidence that the shape above
+/// is *decided* rather than discharged vacuously.
+/// requires: n <= 100
+/// invariant: i - 1 <= n
+/// ensures: ret <= 0
+pub fn an_invariant_subtracts_from_a_counter_cannot_prove_this(n: u32) -> u32 {
+    let mut i = 1u32;
+    while i <= n { i += 1; }
+    i
+}
+
+/// The *written* constant underflow is still refused: `0u32 - 1u32` is a rustc
+/// const-eval error, so a contract carrying it is malformed rather than
+/// imprecise. The negative control for [`an_invariant_subtracts_from_a_counter`].
+/// requires: n <= 100
+/// invariant: 0 - 1 <= n
+/// ensures: ret <= 101
+pub fn an_invariant_written_underflow_is_refused(n: u32) -> u32 {
+    let mut i = 1u32;
+    while i <= n { i += 1; }
     i
 }
 
@@ -7854,6 +9940,207 @@ pub fn local_ord_min_is_not_the_model_tripwire(x: u8, y: u8) -> u8 {
     ord_shim::Ord::min(x, y)
 }
 
+/// `PartialEq::eq`/`ne` and `PartialOrd::lt`/`le`/`gt`/`ge` are the six comparison
+/// operators in their *trait-method* spelling, so the dump spells a call `<u8 as
+/// PartialOrd>::lt` -- the trait, with no `core::num::<impl …>` path. They are
+/// modelled as the same comparison the operator builds, so a method call and its
+/// operator form cannot disagree. Both operands are taken by reference, so the
+/// executor follows the `&self`/`&other` references to their referents.
+///
+/// The model is a *fallback*, as for `Ord`: a same-dump body is resolved first, so
+/// a local trait method of the same shape is inlined rather than modelled.
+/// requires: true
+/// ensures: ret == (x == y)
+pub fn partial_eq_method_is_the_operator(x: u8, y: u8) -> bool {
+    x.eq(&y)
+}
+
+/// `ne` is `!=`.
+/// requires: true
+/// ensures: ret == (x != y)
+pub fn partial_ne_method_is_the_operator(x: u8, y: u8) -> bool {
+    x.ne(&y)
+}
+
+/// `lt` is `<`, read unsigned on a `u8`.
+/// requires: true
+/// ensures: ret == (x < y)
+pub fn partial_lt_method_is_the_operator(x: u8, y: u8) -> bool {
+    x.lt(&y)
+}
+
+/// `ge` is `>=`. A model that read `ge` as `le` -- or that swapped the operands --
+/// would refute this; `x == y` is the point where `>=` and `<=` coincide, so the
+/// precondition is chosen to *separate* the orderings rather than to coincide.
+/// requires: x < y
+/// ensures: ret == false
+pub fn partial_ge_method_is_the_operator(x: u8, y: u8) -> bool {
+    x.ge(&y)
+}
+
+/// The signed ordering is not the unsigned one. `i8::MIN`'s bits (`0x80`) are the
+/// largest *unsigned* byte, so a model that read `lt` as `ult` would call
+/// `i8::MIN < 1` false; as a signed value `MIN` is below `1`, so it is true. The
+/// precondition pins the operand to the one value where the two orderings differ.
+/// requires: x == i8::MIN
+/// requires: y == 1
+/// ensures: ret == true
+pub fn partial_lt_signed_is_not_unsigned(x: i8, y: i8) -> bool {
+    x.lt(&y)
+}
+
+/// The false direction: `x.lt(&y)` is not `x <= y`, so with no precondition it
+/// must be refuted at `x == y`. A model that read `lt` as `le` would prove it.
+/// requires: true
+/// ensures: ret == (x <= y)
+pub fn partial_lt_is_not_le_tripwire(x: u8, y: u8) -> bool {
+    x.lt(&y)
+}
+
+/// A local trait whose method shares `PartialOrd`'s `lt` name. Its `lt` returns a
+/// constant, so a call to it must be answered by *this body* and never by `core`'s
+/// ordering. The trait lives in a module, so the dump spells the call `<u8 as
+/// cmp_shim::PartialOrd>::lt`, a trait segment that is not the standard library's,
+/// and `classify` refuses it outright *and* the same-dump lookup finds the body.
+pub mod cmp_shim {
+    pub trait PartialOrd {
+        fn lt(&self, other: &Self) -> bool;
+    }
+    impl PartialOrd for u8 {
+        fn lt(&self, _other: &u8) -> bool {
+            true
+        }
+    }
+}
+
+/// The body returns `true`, so this verifies only if the local trait's body is what
+/// answers the call. If the model answered instead it would return `x < y`, which is
+/// `true` only when `x < y`, so the postcondition would be false at `x == y`.
+/// requires: x == 5
+/// requires: y == 5
+/// ensures: ret == true
+pub fn local_partial_ord_lt_is_answered_by_its_body(x: u8, y: u8) -> bool {
+    cmp_shim::PartialOrd::lt(&x, &y)
+}
+
+/// The false direction on the same call: the *model's* answer (`5 < 5` is `false`)
+/// is what this claims, and the body returns `true`, so it must be refuted. A model
+/// that answered the call would return `false` and *prove* it.
+/// requires: x == 5
+/// requires: y == 5
+/// ensures: ret == false
+pub fn local_partial_ord_lt_is_not_the_model_tripwire(x: u8, y: u8) -> bool {
+    cmp_shim::PartialOrd::lt(&x, &y)
+}
+
+/// A comparison against a *constant* operand. In unoptimised MIR the literal is
+/// promoted to its own item (`const F::promoted[0]: &u8 = { _1 = const 5_u8; _0 =
+/// &_1; }`) and the call passes a reference to it, so the operand is a place
+/// naming a promoted constant, not an inline `Const`. Before the promoted scalar
+/// was collected the reference's referent was unknown and the call came back
+/// `unmodelled argument to <u8 as PartialEq>::eq` -- every comparison against a
+/// literal bound, an everyday idiom.
+/// requires: x == 5
+/// ensures: ret == true
+pub fn partial_eq_const_is_the_operator(x: u8) -> bool {
+    x.eq(&5)
+}
+
+/// The signed reading is the content: `i8::MIN < -1` is true signed, and false
+/// unsigned (`MIN`'s bits, `0x80`, are the largest *unsigned* byte). A model that
+/// read the promoted `-1` as unsigned would refute this.
+/// requires: x == i8::MIN
+/// ensures: ret == true
+pub fn partial_lt_const_signed_is_not_unsigned(x: i8) -> bool {
+    x.lt(&-1)
+}
+
+/// The false direction on a constant operand: `x.lt(&100)` is not `x <= 100`, so
+/// it fails at `x == 100`. A model that read `lt` as `le` -- or that ignored the
+/// constant and compared the operand with itself -- would prove it.
+/// requires: x == 100
+/// ensures: ret == true
+pub fn partial_lt_const_is_not_le_tripwire(x: i32) -> bool {
+    x.lt(&100)
+}
+
+/// `Ord::cmp` is the third `Ord` trait method, and unlike every other modelled
+/// shape its result is a *three-variant enum*, `core::cmp::Ordering`, whose
+/// discriminants are the signed `i8` values `Less` = -1, `Equal` = 0, `Greater` =
+/// 1. The dump lowers a `match x.cmp(&y)` to `_n = discriminant(_k); switchInt(move
+/// _n) -> [-1: …, 0: …, 1: …, otherwise: unreachable]`, so the model writes the
+/// destination's *discriminant* (the variants are unit, so there is no payload) and
+/// the `switchInt` decides.
+///
+/// The three arms return distinct constants, so each arm pins which tag the model
+/// produced: `Less` and `Greater` separate a swapped operands, and `Equal`
+/// separates the third arm.
+/// requires: x < y
+/// ensures: ret == 1
+pub fn ord_cmp_less_arm(x: u8, y: u8) -> i8 {
+    match x.cmp(&y) {
+        core::cmp::Ordering::Less => 1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => -1,
+    }
+}
+
+/// The `Equal` arm, reached only when `x == y`.
+/// requires: x == y
+/// ensures: ret == 0
+pub fn ord_cmp_equal_arm(x: u8, y: u8) -> i8 {
+    match x.cmp(&y) {
+        core::cmp::Ordering::Less => 1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => -1,
+    }
+}
+
+/// The `Greater` arm. The precondition separates it from `Less`, so a model that
+/// swapped the two comparisons would take the `Less` arm and return `1`.
+/// requires: x > y
+/// ensures: ret == -1
+pub fn ord_cmp_greater_arm(x: u8, y: u8) -> i8 {
+    match x.cmp(&y) {
+        core::cmp::Ordering::Less => 1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => -1,
+    }
+}
+
+/// The signed ordering is not the unsigned one, through the three-way result.
+/// `i8::MIN`'s bits (`0x80`) are the largest *unsigned* byte, so an unsigned model
+/// would take the `Greater` arm and return `-1`; as a signed value `MIN` is below
+/// `1`, so the `Less` arm returns `1`.
+/// requires: x == i8::MIN
+/// requires: y == 1
+/// ensures: ret == 1
+pub fn ord_cmp_signed_is_not_unsigned(x: i8, y: i8) -> i8 {
+    match x.cmp(&y) {
+        core::cmp::Ordering::Less => 1,
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Greater => -1,
+    }
+}
+
+/// The `matches!` form: `x.cmp(&y) == Ordering::Less` lowers to the same
+/// `switchInt`, and a model that read the tag as unsigned would compare the
+/// `Less` discriminant `0xff` against `255` and take the arm for every input.
+/// requires: true
+/// ensures: ret == (x < y)
+pub fn ord_cmp_matches_less(x: u8, y: u8) -> bool {
+    matches!(x.cmp(&y), core::cmp::Ordering::Less)
+}
+
+/// The false direction: `x.cmp(&y) == Less` is not `x <= y`, so with no
+/// precondition it must be refuted at `x == y`. A model that read the tag as
+/// unsigned -- or that confused `Less` with `Equal` -- would prove it.
+/// requires: true
+/// ensures: ret == (x <= y)
+pub fn ord_cmp_is_not_le_tripwire(x: u8, y: u8) -> bool {
+    matches!(x.cmp(&y), core::cmp::Ordering::Less)
+}
+
 /// A local trait whose *name* collides with a modelled conversion's, and whose
 /// owner type does too.
 ///
@@ -7946,6 +10233,112 @@ pub fn signed_widening_is_not_zero_fill_tripwire(x: i8) -> i16 {
 /// ensures: ret == 255
 pub fn unsigned_source_widens_to_signed_destination(x: u8) -> i16 {
     i16::from(x)
+}
+
+// ---------------------------------------------------------------------------
+// A user type named `Range` must not be answered by the for-loop range model.
+//
+// rustc 1.85 (the MSRV) prints the standard library's `for`-loop projection with
+// the type *unqualified* (`<RangeInclusive<u32> as IntoIterator>::into_iter`),
+// which is also a name a user type can carry. `names_range` therefore matches the
+// `Iterator` methods on the *trait* as well as the type, so a custom `into_iter`
+// on a user `Range` is refused rather than answered with the model's identity
+// semantics. The panic is the sharpest test: a model that returned the range
+// unchanged would give `ret == 1` and prove a function that always panics.
+// ---------------------------------------------------------------------------
+
+/// A user `Range` with a trait whose `into_iter` is *not* the identity. Two traits
+/// share the method name (`a::Custom` and `b::Custom`) so rustc prints the call
+/// with the qualified trait path, the spelling a bare `Range::into_iter` would not
+/// reach.
+pub mod range_shim {
+    pub mod a {
+        pub trait Custom {
+            fn into_iter(self) -> Self
+            where
+                Self: Sized,
+            {
+                panic!("into_iter is not the identity here")
+            }
+        }
+    }
+    pub mod b {
+        pub trait Custom {
+            fn into_iter(self) -> Self
+            where
+                Self: Sized,
+            {
+                panic!("the other trait")
+            }
+        }
+    }
+    pub struct Range<T> {
+        pub start: T,
+        pub end: T,
+    }
+    impl a::Custom for Range<u8> {}
+}
+
+/// A call to a user `Range`'s custom `into_iter` must never be answered by the
+/// range model. The model would return the range unchanged and *prove* `ret == 1`;
+/// the real method always panics, so the honest verdict is a refutation (the panic
+/// fires on every input). This is the tripwire for the unqualified-`Range` hole.
+/// requires: true
+/// ensures: ret == 1
+pub fn user_range_into_iter_is_not_the_model_cannot_prove_this() -> u8 {
+    let r = range_shim::Range { start: 1u8, end: 2u8 };
+    let x = <range_shim::Range<u8> as range_shim::a::Custom>::into_iter(r);
+    x.start
+}
+
+/// A trait *default* body that mutates `self` through a helper the impl overrides.
+///
+/// The call inside `go` prints as `<Self as Sized2>::set`, whose receiver is
+/// literally `Self`, so the concrete type is not known there. `resolve_callee` used
+/// to fall through to the *default* `set` (a no-op) and inline it, so this contract
+/// -- `ret == 1`, the seed -- was **proved** for a body whose real result is `42`.
+/// The call is refused now, so the verdict is not `verified`. The companion below
+/// verifies, which pins that the impl's override is read where the type *is* known.
+pub trait Sized2: Copy {
+    fn go(mut self) -> Self
+    where
+        Self: Sized,
+    {
+        self.set(42);
+        self
+    }
+    fn set(&mut self, _x: u8) {}
+}
+
+#[derive(Clone, Copy)]
+pub struct Marker {
+    pub v: u8,
+}
+
+impl Sized2 for Marker {
+    fn set(&mut self, x: u8) {
+        self.v = x;
+    }
+}
+
+/// The false direction: the real `set` writes `42`, so `ret == 1` is false. A model
+/// that inlined the *default* `set` would leave the seed `1` and *prove* this.
+/// requires: true
+/// ensures: ret == 1
+pub fn default_body_self_call_is_not_the_default_cannot_prove_this() -> u8 {
+    let p = Marker { v: 1 };
+    let q = <Marker as Sized2>::go(p);
+    q.v
+}
+
+/// The true direction on the same shape, read where the concrete type *is* known:
+/// `Marker::set` is called directly, so the override's `42` is what answers.
+/// requires: true
+/// ensures: ret == 42
+pub fn impl_override_is_read_when_the_type_is_known() -> u8 {
+    let mut p = Marker { v: 1 };
+    Sized2::set(&mut p, 42);
+    p.v
 }
 
 
@@ -8880,4 +11273,1720 @@ pub fn a_pinned_rewrite_does_not_revive_the_old_leaf(i: usize) -> u8 {
     a[0].v = 9;
     let x = a[0];
     x.v
+}
+
+/// The inherent `iN::abs`, modelled as a value plus a *reachable-panic*
+/// obligation. The precondition rules out `MIN` -- the one input where `abs`
+/// overflows -- so the call is panic-free and the postcondition is the
+/// mathematical absolute value. The precondition `x > -100` is what discharges
+/// the `abs(MIN)` panic, and `ret >= 0` is the value's own range.
+/// requires: x > -100 && x < 100
+/// ensures: ret >= 0
+pub fn abs_small_reads(x: i32) -> i32 {
+    x.abs()
+}
+
+/// The tripwire for `abs`'s *value*: the result is `|x|`, so claiming `ret <= 127`
+/// is false for a wide `i32` at `x == 1000`. A model that treated `abs` as an
+/// uninterpreted call -- or as a constant -- would prove this. It must be
+/// refuted, and the witness is a large positive input.
+///
+/// The precondition rules out `MIN` on purpose. Without it the *panic*
+/// obligation fires first (at `x == i32::MIN`), so the entry would be refuted for
+/// a reason that has nothing to do with the value -- and a model that returned a
+/// constant would still be refuted, by the panic. Discharging the panic here
+/// leaves the value as the only thing under test, and the failure kind is
+/// asserted to be the postcondition for exactly that reason.
+/// requires: x != i32::MIN
+/// ensures: ret <= 127
+pub fn abs_small_is_a_value_cannot_prove_this(x: i32) -> i32 {
+    x.abs()
+}
+
+/// The panic obligation, not the value: `i8::abs` overflows at `MIN`, so with no
+/// precondition ruling it out the call *can* panic and the function must be
+/// reported as a failing panic. This is the entry that separates "the value is
+/// modelled" from "the panic is modelled": a model that returned `|x|` and no
+/// panic predicate would verify a function that panics on a real input.
+/// requires: true
+/// ensures: true
+pub fn abs_min_can_overflow(x: i8) -> i8 {
+    x.abs()
+}
+
+/// The inherent `iN::unsigned_abs`: the same magnitude as `abs`, read as the
+/// unsigned type. `i8::unsigned_abs(-128)` is `128u8`, so the result is always
+/// `>= 0` as an *unsigned* value -- and unlike `abs` the call is total, with no
+/// panic at `MIN`. The postcondition is the value's own range.
+/// requires: true
+/// ensures: ret >= 0
+pub fn unsigned_abs_reads(x: i32) -> u32 {
+    x.unsigned_abs()
+}
+
+/// The `MIN` boundary, which is the whole reason the shape is not `abs`: the
+/// magnitude of `i8::MIN` (`128`) fits the unsigned result, so this call does
+/// *not* panic and the postcondition is exactly the magnitude. A model that
+/// reused the signed `abs`'s failure predicate -- or read the magnitude back as a
+/// signed `-128` -- would fail here.
+/// requires: x == i8::MIN
+/// ensures: ret == 128
+pub fn unsigned_abs_of_min_is_the_magnitude(x: i8) -> u8 {
+    x.unsigned_abs()
+}
+
+/// The tripwire for `unsigned_abs`'s *value*: the result is `|x|`, so claiming
+/// `ret <= 127` is false for a wide `i32` at `x == 1000`. A model that treated
+/// the call as uninterpreted -- or as a constant -- would prove this.
+/// requires: true
+/// ensures: ret <= 127
+pub fn unsigned_abs_is_a_value_cannot_prove_this(x: i32) -> u32 {
+    x.unsigned_abs()
+}
+
+/// The control that separates `unsigned_abs` from `abs`: at `MIN` the signed
+/// `abs` panics, but `unsigned_abs` is total, so this function has *no* panic
+/// obligation to discharge and must verify with `requires: true`. A model that
+/// gave `unsigned_abs` the signed `abs`'s failure predicate would refute it.
+/// requires: true
+/// ensures: ret >= 0
+pub fn unsigned_abs_of_min_is_panic_free(x: i8) -> u8 {
+    x.unsigned_abs()
+}
+
+/// `Ord::clamp`, the three-operand trait method. With `lo <= hi` the one panic
+/// (`assert!(lo <= hi)`) is discharged, and the postcondition is the clamp's own
+/// range: the result is at or above `lo` and at or below `hi`. `x` may be
+/// anywhere -- an out-of-range `x` is clamped, not an error.
+/// requires: lo <= hi
+/// ensures: lo <= ret
+/// ensures: ret <= hi
+pub fn clamp_builtin_reads(x: u32, lo: u32, hi: u32) -> u32 {
+    x.clamp(lo, hi)
+}
+
+/// The clamp's panic: with no precondition, `lo > hi` is reachable, so the call
+/// panics and the function must be reported as a failing panic. A model that
+/// ignored the `assert!(lo <= hi)` would verify this.
+/// requires: true
+/// ensures: true
+pub fn clamp_builtin_can_panic(x: u32, lo: u32, hi: u32) -> u32 {
+    x.clamp(lo, hi)
+}
+
+/// The clamp's *value* tripwire: the result is never above `hi`, so claiming it
+/// is below `hi - 1` for every input is false at `x == hi`. A model that treated
+/// the call as an uninterpreted value would prove it. The precondition keeps
+/// `lo <= hi`, so the panic is discharged and the value is the only thing under
+/// test (the failure kind is asserted to be the postcondition).
+/// requires: lo <= hi && x <= hi
+/// ensures: ret <= hi - 1
+pub fn clamp_builtin_is_a_value_cannot_prove_this(x: u32, lo: u32, hi: u32) -> u32 {
+    x.clamp(lo, hi)
+}
+
+/// A *signed* clamp, which pins the sign of the comparisons: `i8::MIN` is the
+/// smallest signed value, so a model reading the ordering as unsigned would
+/// return the wrong operand for every negative pair. The body clamps into
+/// `[lo, hi]` with `lo <= hi`; the postcondition is the same range.
+/// requires: lo <= hi
+/// ensures: ret >= lo
+pub fn clamp_builtin_signed_reads(x: i8, lo: i8, hi: i8) -> i8 {
+    x.clamp(lo, hi)
+}
+
+/// The ASCII class tests, which are `bool`-valued predicates on `u8` and take
+/// `&self`. `digit` returns the value's digit, so the postcondition pins both the
+/// predicate's boundary and the arithmetic after it: a model that read
+/// `is_ascii_digit` as `false` everywhere would prove `ret == 0`, and one that read
+/// it as `true` everywhere would leave the `b - b'0'` subtraction unguarded.
+/// requires: true
+/// ensures: ret <= 9
+pub fn ascii_digit_value(b: u8) -> u8 {
+    if b.is_ascii_digit() { b - b'0' } else { 0 }
+}
+
+/// A tripwire for the digit test: `b'9' + 1` is not a digit, so the body returns
+/// `0`, and claiming the *subtraction* ran (`ret >= 1`) is false at that input. A
+/// model that made every byte a digit would prove it.
+/// requires: true
+/// ensures: ret >= 1
+pub fn ascii_digit_is_not_every_byte_cannot_prove_this(b: u8) -> u8 {
+    if b.is_ascii_digit() { b - b'0' } else { 0 }
+}
+
+/// `is_ascii_hexdigit` and `is_ascii_alphabetic` are different classes, and the
+/// body returns a different constant for each. The postcondition pins the
+/// discrimination: a model that collapsed the two classes would return one
+/// constant for the other's inputs.
+/// requires: true
+/// ensures: ret <= 2
+pub fn ascii_class_discriminates(b: u8) -> u8 {
+    if b.is_ascii_hexdigit() {
+        1
+    } else if b.is_ascii_alphabetic() {
+        2
+    } else {
+        0
+    }
+}
+
+/// A tripwire for the class discrimination: `b'g'` is alphabetic but not a hex
+/// digit, so the body returns `2`, and claiming the hex arm ran for every byte is
+/// false there. A model that answered `1` for a letter would prove it.
+/// requires: true
+/// ensures: ret != 2
+pub fn ascii_class_hex_arm_is_not_every_byte_cannot_prove_this(b: u8) -> u8 {
+    if b.is_ascii_hexdigit() {
+        1
+    } else if b.is_ascii_alphabetic() {
+        2
+    } else {
+        0
+    }
+}
+
+/// `is_ascii` is the single comparison `b < 128`, so a byte above `0x7f` takes
+/// the else arm. The postcondition pins the boundary: a model that read `is_ascii`
+/// as always true would return `1` for every byte.
+/// requires: true
+/// ensures: ret <= 1
+pub fn ascii_is_ascii_boundary(b: u8) -> u8 {
+    if b.is_ascii() { 1 } else { 0 }
+}
+
+/// A tripwire for `is_ascii`'s boundary: `0xff` is not ASCII, so the body returns
+/// `0`, and claiming `ret == 1` is false there. A model that answered `true` for
+/// every byte would prove it.
+/// requires: true
+/// ensures: ret == 1
+pub fn ascii_is_ascii_is_not_every_byte_cannot_prove_this(b: u8) -> u8 {
+    if b.is_ascii() { 1 } else { 0 }
+}
+
+/// `abs_diff` returns the *unsigned* magnitude of the difference. `b >= a` makes
+/// the body take the `b - a` arm, so the result is `b - a`; the postcondition pins
+/// that the arms are not swapped. A model that returned the signed difference
+/// would give a negative value read as a huge unsigned one.
+/// requires: a <= b
+/// ensures: ret == b - a
+pub fn abs_diff_ordered(a: u32, b: u32) -> u32 {
+    a.abs_diff(b)
+}
+
+/// A tripwire for `abs_diff`: the difference is symmetric in the operands, so
+/// `a.abs_diff(b)` is not `b - a` when `a > b`. A model that ignored the ordering
+/// would prove it.
+/// requires: a > b
+/// ensures: ret == b - a
+pub fn abs_diff_is_symmetric_cannot_prove_this(a: u32, b: u32) -> u32 {
+    a.abs_diff(b)
+}
+
+/// A rotation by a nonzero constant moves bits and wraps the top to the bottom.
+/// `0b1000_0001` rotated left by one is `0b0000_0011`; the postcondition pins the
+/// wrap, which a plain shift (dropping the top bit) would get wrong.
+/// requires: true
+/// ensures: ret == 3
+pub fn rotate_left_wraps_the_top_bit() -> u8 {
+    0x81u8.rotate_left(1)
+}
+
+/// A tripwire for the rotation: a rotation is not a shift, so the body is not
+/// `0x81 << 1` (which wraps to `2` in eight bits). A model that used a shift would
+/// prove it.
+/// requires: true
+/// ensures: ret == 2
+pub fn rotate_is_not_a_shift_cannot_prove_this() -> u8 {
+    0x81u8.rotate_left(1)
+}
+
+/// A rotation by the full width is the identity, which is what the amount being
+/// reduced modulo the width means. A model that saturated the amount (as a shift
+/// does) would give `0` instead.
+/// requires: true
+/// ensures: ret == 0x81
+pub fn rotate_by_the_width_is_the_identity() -> u8 {
+    0x81u8.rotate_right(8)
+}
+
+/// A rotation by more than the width wraps, so `w + 1` is a rotation by `1`. A
+/// model that read the amount as a shift would return `0` past the width.
+/// requires: true
+/// ensures: ret == 3
+pub fn rotate_by_more_than_the_width_wraps() -> u8 {
+    0x81u8.rotate_left(9)
+}
+
+/// `signum` is `-1`, `0` or `1`. This pins the negative arm, which is the one an
+/// unsigned reading of the top bit would get wrong: `i8::MIN`'s bits (`0x80`) are
+/// the largest unsigned byte, so an unsigned `signum` would return `1`, not `-1`.
+/// requires: x == i8::MIN
+/// ensures: ret == -1
+pub fn signum_of_min_is_minus_one(x: i8) -> i8 {
+    x.signum()
+}
+
+/// The tripwire: `signum` is not `x / |x|` rounded toward zero, so it is not `0`
+/// for a negative input. A model that answered `0` for every negative value, or
+/// that read the sign unsigned, would prove it.
+/// requires: x == -5
+/// ensures: ret == 0
+pub fn signum_of_a_negative_cannot_prove_this(x: i8) -> i8 {
+    x.signum()
+}
+
+/// `i32::cast_unsigned` reinterprets the same 32 bits as `u32`: `-1i32` is
+/// `0xffff_ffff`, which reads as `4294967295u32`, not `-1`.
+/// requires: x == -1
+/// ensures: ret == 4294967295
+pub fn cast_unsigned_reinterprets_negative_as_large(x: i32) -> u32 {
+    x.cast_unsigned()
+}
+
+/// The false direction: an unsigned reading of `-1i32` is `4294967295`, so a
+/// model that carried the operand's *signed* type would prove this.
+/// requires: x == -1
+/// ensures: ret == 0
+pub fn cast_unsigned_reinterprets_negative_cannot_prove_this(x: i32) -> u32 {
+    x.cast_unsigned()
+}
+
+/// `u32::cast_signed` reinterprets `0xffff_ffff` as `-1i32`.
+/// requires: x == 4294967295
+/// ensures: ret == -1
+pub fn cast_signed_reinterprets_large_as_negative(x: u32) -> i32 {
+    x.cast_signed()
+}
+
+/// The false direction: a model that kept the *unsigned* type would read
+/// `4294967295` and prove this.
+/// requires: x == 4294967295
+/// ensures: ret == 0
+pub fn cast_signed_reinterprets_large_cannot_prove_this(x: u32) -> i32 {
+    x.cast_signed()
+}
+
+/// The type the cast produces is what a *later* comparison reads: `-1i32` cast
+/// to `u32` is greater than `0` unsigned, where the signed `-1` is not.
+/// requires: x == -1
+/// ensures: ret == 1
+pub fn cast_unsigned_makes_a_comparison_unsigned(x: i32) -> u8 {
+    if x.cast_unsigned() > 0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// `div_euclid` rounds the quotient so the remainder is non-negative, which is
+/// what separates it from `/` for a negative dividend. `-7 / 3` is `-2` (the
+/// truncating quotient) but `-7.div_euclid(3)` is `-3`.
+/// requires: true
+/// ensures: ret == -3
+pub fn div_euclid_rounds_toward_negative_infinity() -> i32 {
+    (-7i32).div_euclid(3)
+}
+
+/// The tripwire: `div_euclid` is *not* the truncating `/` for a negative dividend.
+/// A model that used `/` would prove this.
+/// requires: true
+/// ensures: ret == -2
+pub fn div_euclid_is_not_truncating_division_cannot_prove_this() -> i32 {
+    (-7i32).div_euclid(3)
+}
+
+/// `rem_euclid` returns a *non-negative* remainder, unlike `%`: `-7 % 3` is `-1`,
+/// but `-7.rem_euclid(3)` is `2`.
+/// requires: true
+/// ensures: ret == 2
+pub fn rem_euclid_is_non_negative() -> i32 {
+    (-7i32).rem_euclid(3)
+}
+
+/// The tripwire: `rem_euclid` is not `%` for a negative dividend. A model that
+/// used `%` would prove this.
+/// requires: true
+/// ensures: ret == -1
+pub fn rem_euclid_is_not_the_truncating_remainder_cannot_prove_this() -> i32 {
+    (-7i32).rem_euclid(3)
+}
+
+/// On an *unsigned* receiver the remainder is never negative, so `rem_euclid` is
+/// the plain `%` and `7u32.rem_euclid(3)` is `1`. This pins that the model does
+/// not apply the signed adjustment where the sign cannot be negative.
+/// requires: true
+/// ensures: ret == 1
+pub fn unsigned_rem_euclid_is_the_plain_remainder() -> u32 {
+    7u32.rem_euclid(3)
+}
+
+/// The tripwire: on an unsigned receiver `rem_euclid` is not `% + 3` (the signed
+/// adjustment). A model that kept the signed path for an unsigned operand would
+/// compute `1 + 3 == 4` here.
+/// requires: true
+/// ensures: ret == 4
+pub fn unsigned_rem_euclid_is_not_the_signed_adjustment_cannot_prove_this() -> u32 {
+    7u32.rem_euclid(3)
+}
+
+/// On an unsigned receiver `div_euclid` is the truncating `/`: `7u32.div_euclid(3)`
+/// is `2`.
+/// requires: true
+/// ensures: ret == 2
+pub fn unsigned_div_euclid_is_the_plain_quotient() -> u32 {
+    7u32.div_euclid(3)
+}
+
+/// The tripwire: on an unsigned receiver `div_euclid` is not the signed
+/// Euclidean quotient (which would subtract one where the signed remainder was
+/// negative, a case that cannot arise for an unsigned operand).
+/// requires: true
+/// ensures: ret == 1
+pub fn unsigned_div_euclid_is_not_the_signed_adjustment_cannot_prove_this() -> u32 {
+    7u32.div_euclid(3)
+}
+
+/// `div_ceil` rounds toward positive infinity: `7 / 2` is `3` with a remainder,
+/// so `7u32.div_ceil(2)` is `4`. It is the unsigned, *stable* counterpart of
+/// `div_euclid` rounding, and it is modelled only on the unsigned types.
+/// requires: true
+/// ensures: ret == 4
+pub fn div_ceil_rounds_toward_positive_infinity() -> u32 {
+    7u32.div_ceil(2)
+}
+
+/// The tripwire: `div_ceil` is not the truncating `/`, so it is not `3` here. A
+/// model that used `/` would prove it.
+/// requires: true
+/// ensures: ret == 3
+pub fn div_ceil_is_not_truncating_division_cannot_prove_this() -> u32 {
+    7u32.div_ceil(2)
+}
+
+/// `reverse_bits` reverses the bit order: `0b1000_0000` (`128`) becomes `1`. A
+/// model that returned the operand unchanged, or applied a rotation, would fail.
+/// requires: true
+/// ensures: ret == 1
+pub fn reverse_bits_of_the_top_bit() -> u8 {
+    0x80u8.reverse_bits()
+}
+
+/// The tripwire: `reverse_bits` is not a byte swap on a single-byte type (both
+/// are the identity there), so this pins that the *bits* are reversed at all. A
+/// model that returned the operand unchanged would prove it.
+/// requires: true
+/// ensures: ret == 0x80
+pub fn reverse_bits_is_not_the_identity_cannot_prove_this() -> u8 {
+    0x80u8.reverse_bits()
+}
+
+/// `swap_bytes` reverses the *bytes*: `0x1234u16.swap_bytes()` is `0x3412`. This
+/// is the multi-byte case, which the rotation model has to get right (a rotation
+/// by `w/2` bits, not by `w/2 * 8`).
+/// requires: true
+/// ensures: ret == 0x3412
+pub fn swap_bytes_reverses_the_bytes() -> u16 {
+    0x1234u16.swap_bytes()
+}
+
+/// The tripwire: `swap_bytes` is not the identity on a multi-byte type. A model
+/// that returned the operand unchanged (or that took the rotation amount at the
+/// wrong width) would prove this.
+/// requires: true
+/// ensures: ret == 0x1234
+pub fn swap_bytes_is_not_the_identity_cannot_prove_this() -> u16 {
+    0x1234u16.swap_bytes()
+}
+
+/// `to_be` on a little-endian target is a byte swap; the model reads the target
+/// endianness from the compilation rather than guessing. This is the shape a
+/// plain `#[cfg]`-free body has, and the value is Rust's own `to_be`.
+/// requires: true
+/// ensures: ret == 0x3412
+pub fn to_be_on_a_little_endian_target_swaps() -> u16 {
+    0x1234u16.to_be()
+}
+
+/// The tripwire: on a little-endian target `to_be` is *not* the identity. A model
+/// that read the target as big-endian would prove this.
+/// requires: true
+/// ensures: ret == 0x1234
+pub fn to_be_is_not_the_identity_here_cannot_prove_this() -> u16 {
+    0x1234u16.to_be()
+}
+
+/// `to_le` on a little-endian target is the identity (the value is already in
+/// little-endian order), which is the mirror of `to_be` above.
+/// requires: true
+/// ensures: ret == 0x1234
+pub fn to_le_on_a_little_endian_target_is_the_identity() -> u16 {
+    0x1234u16.to_le()
+}
+
+/// `from_be` is the involution of `to_be`: on a little-endian target both are the
+/// same byte swap, so `from_be` swaps here too.
+/// requires: true
+/// ensures: ret == 0x3412
+pub fn from_be_on_a_little_endian_target_swaps() -> u16 {
+    u16::from_be(0x1234)
+}
+
+/// The tripwire: on a little-endian target `from_be` is *not* the identity. A
+/// model that read `from_be` as a no-op -- or that took it for a `to_le`-style
+/// identity -- would prove this.
+/// requires: true
+/// ensures: ret == 0x1234
+pub fn from_be_is_not_the_identity_here_cannot_prove_this() -> u16 {
+    u16::from_be(0x1234)
+}
+
+/// `from_le` on a little-endian target is the identity, the mirror of `from_be`.
+/// requires: true
+/// ensures: ret == 0x1234
+pub fn from_le_on_a_little_endian_target_is_the_identity() -> u16 {
+    u16::from_le(0x1234)
+}
+
+/// A `to_be`/`from_be` round trip is the identity on every target: the two are the
+/// same permutation, so applying it twice cancels. This is the property that makes
+/// `from_be` the involution of `to_be`, and it holds whatever the target's
+/// endianness.
+/// requires: true
+/// ensures: ret == 0x1234
+pub fn to_be_then_from_be_is_the_identity() -> u16 {
+    u16::from_be(0x1234u16.to_be())
+}
+
+/// The tripwire for the round trip: `to_le` then `from_be` is *not* the identity
+/// when the two directions disagree, so a model that collapsed every byte-order
+/// method to one no-op would prove this.
+/// requires: true
+/// ensures: ret == 0x1234
+pub fn to_le_then_from_be_is_not_the_identity_cannot_prove_this() -> u16 {
+    u16::from_be(0x1234u16.to_le())
+}
+
+/// `to_ascii_uppercase` maps `b'a'..=b'z'` to their uppercase letters and leaves
+/// every other byte alone. This is the boundary: `b'a'` becomes `b'A'`. The
+/// receiver is an *argument* rather than a literal, because a literal receiver
+/// lowers to a promoted `const` reference (`const f::promoted[0]: &u8`), which is
+/// a separate shape the frontend does not model; the argument form is the one a
+/// contract can pin.
+/// requires: b == 97
+/// ensures: ret == 65
+pub fn to_ascii_uppercase_of_a_lowercase_letter(b: u8) -> u8 {
+    b.to_ascii_uppercase()
+}
+
+/// The tripwire: a byte outside the lowercase range is unchanged, so `b'A'`
+/// (already uppercase) stays `b'A'` -- a model that added `32` unconditionally
+/// would prove the wrong value here.
+/// requires: b == 65
+/// ensures: ret == 97
+pub fn to_ascii_uppercase_leaves_uppercase_cannot_prove_this(b: u8) -> u8 {
+    b.to_ascii_uppercase()
+}
+
+/// `to_ascii_lowercase` is the mirror of the uppercase conversion.
+/// requires: b == 65
+/// ensures: ret == 97
+pub fn to_ascii_lowercase_of_an_uppercase_letter(b: u8) -> u8 {
+    b.to_ascii_lowercase()
+}
+
+/// `is_multiple_of` is `a % b == 0`, with `b == 0` defined as `a == 0`. This pins
+/// the ordinary true case.
+/// requires: true
+/// ensures: ret == true
+pub fn is_multiple_of_six_by_three() -> bool {
+    6u32.is_multiple_of(3)
+}
+
+/// The tripwire: seven is not a multiple of three, so a model that answered
+/// `true` unconditionally would prove it.
+/// requires: true
+/// ensures: ret == true
+pub fn is_multiple_of_seven_by_three_cannot_prove_this() -> bool {
+    7u32.is_multiple_of(3)
+}
+
+/// The `b == 0` corner, which `core` defines as `a == 0`: `0.is_multiple_of(0)`
+/// is `true`. A model that read `a % 0` without the `b != 0` guard would take the
+/// engine's defined `urem(a, 0)` value and could answer `false`.
+/// requires: true
+/// ensures: ret == true
+pub fn is_multiple_of_zero_by_zero() -> bool {
+    0u32.is_multiple_of(0)
+}
+
+/// The complement of the zero corner: `5.is_multiple_of(0)` is `false`, because
+/// `core` defines it as `a == 0` and `a` is not zero. A model that answered `true`
+/// for every zero divisor would prove this.
+/// requires: true
+/// ensures: ret == false
+pub fn is_multiple_of_five_by_zero() -> bool {
+    5u32.is_multiple_of(0)
+}
+
+/// A guard whose destructor is empty. Its `drop` has a body in the dump, so the
+/// executor runs it; because it touches nothing, the function decides instead of
+/// reporting an unmodelled `drop`.
+pub struct QuietGuard(pub u8);
+impl Drop for QuietGuard {
+    fn drop(&mut self) {}
+}
+
+/// The C1 gap the review named: a function holding an RAII local was `incomplete`
+/// on an unmodelled `drop`. With an empty destructor the value of `x` is what
+/// survives, so the contract is the body's own value.
+/// requires: true
+/// ensures: ret == x
+pub fn guard_is_dropped_cleanly(x: u8) -> u8 {
+    let _g = QuietGuard(x);
+    x
+}
+
+/// The `guard_guarded` half of the review's C1 exit criterion: an assert that
+/// holds is verified even with a live `Drop` local.
+/// requires: x < 200
+/// ensures: ret == 1
+pub fn guard_guarded(x: u8) -> u8 {
+    let _g = QuietGuard(0);
+    assert!(x < 200);
+    1
+}
+
+/// The `guard_misguarded` half: the same body with no precondition, so the assert
+/// is a reachable panic. A `drop` treated as a no-op would not change this, but
+/// dropping the *path* at the `drop` -- the pre-fix behaviour -- would leave it
+/// undecided rather than refuted.
+/// requires: true
+/// ensures: ret == 1
+pub fn guard_misguarded_cannot_prove_this(x: u8) -> u8 {
+    let _g = QuietGuard(0);
+    assert!(x < 200);
+    1
+}
+
+/// A destructor that *panics* on part of its domain. Treating the `drop` as a
+/// no-op -- the tempting way to make RAII locals decide -- would prove this
+/// function, which panics for `x >= 10`. The destructor's body is executed, so the
+/// panic is a real obligation.
+/// requires: true
+/// ensures: ret == 1
+pub fn destructor_panic_cannot_prove_this(x: u8) -> u8 {
+    let _p = PanicGuard { v: x };
+    1
+}
+
+/// The guarded companion: with `x < 10` the destructor cannot panic, so the same
+/// body verifies. A refusal of every `drop` would leave it undecided.
+/// requires: x < 10
+/// ensures: ret == 1
+pub fn destructor_panic_guarded(x: u8) -> u8 {
+    let _p = PanicGuard { v: x };
+    1
+}
+
+/// A guard whose destructor is empty.
+pub struct PanicGuard {
+    pub v: u8,
+}
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        assert!(self.v < 10);
+    }
+}
+
+/// A plain struct with no `impl Drop`. rustc emits no `drop` for it (a type with
+/// no drop glue is dropped nowhere), so this function never reaches the
+/// `Term::Drop` arm -- it pins that an aggregate local still decides, which is the
+/// shape the review's `everyday` corpus hits.
+/// requires: true
+/// ensures: ret == s.x
+pub fn plain_struct_local_decides(s: PlainStruct) -> u8 {
+    let _p = s;
+    s.x
+}
+
+/// A struct with no destructor.
+#[derive(Clone, Copy)]
+pub struct PlainStruct {
+    pub x: u8,
+}
+
+/// An array local. Like the struct above, an array of a glue-free type carries no
+/// drop glue, so rustc emits no `drop` and this pins that the local decides.
+/// requires: true
+/// ensures: ret == a[0]
+pub fn array_local_decides(a: [u8; 4]) -> u8 {
+    let _copy = a;
+    a[0]
+}
+
+/// A `String` local: its destructor frees the heap, which this tool cannot
+/// represent, so the `drop` is *refused* -- never assumed to be a no-op. Assuming
+/// it were a no-op would be a false proof whenever the destructor's effect is
+/// observable, which is the one outcome this crate must never produce.
+/// requires: true
+/// ensures: ret == 1
+pub fn string_drop_is_refused(s: String) -> u8 {
+    let _owned = s;
+    1
+}
+
+// ---------------------------------------------------------------------------
+// A scalar reference argument named in a contract (C9)
+//
+// `Ty::Ref` is modelled as its referent, so a `&mut u16` argument's name in a
+// contract denotes the `u16` it addresses. The name is the *final* value (what
+// the body left there); the entry value is reachable through `old(...)`. This is
+// the C9 exit shape: `bump(c: &mut u16)` with `ensures: c == old(c) + 1`.
+// ---------------------------------------------------------------------------
+
+/// The C9 exit criterion: a scalar `&mut` argument named in the postcondition.
+/// requires: c < 65535
+/// ensures: c == old(c) + 1
+pub fn bump_scalar_ref(c: &mut u16) {
+    *c += 1;
+}
+
+/// The false direction of [`bump_scalar_ref`]: the postcondition's `c` is the
+/// *final* value, so claiming the entry value must be refuted. Binding `c` to the
+/// entry value instead (the bug this shape closed) would **prove** it.
+/// requires: c < 65535
+/// ensures: c == old(c)
+pub fn a_stale_scalar_ref_cannot_prove_this(c: &mut u16) {
+    *c += 1;
+}
+
+/// A scalar `&mut` argument written to a constant.
+/// requires: true
+/// ensures: c == 5
+pub fn set_scalar_ref(c: &mut u16) {
+    *c = 5;
+}
+
+/// The false direction of [`set_scalar_ref`].
+/// requires: true
+/// ensures: c == 0
+pub fn a_scalar_ref_write_cannot_prove_this(c: &mut u16) {
+    *c = 5;
+}
+
+/// A *signed* scalar `&mut` argument: `c < 0` is a signed comparison. An unsigned
+/// reading would make `-1` read as `65535`, so `c < 0` would be false and the
+/// function refuted rather than verified -- `verified` is the evidence the sign
+/// was read.
+/// requires: true
+/// ensures: c < 0
+pub fn signed_scalar_ref(c: &mut i16) {
+    *c = -1;
+}
+
+/// A caller of the scalar-`&mut` helper, verified through the inlined body.
+/// requires: x == 4
+/// ensures: ret == 5
+pub fn a_scalar_ref_caller(x: u16) -> u16 {
+    let mut y = x;
+    bump_scalar_ref(&mut y);
+    y
+}
+
+/// The roadmap's exact exit spelling: `*c` (the explicit deref) and `old(*c)`.
+/// requires: c < 65535
+/// ensures: *c == old(*c) + 1
+pub fn bump_scalar_ref_star(c: &mut u16) {
+    *c += 1;
+}
+
+// ---------------------------------------------------------------------------
+// A `&mut bool` argument: the final value is a *predicate* (`Val::Bool`), not a
+// word, so `ref_final` dropped it and the postcondition was refused as an unknown
+// name -- the same final-value loss the word case exists to prevent. The
+// predicate is widened to a one-bit word, exactly as a `bool` `ret` is.
+// ---------------------------------------------------------------------------
+
+/// A `&mut bool` written to a constant.
+/// requires: true
+/// ensures: c == true
+pub fn set_bool_ref(c: &mut bool) {
+    *c = true;
+}
+
+/// The false direction of [`set_bool_ref`]: the final value is `true`, so a claim
+/// of `false` is refutable. Dropping the binding would make the contract
+/// *unreadable* rather than refuted, which is the milder bug this pins shut.
+/// requires: true
+/// ensures: c == false
+pub fn a_bool_ref_write_cannot_prove_this(c: &mut bool) {
+    *c = true;
+}
+
+/// A `&mut bool` read but not written: the final value is the entry value.
+/// requires: c == true
+/// ensures: c == true
+pub fn keep_bool_ref(c: &mut bool) {
+    let _ = *c;
+}
+
+
+// ---------------------------------------------------------------------------
+// The `?` operator (`Try::branch` + `FromResidual::from_residual`). `expr?`
+// lowers to `<T as Try>::branch(expr)` producing a `ControlFlow`, a `switchInt`
+// on its discriminant, and (on `Break`) a `from_residual` call that re-wraps the
+// error as the function's return enum. The model answers both calls from the
+// receiver's enum state; the residual's tag is fixed by the receiver type, and
+// `from_residual` re-numbers it for the return enum. The `_propagate` pair pins
+// the `Err` path, the `_value` pair the `Ok` path, and each `_cannot_prove_this`
+// the opposite direction.
+// ---------------------------------------------------------------------------
+
+/// `?` on a `Result`, success path: the value flows through unchanged.
+/// requires: r.is_ok()
+/// ensures: ret.is_ok() && ret.Ok == r.Ok
+pub fn result_try_ok_value(r: Result<u8, u8>) -> Result<u8, u8> {
+    let v = r?;
+    Ok(v)
+}
+
+/// The false direction of [`result_try_ok_value`]: under `is_ok` the result is
+/// `Ok`, so a claim of `Err` is refutable.
+/// requires: r.is_ok()
+/// ensures: ret.is_err()
+pub fn result_try_ok_value_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
+    let v = r?;
+    Ok(v)
+}
+
+/// `?` on a `Result`, failure path: the error propagates as `Err`.
+/// requires: r.is_err()
+/// ensures: ret.is_err() && ret.Err == r.Err
+pub fn result_try_err_propagates(r: Result<u8, u8>) -> Result<u8, u8> {
+    let v = r?;
+    Ok(v)
+}
+
+/// The false direction of [`result_try_err_propagates`]: under `is_err` the
+/// result is `Err`, so a claim of `Ok` is refutable.
+/// requires: r.is_err()
+/// ensures: ret.is_ok()
+pub fn result_try_err_propagates_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
+    let v = r?;
+    Ok(v)
+}
+
+/// `?` whose yielded value is then *used*: the `Continue` payload reaches the
+/// arithmetic, so a model that bound the payload to the wrong variant would
+/// refute the `+ 1` relation.
+/// requires: r.is_ok() && r.Ok < 100
+/// ensures: ret.is_ok() && ret.Ok == r.Ok + 1
+pub fn result_try_value_used(r: Result<u8, u8>) -> Result<u8, u8> {
+    let v = r?;
+    Ok(v + 1)
+}
+
+/// The false direction of [`result_try_value_used`]: the result is `r.Ok + 1`,
+/// not `r.Ok`, so claiming the value passed through unchanged is refutable.
+/// requires: r.is_ok() && r.Ok < 100
+/// ensures: ret.Ok == r.Ok
+pub fn result_try_value_used_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
+    let v = r?;
+    Ok(v + 1)
+}
+
+/// `?` on an `Option`, success path: the value flows through.
+/// requires: x.is_some()
+/// ensures: ret.is_some()
+pub fn option_try_some_value(x: Option<u8>) -> Option<u8> {
+    let v = x?;
+    Some(v)
+}
+
+/// The false direction of [`option_try_some_value`]: under `is_some` the result
+/// is `Some`, so a claim of `None` is refutable.
+/// requires: x.is_some()
+/// ensures: ret.is_none()
+pub fn option_try_some_value_cannot_prove_this(x: Option<u8>) -> Option<u8> {
+    let v = x?;
+    Some(v)
+}
+
+/// `?` on an `Option`, failure path: `None` propagates.
+/// requires: x.is_none()
+/// ensures: ret.is_none()
+pub fn option_try_none_propagates(x: Option<u8>) -> Option<u8> {
+    let v = x?;
+    Some(v)
+}
+
+/// The false direction of [`option_try_none_propagates`]: under `is_none` the
+/// result is `None`, so a claim of `Some` is refutable.
+/// requires: x.is_none()
+/// ensures: ret.is_some()
+pub fn option_try_none_propagates_cannot_prove_this(x: Option<u8>) -> Option<u8> {
+    let v = x?;
+    Some(v)
+}
+
+/// `?` on a *locally constructed* `Ok`: the receiver's tag is a known constant,
+/// so the `branch` is decided statically and the value flows through.
+/// requires: true
+/// ensures: ret.is_ok() && ret.Ok == 6
+pub fn result_try_of_a_known_ok() -> Result<u8, u8> {
+    let r: Result<u8, u8> = Ok(5);
+    let v = r?;
+    Ok(v + 1)
+}
+
+/// `?` on a locally constructed `Err`: the early return is taken unconditionally.
+/// requires: true
+/// ensures: ret.is_err()
+pub fn result_try_of_a_known_err() -> Result<u8, u8> {
+    let r: Result<u8, u8> = Err(3);
+    let v = r?;
+    Ok(v)
+}
+
+/// The false direction of [`result_try_of_a_known_err`]: the known `Err` always
+/// returns `Err`, so a claim of `Ok` is refutable.
+/// requires: true
+/// ensures: ret.is_ok()
+pub fn result_try_of_a_known_err_cannot_prove_this() -> Result<u8, u8> {
+    let r: Result<u8, u8> = Err(3);
+    let v = r?;
+    Ok(v)
+}
+
+/// `?` on a locally constructed `None`: the early return is taken, `None` flows.
+/// requires: true
+/// ensures: ret.is_none()
+pub fn option_try_of_a_known_none() -> Option<u8> {
+    let r: Option<u8> = None;
+    let v = r?;
+    Some(v)
+}
+
+/// The false direction of [`option_try_of_a_known_none`]: a known `None` always
+/// returns `None`, so a claim of `Some` is refutable.
+/// requires: true
+/// ensures: ret.is_some()
+pub fn option_try_of_a_known_none_cannot_prove_this() -> Option<u8> {
+    let r: Option<u8> = None;
+    let v = r?;
+    Some(v)
+}
+
+/// Two `?` in sequence: each propagates independently, so the result is `Err`
+/// whenever *either* input is, and the second `?` is only reached on the first's
+/// success path.
+/// requires: r.is_ok() && s.is_ok()
+/// ensures: ret.is_ok()
+pub fn result_try_chained(r: Result<u8, u8>, s: Result<u8, u8>) -> Result<u8, u8> {
+    let a = r?;
+    let b = s?;
+    Ok(a.wrapping_add(b))
+}
+
+/// The false direction of [`result_try_chained`]: both inputs are `Ok`, so the
+/// result is `Ok`; a claim of `Err` is refutable.
+/// requires: r.is_ok() && s.is_ok()
+/// ensures: ret.is_err()
+pub fn result_try_chained_cannot_prove_this(r: Result<u8, u8>, s: Result<u8, u8>) -> Result<u8, u8> {
+    let a = r?;
+    let b = s?;
+    Ok(a.wrapping_add(b))
+}
+
+/// `?` on one of *two* branches: the propagation must be path-sensitive, so under
+/// "both inputs are `Err`" every path returns `Err`.
+/// requires: r.is_err() && s.is_err()
+/// ensures: ret.is_err()
+pub fn result_try_in_either_branch(c: bool, r: Result<u8, u8>, s: Result<u8, u8>) -> Result<u8, u8> {
+    if c {
+        let v = r?;
+        Ok(v)
+    } else {
+        let v = s?;
+        Ok(v)
+    }
+}
+
+/// The false direction of [`result_try_in_either_branch`]: both inputs are `Ok`,
+/// so no branch can produce an `Err`.
+/// requires: r.is_ok() && s.is_ok()
+/// ensures: ret.is_err()
+pub fn result_try_in_either_branch_cannot_prove_this(
+    c: bool,
+    r: Result<u8, u8>,
+    s: Result<u8, u8>,
+) -> Result<u8, u8> {
+    if c {
+        let v = r?;
+        Ok(v)
+    } else {
+        let v = s?;
+        Ok(v)
+    }
+}
+
+/// A `?` that widens the error type: `Result<u8, u8>` into a function returning
+/// `Result<u8, u16>`, so the residual `u8` is converted by `From`. The conversion
+/// happens inside `from_residual`, so a model that copied the error value without
+/// widening it would refute the `200` claim (or, at the wrong width, accept a
+/// wrong one).
+/// requires: r.is_err() && r.Err == 200
+/// ensures: ret.is_err() && ret.Err == 200
+pub fn result_try_widens_the_error(r: Result<u8, u8>) -> Result<u8, u16> {
+    let v = r?;
+    Ok(v)
+}
+
+/// The false direction of [`result_try_widens_the_error`]: the widened error is
+/// `200`, not `201`, so the claim is refutable.
+/// requires: r.is_err() && r.Err == 200
+/// ensures: ret.Err == 201
+pub fn result_try_widens_the_error_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u16> {
+    let v = r?;
+    Ok(v)
+}
+
+// ---------------------------------------------------------------------------
+// `iN::midpoint`, `iN::next_multiple_of`, `iN::ilog2` and `iN::ilog10`.
+//
+// Four `core::num` methods added as a group. Each pairs a true contract with a
+// `_cannot_prove_this` twin, so the model is pinned in both directions: a
+// `verified` that came from a constant, or from the wrong rounding, fails the
+// twin. The panic-shaped methods (`next_multiple_of`, the logs) also carry an
+// entry whose *failure* is the evidence, and a control that must not panic.
+// ---------------------------------------------------------------------------
+
+/// `midpoint` is `(a + b) / 2` computed so the sum cannot overflow, and
+/// `midpoint(a, a)` is `a` for every input -- a value, not a constant, so a model
+/// that folded the method away would fail this.
+/// requires: true
+/// ensures: ret == a
+pub fn midpoint_self_is_the_identity(a: u8) -> u8 {
+    a.midpoint(a)
+}
+
+/// `255u8.midpoint(255)` is `255`: the true sum is `510`, whose half is `255`. A
+/// model that formed `a + b` at eight bits would wrap to `254` and refute this.
+/// requires: a == 255 && b == 255
+/// ensures: ret == 255
+pub fn midpoint_of_an_overflowing_sum(a: u8, b: u8) -> u8 {
+    a.midpoint(b)
+}
+
+/// The false direction of [`midpoint_of_an_overflowing_sum`]: the wrapped sum
+/// would give `254`, so this is the claim a width-losing model proves.
+/// requires: a == 255 && b == 255
+/// ensures: ret == 254
+pub fn midpoint_of_an_overflowing_sum_cannot_prove_this(a: u8, b: u8) -> u8 {
+    a.midpoint(b)
+}
+
+/// `midpoint` rounds toward zero, not toward negative infinity: `(3 + 4) / 2` is
+/// `3`, where the floor is `3` too -- but see the signed entry, where the two
+/// differ.
+/// requires: a == 3 && b == 4
+/// ensures: ret == 3
+pub fn midpoint_rounds_toward_zero(a: u8, b: u8) -> u8 {
+    a.midpoint(b)
+}
+
+/// The false direction of [`midpoint_rounds_toward_zero`].
+/// requires: a == 3 && b == 4
+/// ensures: ret == 4
+pub fn midpoint_rounds_toward_zero_cannot_prove_this(a: u8, b: u8) -> u8 {
+    a.midpoint(b)
+}
+
+/// `(-5).midpoint(-2)` is `-3`, which is *truncation* toward zero; the floor of
+/// `-3.5` is `-4`. A model that used a logical shift (or the floor) would give
+/// `-4` and refute this.
+/// requires: a == -5 && b == -2
+/// ensures: ret == -3
+pub fn midpoint_signed_truncates(a: i8, b: i8) -> i8 {
+    a.midpoint(b)
+}
+
+/// The false direction of [`midpoint_signed_truncates`]: the floor, which a model
+/// without the odd-bit correction would prove.
+/// requires: a == -5 && b == -2
+/// ensures: ret == -4
+pub fn midpoint_signed_truncates_cannot_prove_this(a: i8, b: i8) -> i8 {
+    a.midpoint(b)
+}
+
+/// `midpoint` lies between its arguments when they are ordered -- a symbolic
+/// property, so it pins the whole model rather than one point.
+/// requires: a <= b
+/// ensures: ret >= a && ret <= b
+pub fn midpoint_is_between(a: u8, b: u8) -> u8 {
+    a.midpoint(b)
+}
+
+/// The false direction of [`midpoint_is_between`].
+/// requires: a <= b
+/// ensures: ret < a
+pub fn midpoint_is_between_cannot_prove_this(a: u8, b: u8) -> u8 {
+    a.midpoint(b)
+}
+
+/// `100u8.next_multiple_of(7)` is `105` (`7 * 15`), not `100` or `112`.
+/// requires: a == 100 && b == 7
+/// ensures: ret == 105
+pub fn next_multiple_of_rounds_up(a: u8, b: u8) -> u8 {
+    a.next_multiple_of(b)
+}
+
+/// When `a` is already a multiple of `b`, `next_multiple_of` is the identity --
+/// the case a model that always added `b` would get wrong.
+/// requires: a == 21 && b == 7
+/// ensures: ret == 21
+pub fn next_multiple_of_an_exact_multiple_is_the_identity(a: u8, b: u8) -> u8 {
+    a.next_multiple_of(b)
+}
+
+/// The false direction of [`next_multiple_of_rounds_up`].
+/// requires: a == 100 && b == 7
+/// ensures: ret == 112
+pub fn next_multiple_of_rounds_up_cannot_prove_this(a: u8, b: u8) -> u8 {
+    a.next_multiple_of(b)
+}
+
+/// `255u8.next_multiple_of(100)` overflows (`300 > 255`), so the method panics --
+/// the obligation is the evidence the failure predicate is exact.
+/// requires: a == 255 && b == 100
+/// ensures: false
+pub fn next_multiple_of_that_overflows_panics(a: u8, b: u8) -> u8 {
+    a.next_multiple_of(b)
+}
+
+/// The control: `next_multiple_of` is total wherever it does not overflow, so a
+/// model that reported a panic unconditionally would fail here.
+/// requires: a == 100 && b == 7
+/// ensures: ret <= 255
+pub fn next_multiple_of_is_panic_free_here(a: u8, b: u8) -> u8 {
+    a.next_multiple_of(b)
+}
+
+/// The `Option` counterpart: `100u8.checked_next_multiple_of(7)` is `Some(105)`,
+/// so the tag is `1` and the payload is the same value the plain method returns.
+/// A model that swapped the tag would have `None` here.
+/// requires: a == 100 && b == 7
+/// ensures: ret.is_some() && ret.Some == 105
+pub fn checked_next_multiple_of_rounds_up(a: u8, b: u8) -> Option<u8> {
+    a.checked_next_multiple_of(b)
+}
+
+/// `255u8.checked_next_multiple_of(100)` would overflow, so it is `None` -- the
+/// `Option` spelling of the panic the plain method reports. The tag is a *term*,
+/// so a model that wrote a constant tag would take one arm always and prove this.
+/// requires: a == 255 && b == 100
+/// ensures: ret.is_none()
+pub fn checked_next_multiple_of_that_overflows_is_none(a: u8, b: u8) -> Option<u8> {
+    a.checked_next_multiple_of(b)
+}
+
+/// A zero divisor is the other `None`: `10u8.checked_next_multiple_of(0)` is
+/// `None` where the plain method panics.
+/// requires: a == 10 && b == 0
+/// ensures: ret.is_none()
+pub fn checked_next_multiple_of_by_zero_is_none(a: u8, b: u8) -> Option<u8> {
+    a.checked_next_multiple_of(b)
+}
+
+/// The false direction: an overflowing input is `None`, so claiming it is `Some`
+/// must be refuted. A model that ignored the failure predicate and always wrote
+/// the tag `1` would prove this.
+/// requires: a == 255 && b == 100
+/// ensures: ret.is_some()
+pub fn checked_next_multiple_of_overflow_is_some_cannot_prove_this(a: u8, b: u8) -> Option<u8> {
+    a.checked_next_multiple_of(b)
+}
+
+/// `100u8.ilog2()` is `6` (`2^6 = 64 <= 100 < 128 = 2^7`).
+/// requires: a == 100
+/// ensures: ret == 6
+pub fn ilog2_of_100(a: u8) -> u32 {
+    a.ilog2()
+}
+
+/// The false direction of [`ilog2_of_100`].
+/// requires: a == 100
+/// ensures: ret == 7
+pub fn ilog2_of_100_cannot_prove_this(a: u8) -> u32 {
+    a.ilog2()
+}
+
+/// `1u8.ilog2()` is `0` -- the boundary a model built from `leading_zeros` gets
+/// right only if the index is `w - 1 - lz`, not `lz`.
+/// requires: a == 1
+/// ensures: ret == 0
+pub fn ilog2_of_one_is_zero(a: u8) -> u32 {
+    a.ilog2()
+}
+
+/// The result is a `u32` even for an `i8` operand, and the index of the highest
+/// set bit of `100` is `6`.
+/// requires: a == 100
+/// ensures: ret == 6
+pub fn ilog2_of_a_signed_100(a: i8) -> u32 {
+    a.ilog2()
+}
+
+/// `ilog2` is at most `w - 1` on the live path, so it is bounded by `7` at eight
+/// bits -- a symbolic property, and the panic precondition is what makes the
+/// obligation discharge.
+/// requires: a >= 1
+/// ensures: ret <= 7
+pub fn ilog2_is_bounded(a: u8) -> u32 {
+    a.ilog2()
+}
+
+/// `ilog2` panics on `0`, so the obligation is the evidence the failure predicate
+/// fires on exactly the non-positive argument.
+/// requires: a == 0
+/// ensures: false
+pub fn ilog2_of_zero_panics(a: u8) -> u32 {
+    a.ilog2()
+}
+
+/// `100u8.ilog10()` is `2` (`10^2 = 100 <= 100 < 1000`).
+/// requires: a == 100
+/// ensures: ret == 2
+pub fn ilog10_of_100(a: u8) -> u32 {
+    a.ilog10()
+}
+
+/// Below ten, `ilog10` is `0`.
+/// requires: a == 9
+/// ensures: ret == 0
+pub fn ilog10_below_ten_is_zero(a: u8) -> u32 {
+    a.ilog10()
+}
+
+/// The false direction of [`ilog10_of_100`].
+/// requires: a == 100
+/// ensures: ret == 3
+pub fn ilog10_of_100_cannot_prove_this(a: u8) -> u32 {
+    a.ilog10()
+}
+
+/// `ilog10` at a wider width: `1000u32.ilog10()` is `3`.
+/// requires: a == 1000
+/// ensures: ret == 3
+pub fn ilog10_of_a_u32_thousand(a: u32) -> u32 {
+    a.ilog10()
+}
+
+/// `ilog10` panics on `0`.
+/// requires: a == 0
+/// ensures: false
+pub fn ilog10_of_zero_panics(a: u8) -> u32 {
+    a.ilog10()
+}
+
+/// `ilog10` is bounded by the number of powers of ten that fit `w` bits.
+/// requires: a >= 1
+/// ensures: ret <= 2
+pub fn ilog10_is_bounded(a: u8) -> u32 {
+    a.ilog10()
+}
+
+/// `checked_ilog2` is `Some(6)` for `100` (`2^6 = 64 <= 100 < 128`).
+/// requires: a == 100
+/// ensures: ret.is_some() && ret.Some == 6
+pub fn checked_ilog2_in_range(a: u8) -> Option<u32> {
+    a.checked_ilog2()
+}
+
+/// The false direction: the payload is `6`, so a model that read the tag or the
+/// payload the wrong way round would prove this.
+/// requires: a == 100
+/// ensures: ret.is_some() && ret.Some == 7
+pub fn checked_ilog2_overflow_is_some_cannot_prove_this(a: u8) -> Option<u32> {
+    a.checked_ilog2()
+}
+
+/// `checked_ilog2` is `None` on `0`, where the plain call would panic -- so no
+/// panic obligation is emitted here, and the value is the `None` tag.
+/// requires: a == 0
+/// ensures: ret.is_none()
+pub fn checked_ilog2_of_zero_is_none(a: u8) -> Option<u32> {
+    a.checked_ilog2()
+}
+
+/// `checked_ilog10` is `Some(2)` for `100`.
+/// requires: a == 100
+/// ensures: ret.is_some() && ret.Some == 2
+pub fn checked_ilog10_in_range(a: u8) -> Option<u32> {
+    a.checked_ilog10()
+}
+
+/// `checked_ilog10` is `None` on `0` (the plain `ilog10` would panic there).
+/// requires: a == 0
+/// ensures: ret.is_none()
+pub fn checked_ilog10_of_zero_is_none(a: u8) -> Option<u32> {
+    a.checked_ilog10()
+}
+
+/// `checked_ilog2` on a signed argument is signed too: `-1i8` is non-positive,
+/// so it is `None`.
+/// requires: a == -1
+/// ensures: ret.is_none()
+pub fn checked_ilog2_of_a_negative_is_none(a: i8) -> Option<u32> {
+    a.checked_ilog2()
+}
+
+/// `checked_ilog2` on a signed argument reads the signed order: `-1i8` is
+/// `0xff`, the *largest* unsigned byte, so an unsigned model would report
+/// `Some(7)` where Rust reports `None`.
+/// requires: a == -1
+/// ensures: ret.is_some() && ret.Some == 7
+pub fn checked_ilog2_of_a_negative_cannot_prove_this(a: i8) -> Option<u32> {
+    a.checked_ilog2()
+}
+
+/// `100u8.next_power_of_two()` is `128` (`2^7`, the smallest power of two that
+/// is `>= 100`), not `100` or `64`.
+/// requires: a == 100
+/// ensures: ret == 128
+pub fn next_power_of_two_rounds_up(a: u8) -> u8 {
+    a.next_power_of_two()
+}
+
+/// An input that is already a power of two rounds to itself -- the case a model
+/// that smeared the value without first subtracting one would get wrong.
+/// requires: a == 128
+/// ensures: ret == 128
+pub fn next_power_of_two_of_a_power_is_itself(a: u8) -> u8 {
+    a.next_power_of_two()
+}
+
+/// `0.next_power_of_two()` is `1`, which `core` defines specially (`x <= 1 => 1`)
+/// -- the input an unguarded `x - 1` would wrap to all-ones on.
+/// requires: a == 0
+/// ensures: ret == 1
+pub fn next_power_of_two_of_zero_is_one(a: u8) -> u8 {
+    a.next_power_of_two()
+}
+
+/// The false direction of [`next_power_of_two_rounds_up`].
+/// requires: a == 100
+/// ensures: ret == 100
+pub fn next_power_of_two_rounds_up_cannot_prove_this(a: u8) -> u8 {
+    a.next_power_of_two()
+}
+
+/// At a wider width the rounding is the same: `1000u32.next_power_of_two()` is
+/// `1024`.
+/// requires: a == 1000
+/// ensures: ret == 1024
+pub fn next_power_of_two_of_a_u32_thousand(a: u32) -> u32 {
+    a.next_power_of_two()
+}
+
+/// `129u8.next_power_of_two()` overflows (`256` does not fit), so the method
+/// panics -- the obligation is the evidence the failure predicate fires exactly
+/// where the result does not fit.
+/// requires: a == 129
+/// ensures: false
+pub fn next_power_of_two_that_overflows_panics(a: u8) -> u8 {
+    a.next_power_of_two()
+}
+
+/// The control: `next_power_of_two` is total wherever it does not overflow, so a
+/// model that reported a panic unconditionally would fail here.
+/// requires: a == 100
+/// ensures: ret <= 255
+pub fn next_power_of_two_is_panic_free_here(a: u8) -> u8 {
+    a.next_power_of_two()
+}
+
+/// `100u8.checked_next_power_of_two()` is `Some(128)`, so the payload of the
+/// `Some` arm is the rounded value.
+/// requires: a == 100
+/// ensures: ret.is_some() && ret.Some == 128
+pub fn checked_next_power_of_two_in_range(a: u8) -> Option<u8> {
+    a.checked_next_power_of_two()
+}
+
+/// The false direction of [`checked_next_power_of_two_in_range`].
+/// requires: a == 100
+/// ensures: ret.is_none()
+pub fn checked_next_power_of_two_in_range_cannot_prove_this(a: u8) -> Option<u8> {
+    a.checked_next_power_of_two()
+}
+
+/// The payload of the `Some` arm is `128`, so claiming `127` is refutable.
+/// requires: a == 100
+/// ensures: ret.Some == 127
+pub fn checked_next_power_of_two_payload_cannot_prove_this(a: u8) -> Option<u8> {
+    a.checked_next_power_of_two()
+}
+
+/// `129u8.checked_next_power_of_two()` is `None`, where the plain method panics
+/// -- the `checked_` shape turning a panic into a value.
+/// requires: a == 129
+/// ensures: ret.is_none()
+pub fn checked_next_power_of_two_out_of_range_is_none(a: u8) -> Option<u8> {
+    a.checked_next_power_of_two()
+}
+
+/// A `&str` length is a symbolic input, so an unbounded one bounds nothing but
+/// itself.
+/// requires: true
+/// ensures: ret <= s.len()
+pub fn str_len_is_itself(s: &str) -> usize {
+    s.len()
+}
+
+/// The length is pinned by the precondition, so the body's read is that value --
+/// the contract's `s.len()` and the body's are one variable.
+/// requires: s.len() == 3
+/// ensures: ret == 3
+pub fn str_len_pinned(s: &str) -> usize {
+    s.len()
+}
+
+/// The false twin: an unbounded `&str` length is not a fixed value.
+/// requires: true
+/// ensures: ret == 4
+pub fn str_len_cannot_prove_this(s: &str) -> usize {
+    s.len()
+}
+
+/// `is_empty` reads the same length variable, so it agrees with `len`.
+/// requires: s.len() == 0
+/// ensures: ret
+pub fn str_is_empty_pinned(s: &str) -> bool {
+    s.is_empty()
+}
+
+/// The false twin of `str_is_empty_pinned`: a non-empty string is not empty.
+/// requires: s.len() == 5
+/// ensures: ret
+pub fn str_is_empty_cannot_prove_this(s: &str) -> bool {
+    s.is_empty()
+}
+
+/// `unwrap_or_default` is total and yields the payload's own zero on the failure
+/// variant, so a `None` receiver is `0`.
+/// requires: x.is_none()
+/// ensures: ret == 0
+pub fn unwrap_or_default_none_is_zero(x: Option<u8>) -> u8 {
+    x.unwrap_or_default()
+}
+
+/// The false twin: the `Some` path can carry any payload, so a fixed value is not
+/// provable.
+/// requires: true
+/// ensures: ret == 7
+pub fn unwrap_or_default_cannot_prove_this(x: Option<u8>) -> u8 {
+    x.unwrap_or_default()
+}
+
+/// The same shape on a `Result`: the failure variant (`Err`) yields the payload's
+/// zero.
+/// requires: r.is_err()
+/// ensures: ret == 0
+pub fn result_unwrap_or_default_err_is_zero(r: Result<u8, u8>) -> u8 {
+    r.unwrap_or_default()
+}
+
+/// The false twin on a `Result`.
+/// requires: r.is_err()
+/// ensures: ret == 5
+pub fn result_unwrap_or_default_cannot_prove_this(r: Result<u8, u8>) -> u8 {
+    r.unwrap_or_default()
+}
+
+
+// ---------------------------------------------------------------------------
+// `Vec::is_empty` and `Vec::pop`
+// ---------------------------------------------------------------------------
+
+/// A fresh vector is empty.
+/// requires: true
+/// ensures: ret == 1
+pub fn vec_is_empty_new() -> u8 {
+    Vec::<u8>::new().is_empty() as u8
+}
+
+/// The false twin: a fresh vector is not non-empty.
+/// requires: true
+/// ensures: ret == 0
+pub fn vec_is_empty_new_cannot_prove_this() -> u8 {
+    Vec::<u8>::new().is_empty() as u8
+}
+
+/// After one push the vector is no longer empty.
+/// requires: true
+/// ensures: ret == 0
+pub fn vec_not_empty_after_push() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(1u8);
+    v.is_empty() as u8
+}
+
+/// The false twin: the push made it non-empty, so `is_empty` is not `1`.
+/// requires: true
+/// ensures: ret == 1
+pub fn vec_not_empty_after_push_cannot_prove_this() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(1u8);
+    v.is_empty() as u8
+}
+
+/// `pop` on a fresh vector is `None` and leaves the length at zero.
+/// requires: true
+/// ensures: ret == 0
+pub fn vec_pop_empty_then_len() -> usize {
+    let mut v = Vec::<u8>::new();
+    v.pop();
+    v.len()
+}
+
+/// The false twin: `pop` on a fresh vector cannot leave a length of one.
+/// requires: true
+/// ensures: ret == 1
+pub fn vec_pop_empty_then_len_cannot_prove_this() -> usize {
+    let mut v = Vec::<u8>::new();
+    v.pop();
+    v.len()
+}
+
+/// `pop` on a one-element vector yields `Some` and returns the length to zero.
+/// requires: true
+/// ensures: ret == 1
+pub fn vec_pop_one_is_some() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(9u8);
+    v.pop().is_some() as u8
+}
+
+/// The false twin: `pop` on a one-element vector is not `None`.
+/// requires: true
+/// ensures: ret == 0
+pub fn vec_pop_one_is_some_cannot_prove_this() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(9u8);
+    v.pop().is_some() as u8
+}
+
+// ---------------------------------------------------------------------------
+// Chained `Option` combinators: the element identity must compose
+// ---------------------------------------------------------------------------
+
+/// A chain of `or` selects the *first* non-empty slice's element. The identity
+/// must compose through both combinators; a flat representation that read only
+/// the operands' leaves would take `c`'s element on the `Some` path.
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: c.len() > 0
+/// requires: a[0] == 5
+/// requires: b[0] == 7
+/// requires: c[0] == 9
+/// ensures: ret == 5
+pub fn chained_or_selects_the_first(a: &[u8], b: &[u8], c: &[u8]) -> u8 {
+    *a.first().or(b.first()).or(c.first()).unwrap()
+}
+
+/// The false twin: the chain returns `a[0]` (`5`), never `c[0]` (`9`).
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: c.len() > 0
+/// requires: a[0] == 5
+/// requires: b[0] == 7
+/// requires: c[0] == 9
+/// ensures: ret == 9
+pub fn chained_or_selects_the_first_cannot_prove_this(a: &[u8], b: &[u8], c: &[u8]) -> u8 {
+    *a.first().or(b.first()).or(c.first()).unwrap()
+}
+
+/// `and` with a conditional argument: on `Some` the result is the argument, whose
+/// own element identity is a chain.
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: c.len() > 0
+/// requires: b[0] == 7
+/// requires: c[0] == 9
+/// ensures: ret == 7
+pub fn and_with_a_conditional_argument(a: &[u8], b: &[u8], c: &[u8]) -> u8 {
+    *a.first().and(b.first().or(c.first())).unwrap()
+}
+
+/// The false twin: the argument's `or` selects `b[0]` (`7`), never `c[0]` (`9`).
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: c.len() > 0
+/// requires: b[0] == 7
+/// requires: c[0] == 9
+/// ensures: ret == 9
+pub fn and_with_a_conditional_argument_cannot_prove_this(a: &[u8], b: &[u8], c: &[u8]) -> u8 {
+    *a.first().and(b.first().or(c.first())).unwrap()
+}
+
+/// A conditional choice between two elements of a *signed* slice keeps its
+/// signedness, so `< 0` is a signed comparison.
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: a[0] == -1
+/// ensures: ret == 1
+pub fn signed_or_element_is_signed(a: &[i8], b: &[i8]) -> u8 {
+    (*a.first().or(b.first()).unwrap() < 0) as u8
+}
+
+/// The false twin: `-1 < 0` is true, so the unsigned reading (255) is not `false`.
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: a[0] == -1
+/// ensures: ret == 0
+pub fn signed_or_element_is_signed_cannot_prove_this(a: &[i8], b: &[i8]) -> u8 {
+    (*a.first().or(b.first()).unwrap() < 0) as u8
+}
+
+/// The signedness also drives signed division: `-4 / 2` is `-2`, not `126`.
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: a[0] == -4
+/// ensures: ret == -2
+pub fn signed_or_element_divides_signed(a: &[i8], b: &[i8]) -> i8 {
+    *a.first().or(b.first()).unwrap() / 2
+}
+
+/// The false twin: the unsigned reading of `-4` divided by two is `126`.
+/// requires: a.len() > 0
+/// requires: b.len() > 0
+/// requires: a[0] == -4
+/// ensures: ret == 126
+pub fn signed_or_element_divides_signed_cannot_prove_this(a: &[i8], b: &[i8]) -> i8 {
+    *a.first().or(b.first()).unwrap() / 2
+}
+
+/// `slice::last` on a slice is a fresh element: a contract true of every element
+/// holds of the last one, so this verifies.
+/// requires: xs.len() > 0
+/// ensures: ret <= 255
+pub fn slice_last_is_an_element(xs: &[u8]) -> u8 {
+    match xs.last() {
+        Some(v) => *v,
+        None => 0,
+    }
+}
+
+/// `slice::last` on an *array* is the exact element `a[N-1]`, so a contract about
+/// that element decides rather than being a fresh value.
+/// requires: a[3] == 7
+/// ensures: ret == 7
+pub fn array_last_is_the_last_element(a: [u8; 4]) -> u8 {
+    a.last().copied().unwrap_or(0)
+}
+
+/// The false twin: the fresh element of a slice is not pinned to any value, so a
+/// claim that it is `0` is refuted (a slice whose last element is non-zero exists).
+/// requires: xs.len() > 0
+/// ensures: ret == 0
+pub fn slice_last_is_an_element_cannot_prove_this(xs: &[u8]) -> u8 {
+    match xs.last() {
+        Some(v) => *v,
+        None => 0,
+    }
+}
+
+/// The false twin: the array's last element is `a[3]`, not `a[0]`, so a claim
+/// about the first element refutes.
+/// requires: a[0] == 9
+/// requires: a[3] == 7
+/// ensures: ret == 9
+pub fn array_last_is_the_last_element_cannot_prove_this(a: [u8; 4]) -> u8 {
+    a.last().copied().unwrap_or(0)
+}
+
+/// A concrete-index write can reach the last element, so a `last()` read after it
+/// must see the write when the length makes the index the last one.
+///
+/// A slice's `last()` is one fresh variable keyed by a sentinel, and a write to a
+/// concrete index used to replace only that index's entry -- leaving the sentinel
+/// at its pre-write value. `let before = *xs.last().unwrap(); xs[0] = 1; before ==
+/// *xs.last().unwrap()` was therefore *proved* for a one-element slice, though the
+/// write replaced the only element. The sentinel now carries the relationship
+/// `last == x` when `len == index + 1`, so this verifies (the write is seen) while
+/// its false twin refutes (the pre-write value is not kept).
+/// requires: xs.len() == 1
+/// ensures: ret == 1
+pub fn slice_last_after_write_is_seen(xs: &mut [u8]) -> u8 {
+    xs[0] = 1;
+    *xs.last().unwrap()
+}
+
+/// The false twin: `xs[0] = 1` on a one-element slice *is* the write to `last()`,
+/// so the pre-write value does not survive. A model that left the sentinel at its
+/// pre-write value would prove this.
+/// requires: xs.len() == 1
+/// ensures: ret == 0
+pub fn slice_last_after_write_is_seen_cannot_prove_this(xs: &mut [u8]) -> u8 {
+    xs[0] = 1;
+    *xs.last().unwrap()
+}
+
+/// The mirror: a write to an index that is *not* the last element leaves `last()`
+/// alone, so a read taken before the write equals the one after it. The
+/// relationship is `len == index + 1`, so at length 2 the index `0` write does not
+/// touch `last()`.
+/// requires: xs.len() == 2
+/// ensures: ret == true
+pub fn slice_last_is_kept_when_another_index_is_written(xs: &mut [u8]) -> bool {
+    let before = *xs.last().unwrap();
+    xs[0] = 9;
+    before == *xs.last().unwrap()
+}
+
+/// The discriminating twin of the fixture above: at length 1 the write *does*
+/// reach `last()`, so a read taken before it and a read taken after it differ and
+/// their equality is false. A model that left the sentinel at its pre-write value
+/// -- so that both reads returned the same variable -- would *prove* this. The
+/// `len == 2` fixture above cannot catch that: it keeps `last()` on both reads, so
+/// it stays green whether or not the sentinel is refreshed, and it is the `len == 1`
+/// direction that has teeth.
+/// requires: xs.len() == 1
+/// ensures: ret == true
+pub fn slice_last_read_before_a_write_is_not_kept_cannot_prove_this(xs: &mut [u8]) -> bool {
+    let before = *xs.last().unwrap();
+    xs[0] = 1;
+    before == *xs.last().unwrap()
+}
+
+/// `u8::from(bool)` is the zero-extension of the one-bit value: `false` -> 0,
+/// `true` -> 1. A `bool` has no integer width, so this is the one conversion the
+/// integer model would otherwise refuse.
+/// requires: true
+/// ensures: ret <= 1
+pub fn bool_to_u8_is_zero_or_one(b: bool) -> u8 {
+    u8::from(b)
+}
+
+/// The `true` direction, so the bit is the *value* and not a constant zero.
+/// requires: b == true
+/// ensures: ret == 1
+pub fn bool_to_u8_of_true_is_one(b: bool) -> u8 {
+    u8::from(b)
+}
+
+/// The false twin: `false` is 0, so a claim that it is 1 refutes.
+/// requires: b == false
+/// ensures: ret == 1
+pub fn bool_to_u8_of_true_is_one_cannot_prove_this(b: bool) -> u8 {
+    u8::from(b)
+}
+
+/// A wider destination zero-extends the same bit.
+/// requires: true
+/// ensures: ret <= 1
+pub fn bool_to_u32_is_zero_or_one(b: bool) -> u32 {
+    u32::from(b)
 }

@@ -9,7 +9,7 @@
 //! [`Term::Unknown`] — which the executor turns into `Unknown`, never into a
 //! proof. A parse failure is a gap in coverage, not a silent assumption.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A local variable slot, `_0`, `_1`, …
 pub type LocalIdx = u32;
@@ -33,6 +33,17 @@ pub enum Ty {
     I64,
     I128,
     Isize,
+    /// `char`, modelled as a 32-bit unsigned value.
+    ///
+    /// A `char` is a Unicode scalar value (`0..=0x10FFFF`, surrogates excluded),
+    /// but the engine holds it at its 32-bit width and leaves the range
+    /// unconstrained. That is an *over*-approximation of the input domain, which is
+    /// the sound direction: a contract proved for every 32-bit value holds for
+    /// every `char`, so the ASCII predicates (which compare the full width against
+    /// byte ranges) are exact, and a magnitude contract may be refuted with a
+    /// counterexample that is not a valid `char` -- a lost proof, never a false
+    /// one.
+    Char,
     /// A tuple, e.g. `(u32, bool)` from an overflowing add.
     Tuple(Vec<Ty>),
     /// A fixed-size array, e.g. `[u32; 3]`.
@@ -61,6 +72,7 @@ impl Ty {
     pub fn width(&self) -> Option<u8> {
         Some(match self {
             Ty::Bool => 1,
+            Ty::Char => 32,
             Ty::U8 => 8,
             Ty::U16 => 16,
             Ty::U32 => 32,
@@ -105,12 +117,28 @@ impl Ty {
         )
     }
 
+    /// The type a reference points at, or the type itself when it is not one.
+    ///
+    /// `Ty::Ref` is modelled as its referent throughout (a `&u16` argument's
+    /// value *is* the `u16` it addresses), so this is what a reader needs to size
+    /// a value reached through a reference. One level only: a `&mut &mut u8` is a
+    /// reference to a reference, which is a shape the frontend refuses rather than
+    /// models (see the `&mut &mut T` note in `exec.rs`), so collapsing both levels
+    /// here would claim a width the caller cannot reach.
+    pub fn referent(&self) -> &Ty {
+        match self {
+            Ty::Ref(inner) => inner,
+            other => other,
+        }
+    }
+
     /// Parse a printed type. `usize`/`isize` are modelled at 64 bits, which is
     /// what this tool's own host target uses.
     pub fn parse(s: &str) -> Ty {
         let s = s.trim();
         match s {
             "bool" => return Ty::Bool,
+            "char" => return Ty::Char,
             "u8" => return Ty::U8,
             "u16" => return Ty::U16,
             "u32" => return Ty::U32,
@@ -214,6 +242,16 @@ pub enum Const {
     UInt(u128, Option<Ty>),
     Bool(bool),
     Unit,
+    /// A string literal, as the dump prints it (`"zero"`). The contents are
+    /// already unescaped, so a message can be reported verbatim. It is a `String`
+    /// rather than a `&'static str` because a `no_std` parser may see any dump.
+    Str(String),
+    /// A *byte*-string literal (`b"\x05zero \xc0\x00"`), as the dump prints it.
+    ///
+    /// Edition 2024 passes a `panic!` message's `format_args!` template as a byte
+    /// string, so the raw bytes are kept and decoded later by
+    /// [`decode_format_template`]. Bytes, not a `String`: the template is not text.
+    Bytes(Vec<u8>),
     Other(String),
 }
 
@@ -358,6 +396,17 @@ pub enum Term {
         callee: Callee,
         args: Vec<Operand>,
         dest: Place,
+        /// The call has no normal successor: it returns `!` and always diverges.
+        ///
+        /// rustc prints such a call as `_3 = core::panicking::panic(...) -> unwind
+        /// continue`, with no `[return: bbN]` arm and therefore no `target`. That is
+        /// how `panic!`, `assert!`, `unwrap` and an out-of-bounds index lower: the
+        /// call is the only way the path ends. It is a *reachable failure*, not a
+        /// line the parser failed to understand, and reading it as one dropped the
+        /// whole path -- so a function whose safety rested on an `assert!` came back
+        /// `Incomplete` and the assert itself was never checked. The executor turns
+        /// it into a panic obligation instead.
+        diverges: bool,
         target: usize,
     },
     /// `assert(cond, "msg", args…)` — failure is a reachable panic.
@@ -373,6 +422,22 @@ pub enum Term {
         msg_args: Vec<Operand>,
         target: usize,
     },
+    /// `drop(place)` — run `place`'s destructor, then continue at `target`.
+    ///
+    /// A type with no drop glue (an integer, `bool`, a plain struct or tuple of
+    /// such) has nothing to run, so the executor treats it as a no-op. A user
+    /// `impl Drop` has a body in the dump and the executor runs it; a container
+    /// whose destructor this tool cannot represent (`Vec`, `String`, `Box`) is
+    /// refused, because assuming such a `drop` changes nothing is a false proof
+    /// whenever the destructor is observable.
+    ///
+    /// Every RAII local lowers to this, so before it was modelled any function
+    /// with a `Drop` local — a `Vec`, a guard, a lock — reported `incomplete` on
+    /// an unmodelled `drop`, even when the destructor had no scalar effect.
+    Drop {
+        place: Place,
+        target: usize,
+    },
     /// `unreachable`
     Unreachable,
     Unknown(String),
@@ -384,6 +449,18 @@ pub struct Block {
     pub id: usize,
     pub stmts: Vec<Stmt>,
     pub term: Term,
+    /// True for a `bbN (cleanup)` block: one that only runs drops and ends in
+    /// `resume`. It is not reachable by ordinary control flow; a call reaches it
+    /// only through its `unwind`/cleanup edge.
+    ///
+    /// This is what tells the *cleanup* form of a diverging call apart from an
+    /// ordinary call. A diverging call in a function with a live `Drop` local is
+    /// printed with its cleanup block as the single successor (`_4 =
+    /// core::panicking::panic(…) -> bb4`, with `bb4 (cleanup)`), not with the
+    /// `-> unwind continue` arm the parser first recognised -- so without this
+    /// marker an `assert!` in any function with a live RAII local was still a
+    /// dropped path.
+    pub cleanup: bool,
 }
 
 /// One function's MIR.
@@ -614,6 +691,18 @@ pub struct MirProgram {
     /// and a suffix match would let the wrong `impl` answer -- a false proof. See
     /// the executor's `trait_candidate_admits`.
     pub declared_traits: std::collections::BTreeSet<String>,
+    /// The string pieces of each `promoted` constant, keyed by the name a use
+    /// site spells (`lit::promoted[0]`).
+    ///
+    /// Edition 2024 lowers `panic!("literal")` and `panic!("a{}", x)` through
+    /// `Arguments::new_const`/`new_v1`, whose first argument is a *promoted*
+    /// constant holding an array of `&str` pieces. That body prints as its own
+    /// `const NAME::promoted[0]: &[&str; N] = { … }` item, outside any function,
+    /// so the executor cannot see it by walking the function's blocks: without
+    /// this table the format pieces are unknown and the panic's message cannot be
+    /// recovered. Only the literal pieces are kept -- the `&_1` that borrows them
+    /// is not a value the message needs.
+    pub promoted_strs: BTreeMap<String, Vec<String>>,
 }
 
 /// A variant's name and discriminant, for resolving a downcast.
@@ -850,6 +939,13 @@ pub fn variant_index(name: &str, enums: &BTreeMap<String, EnumLayout>) -> Option
     match short {
         "None" | "Ok" => return Some(0),
         "Some" | "Err" => return Some(1),
+        // `ControlFlow`'s variants, from the `?` desugaring's `(_2 as Continue)` /
+        // `(_2 as Break)` downcasts. rustc numbers `Continue` 0 and `Break` 1. No
+        // source file declares `ControlFlow`, and a *declared* enum with those
+        // variant names has already been given the chance to answer above, so this
+        // default cannot shadow one.
+        "Continue" => return Some(0),
+        "Break" => return Some(1),
         _ => {}
     }
     // A bare variant name is looked up in every layout. Two layouts claiming the
@@ -869,7 +965,7 @@ pub fn variant_index(name: &str, enums: &BTreeMap<String, EnumLayout>) -> Option
 
 /// Drop balanced `<…>` generic arguments from a path, so `Option::<u8>::Some`
 /// reads as `Option::::Some` (empty segments are filtered by the caller).
-fn strip_generics(s: &str) -> String {
+pub(crate) fn strip_generics(s: &str) -> String {
     let mut out = String::new();
     let mut depth = 0i32;
     for c in s.chars() {
@@ -1447,8 +1543,8 @@ fn cval_of_const(c: &Const, want: Option<u8>, consts: &BTreeMap<String, Const>) 
             Some(CVal::Word((*v as u64) & c_mask(w), w, signed))
         }
         Const::Other(name) => cval_of_const(consts.get(name)?, want, consts),
-        // `()` is not a literal this folder can take.
-        Const::Unit => None,
+        // `()` is not a literal this folder can take, and a string has no word.
+        Const::Unit | Const::Str(_) | Const::Bytes(_) => None,
     }
 }
 
@@ -1896,9 +1992,203 @@ fn c_const_of(v: CVal, ret_ty: &Ty) -> Option<Const> {
     }
 }
 
+/// Parse a Rust string literal exactly as `rustc --emit=mir` prints it.
+///
+/// The dump writes a `str` constant with double quotes and Rust's own escapes
+/// (`"a\"b"`, `"\u{1f600}"`), so the raw text between the quotes is not the value.
+/// Only a string that *starts* with a quote is a literal: a path constant
+/// (`core::num::MAX`) and an enum construction (`Mode::Idle`) are not, and reading
+/// one as a string would invent a message. The escapes decoded here are the ones
+/// the pretty-printer emits: `\n \r \t \\ \" \0`, `\xNN`, and `\u{…}`.
+pub fn parse_str_literal(s: &str) -> Option<String> {
+    let t = s.trim();
+    let inner = t.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            '\\' => out.push('\\'),
+            '"' => out.push('"'),
+            '\'' => out.push('\''),
+            '0' => out.push('\0'),
+            'x' => {
+                let hi = chars.next()?.to_digit(16)?;
+                let lo = chars.next()?.to_digit(16)?;
+                out.push(char::from((hi * 16 + lo) as u8));
+            }
+            'u' => {
+                // `\u{1f600}`: the braces are part of the escape.
+                if chars.next()? != '{' {
+                    return None;
+                }
+                let mut hex = String::new();
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        break;
+                    }
+                    hex.push(c);
+                }
+                out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+            }
+            // An escape the printer does not emit is not silently dropped: a
+            // literal this reader does not understand must not become a wrong
+            // message, so the whole literal is refused.
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Parse a Rust *byte*-string literal as `rustc --emit=mir` prints it (`b"…"`).
+///
+/// The dump escapes a byte string byte by byte, so a non-ASCII byte appears as
+/// `\xNN` rather than as a `char`; the escapes are decoded to raw bytes, not to
+/// UTF-8. Returns `None` for anything that is not a byte-string literal, so a
+/// caller can tell "not this shape" from "an empty byte string".
+pub fn parse_byte_str_literal(s: &str) -> Option<Vec<u8>> {
+    let t = s.trim();
+    let inner = t.strip_prefix("b\"")?.strip_suffix('"')?;
+    let mut out = Vec::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            // A literal character is UTF-8 encoded, matching how rustc writes a
+            // printable non-ASCII byte in a byte string.
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match chars.next()? {
+            'n' => out.push(b'\n'),
+            'r' => out.push(b'\r'),
+            't' => out.push(b'\t'),
+            '\\' => out.push(b'\\'),
+            '"' => out.push(b'"'),
+            '\'' => out.push(b'\''),
+            '0' => out.push(0),
+            'x' => {
+                let hi = chars.next()?.to_digit(16)?;
+                let lo = chars.next()?.to_digit(16)?;
+                out.push((hi * 16 + lo) as u8);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Render the pieces of a `format_args!` message into the message a reader wants.
+///
+/// Edition 2024 does not put a literal `panic!("a{}b", x)` in the MIR; it puts the
+/// *pieces* (`["a", "b"]`) and, separately, the arguments. The number of arguments
+/// is `P` (the piece count) or `P - 1`: `format_args!` interleaves each argument
+/// with a piece, and the two shapes are "an argument in every gap" (`P - 1` of
+/// them, `{}` between each adjacent pair) and "one more argument after the last
+/// piece" (`P`, the extra one appended). `new_const` has no arguments at all, so
+/// its pieces are concatenated as they stand.
+///
+/// This matters for the message, not for the count: a `panic!("{} tail", x)`
+/// prints `["", " tail"]` with *one* argument, so joining every gap would claim
+/// two placeholders and the report would say `{} tail{}` for a message that has
+/// one. A `Count` argument (dynamic width/precision) is not produced by a panic
+/// message, so it cannot appear here.
+pub fn join_format_pieces(pieces: &[String], args: usize) -> String {
+    if pieces.is_empty() {
+        return String::new();
+    }
+    let gaps = (pieces.len() - 1).min(args);
+    let mut out = String::new();
+    for (i, p) in pieces.iter().enumerate() {
+        if i > 0 {
+            out.push_str("{}");
+        }
+        out.push_str(p);
+    }
+    for _ in gaps..args {
+        out.push_str("{}");
+    }
+    out
+}
+
+/// Decode the `b"…"` template of `Arguments::new::<LEN, N>(const b"…", …)`.
+///
+/// The encoding is `core`'s own (see `core::fmt::rt` and the comment on
+/// `fmt::Arguments`): `0x00` ends the template, a byte `< 0x80` introduces that
+/// many literal bytes, `0x80` introduces a `u16` little-endian length followed by
+/// that many literal bytes, `0xC0` is a placeholder for the next argument with
+/// default options, and any other byte `> 0xC0` is a placeholder with custom
+/// options whose low bits say which option words follow. Only the *literal* pieces
+/// are needed for a message, so the option words are skipped by their fixed sizes
+/// and a `{}` is emitted for each placeholder -- the same rendering
+/// [`join_format_pieces`] gives the `new_v1` shape. A malformed template is
+/// refused rather than guessed at, so a printer change surfaces as an unmodelled
+/// panic rather than as a wrong message.
+pub fn decode_format_template(bytes: &[u8]) -> Option<Vec<String>> {
+    let mut pieces = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0usize;
+    let read_u16 = |i: &mut usize| -> Option<u16> {
+        let v = u16::from_le_bytes([*bytes.get(*i)?, *bytes.get(*i + 1)?]);
+        *i += 2;
+        Some(v)
+    };
+    while i < bytes.len() {
+        let n = bytes[i];
+        i += 1;
+        if n == 0 {
+            pieces.push(lit);
+            return Some(pieces);
+        } else if n < 0x80 {
+            let end = i + n as usize;
+            let s = bytes.get(i..end)?;
+            lit.push_str(std::str::from_utf8(s).ok()?);
+            i = end;
+        } else if n == 0x80 {
+            let len = read_u16(&mut i)? as usize;
+            let end = i + len;
+            lit.push_str(std::str::from_utf8(bytes.get(i..end)?).ok()?);
+            i = end;
+        } else if n == 0xC0 {
+            pieces.push(std::mem::take(&mut lit));
+        } else {
+            // Custom options: the low bits say which words follow, in order.
+            if n & 1 != 0 {
+                i += 4;
+            }
+            if n & 2 != 0 {
+                i += 2;
+            }
+            if n & 4 != 0 {
+                i += 2;
+            }
+            if n & 8 != 0 {
+                i += 2;
+            }
+            if i > bytes.len() {
+                return None;
+            }
+            pieces.push(std::mem::take(&mut lit));
+        }
+    }
+    None
+}
+
 /// Parse a constant like `0_u32`, `true`, `255_u32`, `()`.
 fn parse_const(s: &str) -> Const {
     let t = s.trim();
+    if let Some(bytes) = parse_byte_str_literal(t) {
+        return Const::Bytes(bytes);
+    }
+    if let Some(text) = parse_str_literal(t) {
+        return Const::Str(text);
+    }
     if t == "true" {
         return Const::Bool(true);
     }
@@ -1957,7 +2247,20 @@ fn parse_const(s: &str) -> Const {
                     // make `a != i8::MIN` mean `a != 0`, so the assert guarding a
                     // signed negation looked dischargeable and the negation was
                     // reported panic-free.
+                    //
+                    // A `char` is the exception, and the exception is why this
+                    // reads the *type* rather than its width: `char::MAX` is the
+                    // Unicode scalar maximum `0x10FFFF`, not `2^32 - 1`. `char` is
+                    // modelled at 32 bits so a `char` comparison is exact, but the
+                    // value a bound *names* is a property of the type, and taking
+                    // it from the width made `c == char::MAX` a comparison against
+                    // `0xffffffff` -- a false proof for a body that reads the real
+                    // maximum. The `char` bounds are named here because a `char`
+                    // has no signed/unsigned split: `MAX` is the top scalar value
+                    // and `MIN` is `'\0'`.
                     let v = match (name, ty.is_signed()) {
+                        ("MAX", _) if ty == Ty::Char => 0x10FFFF,
+                        ("MIN", _) if ty == Ty::Char => 0,
                         ("MAX", true) => (1u128 << (w - 1)) - 1,
                         ("MAX", false) => {
                             if w == 64 {
@@ -2121,6 +2424,36 @@ fn parse_success_target(s: &str) -> Option<usize> {
 }
 
 /// `[return: bb1, unwind continue]`
+/// Parse the `dest = callee(args)` head of a call terminator, up to the ` -> `.
+///
+/// Shared by the two call shapes: the ordinary one with a `[return: bbN]` arm and
+/// the diverging one without. Only the arrow and what follows it differ between
+/// them, so the head is read once here rather than twice.
+fn parse_call_head(
+    head: &str,
+    enums: &BTreeMap<String, EnumLayout>,
+) -> Option<(Callee, Vec<Operand>, Place)> {
+    let lhs = head.trim();
+    let eq = lhs.find(" = ")?;
+    let dest_text = lhs[..eq].trim();
+    let call = lhs[eq + 3..].trim();
+    let dest = parse_place(dest_text, enums).unwrap_or(Place::new(u32::MAX));
+    let open = call.find('(')?;
+    if !call.ends_with(')') {
+        return None;
+    }
+    let name = call[..open].trim();
+    let inner = &call[open + 1..call.len() - 1];
+    let args: Vec<Operand> =
+        split_top_level(inner, ',').iter().map(|a| parse_operand(a, enums)).collect();
+    let callee = if name.is_empty() {
+        Callee::Indirect(dest.clone())
+    } else {
+        Callee::Name(name.to_string())
+    };
+    Some((callee, args, dest))
+}
+
 fn parse_return_target(s: &str) -> Option<usize> {
     let i = s.find("return:")?;
     let rest = s[i + "return:".len()..].trim();
@@ -2176,22 +2509,6 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
             }
         }
     }
-    // The cast check has to come *before* the `const ` check, because rustc prints
-    // a cast constant as `const 3_i32 as u32 (IntToInt)`. Matching `const ` first
-    // hands the whole string to `parse_const`, which reads `i32 as u32 (IntToInt)`
-    // as a type name and produces a constant with no width -- an `Unknown` that
-    // then makes every guard written against it unmodelled.
-    if let Some(i) = t.find(" as ") {
-        let (src, dst) = (t[..i].trim(), t[i + 4..].trim());
-        let ty_text = dst.split_whitespace().next().unwrap_or(dst);
-        return Rvalue::Cast(parse_operand(src, enums), Ty::parse(ty_text));
-    }
-    if let Some(rest) = t.strip_prefix("const ") {
-        return Rvalue::Use(Operand::Const(parse_const(rest)));
-    }
-    if t.starts_with("copy ") || t.starts_with("move ") {
-        return Rvalue::Use(parse_operand(t, enums));
-    }
     // `&_1`, `&mut _1`, `&raw const _1`, `&raw mut _1`
     //
     // The raw forms appear for a `&mut [T]` argument's bounds check: rustc
@@ -2199,6 +2516,17 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
     // (*_1); _4 = PtrMetadata(move _3)`, where the immutable `&[T]` reads
     // `PtrMetadata(copy _1)` directly. Both name the same place, so both are a
     // `Ref`.
+    //
+    // The reference check comes *before* the cast check, because a borrow of an
+    // enum payload contains ` as `: `_4 = &((_1 as Run).0: u8)` is the address of
+    // a downcast place, and the cast arm's `find(" as ")` would split it into a
+    // cast of the string `&((_1` -- which parses as neither a place nor an operand,
+    // so the rvalue became a cast of `Unknown`, `_4` got no address, and the
+    // `copy (*_4)` that reads the guard read `Unknown`. That made every `match`
+    // with a `Variant(n) if guard` arm report "unmodelled switch discriminant" --
+    // the guard's own payload read was the thing that failed, not the switch. The
+    // cast arm cannot mis-take a reference, because `&…` is not a place, so trying
+    // the reference form first is safe for a real cast.
     let raw = t.strip_prefix("&raw const ").or_else(|| t.strip_prefix("&raw mut "));
     if let Some(r) = raw.or_else(|| t.strip_prefix("&mut ")).or_else(|| t.strip_prefix('&')) {
         // `(fake)` is the marker rustc prints on the *place* of a `&mut [T]`
@@ -2210,6 +2538,22 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
         if let Some(p) = parse_place(r, enums) {
             return Rvalue::Ref(p);
         }
+    }
+    // The cast check has to come *before* the `const ` check, because rustc prints
+    // a cast constant as `const 3_i32 as u32 (IntToInt)`. Matching `const ` first
+    // hands the whole string to `parse_const`, which reads `i32 as u32 (IntToInt)`
+    // as a type name and produces a constant with no width -- an `Unknown` that
+    // then makes every guard written against it unmodelled.
+    if let Some(i) = find_top_level_as(t) {
+        let (src, dst) = (t[..i].trim(), t[i + 4..].trim());
+        let ty_text = dst.split_whitespace().next().unwrap_or(dst);
+        return Rvalue::Cast(parse_operand(src, enums), Ty::parse(ty_text));
+    }
+    if let Some(rest) = t.strip_prefix("const ") {
+        return Rvalue::Use(Operand::Const(parse_const(rest)));
+    }
+    if t.starts_with("copy ") || t.starts_with("move ") {
+        return Rvalue::Use(parse_operand(t, enums));
     }
     if let Some(rest) = t.strip_prefix("Len(") {
         if let Some(p) = parse_place(strip_copy(close_paren(rest)), enums) {
@@ -2296,7 +2640,13 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
             // separates it from a plain call; the executor resolves the variant
             // against the program's enum layouts, which is the only place the
             // declaration order is known.
-            if name.contains("::") && !name.contains(' ') {
+            //
+            // The space check ignores spaces *inside* a generic list, so
+            // `Result::<u8, u8>::Ok(x)` -- which rustc prints with a space after
+            // the comma -- is recognised. A top-level space would mean something
+            // else (a call expression this parser does not produce), so it still
+            // refuses.
+            if name.contains("::") && !has_top_level_space(name) {
                 return Rvalue::Variant(name.to_string(), args);
             }
         }
@@ -2325,11 +2675,64 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
     // even once a tag read from an argument worked. A `::` with no spaces or
     // parens is the shape; the discriminant is resolved by the executor, which
     // is the only place the enum's layout is known.
-    if t.contains("::") && !t.contains(' ') && !t.contains('(') {
+    if t.contains("::") && !has_top_level_space(t) && !t.contains('(') {
         return Rvalue::Use(Operand::Const(Const::Other(t.to_string())));
     }
     Rvalue::Unknown(t.to_string())
 }
+
+/// Whether `s` has a space that is not inside a `<...>` generic list.
+///
+/// rustc prints a generic argument list with a space after the comma
+/// (`Result::<u8, u8>::Ok`), so a plain `contains(' ')` rejects a variant
+/// construction this parser can read. A space *outside* the angle brackets is a
+/// different shape (a call expression), so it is still refused.
+fn has_top_level_space(s: &str) -> bool {
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ' ' if depth <= 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The byte offset of the first ` as ` that is not inside `<...>` or `(...)`.
+///
+/// The cast arm needs the *cast's* ` as `, but a promoted constant's use-site
+/// spelling contains one of its own inside the `<T as Trait>` projection
+/// (`const <Self as range_shim::a::Custom>::into_iter::promoted[0]`). A plain
+/// `find(" as ")` matched that one, so the whole operand was read as a cast of the
+/// string `const <Self` and the promoted constant was never recorded -- an
+/// MSRV-only failure, because current stable prints a plain `from_str` instead.
+/// The search skips `<>` and `()` nesting, so the projection's ` as ` is invisible
+/// and a real cast (`const 3_i32 as u32 (IntToInt)`) is still found.
+fn find_top_level_as(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut angle = 0i32;
+    let mut paren = 0i32;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'<' => angle += 1,
+            b'>' => angle -= 1,
+            b'(' => paren += 1,
+            b')' => paren -= 1,
+            b' ' if angle <= 0 && paren <= 0
+                && s[i..].starts_with(" as ") =>
+            {
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Parse one statement or terminator line.
 fn parse_stmt_or_term(line: &str, enums: &BTreeMap<String, EnumLayout>) -> Result<Stmt, Term> {
     let t = line.trim().trim_end_matches(';').trim();
@@ -2392,35 +2795,61 @@ fn parse_stmt_or_term(line: &str, enums: &BTreeMap<String, EnumLayout>) -> Resul
             None => Term::Unknown(t.to_string()),
         });
     }
-    // A call terminator: `dest = callee(args) -> [return: bbN, …]`
-    if let Some(i) = t.find(" -> [return:") {
-        let lhs = t[..i].trim();
-        let target = parse_return_target(&t[i..]).unwrap_or(usize::MAX);
-        if let Some(eq) = lhs.find(" = ") {
-            let dest_text = lhs[..eq].trim();
-            let call = lhs[eq + 3..].trim();
-            let dest = parse_place(dest_text, enums).unwrap_or(Place::new(u32::MAX));
-            if let Some(open) = call.find('(') {
-                if call.ends_with(')') {
-                    let name = call[..open].trim();
-                    let inner = &call[open + 1..call.len() - 1];
-                    let args: Vec<Operand> =
-                        split_top_level(inner, ',').iter().map(|a| parse_operand(a, enums)).collect();
-                    let callee = if name.is_empty() {
-                        Callee::Indirect(dest.clone())
-                    } else {
-                        Callee::Name(name.to_string())
-                    };
-                    return Err(Term::Call { callee, args, dest, target });
-                }
+    // A `drop(place) -> [return: bbN, …]` terminator. It prints with the same
+    // `-> [return:` shape as a call, so without this arm the call arm below claims
+    // it: `parse_call_head` finds no ` = ` and returns `None`, and the arm's
+    // fallback turns the whole line into `Unknown`, reported as "unmodelled
+    // terminator" and dropping the path. Every RAII local lowers to a `drop`, so
+    // any function with a `Vec`, a guard or a lock was `incomplete` on this -- a
+    // refusal, never a false proof. The arm has to come *before* the call arm,
+    // which would otherwise claim the line.
+    if let Some(r) = t.strip_prefix("drop(") {
+        if let Some((inner, after)) = take_until_close(r) {
+            let place = parse_place(inner, enums);
+            let target = parse_return_target(after).unwrap_or(usize::MAX);
+            if let Some(place) = place {
+                return Err(Term::Drop { place, target });
             }
         }
         return Err(Term::Unknown(t.to_string()));
     }
-    if let Some(r) = t.strip_prefix("drop(") {
-        let _ = r;
-        let target = parse_return_target(t).unwrap_or(usize::MAX);
-        return Err(Term::Goto(target));
+    // A call terminator: `dest = callee(args) -> [return: bbN, …]`
+    if let Some(i) = t.find(" -> [return:") {
+        let target = parse_return_target(&t[i..]).unwrap_or(usize::MAX);
+        if let Some((callee, args, dest)) = parse_call_head(&t[..i], enums) {
+            return Err(Term::Call { callee, args, dest, diverges: false, target });
+        }
+        return Err(Term::Unknown(t.to_string()));
+    }
+    // A *diverging* call: `_3 = core::panicking::panic(…) -> unwind continue`, with
+    // no `[return: bbN]` arm because the call never returns. `panic!`, `assert!`,
+    // `unwrap` and an out-of-bounds index all lower this way, and it is the only
+    // shape where a call has no normal successor. The guard is the absence of
+    // `[return:` before the arrow: a call with both arms is the ordinary kind above.
+    if let Some(i) = t.find(" -> unwind") {
+        if !t[..i].contains("[return:") {
+            if let Some((callee, args, dest)) = parse_call_head(&t[..i], enums) {
+                return Err(Term::Call { callee, args, dest, diverges: true, target: usize::MAX });
+            }
+        }
+    }
+    // The *cleanup* form of a diverging call: `_4 = core::panicking::panic(…) -> bb4;`
+    // with `bb4 (cleanup)`. With a live `Drop` local, rustc prints the call's single
+    // successor as its cleanup edge (`-> bbN`), not the `-> unwind continue` arm
+    // above -- the call still never returns, but the shape differs. The bare
+    // `-> bbN` (no `[`) is what tells it apart: an ordinary call always prints
+    // `-> [return: bbN, unwind …]`. The head is parsed here; the block is marked
+    // diverging *after* the body is read, because the `!`-typed destination and the
+    // `(cleanup)` marker are only both known then. See the fix-up in `parse_fn_body`.
+    if let Some(i) = t.find(" -> bb") {
+        let after = t[i + 4..].trim();
+        if !t[..i].contains("[return:") && !after.starts_with('[') {
+            if let Some(target) = parse_bb_ref(after.trim_end_matches(';')) {
+                if let Some((callee, args, dest)) = parse_call_head(&t[..i], enums) {
+                    return Err(Term::Call { callee, args, dest, diverges: false, target });
+                }
+            }
+        }
     }
     // A plain assignment ----------------------------------------------------
     if let Some(eq) = find_assign_eq(t) {
@@ -2630,6 +3059,64 @@ fn parse_program_impl(
             break;
         }
     }
+    // --- promoted `&[&str]` pieces -----------------------------------------
+    // A `panic!`/`assert!` message on edition 2024 is a *promoted* constant: the
+    // format pieces are an array of `&str` in a `const NAME::promoted[0]` item, and
+    // the call passes a reference to it. The item prints outside any function, so
+    // the executor cannot reach it by walking a body -- it is collected here, next
+    // to the other `const` items, so the `Arguments` model can read the pieces back.
+    for (li, line) in lines.iter().enumerate() {
+        let Some(rest) = line.trim_end().strip_prefix("const ") else { continue };
+        let Some((name_ty, body)) = rest.split_once(" = ") else { continue };
+        // The name/type separator is the *last* `: ` before the type: a promoted
+        // constant inside an `impl` names the impl by location, and on the MSRV that
+        // marker contains a `: ` of its own (`<impl at FILE:L:C: L:C>::m::promoted[0]`),
+        // so the first `: ` would cut the name short and drop the item.
+        let Some((name, _ty)) = name_ty.rsplit_once(": ") else { continue };
+        if !name.ends_with(']') || body.trim() != "{" {
+            continue;
+        }
+        // The array literal is the `_1 = [const "a", const "b"];` statement of the
+        // body; `_0 = &_1;` is the borrow and carries no string.
+        let mut strs = Vec::new();
+        // A *scalar* promoted constant is how rustc lowers `x.eq(&5)` in
+        // unoptimised MIR: the literal `5` is promoted to its own item
+        // (`const F::promoted[0]: &u8 = { _1 = const 5_u8; _0 = &_1; }`) and the
+        // call passes a reference to it. The use site reads
+        // `const F::promoted[0]`, so recording the scalar under the promoted name
+        // lets `operand` resolve it, exactly as a named `const` item does. Only a
+        // body whose sole value statement is a scalar literal is recorded: an
+        // array body has no single word to store (the `&[&str]` case above), and
+        // a body that computes its value is left unmodelled rather than guessed.
+        let mut scalar: Option<Const> = None;
+        for l in lines[li + 1..].iter().take_while(|l| !l.starts_with('}')) {
+            let t = l.trim();
+            if let Some(rest) = t.strip_prefix("_1 = [") {
+                let inner = rest.strip_suffix("];").unwrap_or(rest);
+                for piece in split_top_level(inner, ',') {
+                    if let Some(s) = piece.trim().strip_prefix("const ") {
+                        if let Some(text) = parse_str_literal(s) {
+                            strs.push(text);
+                        }
+                    }
+                }
+            }
+            // `_1 = const <scalar>;` -- the promoted value. The value local is
+            // always `_1` (the return `_0` is `&_1`), so only that local is read:
+            // a body that computes its value (`_2 = AddWithOverflow(…)`) has no
+            // `_1 = const` statement and is left unmodelled, and no other local's
+            // literal can be mistaken for the value.
+            if let Some(rhs) = t.strip_prefix("_1 = ").map(|r| r.trim_end_matches(';')) {
+                if let Some(c) = rhs.strip_prefix("const ") {
+                    scalar = Some(parse_const(c));
+                }
+            }
+        }
+        if let Some(c) = scalar {
+            prog.consts.insert(name.to_string(), c);
+        }
+        prog.promoted_strs.insert(name.to_string(), strs);
+    }
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
@@ -2751,14 +3238,21 @@ fn parse_fn_body(
             j += 1;
             continue;
         }
-        // A block header: `bbN: {`
+        // A block header: `bbN: {` (or `bbN (cleanup): {`)
         if let Some(rest) = t.strip_prefix("bb") {
             if let Some(colon) = rest.find(':') {
-                if let Ok(id) = rest[..colon].trim().parse::<usize>() {
+                let header = &rest[..colon];
+                if let Ok(id) = header.split_whitespace().next().unwrap_or("").parse::<usize>()
+                {
                     if let Some(b) = cur_block.take() {
                         f.blocks.push(b);
                     }
-                    cur_block = Some(Block { id, stmts: Vec::new(), term: Term::Unknown("missing".into()) });
+                    cur_block = Some(Block {
+                        id,
+                        stmts: Vec::new(),
+                        term: Term::Unknown("missing".into()),
+                        cleanup: header.contains("cleanup"),
+                    });
                     j += 1;
                     continue;
                 }
@@ -2805,6 +3299,39 @@ fn parse_fn_body(
         }
         if let Term::Call { dest, .. } = &b.term {
             f.written.insert(dest.local);
+        }
+    }
+    // A call whose destination is a never-typed local (`let mut _4: !;`) and whose
+    // only successor is a `(cleanup)` block is the *cleanup* form of a diverging
+    // call: the callee returns `!`, so the edge into the cleanup block is its
+    // unwind path, and the path ends there. The parser cannot tell this at the
+    // line, because the destination's type is declared above and the target's
+    // `(cleanup)` marker is below, so the two facts are combined here, once both
+    // are known.
+    //
+    // The guard is deliberately narrow. The destination must be declared `!`, and
+    // the target must be a cleanup block -- an ordinary call, which always prints
+    // `-> [return: bbN, unwind …]`, has neither and is untouched. A `!`-typed
+    // destination is the *only* thing a diverging call writes, so this cannot
+    // reclassify a returning call.
+    let cleanup_blocks: BTreeMap<usize, bool> =
+        f.blocks.iter().map(|b| (b.id, b.cleanup)).collect();
+    let never_locals: BTreeSet<LocalIdx> = f
+        .locals
+        .iter()
+        .filter(|(_, ty)| matches!(ty, Ty::Other(s) if s == "!"))
+        .map(|(&l, _)| l)
+        .collect();
+    for b in &mut f.blocks {
+        let Term::Call { dest, diverges, target, .. } = &mut b.term else { continue };
+        if *diverges || *target == usize::MAX {
+            continue;
+        }
+        if never_locals.contains(&dest.local)
+            && cleanup_blocks.get(target).copied().unwrap_or(false)
+        {
+            *diverges = true;
+            *target = usize::MAX;
         }
     }
     j
@@ -2903,6 +3430,33 @@ fn add(_1: u32, _2: u32) -> u32 {
         }
     }
 
+    /// `char::MAX` is the Unicode scalar maximum, not the width's all-ones.
+    ///
+    /// `char` is modelled at 32 bits so a `char` comparison is exact, but the
+    /// *value* a bound names is a property of the type. Reading it from the width
+    /// made `char::MAX` `0xffff_ffff`, so `c == char::MAX` compared against the
+    /// wrong number: a false proof for a body that reads the real maximum. The
+    /// bound must be `0x10FFFF` (`char::MIN` is `'\0'`).
+    #[test]
+    fn a_char_bound_is_its_scalar_value_not_the_width_maximum() {
+        let max = "fn f(_1: char) -> bool {\n    debug c => _1;\n    let mut _0: bool;\n\n    bb0: {\n        _0 = Eq(copy _1, const std::char::methods::<impl char>::MAX);\n        return;\n    }\n}\n";
+        let prog = parse_program(max);
+        match prog.fns[0].blocks[0].stmts.first() {
+            Some(Stmt::Assign(_, Rvalue::Binary(_, _, Operand::Const(Const::UInt(v, Some(Ty::Char)))))) => {
+                assert_eq!(*v, 0x10FFFF, "`char::MAX` is `0x10FFFF`, not `2^32 - 1`");
+            }
+            other => panic!("expected `char::MAX` as a typed constant, got {other:?}"),
+        }
+        let min = "fn f(_1: char) -> bool {\n    debug c => _1;\n    let mut _0: bool;\n\n    bb0: {\n        _0 = Eq(copy _1, const std::char::methods::<impl char>::MIN);\n        return;\n    }\n}\n";
+        let prog = parse_program(min);
+        match prog.fns[0].blocks[0].stmts.first() {
+            Some(Stmt::Assign(_, Rvalue::Binary(_, _, Operand::Const(Const::UInt(v, Some(Ty::Char)))))) => {
+                assert_eq!(*v, 0, "`char::MIN` is `'\\0'`");
+            }
+            other => panic!("expected `char::MIN` as a typed constant, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parses_a_switch_and_its_otherwise_arm() {
         let dump = "fn f(_1: u32) -> u32 {\n    debug x => _1;\n    let mut _0: u32;\n\n    bb0: {\n        switchInt(copy _1) -> [0: bb2, 1: bb1, otherwise: bb3];\n    }\n\n    bb1: {\n        _0 = const 1_u32;\n        return;\n    }\n\n    bb2: {\n        _0 = const 0_u32;\n        return;\n    }\n\n    bb3: {\n        _0 = copy _1;\n        return;\n    }\n}\n";
@@ -2921,10 +3475,94 @@ fn add(_1: u32, _2: u32) -> u32 {
         let dump = "fn f(_1: u32) -> u32 {\n    debug a => _1;\n    let mut _0: u32;\n\n    bb0: {\n        _0 = double(copy _1) -> [return: bb1, unwind continue];\n    }\n\n    bb1: {\n        return;\n    }\n}\n";
         let prog = parse_program(dump);
         match &prog.fns[0].blocks[0].term {
-            Term::Call { callee, args, dest, target } => {
+            Term::Call { callee, args, dest, diverges, target } => {
                 assert_eq!(*callee, Callee::Name("double".to_string()));
                 assert_eq!(args.len(), 1);
                 assert_eq!(dest.local, 0);
+                assert!(!diverges, "a call with a `[return: bbN]` arm does not diverge");
+                assert_eq!(*target, 1);
+            }
+            other => panic!("expected a call, got {other:?}"),
+        }
+    }
+
+    /// A call with no `[return: bbN]` arm is a diverging one, not an unknown line.
+    ///
+    /// This is how `panic!`, `assert!` and `unwrap` lower, and the parser used to
+    /// leave the terminator as `Unknown("missing")` because it looked only for the
+    /// `[return:` shape. The path was then dropped as unmodelled and the assert was
+    /// never checked. Both halves are pinned: the terminator is a `Call`, and it is
+    /// marked as diverging.
+    #[test]
+    fn parses_a_diverging_call_without_a_return_arm() {
+        let dump = "fn f(_1: u8) -> u8 {\n    debug x => _1;\n    let mut _0: u8;\n    let mut _2: bool;\n    let mut _3: !;\n\n    bb0: {\n        _2 = Le(copy _1, const 200_u8);\n        switchInt(move _2) -> [0: bb2, otherwise: bb1];\n    }\n\n    bb1: {\n        _0 = const 1_u8;\n        return;\n    }\n\n    bb2: {\n        _3 = core::panicking::panic(const \"assertion failed: x <= 200\") -> unwind continue;\n    }\n}\n";
+        let prog = parse_program(dump);
+        match &prog.fns[0].blocks[2].term {
+            Term::Call { callee, diverges, .. } => {
+                assert_eq!(*callee, Callee::Name("core::panicking::panic".to_string()));
+                assert!(*diverges, "a call with no return arm diverges");
+            }
+            other => panic!("expected a diverging call, got {other:?}"),
+        }
+    }
+
+    /// The *cleanup* form of a diverging call is recognised too.
+    ///
+    /// With a live `Drop` local, rustc prints the call's single successor as its
+    /// cleanup edge (`-> bb4`) and marks the target `bb4 (cleanup)`, rather than
+    /// the `-> unwind continue` arm above. The call still never returns, so it must
+    /// still be a diverging call -- the destination's `!` type and the target's
+    /// `(cleanup)` marker are the two facts the parser combines once the body is
+    /// read. Without this, an `assert!` in any function with a live RAII local was
+    /// still a dropped path.
+    #[test]
+    fn parses_the_cleanup_form_of_a_diverging_call() {
+        let dump = "fn f(_1: u8) -> u8 {\n    debug x => _1;\n    let mut _0: u8;\n    let _2: Guard;\n    let mut _3: bool;\n    let mut _4: !;\n\n    bb0: {\n        _2 = Guard(const 0_u8);\n        _3 = Lt(copy _1, const 200_u8);\n        switchInt(move _3) -> [0: bb2, otherwise: bb1];\n    }\n\n    bb1: {\n        _0 = const 1_u8;\n        return;\n    }\n\n    bb2: {\n        _4 = core::panicking::panic(const \"assertion failed: x < 200\") -> bb4;\n    }\n\n    bb3 (cleanup): {\n        resume;\n    }\n\n    bb4 (cleanup): {\n        drop(_2) -> [return: bb3, unwind terminate(cleanup)];\n    }\n}\n";
+        let prog = parse_program(dump);
+        let bb2 = prog.fns[0].blocks.iter().find(|b| b.id == 2).expect("bb2");
+        match &bb2.term {
+            Term::Call { callee, diverges, .. } => {
+                assert_eq!(*callee, Callee::Name("core::panicking::panic".to_string()));
+                assert!(*diverges, "a `!`-typed call into a cleanup block diverges");
+            }
+            other => panic!("expected a diverging call, got {other:?}"),
+        }
+        // The cleanup blocks themselves are marked, and a returning call is left
+        // alone -- the marker is not applied to every `-> bbN`.
+        assert!(prog.fns[0].blocks.iter().find(|b| b.id == 4).unwrap().cleanup);
+        assert!(!prog.fns[0].blocks.iter().find(|b| b.id == 0).unwrap().cleanup);
+    }
+
+    /// A `drop(place)` terminator parses as a `Drop`, not as a call.
+    ///
+    /// It prints with the same `-> [return: bbN, …]` shape an ordinary call does,
+    /// so without its own arm the call arm below claims it and turns the whole line
+    /// into `Unknown` (reported as "unmodelled terminator"), dropping the path --
+    /// a refusal, not a false proof, but a lost proof all the same. Every RAII local
+    /// lowers to this, so the shape has to parse.
+    #[test]
+    fn parses_a_drop_terminator() {
+        let dump = "fn f(_1: u8) -> u8 {\n    debug x => _1;\n    let mut _0: u8;\n    let _2: [u8; 2];\n\n    bb0: {\n        _2 = [const 1_u8, const 2_u8];\n        _0 = copy _1;\n        drop(_2) -> [return: bb1, unwind continue];\n    }\n\n    bb1: {\n        return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        match &prog.fns[0].blocks[0].term {
+            Term::Drop { place, target } => {
+                assert_eq!(place.local, 2);
+                assert!(place.proj.is_empty());
+                assert_eq!(*target, 1);
+            }
+            other => panic!("expected a `drop`, got {other:?}"),
+        }
+    }
+
+    /// An ordinary returning call keeps its target, even into a block that happens
+    /// to be a cleanup block -- the destination is not `!`, so it is not diverging.
+    #[test]
+    fn a_returning_call_into_a_cleanup_block_is_not_diverging() {
+        let dump = "fn f(_1: u8) -> u8 {\n    debug x => _1;\n    let mut _0: u8;\n    let mut _2: u8;\n\n    bb0: {\n        _2 = g(copy _1) -> bb1;\n    }\n\n    bb1 (cleanup): {\n        _0 = copy _2;\n        return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        match &prog.fns[0].blocks[0].term {
+            Term::Call { diverges, target, .. } => {
+                assert!(!*diverges, "a `u8` destination is not a diverging call");
                 assert_eq!(*target, 1);
             }
             other => panic!("expected a call, got {other:?}"),
@@ -3059,6 +3697,49 @@ fn add(_1: u32, _2: u32) -> u32 {
         assert_eq!(place, Place { local: 2, proj: vec![Proj::Deref] });
     }
 
+    /// A borrow of an enum payload parses as a `Ref`, not as a cast.
+    ///
+    /// `_4 = &((_1 as Run).0: u8)` -- how a `match` arm guard's payload read
+    /// lowers -- contains the word ` as ` inside its parentheses. The cast arm's
+    /// `find(" as ")` matched that, split the string into a cast of `&((_1`, which
+    /// parses as neither a place nor an operand, and the borrow got no address, so
+    /// the guard read `Unknown` and the `switchInt` on it was "unmodelled switch
+    /// discriminant". The reference arm is tried first, so the downcast place
+    /// parses whole and the `Ref` is produced.
+    #[test]
+    fn a_borrow_of_an_enum_payload_is_a_ref_not_a_cast() {
+        let mut enums = BTreeMap::new();
+        enums.insert(
+            "Msg".to_string(),
+            EnumLayout {
+                variants: vec![
+                    ("Ping".to_string(), 0),
+                    ("Data".to_string(), 1),
+                    ("Stop".to_string(), 2),
+                ],
+            },
+        );
+        let rv = parse_rvalue("&((_1 as Data).0: u8)", &enums);
+        let Rvalue::Ref(place) = rv else { panic!("expected a Ref, got {rv:?}") };
+        assert_eq!(place, Place { local: 1, proj: vec![Proj::Downcast(1), Proj::Field(0)] });
+        // A real cast still parses as a cast: `_1 as u32` is not a place.
+        let rv = parse_rvalue("move _1 as u32 (IntToInt)", &enums);
+        assert!(matches!(rv, Rvalue::Cast(..)), "a cast must stay a cast, got {rv:?}");
+        // A promoted constant's use-site spelling carries an ` as ` of its own,
+        // inside the `<T as Trait>` projection. It must stay a `Use` of the
+        // constant, not become a cast of the string `const <Self` -- the MSRV
+        // prints a trait default body's `panic!` this way, and misreading it made
+        // the `Arguments::new_const` call unmodelled.
+        let rv = parse_rvalue(
+            "const <Self as range_shim::a::Custom>::into_iter::promoted[0]",
+            &enums,
+        );
+        let Rvalue::Use(Operand::Const(Const::Other(n))) = rv else {
+            panic!("a promoted constant must stay a Use, got {rv:?}")
+        };
+        assert_eq!(n, "<Self as range_shim::a::Custom>::into_iter::promoted[0]");
+    }
+
     /// A *qualified* spelling of `Option`/`Result` resolves to the same numbering
     /// as the unqualified one.
     ///
@@ -3145,6 +3826,64 @@ fn add(_1: u32, _2: u32) -> u32 {
         assert!(!prog.consts.contains_key("UNUSED"), "a bare definition with no bare use is not kept");
         assert!(!prog.consts.contains_key("EXPR"), "an expression body is not a literal");
         assert!(!prog.consts.contains_key("ARR"), "a qualified name is not collected");
+    }
+
+    /// A promoted constant's *definition* is read even when its name carries the
+    /// `<impl at FILE:L:C: L:C>` marker, whose `: ` must not be mistaken for the
+    /// name/type separator.
+    ///
+    /// On the MSRV (1.85) a `panic!` inside a trait default body defines
+    /// `const a::Custom::into_iter::promoted[0]: &[&str; 1] = { … }`; the marker is
+    /// not there, but a promoted constant inside an `impl` block is named
+    /// `const NAME::<impl at FILE:L:C: L:C>::m::promoted[0]: …`, and a first-`: `
+    /// split cut the name at the marker's own `: `. The item was then dropped and
+    /// the `Arguments::new_const` call that reads it was unmodelled.
+    #[test]
+    fn a_promoted_const_definition_survives_an_impl_location() {
+        let dump = "const range_shim::<impl at /tmp/x.rs:4:5: 4:30>::m::promoted[0]: &[&str; 1] = {\n\
+                    \x20   let mut _0: &[&str; 1];\n    let mut _1: [&str; 1];\n\n    bb0: {\n        \
+                    _1 = [const \"boom\"];\n        _0 = &_1;\n        return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        assert_eq!(
+            prog.promoted_strs
+                .get("range_shim::<impl at /tmp/x.rs:4:5: 4:30>::m::promoted[0]"),
+            Some(&vec!["boom".to_string()])
+        );
+    }
+
+    /// A *scalar* promoted constant is collected as a `const`, so a comparison
+    /// against a literal operand resolves.
+    ///
+    /// In unoptimised MIR `x.eq(&5)` promotes the literal `5` to its own item
+    /// (`const F::promoted[0]: &u8 = { _1 = const 5_u8; _0 = &_1; }`) and the call
+    /// passes a reference to it. The use site reads `const F::promoted[0]`, so the
+    /// value has to be in the `const` table for the operand to fold; without it
+    /// the reference's referent is unknown and the call is unmodelled. An array
+    /// body (the `&[&str]` case) has no single word, so it is recorded only in
+    /// `promoted_strs`, never as a scalar.
+    #[test]
+    fn a_scalar_promoted_constant_is_collected_as_a_const() {
+        let dump = "const f::promoted[0]: &u8 = {\n\
+                    \x20   let mut _0: &u8;\n    let mut _1: u8;\n\n    bb0: {\n        \
+                    _1 = const 5_u8;\n        _0 = &_1;\n        return;\n    }\n}\n\
+                    const g::promoted[0]: &[&str; 1] = {\n\
+                    \x20   let mut _0: &[&str; 1];\n    let mut _1: [&str; 1];\n\n    bb0: {\n        \
+                    _1 = [const \"boom\"];\n        _0 = &_1;\n        return;\n    }\n}\n";
+        let prog = parse_program(dump);
+        assert_eq!(
+            prog.consts.get("f::promoted[0]"),
+            Some(&Const::UInt(5, Some(Ty::U8))),
+            "a scalar promoted constant must be a `const`"
+        );
+        assert!(
+            !prog.consts.contains_key("g::promoted[0]"),
+            "an array body has no single word and must not become a scalar `const`"
+        );
+        assert_eq!(
+            prog.promoted_strs.get("g::promoted[0]"),
+            Some(&vec!["boom".to_string()]),
+            "the array body is still recorded as string pieces"
+        );
     }
 
     /// A function-local `const`'s definition must not become a bare program-wide
@@ -3559,6 +4298,70 @@ fn add(_1: u32, _2: u32) -> u32 {
         // Without this the test could pass while the reader stopped recognising
         // anything at all.
         assert!(saw_a_function, "no mutation produced a parsed function");
+    }
+
+    /// A `str` literal is decoded; anything else is refused.
+    ///
+    /// The refusal is the load-bearing half: a path constant
+    /// (`core::num::MAX`) reaching the string reader must not become a message,
+    /// and an escape the printer does not emit must not be silently dropped.
+    #[test]
+    fn a_string_literal_is_decoded_and_a_non_literal_is_refused() {
+        assert_eq!(parse_str_literal(r#""zero""#).as_deref(), Some("zero"));
+        assert_eq!(parse_str_literal(r#""a\"b\n""#).as_deref(), Some("a\"b\n"));
+        assert_eq!(parse_str_literal(r#""\u{1f600}""#).as_deref(), Some("\u{1f600}"));
+        assert_eq!(parse_str_literal("core::num::MAX"), None);
+        assert_eq!(parse_str_literal(r#""\q""#), None, "an unknown escape is refused");
+        assert_eq!(parse_str_literal("\"unterminated"), None);
+    }
+
+    /// A byte-string literal decodes to raw bytes, not to UTF-8 text.
+    #[test]
+    fn a_byte_string_literal_decodes_to_raw_bytes() {
+        assert_eq!(parse_byte_str_literal(r#"b"\x04bad \xc0\x00""#).as_deref(), Some(&[
+            0x04, b'b', b'a', b'd', b' ', 0xC0, 0x00,
+        ][..]));
+        assert_eq!(parse_byte_str_literal("b\"\"").as_deref(), Some(&[][..]));
+        assert_eq!(parse_byte_str_literal("\"not bytes\""), None);
+    }
+
+    /// The `new::<LEN, _>` byte template decodes to the same pieces `new_v1`
+    /// passes, and a malformed one is refused rather than guessed at.
+    #[test]
+    fn the_byte_template_decodes_to_the_same_pieces_as_new_v1() {
+        // `panic!("bad {}", x)`, as stable prints it.
+        let pieces = decode_format_template(&[0x04, b'b', b'a', b'd', b' ', 0xC0, 0x00]);
+        assert_eq!(pieces.as_deref(), Some(&["bad ".to_string(), String::new()][..]));
+        // `panic!("fmt {} and {}", x, y)`.
+        let mut t = vec![0x04];
+        t.extend_from_slice(b"fmt ");
+        t.push(0xC0);
+        t.push(0x05);
+        t.extend_from_slice(b" and ");
+        t.push(0xC0);
+        t.push(0x00);
+        let pieces = decode_format_template(&t).expect("a well-formed template");
+        assert_eq!(pieces, vec!["fmt ".to_string(), " and ".to_string(), String::new()]);
+        // A template that never terminates is refused.
+        assert_eq!(decode_format_template(&[0x04, b'a']), None);
+    }
+
+    /// The placeholder count comes from the argument count, not the piece count.
+    ///
+    /// `panic!("{} tail", x)` prints `["", " tail"]` with *one* argument, so a
+    /// join that put a `{}` in every gap would claim two placeholders and name a
+    /// message that is not the one in the source.
+    #[test]
+    fn the_placeholder_count_follows_the_argument_count() {
+        let pieces = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(join_format_pieces(&pieces(&["plain"]), 0), "plain");
+        assert_eq!(join_format_pieces(&pieces(&["", " tail"]), 1), "{} tail");
+        assert_eq!(join_format_pieces(&pieces(&["a", "b"]), 1), "a{}b");
+        assert_eq!(join_format_pieces(&pieces(&["a", "b", "c"]), 2), "a{}b{}c");
+        // A leading argument (`panic!("{}{}", x, y)`) is `["", "", ""]` with two
+        // arguments, which the gap rule alone would render as three placeholders.
+        assert_eq!(join_format_pieces(&pieces(&["", "", ""]), 2), "{}{}");
+        assert_eq!(join_format_pieces(&pieces(&[]), 3), "");
     }
 }
 

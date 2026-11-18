@@ -145,6 +145,35 @@ pub struct FnContract {
     /// it). Like `decreases:`, at most one is taken: two measures could disagree,
     /// and picking either would be guessing which proof the source asked for.
     pub variant: Option<String>,
+    /// The loop-unwinding bound, from `/// unwind: <n>`.
+    ///
+    /// A function with a loop and no `invariant:` is *unwound*: the header is
+    /// re-entered up to `DEFAULT_UNWIND` times and the path is then reported
+    /// unknown. The default is deliberately small, and a loop that needs more
+    /// iterations than it allows is a *reported* refusal, not a silent cut. This
+    /// clause is how a caller says "unwind further": `unwind: 40` raises the bound
+    /// for this function so a loop too long for the default is decided rather than
+    /// refused. It is a bound on the number of times the *back edge* may be taken,
+    /// so it has to be at least the loop's trip count.
+    ///
+    /// It is supplied rather than inferred for the same reason an invariant is:
+    /// guessing a bound means guessing a proof. A non-numeric or zero value is
+    /// refused rather than defaulted.
+    ///
+    /// A *declared* bound is a claim ("this loop finishes within `n` iterations"),
+    /// so a path that runs off the end of it is Kani's **unwinding assertion**: a
+    /// `Failed` obligation naming the bound, not an incompleteness. That is what
+    /// keeps the clause sound -- a `verified` under `unwind: 3` would otherwise be
+    /// a statement about the first three iterations only. A loop with *no* bound
+    /// still cuts off at `DEFAULT_UNWIND`, but that default is not a claim the
+    /// caller made, so it is reported as incompleteness rather than refuted.
+    ///
+    /// Raising the bound is only useful because the walk *prunes* unsatisfiable
+    /// paths: once a guard folds to a constant the impossible edge is dropped, so a
+    /// loop reaches its exit edge at its real trip count instead of at the bound.
+    /// Without that pruning a raised bound is honoured but the loop still cannot
+    /// decide, because the infeasible exit edges are explored too.
+    pub unwind: Option<u32>,
     /// Clause-shaped doc-comment lines that are *not* clauses this frontend
     /// understands, as `(line number, the line as written)`.
     ///
@@ -226,6 +255,14 @@ pub struct Specs {
     /// contract text itself comes from, which keeps the two consistent by
     /// construction. A struct with no entry here has no readable fields, and a
     /// contract naming one is refused rather than guessed.
+    ///
+    /// A struct declared inside a `mod` is keyed by its *module-qualified* path
+    /// (`m::Outer`), with the bare name also inserted when it is unique
+    /// crate-wide. Two modules that each declare `Outer` must not share one
+    /// layout: the drop-glue check would read whichever `Outer` was inserted last,
+    /// and if that one is glue-free a panicking field destructor disappears from
+    /// the proof. Lookups go through [`Specs::struct_of`], which prefers the
+    /// qualified key and falls back to the bare one.
     pub structs: BTreeMap<String, StructDef>,
     /// Enum layouts read from the same source, keyed by enum name.
     ///
@@ -484,6 +521,27 @@ impl Specs {
         } else {
             None
         }
+    }
+
+    /// The struct layout for a type name, qualified-first.
+    ///
+    /// `name` is a `Ty::Other` spelling, which may be module-qualified
+    /// (`m::Outer`), carry generic arguments (`Vec<u8>`), or be bare. The lookup
+    /// tries, in order:
+    ///
+    /// 1. the full name as written (`m::Outer`);
+    /// 2. the name with generics stripped (`Vec`);
+    /// 3. the bare tail (`Outer`), for a struct declared at the crate root or whose
+    ///    qualified key was not recorded.
+    ///
+    /// The qualified key wins, which is what keeps two same-named structs in
+    /// different modules apart. Falling back to the bare tail is only safe because
+    /// the scanner inserts a bare key solely for a struct whose bare name is
+    /// unique crate-wide; when two share a name, only the qualified keys exist and
+    /// a bare-tail miss is a refusal (the caller reports "not modelled"), not a
+    /// wrong layout.
+    pub fn struct_of(&self, name: &str) -> Option<&StructDef> {
+        struct_lookup(&self.structs, name)
     }
 
     /// A second contract the `impl` method `name` carries, when it has both its
@@ -2004,6 +2062,11 @@ pub fn extract(source: &str) -> Specs {
     // rather than a list of fields, so it needs its own cursor; a struct and an
     // enum cannot be open at once, so the two cursors never interleave.
     let mut cur_enum: Option<(String, EnumDef)> = None;
+    // Struct names whose qualified key was recorded, so the bare-name
+    // back-insertion can be deferred to the end and skipped when two structs
+    // share a bare name. See `Specs::structs` and `Specs::struct_of`.
+    let mut struct_paths: BTreeMap<String, String> = BTreeMap::new();
+    let mut struct_name_counts: BTreeMap<String, u32> = BTreeMap::new();
 
     for (lineno, raw_line) in source.lines().enumerate() {
         let line = raw_line.trim();
@@ -2065,6 +2128,22 @@ pub fn extract(source: &str) -> Specs {
             // written above. Carrying it to the next `fn` was a false proof when
             // the leaked `requires` was satisfiable.
             pending = FnContract::default();
+            // The layout is keyed by the struct's *module-qualified* source path
+            // (`m::Outer`), and the bare name is back-inserted at the end only
+            // when it is unique crate-wide. Two modules that each declare `Outer`
+            // must not share one layout: the drop-glue check would otherwise read
+            // whichever was recorded last, and if that one is glue-free a
+            // panicking field destructor vanishes from the proof.
+            let scope = scope_path.get(lineno).cloned().unwrap_or_default();
+            let key_of = |name: &str| -> String {
+                if scope.is_empty() {
+                    name.to_string()
+                } else {
+                    let mut p = scope.clone();
+                    p.push(name.to_string());
+                    p.join("::")
+                }
+            };
             match head {
                 // A tuple struct carries its fields in the head, numbered by
                 // position, so there is no body to cursor over.
@@ -2073,7 +2152,24 @@ pub fn extract(source: &str) -> Specs {
                     for (fname, fty) in fields {
                         def.fields.push((fname, Ty::parse(&fty)));
                     }
-                    specs.structs.insert(name, def);
+                    let key = key_of(&name);
+                    *struct_name_counts.entry(name.clone()).or_insert(0) += 1;
+                    if key != name {
+                        struct_paths.insert(name, key.clone());
+                    }
+                    specs.structs.insert(key, def);
+                }
+                // A unit struct (`struct Guard;`) is a zero-field layout: the
+                // drop-glue check must find no fields rather than refuse the type
+                // as an unknown container, and a contract naming `.0` on it is
+                // still an "unknown field" refusal because there is no field 0.
+                StructHead::Unit { name } => {
+                    let key = key_of(&name);
+                    *struct_name_counts.entry(name.clone()).or_insert(0) += 1;
+                    if key != name {
+                        struct_paths.insert(name, key.clone());
+                    }
+                    specs.structs.insert(key, StructDef::default());
                 }
                 StructHead::Named { name, closed_inline } => {
                     // A one-line body is complete already; opening a cursor would run
@@ -2094,9 +2190,19 @@ pub fn extract(source: &str) -> Specs {
                                 }
                             }
                         }
-                        specs.structs.insert(name, def);
+                        let key = key_of(&name);
+                        *struct_name_counts.entry(name.clone()).or_insert(0) += 1;
+                        if key != name {
+                            struct_paths.insert(name, key.clone());
+                        }
+                        specs.structs.insert(key, def);
                     } else {
-                        cur_struct = Some((name, StructDef::default()));
+                        let key = key_of(&name);
+                        *struct_name_counts.entry(name.clone()).or_insert(0) += 1;
+                        if key != name {
+                            struct_paths.insert(name, key.clone());
+                        }
+                        cur_struct = Some((key, StructDef::default()));
                     }
                 }
             }
@@ -2147,6 +2253,17 @@ pub fn extract(source: &str) -> Specs {
                 } else {
                     pending.variant = Some(r.trim().to_string());
                 }
+            } else if let Some(r) = t.strip_prefix("unwind:") {
+                // A loop-unwinding bound. It has to be a positive integer: a
+                // non-numeric or zero value is refused rather than defaulted, so a
+                // typo cannot silently fall back to `DEFAULT_UNWIND`.
+                match r.trim().parse::<u32>() {
+                    Ok(n) if n > 0 => pending.unwind = Some(n),
+                    _ => pending.unknown.push((
+                        lineno + 1,
+                        format!("{t} — `unwind:` needs a positive integer"),
+                    )),
+                }
             } else if let Some(note) = clause_shaped_word(t) {
                 // A line that reads like a clause but is not one this frontend
                 // takes. A typo (`ensuers:`) would otherwise be dropped and the
@@ -2167,6 +2284,7 @@ pub fn extract(source: &str) -> Specs {
                 || !pending.invariants.is_empty()
                 || !pending.decreases.is_empty()
                 || pending.variant.is_some()
+                || pending.unwind.is_some()
                 // A function carrying *only* a clause the frontend does not take
                 // is still recorded, so it can be refused rather than dropped:
                 // dropping it would leave the function unverified with no
@@ -2232,6 +2350,25 @@ pub fn extract(source: &str) -> Specs {
             pending = FnContract::default();
         }
     }
+    // Back-insert a bare key for every struct whose bare name is unique
+    // crate-wide, so a lookup by the bare tail still resolves. When two structs
+    // share a bare name the bare key is *not* created: a bare-tail lookup then
+    // misses, and the caller reports the layout as not modelled rather than
+    // reading whichever of the two happened to be inserted last (the false proof
+    // this keying exists to prevent).
+    for (bare, count) in &struct_name_counts {
+        if *count != 1 {
+            continue;
+        }
+        if specs.structs.contains_key(bare) {
+            continue;
+        }
+        if let Some(qualified) = struct_paths.get(bare) {
+            if let Some(def) = specs.structs.get(qualified).cloned() {
+                specs.structs.insert(bare.clone(), def);
+            }
+        }
+    }
     specs
 }
 
@@ -2249,7 +2386,8 @@ pub fn extract(source: &str) -> Specs {
 /// keyword and is left as documentation, so a sentence that merely contains a
 /// colon does not fire this.
 fn clause_shaped_word(t: &str) -> Option<String> {
-    const KEYWORDS: [&str; 5] = ["requires", "ensures", "invariant", "decreases", "variant"];
+    const KEYWORDS: [&str; 6] =
+        ["requires", "ensures", "invariant", "decreases", "variant", "unwind"];
     let word = t.split(':').next()?.trim();
     // A clause keyword is a bare identifier; anything else is prose or a value.
     if word.is_empty() || !word.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
@@ -2731,6 +2869,26 @@ pub struct FieldEnv {
     /// The names of enum-typed arguments, for diagnostics: a contract naming
     /// `m.Nope` where `Nope` is not a variant gets a message about the variant.
     pub enum_args: BTreeSet<String>,
+    /// `(tag variable, success discriminant, failure discriminant)` for an
+    /// enum-returning function, so a contract can write `ret.is_ok()` /
+    /// `ret.is_some()` / `ret.is_err()` / `ret.is_none()`.
+    ///
+    /// Kept apart from the bare `ret` binding on purpose: the *tag* is a value, but
+    /// it is not the enum's value, so a bare `ret <= n` on an enum return stays a
+    /// refusal (the return has no single word) rather than silently comparing the
+    /// discriminant. Only the four methods -- which say what they test -- read the
+    /// tag.
+    pub ret_enum_tags: Option<(Var, u64, u64)>,
+    /// `ret.<Variant>` → the discriminant the payload belongs to, so a contract
+    /// clause that names a return payload is guarded on the tag.
+    ///
+    /// Keyed by the *mangled* variable name the rewrite emits (`ret__v_Ok`), because
+    /// that is what the parser sees once `rewrite_fields` has run. A payload exists
+    /// only on the variant's paths, so the parser wraps the clause containing it in
+    /// `tag == discriminant` -- the guard travels with the *binding*, not with the
+    /// spelling, so a contract that mentions `ret.Ok` anywhere gets the same
+    /// treatment.
+    pub ret_payload_guards: BTreeMap<String, (Var, u64)>,
     /// Indexed arguments (slices and arrays): name → (local, element width, the
     /// array's fixed length if it is one), so a contract's `xs.len()` and `xs[0]`
     /// can be bound without the IR's `Ty` in hand.
@@ -3000,7 +3158,7 @@ impl FieldEnv {
     ) {
         // The fields of this aggregate, in field order, which *is* the MIR index.
         let fields: Vec<(String, Ty)> = match ty {
-            Ty::Other(name) => match w.structs.get(name) {
+            Ty::Other(name) => match struct_lookup(w.structs, name) {
                 Some(def) => def.fields.clone(),
                 None => return,
             },
@@ -3165,6 +3323,112 @@ impl FieldEnv {
         Some(())
     }
 
+    /// Record an enum return's tag and discriminants, so a contract can write
+    /// `ret.is_ok()` / `ret.is_some()` / `ret.is_err()` / `ret.is_none()`.
+    ///
+    /// `is_ok`/`is_some` test the *success* variant (`Ok` is 0, `Some` is 1) and
+    /// `is_err`/`is_none` the *failure* one. The tag is a value on every path (the
+    /// executor passes it as the return word), so the four are total; a contract
+    /// that writes them on a non-enum return is refused, because the tag they would
+    /// test does not exist.
+    ///
+    /// A bare *payload* read (`ret.Ok <= n`) is bound separately, by
+    /// [`bind_ret_payload`](Self::bind_ret_payload): it is meaningful only on the
+    /// paths whose tag is that variant, so the clause it appears in is guarded on
+    /// the discriminant rather than read on the wrong path.
+    pub fn bind_ret_enum(&mut self, tag: Var, success: u64, failure: u64) {
+        self.ret_enum_tags = Some((tag, success, failure));
+    }
+
+    /// Bind a *payload* of an enum return to a variable, so a contract can write
+    /// `ret.Ok <= n` / `ret.Some <= n`.
+    ///
+    /// A payload is meaningful only on the paths whose tag is that variant, so the
+    /// binding records the guard (`tag == discriminant`) beside the variable: the
+    /// postcondition is then required only where the payload exists, and a path
+    /// that returns the *other* variant makes the clause vacuous rather than
+    /// checking the payload against a value it does not have. Binding the payload
+    /// with no guard would compare it on every path -- a wrong value, not a weaker
+    /// proof.
+    ///
+    /// The variable is the executor's, not a fresh one, so the contract's
+    /// `ret.Ok` and the body's `((_0 as Ok).0)` name one value.
+    pub fn bind_ret_payload(&mut self, vname: &str, var: Var, tag: Var, disc: u64, signed: bool) {
+        let mangled = format!("ret__v_{vname}");
+        // The generated name must not shadow a source name. `eval_ensures` merges
+        // the field bindings *after* the arguments, so an argument literally named
+        // `ret__v_Ok` would be replaced by the payload binding -- and
+        // `ensures: ret.Ok == ret__v_Ok` then compares the payload with itself and
+        // is *verified* for every argument value. Every other generated binding is
+        // checked against `declared`; this one was inserted unconditionally, so it
+        // is checked here too. On a collision the binding is dropped, and the
+        // parser refuses `ret.Ok` as a name the return type does not have -- a
+        // refusal, never a proof against the wrong value.
+        if !self.name_is_free(&mangled) {
+            return;
+        }
+        self.vars.insert(mangled.clone(), var);
+        // `ret.Ok` and its alias `result.Ok` name the same value, so both rewrite
+        // targets are recorded; the parser accepts either spelling of the return.
+        self.paths.insert(format!("ret.{vname}"), mangled.clone());
+        self.paths.insert(format!("result.{vname}"), mangled.clone());
+        if signed {
+            self.signed.insert(mangled.clone());
+        }
+        self.ret_payload_guards.insert(mangled, (tag, disc));
+    }
+
+    /// Bind the return payloads a contract *names*, for the parse probe.
+    ///
+    /// Only the named variants are bound, so a contract that never mentions a
+    /// payload does not pay for one, and a payload whose type has no bit-vector
+    /// width (`Ok(&u8)`) is refused only when a contract actually asks for it. The
+    /// variable is throwaway (the probe discards its result); it only has to be the
+    /// right width for the comparison to be well-formed.
+    pub fn probe_ret_payloads(
+        &mut self,
+        ret_ty: &Ty,
+        enums: &BTreeMap<String, EnumDef>,
+        tag: Var,
+        ensures: &[String],
+    ) {
+        let Some(def) = ret_enum_def(ret_ty, enums) else { return };
+        for (vname, payload, disc) in &def.variants {
+            let Some(first) = payload.first() else { continue };
+            let Some(w) = first.width() else { continue };
+            let named = ensures
+                .iter()
+                .any(|e| names_ret_variant(e, vname));
+            if !named {
+                continue;
+            }
+            let slot = self.base + self.next_slot + self.next_ret_slot;
+            if slot as usize >= crate::smt::MAX_VARS {
+                continue;
+            }
+            self.next_ret_slot += 1;
+            let v = smt::var_named(slot, w);
+            self.bind_ret_payload(vname, v, tag, *disc, first.is_signed());
+        }
+    }
+
+    /// A fresh variable for an enum return's *tag*, for the parse probe only.
+    ///
+    /// Allocated above every slot the run will use -- the locals (`0..base`) and
+    /// the argument field/tag slots (`base..base+next_slot`) -- so the probe's
+    /// throwaway tag can never collide with a variable the run declares. A
+    /// collision at a *different width* is what `var_named` refuses, and it would
+    /// poison the whole arena and turn every obligation `Unknown`; a slot past the
+    /// run's own allocation is what makes the probe free rather than harmful.
+    pub fn probe_ret_enum_slot(&mut self, width: u8) -> Option<Var> {
+        let slot = self.base + self.next_slot + self.next_ret_slot;
+        if slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        self.next_ret_slot += 1;
+        Some(smt::var_named(slot, width.clamp(1, 64)))
+    }
+
     /// A fresh variable for the `index`-th return projection, for the parse probe.
     ///
     /// Only called for a component a contract actually *names* (see
@@ -3199,7 +3463,10 @@ impl FieldEnv {
         elem_w: u8,
         elem_signed: bool,
     ) -> Option<Var> {
-        if !(1..=64).contains(&elem_w) {
+        // `elem_w == 0` is the unmodelled-width sentinel (a generic `&[T]`): the
+        // length is still a value, so it is bound, but no element can be, which is
+        // what keeps `v.len()`/`v.is_empty()` answerable while `v[0]` stays refused.
+        if elem_w != 0 && !(1..=64).contains(&elem_w) {
             return None;
         }
         let len_name = format!("{arg}__len");
@@ -3926,6 +4193,7 @@ pub const RET_IS_AGGREGATE: &str =
 pub const RET_IS_UNKNOWN: &str = "the return value is not known on this path";
 
 /// Turn an `ensures` contract into a predicate over the arguments and `ret`.
+#[allow(clippy::too_many_arguments)]
 pub fn eval_ensures(
     text: &str,
     args: &BTreeMap<String, Var>,
@@ -3934,6 +4202,7 @@ pub fn eval_ensures(
     signed: &BTreeSet<String>,
     ret_signed: bool,
     fields: &FieldEnv,
+    old_args: &BTreeMap<String, Var>,
 ) -> Result<Pred, SpecError> {
     let orig = text;
     let text = rewrite_fields(text, fields)?;
@@ -3946,6 +4215,9 @@ pub fn eval_ensures(
     p.variant_consts = fields.variant_consts.clone();
     p.enum_args = fields.enum_args.clone();
     p.consts = fields.consts.clone();
+    p.old_args = old_args.clone();
+    p.ret_enum_tags = fields.ret_enum_tags;
+    p.ret_payload_guards = fields.ret_payload_guards.clone();
     let pred = p.parse_or().map_err(|e| e.about(orig))?;
     p.expect_end().map_err(|e| e.about(orig))?;
     Ok(pred)
@@ -4171,6 +4443,24 @@ struct Parser<'a> {
     /// `const` name is refused rather than guessed at -- the same answer the
     /// reader gave before this table existed. See [`FieldEnv::consts`].
     consts: BTreeMap<String, Const>,
+    /// The *entry* value of each name a contract may write `old(name)` for.
+    ///
+    /// A reference argument's name denotes the value it addresses, which the body
+    /// may write, so an `ensures` that names it means the value at *return*; the
+    /// entry value is reachable only through `old`. Empty outside an `ensures`,
+    /// where `old` is refused rather than guessed -- the same discipline as
+    /// `ret_absent`.
+    old_args: BTreeMap<String, Var>,
+    /// `(tag, success discriminant, failure discriminant)` for an enum-returning
+    /// function, so `ret.is_ok()` and friends read the tag. `None` when the return
+    /// is not an enum, in which case the methods are refused rather than answered
+    /// from a tag that does not exist.
+    ret_enum_tags: Option<(Var, u64, u64)>,
+    /// The `ret.<Variant>` payload bindings, mangled name → `(tag, discriminant)`.
+    /// A clause that mentions one of these is guarded on the tag, because the
+    /// payload exists only on that variant's paths. See
+    /// [`FieldEnv::ret_payload_guards`].
+    ret_payload_guards: BTreeMap<String, (Var, u64)>,
     /// The `(min, max)` envelope, as `i128`, of the *literals and folded
     /// intermediate values* in the term a `Var` holds. Rust range-checks every
     /// literal and every constant `+ - *` intermediate against the type the
@@ -4194,6 +4484,34 @@ struct Parser<'a> {
     /// set tells `parse_neg` apart that case from a literal *inside* a fold, whose
     /// magnitude is checked as written (`-(128 - 63)` is rejected for its `128`).
     bare_literals: BTreeSet<u32>,
+    /// The `[start, end)` token ranges of *parenthesized predicate groups* whose
+    /// inner conjuncts already carry their per-variant payload guards.
+    ///
+    /// `parse_and` guards each conjunct by scanning the tokens it consumed. A group
+    /// re-enters the predicate grammar, so its inner conjuncts are guarded per
+    /// variant -- and then the enclosing conjunct's scan would find both payload
+    /// names again and add a *combined* guard `tag == 0 && tag == 1`, which is
+    /// unsatisfiable and makes the whole group vacuously true:
+    /// `(ret.Ok == 9 && ret.Err == 8)` was *verified* on a body returning `Err(7)`.
+    /// The scan skips any token inside a recorded range, so the inner guards are the
+    /// only ones applied -- each payload restricted to its own variant, which is the
+    /// correct reading.
+    ///
+    /// The range is *not* dropped by a negation, and that is deliberate: a negated
+    /// payload clause is guarded by [`Parser::parse_cmp`]'s `!` arm, which applies the
+    /// discriminant guard to the whole negated predicate. The range stays recorded so
+    /// the enclosing conjunct's scan skips the already-guarded tokens.
+    guarded_groups: Vec<(usize, usize)>,
+    /// True while [`Parser::parse_cmp`] is parsing the operand of a `!`.
+    ///
+    /// A negation must not guard its operand's payload clause *inside* the `!`:
+    /// `!(ret.Ok == 9)` as `!(tag == 0 => payload == 9)` is false on an `Err` return,
+    /// a false refutation, while the equivalent `ret.Ok != 9` reads
+    /// `tag == 0 => payload != 9`, true there. A payload clause is *scoped* to its
+    /// variant, and the scope wraps the whole clause including the negation, so the
+    /// guard is applied by the `!` arm *outside* the `not`, and `guard_ret_payloads`
+    /// returns its clause unchanged while this is set.
+    in_negation: bool,
     /// The width a shift amount's bare literals are floored at, or `0` outside an
     /// amount.
     ///
@@ -4215,6 +4533,21 @@ struct Parser<'a> {
     ///
     /// [`amount_width`]: Self::amount_width
     amount_floor: u8,
+    /// The token indices at which an *identifier the parser was given* (an
+    /// argument, `ret`, a local, `old(...)`, `*name`) was consumed, rather than a
+    /// written literal, an associated constant (`i8::MIN`) or a `const` item.
+    ///
+    /// This is *lexical* provenance, and it has to be: a name can be bound to a
+    /// constant term -- an invariant is evaluated in the loop-head state, where a
+    /// counter like `i` holds the constant it had on entry (`0`) -- so a name and
+    /// a written `0` can be the *same* hash-consed term. Keying provenance on the
+    /// term id marked a written literal as a name (a written `0 - 1` was accepted
+    /// because an argument was pinned to `0` elsewhere in the contract). Rust never
+    /// treats a variable's arithmetic as a constant expression, so `i - 1` is a
+    /// wrapping subtraction, not the compile error `0u32 - 1u32`; a `const` *item*
+    /// and an associated constant, by contrast, Rust really does const-evaluate, so
+    /// they stay written constants.
+    name_tokens: BTreeSet<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4243,7 +4576,87 @@ enum Tok {
     /// == 0xFF` became `x == 0`, so `ensures: ret == 0` was "proved" for a
     /// function returning `255`. A refusal is safe; a wrong number is not.
     BadNum,
+    /// A character literal, as its Unicode scalar value.
+    ///
+    /// A `char` is a 32-bit value in this model, so `'0'` is `0x30` at width 32
+    /// and is *typed* (it does not adapt to meet a narrower operand): `'0' == 0u8`
+    /// is `E0308` in Rust, so it must be refused rather than resized. Its
+    /// signedness is `Unsigned`, which is what makes `align_widths` see the width
+    /// mismatch.
+    Char(u32),
+    /// A character literal the tokenizer could not read exactly (an unknown
+    /// escape, a missing closing quote, a multi-character literal). Refused for
+    /// the same reason as [`Tok::BadNum`]: a wrong constant in a precondition is a
+    /// false proof.
+    BadChar,
     Op(String),
+}
+
+/// Read a Rust character literal starting at `start` (which must be a `'`).
+///
+/// Returns the scalar value and the index just past the closing quote, or `None`
+/// for anything this reader cannot spell exactly: an unterminated literal, a
+/// literal with more than one character, or an escape it does not know. A byte
+/// escape (`'\n'`, `'\u{1F600}'`, `'\\'`, `'\''`) is read; a raw or multi-char
+/// literal is refused, because a guessed value in a contract is a false proof.
+fn read_char_literal(b: &[char], start: usize) -> Option<(u32, usize)> {
+    let mut i = start + 1;
+    let v = if *b.get(i)? == '\\' {
+        i += 1;
+        let e = *b.get(i)?;
+        i += 1;
+        match e {
+            'n' => 0x0a,
+            'r' => 0x0d,
+            't' => 0x09,
+            '\\' => 0x5c,
+            '\'' => 0x27,
+            '"' => 0x22,
+            '0' => 0x00,
+            'x' => {
+                // `'\xNN'`: exactly two hex digits.
+                let hi = b.get(i)?.to_digit(16)?;
+                let lo = b.get(i + 1)?.to_digit(16)?;
+                i += 2;
+                hi * 16 + lo
+            }
+            'u' => {
+                // `'\u{...}'`: a braced hex scalar value.
+                if *b.get(i)? != '{' {
+                    return None;
+                }
+                i += 1;
+                let mut n = 0u32;
+                let mut any = false;
+                while let Some(d) = b.get(i).and_then(|c| c.to_digit(16)) {
+                    n = n.checked_mul(16)?.checked_add(d)?;
+                    any = true;
+                    i += 1;
+                }
+                if !any || *b.get(i)? != '}' {
+                    return None;
+                }
+                i += 1;
+                n
+            }
+            _ => return None,
+        }
+    } else {
+        let ch = *b.get(i)?;
+        // A single character, and not the closing quote (an empty literal `''`).
+        if ch == '\'' {
+            return None;
+        }
+        i += 1;
+        ch as u32
+    };
+    // Exactly one closing quote, and no more characters in the literal.
+    if *b.get(i)? != '\'' {
+        return None;
+    }
+    // A `char` must be a Unicode scalar value.
+    char::from_u32(v)?;
+    Some((v, i + 1))
 }
 
 fn tokenize(s: &str) -> Vec<Tok> {
@@ -4252,6 +4665,29 @@ fn tokenize(s: &str) -> Vec<Tok> {
     let mut i = 0;
     while i < b.len() {
         let c = b[i];
+        if c == '\'' {
+            // A character literal. Read it exactly or refuse it: a wrong constant
+            // in a precondition is a false proof, and `'0'` is the everyday way a
+            // contract names a byte.
+            match read_char_literal(&b, i) {
+                Some((v, next)) => {
+                    out.push(Tok::Char(v));
+                    i = next;
+                }
+                None => {
+                    out.push(Tok::BadChar);
+                    // Consume to the end of the would-be literal so the scan makes
+                    // progress and the parser sees one refusal rather than a
+                    // cascade of stray tokens.
+                    i += 1;
+                    while i < b.len() && b[i] != '\'' {
+                        i += 1;
+                    }
+                    i = (i + 1).min(b.len());
+                }
+            }
+            continue;
+        }
         if c.is_whitespace() {
             i += 1;
             continue;
@@ -4392,8 +4828,14 @@ impl<'a> Parser<'a> {
             variant_consts: BTreeMap::new(),
             enum_args: BTreeSet::new(),
             consts: BTreeMap::new(),
+            old_args: BTreeMap::new(),
+            ret_enum_tags: None,
+            ret_payload_guards: BTreeMap::new(),
             range: BTreeMap::new(),
             bare_literals: BTreeSet::new(),
+            name_tokens: BTreeSet::new(),
+            guarded_groups: Vec::new(),
+            in_negation: false,
             amount_floor: 0,
             ret_absent: "`ret` is only meaningful in `ensures`",
         }
@@ -4405,6 +4847,89 @@ impl<'a> Parser<'a> {
             return self.ret_signed;
         }
         self.signed.contains(name)
+    }
+
+    /// Recognize `<name>.is_ok()` / `.is_some()` / `.is_err()` / `.is_none()` as
+    /// a whole predicate, where `<name>` is `ret` (an enum-returning function) or
+    /// an enum-typed *argument*.
+    ///
+    /// The four are the *discriminant* predicates: `is_ok`/`is_some` test the
+    /// success variant's tag (`Ok` is 0, `Some` is 1) and `is_err`/`is_none` the
+    /// failure one. They are total over the tag, so they need no payload guard --
+    /// unlike `ret.Ok`, which names a payload that exists on only one variant.
+    ///
+    /// An argument's tag is bound under `arg__tag`, and the *discriminants* are not
+    /// recorded per argument (only `ret`'s are), so for an argument the method is
+    /// read against the tag's own domain: `is_ok`/`is_some` test the *success*
+    /// discriminant from the enum's layout, which the parser looks up. That lookup
+    /// is the one the return case avoids by recording the pair up front; the
+    /// argument case resolves it here so the two agree on what `Ok`/`Some` mean.
+    ///
+    /// Returns `Ok(None)` when the tokens are not this shape (so the caller
+    /// continues with the ordinary grammar) and `Err` when they *are* the shape but
+    /// the name is not an enum, which is a refusal rather than a silent
+    /// fall-through: `ret.is_ok()` on a `u8` return must not be read as some other
+    /// comparison.
+    fn try_ret_variant_method(&mut self) -> Result<Option<Pred>, SpecError> {
+        let Some(Tok::Ident(base)) = self.peek() else { return Ok(None) };
+        // `ret . method (` -- four tokens. A bare `ret` (no `.`) is left for the
+        // ordinary grammar, which resolves it to the return value.
+        if !matches!(self.toks.get(self.pos + 1), Some(Tok::Op(o)) if o == ".") {
+            return Ok(None);
+        }
+        let Some(Tok::Ident(method)) = self.toks.get(self.pos + 2) else { return Ok(None) };
+        if !matches!(self.toks.get(self.pos + 3), Some(Tok::Op(o)) if o == "(") {
+            return Ok(None);
+        }
+        if !matches!(self.toks.get(self.pos + 4), Some(Tok::Op(o)) if o == ")") {
+            return Ok(None);
+        }
+        let base = base.clone();
+        let method = method.clone();
+        // An enum-typed *argument* binds its tag under `arg__tag`, and that is
+        // checked first: an argument's own name wins over the `ret`/`result` alias,
+        // so a function with an argument called `result` reads the argument rather
+        // than the return.
+        let arg_tag = self.args.get(&format!("{base}__tag")).copied();
+        let (tag, success, failure) = if let Some(tag) = arg_tag {
+            let Some(sf) = self.arg_enum_discriminants(&base) else { return Ok(None) };
+            (tag, sf.0, sf.1)
+        } else if base == "ret" || base == "result" {
+            match self.ret_enum_tags {
+                Some(t) => t,
+                None => {
+                    return Err(self.err(
+                        "`is_ok`/`is_some`/`is_err`/`is_none` is only meaningful on an enum return",
+                    ))
+                }
+            }
+        } else {
+            // Not an enum argument and not `ret`: not this shape, so the caller's
+            // ordinary grammar reports the `.`.
+            return Ok(None);
+        };
+        let d = match method.as_str() {
+            "is_ok" | "is_some" => success,
+            "is_err" | "is_none" => failure,
+            _ => return Ok(None),
+        };
+        let p = smt::eq_const(tag, d);
+        self.pos += 5;
+        Ok(Some(p))
+    }
+
+    /// The `(success, failure)` discriminants of an enum-typed *argument*, from the
+    /// variant constants the binder recorded (`<arg>::Ok`, `<arg>::Some`, …).
+    ///
+    /// Returns `None` when the argument is not an enum (no `__tag` binding) or has
+    /// neither a success nor a failure variant -- a user enum with neither `Ok` nor
+    /// `Some` has no "success" that the type alone names, so `is_ok` on it is
+    /// refused rather than guessed.
+    fn arg_enum_discriminants(&self, arg: &str) -> Option<(u64, u64)> {
+        let find = |v: &str| self.variant_consts.get(&format!("{arg}::{v}")).map(|(d, _)| *d);
+        let success = find("Ok").or_else(|| find("Some"))?;
+        let failure = find("Err").or_else(|| find("None"))?;
+        Some((success, failure))
     }
 
     fn peek(&self) -> Option<&Tok> {
@@ -4450,9 +4975,19 @@ impl<'a> Parser<'a> {
     /// must ask about the `(` that follows the `!`, not the one at the cursor.
     fn paren_is_predicate_from(&self, start: usize) -> bool {
         let mut depth = 0usize;
-        for t in &self.toks[start..] {
+        for (off, t) in self.toks[start..].iter().enumerate() {
             match t {
-                Tok::Op(o) if o == "(" => depth += 1,
+                Tok::Op(o) if o == "(" => {
+                    // A group whose leading predicate is an enum method
+                    // (`(ret.is_ok())`, `!(x.is_none())`) is a predicate even though
+                    // it carries no comparator. Recognising it here is what makes
+                    // grouping and negation of the enum-method predicates parse
+                    // instead of falling through to arithmetic.
+                    if self.enum_method_is_predicate_from(start + off) {
+                        return true;
+                    }
+                    depth += 1;
+                }
                 Tok::Op(o) if o == ")" => {
                     depth -= 1;
                     if depth == 0 {
@@ -4471,6 +5006,37 @@ impl<'a> Parser<'a> {
         false
     }
 
+    /// Whether the `(` at `start` opens the `base.method()` shape of an enum
+    /// discriminant predicate (`ret.is_ok()`, `x.is_none()`).
+    ///
+    /// This is a *syntactic* lookahead only: whether `base` really names an enum is
+    /// decided when the predicate is parsed (and refused if it is not). It exists so
+    /// the grouping and negation lookaheads treat `(ret.is_ok())` as a predicate
+    /// rather than arithmetic; without it the method reached the arithmetic parser
+    /// and the contract was skipped.
+    fn enum_method_is_predicate_from(&self, start: usize) -> bool {
+        matches!(self.toks.get(start), Some(Tok::Op(o)) if o == "(")
+            && self.enum_method_shape(start + 1)
+    }
+
+    /// The bare `base.method()` shape of an enum discriminant predicate, with no
+    /// enclosing parenthesis: `Ident . is_ok|is_some|is_err|is_none ( )` at `start`.
+    /// Used for `!ret.is_some()`, where the `!` is followed by the method directly.
+    fn enum_method_shape(&self, start: usize) -> bool {
+        if !matches!(self.toks.get(start), Some(Tok::Ident(_))) {
+            return false;
+        }
+        if !matches!(self.toks.get(start + 1), Some(Tok::Op(o)) if o == ".") {
+            return false;
+        }
+        let Some(Tok::Ident(m)) = self.toks.get(start + 2) else { return false };
+        if !matches!(m.as_str(), "is_ok" | "is_some" | "is_err" | "is_none") {
+            return false;
+        }
+        matches!(self.toks.get(start + 3), Some(Tok::Op(o)) if o == "(")
+            && matches!(self.toks.get(start + 4), Some(Tok::Op(o)) if o == ")")
+    }
+
     /// Whether the `!` at the cursor applies to a *predicate* rather than a value.
     ///
     /// True for `!(a == b)` (a parenthesized predicate) and `!true`/`!false`; false
@@ -4479,6 +5045,9 @@ impl<'a> Parser<'a> {
         match self.toks.get(self.pos + 1) {
             Some(Tok::Op(o)) if o == "(" => self.paren_is_predicate_from(self.pos + 1),
             Some(Tok::Ident(n)) if n == "true" || n == "false" => true,
+            // `!ret.is_some()`: the `!` is followed by the enum method directly, so
+            // the predicate shape is the bare `base.method()` rather than a group.
+            Some(Tok::Ident(_)) => self.enum_method_shape(self.pos + 1),
             _ => false,
         }
     }
@@ -4501,12 +5070,111 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_and(&mut self) -> Result<Pred, SpecError> {
-        let mut left = self.parse_cmp()?;
+        let start = self.pos;
+        let left = self.parse_cmp()?;
+        let mut left = self.guard_ret_payloads(start, self.pos, left);
         while self.eat_op("&&") {
+            let start = self.pos;
             let right = self.parse_cmp()?;
+            let right = self.guard_ret_payloads(start, self.pos, right);
             left = smt::and(left, right);
         }
         Ok(left)
+    }
+
+    /// Guard a clause on the discriminant of any `ret.<Variant>` payload it names.
+    ///
+    /// A payload exists only on the paths whose tag is that variant, so a clause
+    /// naming one is checked as `tag == disc => clause`: on the other variant's
+    /// paths it is vacuously true, which is the only meaningful reading. Without
+    /// the guard the payload would be compared on *every* path, against a value it
+    /// does not have -- a wrong value, not a weaker proof. The guard is applied per
+    /// top-level `&&` conjunct (`parse_and`), so `ret.Ok <= n && ret.Err <= m`
+    /// checks each payload only on its own variant's paths.
+    ///
+    /// The names are the *mangled* ones `rewrite_fields` emits (`ret__v_Ok`), and
+    /// the scan is over the tokens the conjunct consumed, so the guard is found
+    /// wherever in the clause the payload appears -- under a comparison, a cast, or
+    /// a nested `+`.
+    fn guard_ret_payloads(&self, from: usize, to: usize, p: Pred) -> Pred {
+        if self.ret_payload_guards.is_empty() {
+            return p;
+        }
+        // Inside the operand of a `!` the clause is *not* guarded here: the guard
+        // belongs outside the negation (`tag == 0 => payload != 9`, not
+        // `tag == 0 => payload == 9` negated). `parse_cmp`'s `!` arm applies it to
+        // the whole negated predicate once the operand is parsed.
+        if self.in_negation {
+            return p;
+        }
+        let mut guard: Option<Pred> = None;
+        for (i, t) in self.toks[from..to.min(self.toks.len())].iter().enumerate() {
+            // A payload name inside a parenthesized group is already guarded by the
+            // group's own inner conjuncts; re-guarding it here would combine two
+            // different discriminants into an unsatisfiable guard (see
+            // `guarded_groups`).
+            let idx = from + i;
+            if self
+                .guarded_groups
+                .iter()
+                .any(|(s, e)| idx >= *s && idx < *e)
+            {
+                continue;
+            }
+            if let Tok::Ident(name) = t {
+                if let Some((tag, disc)) = self.ret_payload_guards.get(name) {
+                    let g = smt::eq_const(*tag, *disc);
+                    guard = Some(match guard {
+                        None => g,
+                        Some(prev) => smt::and(prev, g),
+                    });
+                }
+            }
+        }
+        match guard {
+            None => p,
+            Some(g) => smt::implies(g, p),
+        }
+    }
+
+    /// The discriminant guard for the payload names in `[from, to)`, as a bare
+    /// predicate, and the number of *distinct* discriminants those names carry.
+    ///
+    /// The `!` arm of [`Self::parse_cmp`] uses this to re-guard a *negated* payload
+    /// clause: the clause's payload names are scoped to their variant, and the scope
+    /// wraps the whole clause, so the guard is `tag == disc => !clause` rather than
+    /// `!(tag == disc => clause)`. The two differ on the other variant's paths --
+    /// the second is false there, a false refutation, and the first is true, the
+    /// vacuous reading a payload clause is supposed to have. Multiple names of *one*
+    /// discriminant are conjoined (the reading `parse_and` gives the positive
+    /// spelling); names of *different* discriminants cannot share one scope, so the
+    /// caller refuses that shape rather than conjoining two contradictory guards.
+    ///
+    /// Unlike [`Self::guard_ret_payloads`] this scans *every* token in the range,
+    /// `guarded_groups` included: it runs on the operand of a `!`, whose inner
+    /// predicate groups are exactly the clauses the negation scopes, so their
+    /// payloads must be re-guarded from outside the negation.
+    fn ret_payload_guard_for(&self, from: usize, to: usize) -> (Option<Pred>, usize) {
+        if self.ret_payload_guards.is_empty() {
+            return (None, 0);
+        }
+        let mut guard: Option<Pred> = None;
+        let mut discs: Vec<u64> = Vec::new();
+        for t in &self.toks[from..to.min(self.toks.len())] {
+            if let Tok::Ident(name) = t {
+                if let Some((tag, disc)) = self.ret_payload_guards.get(name) {
+                    if !discs.contains(disc) {
+                        discs.push(*disc);
+                    }
+                    let g = smt::eq_const(*tag, *disc);
+                    guard = Some(match guard {
+                        None => g,
+                        Some(prev) => smt::and(prev, g),
+                    });
+                }
+            }
+        }
+        (guard, discs.len())
     }
 
     /// The value of a term that has no free variable, if it is constant.
@@ -4587,11 +5255,23 @@ impl<'a> Parser<'a> {
                 ))),
             },
             Const::Bool(b) => Ok((smt::word(u64::from(*b), 1), Sign::Literal)),
-            Const::Unit | Const::Other(_) => Err(self.err(format!(
+            Const::Unit | Const::Str(_) | Const::Bytes(_) | Const::Other(_) => Err(self.err(format!(
                 "the constant `{name}` is not a literal, so its value is not known to the \
                  contract reader"
             ))),
         }
+    }
+
+    /// Whether the token span `[lo, hi)` the parser just consumed contains an
+    /// identifier that resolved to a *name* rather than a written constant.
+    ///
+    /// See [`name_tokens`](Self::name_tokens) for why this is lexical. A span with
+    /// no name token is a written constant expression -- a literal, a `const` item,
+    /// an associated bound (`i8::MIN`), or a fold of those -- and Rust
+    /// const-evaluates it, so the fold's overflow refusals apply. A span that
+    /// contains a name is a variable's arithmetic, which Rust never const-evaluates.
+    fn span_has_name(&self, lo: usize, hi: usize) -> bool {
+        self.name_tokens.range(lo..hi).next().is_some()
     }
 
     /// Record `v`'s envelope as the union of its operands' envelopes, so a
@@ -4803,6 +5483,12 @@ impl<'a> Parser<'a> {
     ///
     /// Returns `None` when the exact result already fits, in which case the
     /// ordinary wrapping operator produces the same term and nothing changes.
+    ///
+    /// The two operands are `(value, sign, is-name)` triples plus the operator:
+    /// eight scalars in all, each read independently, which is why the grouping
+    /// clippy would prefer is not clearer here -- the same shape the other
+    /// eight-argument helpers in this crate carry an `allow` for.
+    #[allow(clippy::too_many_arguments)]
     fn fold_const_arith(
         &self,
         op: &str,
@@ -4810,12 +5496,24 @@ impl<'a> Parser<'a> {
         sa: Sign,
         b: Var,
         sb: Sign,
+        a_is_name: bool,
+        b_is_name: bool,
     ) -> Result<Option<(Var, Sign)>, SpecError> {
         // Only a fold of two constants can be decided here; a symbolic operand
         // leaves the operation to the engine.
         let (Some(_), Some(_)) = (self.const_value(a), self.const_value(b)) else {
             return Ok(None);
         };
+        // A *name* that happens to hold a constant (a loop counter bound to its
+        // entry value in an invariant) is not a written constant expression, and
+        // Rust never range-checks a variable's arithmetic as one: `i - 1` on a
+        // `u32` `i` is a wrapping subtraction, not `0u32 - 1u32`. Leave it to the
+        // engine rather than refusing it as a written underflow. The flags are
+        // lexical (see `name_tokens`), because a name and a written literal can be
+        // the *same* hash-consed term.
+        if a_is_name || b_is_name {
+            return Ok(None);
+        }
         let w = smt::bits(a);
         let signed = sa.eval() || sb.eval();
         let (va, vb) = (self.signed_value(a, sa.eval()), self.signed_value(b, sb.eval()));
@@ -5241,20 +5939,68 @@ impl<'a> Parser<'a> {
                 return Ok(smt::truth(v));
             }
         }
+        // `ret.is_ok()` / `ret.is_some()` / `ret.is_err()` / `ret.is_none()` as a
+        // whole predicate. These are the *discriminant* predicates of an
+        // enum-returning function, and they are total over the tag -- there is no
+        // path on which they are unreadable -- so they are admitted here rather
+        // than through the payload guard a bare `ret.Ok` needs. A contract that
+        // writes them on a function whose return is *not* an enum is refused: the
+        // tag it would test does not exist.
+        if let Some(p) = self.try_ret_variant_method()? {
+            return Ok(p);
+        }
         if self.bang_is_predicate() && self.eat_op("!") {
-            let inner = self.parse_cmp()?;
-            return Ok(smt::not(inner));
+            // A payload clause is *scoped* to its variant, and the scope wraps the
+            // whole clause, including a negation. So the operand is parsed with the
+            // inner guard suppressed (`in_negation`), and the discriminant guard is
+            // applied to the *negated* predicate afterwards: `!(ret.Ok == 9)` reads
+            // `tag == 0 => payload != 9` (true on an `Err` return, vacuously), not
+            // `!(tag == 0 => payload == 9)` (false there -- a false refutation).
+            let start = self.pos;
+            let saved = self.in_negation;
+            self.in_negation = true;
+            let inner = self.parse_cmp();
+            self.in_negation = saved;
+            let inner = inner?;
+            let negated = smt::not(inner);
+            // The guard is read *before* the group's range is treated as handled, so
+            // the scan sees the payload names the negation covers. The group path
+            // already recorded the range in `guarded_groups`, so the enclosing
+            // conjunct's scan will not apply a *second* guard on top of this one.
+            let (guard, distinct) = self.ret_payload_guard_for(start, self.pos);
+            // A negation that spans *two* variants (`!(ret.Ok == 9 && ret.Err == 8)`)
+            // has no single scope: the conjunction is vacuous per variant, and its
+            // negation would have to hold on both, which is not what the source
+            // means. Refusing is the honest reading -- a skip, not a verdict against
+            // a guard that cannot be stated.
+            if distinct > 1 {
+                return Err(self.err(
+                    "a negated clause names payloads of more than one variant, which \
+                     has no single scope",
+                ));
+            }
+            return Ok(match guard {
+                Some(g) => smt::implies(g, negated),
+                None => negated,
+            });
         }
         // A parenthesized *predicate*, as in `!(a == MIN && b == -1)`. Which
         // meaning a `(` has is decided by a lookahead to its matching `)`: if a
         // comparator appears at that level it is a predicate, otherwise it is
         // arithmetic and `parse_expr` below handles it.
         if matches!(self.peek(), Some(Tok::Op(o)) if o == "(") && self.paren_is_predicate() {
+            let group_start = self.pos;
             self.pos += 1;
             let inner = self.parse_or()?;
             if !self.eat_op(")") {
                 return Err(self.err("missing `)`"));
             }
+            // The group's inner conjuncts are already guarded per variant by
+            // `parse_and`. Record the group's token range so the enclosing
+            // conjunct's scan does not guard the *same* payload names a second time
+            // with a combined `tag == a && tag == b`, which is unsatisfiable and
+            // makes the group vacuously true (see `guarded_groups`).
+            self.guarded_groups.push((group_start, self.pos));
             return Ok(inner);
         }
         let (left, ls) = self.parse_expr()?;
@@ -5324,6 +6070,15 @@ impl<'a> Parser<'a> {
                     _ => unreachable!(),
                 });
             }
+        }
+        // A bare one-bit value at the predicate position *is* a `bool`: a
+        // `bool`-returning function's `ensures: ret`, a bare bool argument, or
+        // `!ret` (a one-bit complement). Rust requires a `bool` here, and a
+        // one-bit word is exactly what a `bool` is, so reading it as `v != 0` is
+        // the value the type means. A word wider than one bit has no such reading
+        // and is still refused -- a bare `u32` is not a predicate.
+        if smt::bits(left) == 1 {
+            return Ok(smt::not(smt::eq_const(left, 0)));
         }
         Err(self.err("expected a comparison operator"))
     }
@@ -5671,9 +6426,13 @@ impl<'a> Parser<'a> {
 
     /// The additive level: `+` and `-`, tighter than the bitwise operators.
     fn parse_add(&mut self) -> Result<(Var, Sign), SpecError> {
+        let start = self.pos;
         let (mut left, mut sgn) = self.parse_mul()?;
+        let mut left_is_name = self.span_has_name(start, self.pos);
         while let Some(op) = self.eat_any(&["+", "-"]) {
+            let op_start = self.pos - 1;
             let (r, rs) = self.parse_mul()?;
+            let r_is_name = self.span_has_name(op_start + 1, self.pos);
             // A signed constant added to an unsigned name (`x + -1` for a `u8`) is
             // a rustc error, and reading the negation as `255` would prove
             // `x + -1 >= 0` for every `x` -- a false proof, exactly as at the
@@ -5687,16 +6446,21 @@ impl<'a> Parser<'a> {
             // A constant sum or difference is folded *exactly*, so a result that
             // overflows the operand width is refused (as rustc refuses the
             // constant expression) instead of wrapping to a wrong value. A result
-            // that fits is left to the ordinary operator.
-            if let Some((v, s)) = self.fold_const_arith(op, l, sgn, r, rs)? {
+            // that fits is left to the ordinary operator. A *name* operand is not a
+            // written constant, so the fold's refusals do not apply to it.
+            if let Some((v, s)) =
+                self.fold_const_arith(op, l, sgn, r, rs, left_is_name, r_is_name)?
+            {
                 self.record_fold_result(v, pl, pr, s);
                 left = v;
                 sgn = s;
+                left_is_name = left_is_name || r_is_name;
                 continue;
             }
             left = if op == "+" { smt::add(l, r) } else { smt::sub(l, r) };
             self.record_fold_result(left, pl, pr, Sign::combine(sgn, rs));
             sgn = Sign::combine(sgn, rs);
+            left_is_name = left_is_name || r_is_name;
         }
         Ok((left, sgn))
     }
@@ -5712,9 +6476,13 @@ impl<'a> Parser<'a> {
     /// imprecise. A *symbolic* divisor is modelled exactly (the engine's divider is
     /// total), which mirrors the body.
     fn parse_mul(&mut self) -> Result<(Var, Sign), SpecError> {
+        let start = self.pos;
         let (mut left, mut sgn) = self.parse_cast()?;
+        let mut left_is_name = self.span_has_name(start, self.pos);
         while let Some(op) = self.eat_any(&["*", "/", "%"]) {
+            let op_start = self.pos - 1;
             let (r, rs) = self.parse_cast()?;
+            let r_is_name = self.span_has_name(op_start + 1, self.pos);
             // The divisor must be checked for *zero*, not for "is a bare zero
             // literal". `x % (1 - 1)` folds to `x % 0` at the additive level, and
             // the raw-literal `const_of` missed it, so the reader built `srem(x, 0)`
@@ -5755,11 +6523,15 @@ impl<'a> Parser<'a> {
             // A constant `/` or `%` can overflow (`i8::MIN / -1`), which rustc
             // rejects; the fold refuses it rather than wrapping. `*` is folded
             // exactly, so a constant product too wide for the operand is refused
-            // instead of wrapping to a wrong value.
-            if let Some((v, s)) = self.fold_const_arith(op, l, sgn, r, rs)? {
+            // instead of wrapping to a wrong value. A *name* operand is not a
+            // written constant, so the fold's refusals do not apply to it.
+            if let Some((v, s)) =
+                self.fold_const_arith(op, l, sgn, r, rs, left_is_name, r_is_name)?
+            {
                 self.record_fold_result(v, pl, pr, s);
                 left = v;
                 sgn = s;
+                left_is_name = left_is_name || r_is_name;
                 continue;
             }
             let signed = sgn.eval() || rs.eval();
@@ -5772,6 +6544,7 @@ impl<'a> Parser<'a> {
             };
             self.record_fold_result(left, pl, pr, Sign::combine(sgn, rs));
             sgn = Sign::combine(sgn, rs);
+            left_is_name = left_is_name || r_is_name;
         }
         Ok((left, sgn))
     }
@@ -5815,6 +6588,23 @@ impl<'a> Parser<'a> {
     /// comparisons consult the flag, so the mistake is a *wrong value* rather than
     /// a refusal -- the one outcome a verifier must not produce silently.
     fn parse_neg(&mut self) -> Result<(Var, Sign), SpecError> {
+        // `*c` names the value a reference argument addresses, which is the same
+        // word the bare `c` names (the referent *is* the value), so the two are
+        // one binding. A contract is this crate's own language rather than a
+        // compiled program, so `*NAME` is read as `NAME` for any bound name; the
+        // value is the one the name already denotes, so no reading is invented.
+        if self.eat_op("*") {
+            let Some(Tok::Ident(inner)) = self.peek().cloned() else {
+                return Err(self.err("`*` must be applied to a name"));
+            };
+            self.pos += 1;
+            self.name_tokens.insert(self.pos - 1);
+            let v = *self
+                .args
+                .get(&inner)
+                .ok_or_else(|| self.err(format!("unknown name `{inner}`")))?;
+            return Ok((v, Sign::from_bool(self.is_signed_name(&inner))));
+        }
         if self.eat_op("-") {
             let (v, sgn) = self.parse_neg()?;
             // Rust rejects `-x` for an unsigned `x` (`E0600: cannot apply unary
@@ -6132,10 +6922,38 @@ impl<'a> Parser<'a> {
                 self.bare_literals.insert(v.0 .0);
                 Ok((v, Sign::Literal))
             }
+            Some(Tok::Char(c)) => {
+                self.pos += 1;
+                // A `char` is a 32-bit value, and it is *typed*: `'0' == 0u8` is
+                // `E0308` in Rust, so `Sign::Unsigned` (which does not adapt) makes
+                // `align_widths` refuse a mismatch rather than resizing the literal
+                // to meet a narrower operand. The value is the Unicode scalar
+                // value, exactly as `char as u32` would give it.
+                let v = smt::word(u64::from(c), 32);
+                self.record_const(v, false);
+                Ok((v, Sign::Unsigned))
+            }
             Some(Tok::Ident(name)) => {
                 self.pos += 1;
                 if name == "ret" || name == "result" {
+                    self.name_tokens.insert(self.pos - 1);
                     let v = self.ret.ok_or_else(|| self.err(self.ret_absent))?;
+                    // A trailing `.field` here means the field was not bound: the
+                    // return has no such component or variant payload. `rewrite_fields`
+                    // binds the ones that exist, so reaching this point with a `.`
+                    // left over is a name that does not exist on the return type --
+                    // report *that*, rather than the parser's "expected a comparison
+                    // operator" for the stray dot.
+                    if matches!(self.peek(), Some(Tok::Op(o)) if o == ".") {
+                        let field = match self.toks.get(self.pos + 1) {
+                            Some(Tok::Ident(f)) => f.clone(),
+                            Some(Tok::Num(n, _)) => n.to_string(),
+                            _ => String::new(),
+                        };
+                        return Err(self.err(format!(
+                            "the return type has no component or variant `{field}` to read"
+                        )));
+                    }
                     return Ok((v, Sign::from_bool(self.ret_signed)));
                 }
                 if name == "true" || name == "false" {
@@ -6145,6 +6963,41 @@ impl<'a> Parser<'a> {
                     // width check then refuses a literal compared against a
                     // wider operand, which is the right refusal.
                     return Ok((smt::word(u64::from(name == "true"), 1), Sign::Literal));
+                }
+                // `old(name)` — the value a name held at *entry*. A reference
+                // argument's name denotes the value it addresses, which the body
+                // may write, so a bare `c` in an `ensures` is the value at
+                // *return*; the entry value is reachable only through `old`.
+                // Only a name the caller recorded an entry value for is admitted
+                // (a reference-to-scalar argument); anything else is refused, so
+                // `old` on a by-value argument -- whose entry value is just its
+                // value, and which the body cannot change -- is not silently
+                // accepted as a second spelling of the same thing.
+                //
+                // Gated on the `(` so an argument *named* `old` still resolves:
+                // `old == 5` is the argument, `old(c)` is the operator.
+                if name == "old" && matches!(self.peek(), Some(Tok::Op(o)) if o == "(") {
+                    self.name_tokens.insert(self.pos - 1);
+                    self.pos += 1;
+                    // `old(*c)` and `old(c)` name the same entry value: the deref
+                    // is the explicit spelling of the referent the bare name
+                    // already denotes.
+                    self.eat_op("*");
+                    let Some(Tok::Ident(inner)) = self.peek().cloned() else {
+                        return Err(self.err("`old(...)` must name a variable"));
+                    };
+                    self.pos += 1;
+                    self.name_tokens.insert(self.pos - 1);
+                    if !self.eat_op(")") {
+                        return Err(self.err("`old(...)` takes a single name"));
+                    }
+                    let Some(v) = self.old_args.get(&inner).copied() else {
+                        return Err(self.err(format!(
+                            "`old({inner})` is not a reference argument, so its entry value \
+                             is not tracked"
+                        )));
+                    };
+                    return Ok((v, Sign::from_bool(self.is_signed_name(&inner))));
                 }
                 // `i16::MIN` and friends: the named bound of an integer type,
                 // which is how a contract names the value it must exclude. The
@@ -6222,6 +7075,7 @@ impl<'a> Parser<'a> {
                 // reading the constant there would bind the wrong value -- a false
                 // proof, not a refusal.
                 if let Some(v) = self.args.get(&name).copied() {
+                    self.name_tokens.insert(self.pos - 1);
                     let s = self.is_signed_name(&name);
                     return Ok((v, Sign::from_bool(s)));
                 }
@@ -6244,10 +7098,32 @@ impl<'a> Parser<'a> {
                 Err(self.err(format!("unknown name `{name}` (not an argument)")))
             }
             Some(Tok::Op(o)) if o == "(" => {
+                // The lookahead must run with the cursor *on* the `(`, so it is
+                // taken before the cursor advances.
+                let is_pred = self.paren_is_predicate();
                 self.pos += 1;
-                // A parenthesized *arithmetic* expression is fine; only a
-                // parenthesized predicate is refused, and that is caught by the
-                // grammar because `parse_expr` cannot consume `&&`.
+                // A group whose contents are a *predicate* (`(x == 1)`) is a
+                // `bool`-typed operand, not arithmetic: `ret == (x == 1)` is the
+                // natural way to write a `bool`-returning function's postcondition,
+                // and reading the group with `parse_expr` (which cannot consume a
+                // comparator) refused it with "missing `)`". The predicate is turned
+                // into a one-bit value (`ite(p, 1, 0)`), the width a `bool` has, so
+                // the surrounding `==` compares two `bool`s exactly as Rust does.
+                // Which meaning a `(` has is decided by the same lookahead the
+                // comparison level uses, so a parenthesized *arithmetic* expression
+                // (`(x + 1)`) still parses as arithmetic.
+                if is_pred {
+                    let group_start = self.pos - 1;
+                    let p = self.parse_or()?;
+                    if !self.eat_op(")") {
+                        return Err(self.err("missing `)`"));
+                    }
+                    // Record the group so an enclosing conjunct's payload-guard scan
+                    // does not re-guard its inner payload names (see
+                    // `guarded_groups`).
+                    self.guarded_groups.push((group_start, self.pos));
+                    return Ok((smt::ite(p, smt::word(1, 1), smt::word(0, 1)), Sign::Unsigned));
+                }
                 let (v, s) = self.parse_expr()?;
                 if !self.eat_op(")") {
                     return Err(self.err("missing `)`"));
@@ -6256,6 +7132,9 @@ impl<'a> Parser<'a> {
             }
             Some(Tok::BadNum) => {
                 Err(self.err("a numeric literal that is not an exact integer (bad digit for its radix, or past u64)"))
+            }
+            Some(Tok::BadChar) => {
+                Err(self.err("a character literal that is not an exact Unicode scalar value (an unknown escape, a multi-character literal, or a missing quote)"))
             }
             Some(t) => Err(self.err(format!("unexpected token {t:?}"))),
             None => Err(self.err("unexpected end of contract")),
@@ -6340,18 +7219,42 @@ impl<'a> Parser<'a> {
 /// A *tuple* struct (`pub struct P(pub u8, pub u8);`) carries its fields in the
 /// head itself, numbered by position, and needs no cursor.
 ///
-/// A unit struct is neither: it has no fields to project, so returning `None`
-/// leaves a contract naming `.0` as an "unknown name" refusal rather than
-/// inventing a layout with no fields.
+/// A unit struct is neither: it has no fields to project, so it is recorded as a
+/// *zero-field* layout. That is what lets a `Drop` on a unit struct run (the
+/// field-glue check finds no fields rather than refusing the type as an unknown
+/// container), while a contract naming `.0` on it is still an "unknown field"
+/// refusal, because the layout has no field 0.
 enum StructHead {
     Named { name: String, closed_inline: bool },
     Tuple { name: String, fields: Vec<(String, String)> },
+    /// A unit struct: `struct Guard;` — a layout with no fields.
+    Unit { name: String },
+}
+
+/// The struct layout for a type name, qualified-first.
+///
+/// Shared by [`Specs::struct_of`] and the drop-glue check, so the two cannot
+/// disagree about which layout a type name names. See `Specs::struct_of` for the
+/// lookup order and why the bare fallback is safe.
+pub(crate) fn struct_lookup<'a>(
+    structs: &'a BTreeMap<String, StructDef>,
+    name: &str,
+) -> Option<&'a StructDef> {
+    if let Some(def) = structs.get(name) {
+        return Some(def);
+    }
+    let no_generics = name.split('<').next().unwrap_or(name);
+    if let Some(def) = structs.get(no_generics) {
+        return Some(def);
+    }
+    let bare = no_generics.rsplit("::").next().unwrap_or(no_generics);
+    structs.get(bare)
 }
 
 fn struct_head(line: &str) -> Option<StructHead> {
     let t = line.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
     let rest = t.strip_prefix("struct ")?;
-    let name = rest.split(|c: char| c == '{' || c == '(' || c == '<' || c.is_whitespace()).next()?;
+    let name = rest.split(|c: char| c == '{' || c == '(' || c == '<' || c == ';' || c.is_whitespace()).next()?;
     if name.is_empty() {
         return None;
     }
@@ -6387,7 +7290,21 @@ fn struct_head(line: &str) -> Option<StructHead> {
         }
     }
     // Only a brace body on this line is a named-field struct.
-    let open = rest.find('{')?;
+    let Some(open) = rest.find('{') else {
+        // A `;`-terminated head with no `(` and no `{` is a unit struct
+        // (`struct Guard;`) or a generic unit struct (`struct Marker<T>;`). Both
+        // are a zero-field layout, which is what the drop-glue check needs.
+        //
+        // The `;` is required: a head whose brace is on a *later* line (a
+        // `where`-clause, say) must not be read as unit here, or its real fields
+        // would be lost and a field with its own destructor would look glue-free.
+        // That shape stays `None` — an unrecorded layout, which refuses rather
+        // than guesses.
+        if rest.trim_end().ends_with(';') {
+            return Some(StructHead::Unit { name: name.to_string() });
+        }
+        return None;
+    };
     // Closed on the head line iff a `}` follows the `{`.
     let closed_inline = rest[open + 1..].contains('}');
     Some(StructHead::Named { name: name.to_string(), closed_inline })
@@ -6762,6 +7679,119 @@ pub fn std_enum_def(name: &str) -> Option<EnumDef> {
     None
 }
 
+/// The `(success discriminant, failure discriminant)` of an enum-returning
+/// function's type, for `ret.is_ok()` and friends.
+///
+/// `Option` and `Result` are the two standard enums with a fixed numbering
+/// (`Some`/`Err` are the success variant at 1, `Ok`/`None` at 0). A *declared* enum
+/// resolves through its own layout, which is the map the caller passes in; a
+/// standard enum has no declared layout, so it is recognised by name. A return type
+/// that is neither is `None`, and the parser refuses the methods rather than testing
+/// a tag that does not exist.
+pub fn enum_ret_discriminants(
+    ret_ty: &Ty,
+    enums: &BTreeMap<String, EnumDef>,
+) -> Option<(u64, u64)> {
+    let def = ret_enum_def(ret_ty, enums)?;
+    let find = |n: &str| def.variants.iter().find(|(vn, _, _)| vn == n).map(|(_, _, d)| *d);
+    let ok = find("Ok").or_else(|| find("Some"))?;
+    let err = find("Err").or_else(|| find("None"))?;
+    Some((ok, err))
+}
+
+/// The [`EnumDef`] an enum-returning function's type names, whether the enum is
+/// declared in the source or is one of the two standard ones.
+///
+/// This is the layout `enum_ret_discriminants` reads its tag pair from and that
+/// [`bind_ret_payloads`] reads its payload types from, so `ret.is_ok()` and
+/// `ret.Ok` agree about the numbering and the payload width by construction: there
+/// is one lookup.
+pub fn ret_enum_def(ret_ty: &Ty, enums: &BTreeMap<String, EnumDef>) -> Option<EnumDef> {
+    let Ty::Other(name) = ret_ty else { return None };
+    let bare = strip_generics(name);
+    let segs: Vec<&str> = bare.split("::").filter(|s| !s.is_empty()).collect();
+    let short = segs.last().copied().unwrap_or(&bare);
+    if let Some(def) = enums.get(short).or_else(|| enums.get(&bare)) {
+        return Some(def.clone());
+    }
+    // A standard enum is recognised from the *full* type, because its payloads are
+    // its generic arguments: `Option<u8>` gives `Some: u8`, and the stripped `short`
+    // has no arguments left to read. The declared-layout lookup above keeps a user
+    // `enum Option { .. }` winning over the built-in numbering. A turbofished
+    // spelling (`Option::<u8>`) is the same type, so the `::` before `<` is dropped.
+    std_enum_def(&name.trim().replace("::<", "<"))
+}
+
+/// Whether a contract clause names `ret.<vname>` (or `result.<vname>`).
+///
+/// The same textual scan `named_ret_components` uses for `ret.N`, but matching a
+/// variant *name* rather than a component index. It decides which payloads the
+/// probe binds; a name that is not a variant is left for the parser to refuse.
+fn names_ret_variant(text: &str, vname: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_alphabetic() || chars[i] == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let ident: String = chars[start..i].iter().collect();
+            if (ident == "ret" || ident == "result") && chars.get(i) == Some(&'.') {
+                let j = i + 1;
+                let mut k = j;
+                while k < chars.len() && (chars[k].is_alphanumeric() || chars[k] == '_') {
+                    k += 1;
+                }
+                let field: String = chars[j..k].iter().collect();
+                if field == vname {
+                    return true;
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Bind the return payloads a contract names, for the *run*.
+///
+/// `projs` is the executor's return-payload list, keyed by discriminant; the
+/// payload's own type comes from the enum's layout, so the contract's `ret.Ok`
+/// and the body's `((_0 as Ok).0)` name the same variable. A variant the contract
+/// names but no path produced stays unbound, so a postcondition about it is
+/// refused rather than checked against a fabricated value -- the same rule
+/// `ret.N` follows.
+pub fn bind_ret_payloads(
+    fields: &mut FieldEnv,
+    ret_ty: &Ty,
+    enums: &BTreeMap<String, EnumDef>,
+    tag: Var,
+    projs: &[(u64, Var)],
+    ensures: &[String],
+) {
+    let Some(def) = ret_enum_def(ret_ty, enums) else { return };
+    for (vname, payload, disc) in &def.variants {
+        let Some(first) = payload.first() else { continue };
+        if first.width().is_none() {
+            continue;
+        }
+        if !ensures.iter().any(|e| names_ret_variant(e, vname)) {
+            continue;
+        }
+        if let Some((_, v)) = projs.iter().find(|(k, _)| k == disc) {
+            fields.bind_ret_payload(vname, *v, tag, *disc, first.is_signed());
+        }
+    }
+}
+
+/// The generics-stripped head of a type name, so `Option::<u8>` and `Option<u8>`
+/// both read as `Option`.
+fn strip_generics(s: &str) -> String {
+    crate::mir::parse::strip_generics(s)
+}
+
 /// Bind every field of every struct-typed argument to a symbolic variable.
 ///
 /// A struct argument has no width of its own (`Ty::Other("Config")`), so it gets
@@ -6824,9 +7854,20 @@ pub fn field_env_named(
         // A slice argument: `&[u8]`. Its length is a symbolic input, and its
         // elements are bound on demand (by `bind_index_refs` for the contract and
         // by the executor for the body).
+        //
+        // A *generic* `&[T]` has no element width (`elem.width()` is `None`), but
+        // its length is still a value: `v.len()`/`v.is_empty()` read only the
+        // length. Binding it with the `0` sentinel keeps those answerable while
+        // every element operation stays refused, which is what lets an ordinary
+        // generic slice helper decide instead of being dropped whole.
         if let Ty::Slice(elem) = base {
-            if let Some(w) = elem.width() {
-                env.bind_indexed_len(l, &arg, w, elem.is_signed());
+            match elem.width() {
+                Some(w) => {
+                    env.bind_indexed_len(l, &arg, w, elem.is_signed());
+                }
+                None => {
+                    env.bind_indexed_len(l, &arg, 0, false);
+                }
             }
             continue;
         }
@@ -6859,11 +7900,28 @@ pub fn field_env_named(
             env.bind_enum(l, &arg, name, &def);
             continue;
         }
+        // A `&str` argument: its length is a symbolic input exactly as a slice's
+        // is (a `str` is unsized, so the length lives in the fat pointer), and
+        // `s.len()`/`s.is_empty()` read only that length. Binding it with the
+        // unmodelled-width sentinel keeps those answerable while every element
+        // operation stays refused. A `String` is *not* `str`: its own type is
+        // `alloc::string::String`, so a `s.len()` on one goes through a deref to
+        // a `&str` local the binder never saw and stays a refusal.
+        //
+        // Rust lets a user type shadow the primitive name (`pub struct str { .. }`,
+        // which rustc prints at the crate root as the bare `str`), so the
+        // declared layout is consulted *first*: a `str` with a declaration is the
+        // user's type and is bound as a struct below, not as the primitive. Only
+        // when nothing declares `str` is the primitive meant.
+        if name == "str" && struct_lookup(structs, name).is_none() {
+            env.bind_indexed_len(l, &arg, 0, false);
+            continue;
+        }
         // Recorded whether or not a layout was found, so a contract naming a field
         // gets a message about the field even when the struct's definition was not
         // readable.
         env.declare_arg(&arg);
-        let Some(def) = structs.get(name) else { continue };
+        let Some(def) = struct_lookup(structs, name) else { continue };
         for (i, (fname, fty)) in def.fields.iter().enumerate() {
             env.bind(l, &arg, fname, i as u32, fty);
             // An array-typed field is subscriptable: `o.a[0]`. Recorded so a contract's
@@ -6915,7 +7973,12 @@ pub fn signed_args_named(
 ) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for &l in &f.arg_locals {
-        if f.ty_of(l).map(|t| t.is_signed()).unwrap_or(false) {
+        // The *referent's* sign: a `&i16` argument is named in a contract as the
+        // `i16` it addresses, so `c < 0` on `c: &mut i16` is a signed comparison.
+        // Reading the reference's own sign (`Ty::Ref` is neither signed nor
+        // unsigned) would make it an unsigned one -- the exact class of bug the
+        // `Sign` type exists to prevent.
+        if f.ty_of(l).map(|t| t.referent().is_signed()).unwrap_or(false) {
             let name = rename
                 .and_then(|r| r.name_of(l))
                 .map(|s| s.to_string())
@@ -7024,17 +8087,8 @@ pub fn arg_vars_named(
     f: &crate::mir::parse::MirFn,
     rename: Option<&ArgRename>,
 ) -> BTreeMap<String, Var> {
-    let mut out = BTreeMap::new();
-    for &l in &f.arg_locals {
-        let ty = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
-        if let Some(w) = ty.width() {
-            let name = rename
-                .and_then(|r| r.name_of(l))
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| f.name_of(l));
-            out.insert(name, smt::var_named(l, w));
-        }
-    }
+    let mut out: BTreeMap<String, Var> =
+        arg_bindings(f, rename).into_iter().map(|(_, n, v)| (n, v)).collect();
     if rename.is_some() {
         return out;
     }
@@ -7045,6 +8099,49 @@ pub fn arg_vars_named(
         }
     }
     out
+}
+
+/// The argument bindings, as `(local, name, variable)`, in argument order.
+///
+/// The one place the contract's name for an argument is decided, so `arg_vars_named`
+/// and [`arg_name_of`] cannot disagree about it. `Ty::Ref` is modelled as its
+/// referent, so a `&u16` argument's value *is* the `u16` it addresses, at the
+/// referent's width: a contract names it by the argument's own name
+/// (`bump(c: &mut u16)` with `ensures: c == 0`), and the body's `*c` and the
+/// contract's `c` are the same word. A reference to an aggregate has no single
+/// word (`&Config` is bound field by field instead), so only a scalar referent is
+/// bound here.
+fn arg_bindings(
+    f: &crate::mir::parse::MirFn,
+    rename: Option<&ArgRename>,
+) -> Vec<(crate::mir::parse::LocalIdx, String, Var)> {
+    let mut out = Vec::new();
+    for &l in &f.arg_locals {
+        let ty = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
+        if let Some(w) = ty.referent().width() {
+            let name = rename
+                .and_then(|r| r.name_of(l))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| f.name_of(l));
+            out.push((l, name, smt::var_named(l, w)));
+        }
+    }
+    out
+}
+
+/// The contract name of one argument local, or `None` when it has no binding.
+///
+/// The inverse of the argument-binding list, used to key a reference argument's
+/// *final* value back onto the name the postcondition will use for it.
+pub fn arg_name_of(
+    f: &crate::mir::parse::MirFn,
+    rename: Option<&ArgRename>,
+    local: crate::mir::parse::LocalIdx,
+) -> Option<String> {
+    arg_bindings(f, rename)
+        .into_iter()
+        .find(|(l, _, _)| *l == local)
+        .map(|(_, name, _)| name)
 }
 
 #[cfg(test)]
@@ -7130,6 +8227,337 @@ mod tests {
         assert!(std_enum_def("Option").is_none(), "no type argument is not Option<T>");
         assert!(std_enum_def("Option<u8>X").is_none(), "trailing text is not Option<u8>");
         assert!(std_enum_def("Result<u8>").is_none(), "Result needs two arguments");
+    }
+
+    /// The two standard enums' return discriminants: `Ok` is 0 and `Err` is 1 for
+    /// `Result`, `Some` is 1 and `None` is 0 for `Option`. A declared enum resolves
+    /// through its own layout; a non-enum return is `None`, so the methods are
+    /// refused rather than tested against a tag that does not exist.
+    #[test]
+    fn an_enum_return_type_gives_its_discriminants() {
+        let none = BTreeMap::new();
+        assert_eq!(
+            enum_ret_discriminants(&Ty::Other("Result<u8, u8>".into()), &none),
+            Some((0, 1)),
+            "Result: Ok is 0, Err is 1"
+        );
+        assert_eq!(
+            enum_ret_discriminants(&Ty::Other("Option<u8>".into()), &none),
+            Some((1, 0)),
+            "Option: Some is 1, None is 0"
+        );
+        assert_eq!(
+            enum_ret_discriminants(&Ty::Other("Option::<u8>".into()), &none),
+            Some((1, 0)),
+            "a turbofished spelling is the same type"
+        );
+        assert_eq!(enum_ret_discriminants(&Ty::U8, &none), None, "a scalar has no tag");
+        assert_eq!(
+            enum_ret_discriminants(&Ty::Other("Mode".into()), &none),
+            None,
+            "a non-standard name is not a tag"
+        );
+        // A *declared* enum resolves through its layout, keyed by the short name.
+        let mut enums = BTreeMap::new();
+        enums.insert("E".to_string(), def("pub enum E { Ok(u8), Err }"));
+        assert_eq!(
+            enum_ret_discriminants(&Ty::Other("E".into()), &enums),
+            Some((0, 1)),
+            "a declared enum uses its own discriminants"
+        );
+    }
+
+    /// `ret.is_ok()` / `ret.is_some()` / `ret.is_err()` / `ret.is_none()` read the
+    /// return place's *tag*, and a non-enum return refuses them.
+    ///
+    /// The values are evaluated on the engine at both discriminants, so a method
+    /// that tested the wrong tag (or read the tag as a constant) shows up as a
+    /// wrong boolean, not a compile error.
+    #[test]
+    fn an_enum_return_reads_the_discriminant_methods() {
+        let tag = smt::var_named(1, 64);
+        let mut fields = FieldEnv::default();
+        // Result: Ok is 0, Err is 1.
+        fields.bind_ret_enum(tag, 0, 1);
+        let args = BTreeMap::new();
+        let signed = BTreeSet::new();
+        let old = BTreeMap::new();
+        let at = |k: u64| move |i: u32| if i == 1 { Some(k) } else { None };
+        let read = |text: &str| {
+            eval_ensures(
+                text,
+                &args,
+                Some(tag),
+                RET_IS_UNKNOWN,
+                &signed,
+                false,
+                &fields,
+                &old,
+            )
+            .unwrap_or_else(|e| panic!("`{text}` must parse: {e}"))
+        };
+        for (text, on_ok, on_err) in [
+            ("ret.is_ok()", true, false),
+            ("ret.is_err()", false, true),
+            ("ret.is_ok() || ret.is_err()", true, true),
+            ("ret.is_ok() && ret.is_err()", false, false),
+        ] {
+            let p = read(text);
+            assert_eq!(
+                smt::evaluate_pred(p, at(0)),
+                Some(on_ok),
+                "`{text}` at the Ok tag (0)"
+            );
+            assert_eq!(
+                smt::evaluate_pred(p, at(1)),
+                Some(on_err),
+                "`{text}` at the Err tag (1)"
+            );
+        }
+        // A non-enum return: the method names a tag that does not exist, so the
+        // contract is refused rather than read against a fabricated value.
+        let plain = FieldEnv::default();
+        let err = eval_ensures(
+            "ret.is_ok()",
+            &args,
+            Some(tag),
+            RET_IS_UNKNOWN,
+            &signed,
+            false,
+            &plain,
+            &old,
+        );
+        assert!(err.is_err(), "`ret.is_ok()` on a non-enum return must be refused");
+    }
+
+    /// A bare payload read on an enum return (`ret.Ok`, `ret.Some`) is *guarded on
+    /// the discriminant*: the clause is `tag == disc => clause`, so it is vacuous on
+    /// the other variant.
+    ///
+    /// The guard is the whole content: a payload exists only on the variant's paths.
+    /// Evaluated at the payload's own tag the clause is checked, and at the *other*
+    /// tag it is vacuously true -- which a model that bound the payload with no
+    /// guard would get wrong (it would check the clause on every path).
+    #[test]
+    fn an_enum_return_reads_a_payload_guarded_on_the_discriminant() {
+        let tag = smt::var_named(1, 1);
+        let ok = smt::var_named(2, 8);
+        let mut fields = FieldEnv::default();
+        fields.bind_ret_enum(tag, 0, 1);
+        fields.bind_ret_payload("Ok", ok, tag, 0, false);
+        let args = BTreeMap::new();
+        let signed = BTreeSet::new();
+        let old = BTreeMap::new();
+        // `Ok` is the success discriminant (0), so the guard is `tag == 0`.
+        let at = |t: u64, o: u64| move |i: u32| match i {
+            1 => Some(t),
+            2 => Some(o),
+            _ => None,
+        };
+        let read = |text: &str| {
+            eval_ensures(text, &args, Some(tag), RET_IS_UNKNOWN, &signed, false, &fields, &old)
+                .unwrap_or_else(|e| panic!("`{text}` must parse: {e}"))
+        };
+        let p = read("ret.Ok <= 9");
+        // On the `Ok` path the clause is checked: the payload's own bound decides.
+        assert_eq!(smt::evaluate_pred(p, at(0, 9)), Some(true), "Ok tag, payload 9");
+        assert_eq!(smt::evaluate_pred(p, at(0, 10)), Some(false), "Ok tag, payload 10");
+        // On the `Err` path there is no `Ok` payload, so the clause is *vacuously*
+        // true whatever the (unconstrained) payload variable holds -- which is the
+        // whole reason for the guard.
+        assert_eq!(smt::evaluate_pred(p, at(1, 10)), Some(true), "Err tag is vacuous");
+        // An unguarded reading would refute the clause on the Err path, so this is
+        // the evidence the guard is load-bearing rather than decorative.
+        assert_ne!(smt::evaluate_pred(p, at(1, 10)), Some(false), "must not check on Err");
+    }
+
+    /// The same discriminant methods on an enum-typed *argument*: `r.is_ok()` reads
+    /// the argument's tag, which the binder records under `r__tag`, and the
+    /// discriminants come from the variant constants it recorded.
+    #[test]
+    fn an_enum_argument_reads_the_discriminant_methods() {
+        let tag = smt::var_named(7, 1);
+        let mut args = BTreeMap::new();
+        args.insert("r__tag".to_string(), tag);
+        let mut fields = FieldEnv::default();
+        fields.variant_consts.insert("r::Ok".to_string(), (0, 1));
+        fields.variant_consts.insert("r::Err".to_string(), (1, 1));
+        let signed = BTreeSet::new();
+        let at = |k: u64| move |i: u32| if i == 7 { Some(k) } else { None };
+        let read = |text: &str| {
+            eval_requires(text, &args, &signed, &fields)
+                .unwrap_or_else(|e| panic!("`{text}` must parse: {e}"))
+        };
+        assert_eq!(smt::evaluate_pred(read("r.is_ok()"), at(0)), Some(true), "Ok tag");
+        assert_eq!(smt::evaluate_pred(read("r.is_ok()"), at(1)), Some(false), "Err tag");
+        assert_eq!(smt::evaluate_pred(read("r.is_err()"), at(1)), Some(true), "Err tag");
+        assert_eq!(
+            smt::evaluate_pred(read("r.is_ok() || r.is_err()"), at(1)),
+            Some(true),
+            "the disjunction is a tautology"
+        );
+        assert_eq!(
+            smt::evaluate_pred(read("r.is_ok() && r.is_err()"), at(0)),
+            Some(false),
+            "the conjunction is refutable"
+        );
+    }
+
+    /// Grouping and negation of the enum discriminant methods parse and read the
+    /// same predicate.
+    ///
+    /// `(ret.is_ok())` and `!r.is_err()` carry no comparator, so the grouping and
+    /// negation lookaheads -- which recognised only comparators and boolean
+    /// literals -- routed them into arithmetic and the contract was skipped. The
+    /// lookaheads now know the `base.method()` shape. Evaluated at both
+    /// discriminants, so a wrong tree is a wrong boolean rather than a parse error.
+    #[test]
+    fn a_grouped_or_negated_enum_method_is_a_predicate() {
+        let tag = smt::var_named(1, 64);
+        let mut fields = FieldEnv::default();
+        fields.bind_ret_enum(tag, 0, 1);
+        let args = BTreeMap::new();
+        let signed = BTreeSet::new();
+        let old = BTreeMap::new();
+        let at = |k: u64| move |i: u32| if i == 1 { Some(k) } else { None };
+        let read = |text: &str| {
+            eval_ensures(
+                text,
+                &args,
+                Some(tag),
+                RET_IS_UNKNOWN,
+                &signed,
+                false,
+                &fields,
+                &old,
+            )
+            .unwrap_or_else(|e| panic!("`{text}` must parse: {e}"))
+        };
+        for (text, on_ok, on_err) in [
+            ("(ret.is_ok())", true, false),
+            ("!(ret.is_ok())", false, true),
+            ("!ret.is_ok()", false, true),
+            ("((ret.is_err()))", false, true),
+            ("!(ret.is_ok() && ret.is_err())", true, true),
+        ] {
+            let p = read(text);
+            assert_eq!(
+                smt::evaluate_pred(p, at(0)),
+                Some(on_ok),
+                "`{text}` at the Ok tag (0)"
+            );
+            assert_eq!(
+                smt::evaluate_pred(p, at(1)),
+                Some(on_err),
+                "`{text}` at the Err tag (1)"
+            );
+        }
+    }
+
+    /// A parenthesized comparison used as an *operand* is a `bool` value, not
+    /// arithmetic: `ret == (x == 1)` is the natural spelling of a
+    /// `bool`-returning function's postcondition, and reading the group with the
+    /// arithmetic parser refused it with "missing `)`". The group's predicate is
+    /// turned into a one-bit value, so the surrounding `==` compares two `bool`s
+    /// exactly as Rust does. A parenthesized *arithmetic* group still parses as
+    /// arithmetic, and a bare one-bit name at the predicate position (`ret`) reads
+    /// as `ret != 0` -- the value a `bool` means. A wider bare name is still
+    /// refused, because a `u32` is not a predicate.
+    #[test]
+    fn a_parenthesized_comparison_is_a_bool_operand() {
+        // `ret` is a one-bit word (as a `bool` return is bound), and `x` is an
+        // 8-bit variable. `ret` is index 0, `x` index 1.
+        let ret = smt::var_named(0, 1);
+        let x = smt::var_named(1, 8);
+        let mut args = BTreeMap::new();
+        args.insert("x".to_string(), x);
+        let unsigned = BTreeSet::new();
+        let old = BTreeMap::new();
+        let fields = FieldEnv::default();
+        let read = |text: &str| {
+            eval_ensures(
+                text,
+                &args,
+                Some(ret),
+                RET_IS_UNKNOWN,
+                &unsigned,
+                false,
+                &fields,
+                &old,
+            )
+            .unwrap_or_else(|e| panic!("`{text}` must parse: {e}"))
+        };
+        // Evaluate with `ret = r` and `x = xv`.
+        let eval = |p, r: u64, xv: u64| {
+            smt::evaluate_pred(p, move |i| match i {
+                0 => Some(r),
+                _ => Some(xv),
+            })
+        };
+
+        // Every true spelling of "`ret` is `x == 1`" reads and holds exactly when
+        // `ret` equals the comparison's truth value -- so the group is read as a
+        // `bool` value, not dropped and not a constant.
+        for text in [
+            "ret == (x == 1)",
+            "ret == ((x) == 1)",
+            "ret == (x + 1 == 2)",
+            "ret == ((x + 1) == 2)",
+            "!ret == !(x == 1)",
+        ] {
+            let p = read(text);
+            for xv in [0u64, 1, 2, 255] {
+                let truth = xv == 1;
+                assert_eq!(eval(p, 1, xv), Some(truth), "`{text}` ret=1 x={xv}");
+                assert_eq!(eval(p, 0, xv), Some(!truth), "`{text}` ret=0 x={xv}");
+            }
+        }
+
+        // A parenthesized *arithmetic* group still parses as arithmetic, and a
+        // bare one-bit name at the predicate position reads as `v != 0`.
+        let mut p = Parser::new("(x + 1) == 2", &args, None, &unsigned, false);
+        let pred = p.parse_cmp().expect("`(x + 1) == 2` parses");
+        assert_eq!(smt::evaluate_pred(pred, |i| Some(if i == 1 { 1 } else { 0 })), Some(true));
+        assert_eq!(eval(read("ret"), 1, 0), Some(true), "a bare `ret` reads as `ret != 0`");
+        assert_eq!(eval(read("!ret"), 1, 0), Some(false), "`!ret` negates the bit");
+
+        // A bare *wider* name has no predicate reading and is refused.
+        let err = eval_ensures(
+            "x",
+            &args,
+            Some(ret),
+            RET_IS_UNKNOWN,
+            &unsigned,
+            false,
+            &fields,
+            &old,
+        );
+        assert!(err.is_err(), "a bare `u32` is not a predicate");
+    }
+
+    /// A name that *holds* a constant is not a written constant expression.
+    ///
+    /// An invariant is evaluated in the loop-head state, where a counter like `i`
+    /// is bound to the value it holds on entry (`0`). `i - 1` is then two constant
+    /// operands, and the fold treated it as the written expression `0 - 1` and
+    /// refused it as an unsigned underflow -- even though `i` is a variable, and
+    /// Rust never range-checks a variable's arithmetic as a constant expression.
+    /// Pinned here, not only in the nightly-gated MIR tests.
+    #[test]
+    fn a_name_holding_a_constant_is_not_a_written_constant_expression() {
+        let mut names = BTreeMap::new();
+        names.insert("i".to_string(), smt::word(0, 32));
+        let signed = BTreeSet::new();
+        let consts = BTreeMap::new();
+        assert!(
+            eval_invariant("i - 1 <= 5", &names, &signed, &consts).is_ok(),
+            "a name holding `0` must not be read as the written constant `0`"
+        );
+        // The *written* form is still refused: rustc rejects `0u32 - 1u32`.
+        assert!(
+            eval_invariant("0 - 1 <= 5", &names, &signed, &consts).is_err(),
+            "the written `0 - 1` is still a rustc const-eval error"
+        );
     }
 
     /// A contract cast sets the target's width *and* sign, and a chain applies
@@ -8183,6 +9611,67 @@ mod tests {
         assert_eq!(smt::evaluate(parse("x / (1 + 1)"), |_| Some(4)), Some(2));
     }
 
+    /// A character literal is read as its Unicode scalar value, and one that is not
+    /// an exact scalar value is refused.
+    ///
+    /// `'0'` is the everyday way a contract names a byte, and it must read as `0x30`
+    /// at width 32. The escapes (`'\n'`, `'\u{...}'`, `'\\'`, `'\''`, `'\xNN'`) are
+    /// read; a multi-character literal, an unknown escape and an unterminated
+    /// literal are refused, because a guessed value in a contract is a false proof.
+    #[test]
+    fn a_char_literal_is_read_as_its_scalar_value_or_refused() {
+        let mut args = BTreeMap::new();
+        args.insert("c".to_string(), smt::var(32));
+        let unsigned = BTreeSet::new();
+        let val = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            let (v, _) = p.parse_expr().expect("parses");
+            p.expect_end().expect("no trailing tokens");
+            smt::evaluate(v, |_| None).expect("a constant")
+        };
+        let refuses = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            p.parse_expr().is_err() || p.expect_end().is_err()
+        };
+        assert_eq!(val("'0'"), 0x30, "`'0'` is 48");
+        assert_eq!(val("'A'"), 65);
+        assert_eq!(val("'\\n'"), 0x0a, "a newline escape");
+        assert_eq!(val("'\\t'"), 0x09);
+        assert_eq!(val("'\\\\'"), 0x5c, "a backslash escape");
+        assert_eq!(val("'\\''"), 0x27, "an escaped quote");
+        assert_eq!(val("'\\x41'"), 0x41, "a byte escape");
+        assert_eq!(val("'\\u{1F600}'"), 0x1F600, "a Unicode escape");
+        assert_eq!(val("'\u{130}'"), 0x130, "a literal non-ASCII char");
+        // Refusals, never a guessed value.
+        assert!(refuses("'ab'"), "a multi-character literal is refused");
+        assert!(refuses("'\\q'"), "an unknown escape is refused");
+        assert!(refuses("'a"), "an unterminated literal is refused");
+        assert!(refuses("''"), "an empty literal is refused");
+        assert!(refuses("'\\u{110000}'"), "past the Unicode range is refused");
+    }
+
+    /// A `char` literal is *typed*: it does not resize to meet a narrower operand,
+    /// so `'0' == 0u8` is refused exactly as rustc's `E0308` rejects it.
+    ///
+    /// The literal is built at width 32, and `Sign::Unsigned` does not adapt, so
+    /// `align_widths` sees a width mismatch and refuses. A `char` compared against a
+    /// `char` (both 32 bits) still reads, so the refusal is about the *mismatch*, not
+    /// about `char` itself.
+    #[test]
+    fn a_char_literal_does_not_resize_to_a_narrower_operand() {
+        let mut args = BTreeMap::new();
+        args.insert("b".to_string(), smt::var(8));
+        args.insert("c".to_string(), smt::var(32));
+        let unsigned = BTreeSet::new();
+        // A comparison is a *predicate*, so the entry point is `parse_cmp`.
+        let parses = |text: &str| {
+            let mut p = Parser::new(text, &args, None, &unsigned, false);
+            p.parse_cmp().is_ok() && p.expect_end().is_ok()
+        };
+        assert!(parses("c == '0'"), "two `char`s compare");
+        assert!(!parses("b == '0'"), "`'0' == 0u8` is `E0308`, so it is refused");
+    }
+
     /// A radix literal is read at its *radix*, and one that is not an exact
     /// integer is refused rather than truncated.
     ///
@@ -8650,6 +10139,37 @@ mod tests {
         let c = specs.by_fn.get("f").expect("a `decreases:` alone is a claim");
         assert_eq!(c.decreases, vec!["n".to_string()], "the measure text must be kept");
         assert!(c.requires.is_empty() && c.ensures.is_empty());
+    }
+
+    /// `unwind: <n>` is read as a number and counts as a claim, so a function that
+    /// carries only an `unwind:` is not silently dropped.
+    #[test]
+    fn an_unwind_clause_is_read_and_counts_as_a_claim() {
+        let src = "/// unwind: 40\n\
+                   pub fn f(n: u8) -> u8 { n }\n";
+        let specs = extract(src);
+        let c = specs.by_fn.get("f").expect("an `unwind:` alone is a claim");
+        assert_eq!(c.unwind, Some(40), "the bound must be read as a number");
+        assert!(c.requires.is_empty() && c.ensures.is_empty());
+    }
+
+    /// A non-numeric, zero or negative `unwind:` is refused rather than defaulted.
+    ///
+    /// A guessed bound is a guessed proof, and a bound of zero would make every
+    /// loop an immediate cutoff while reading as an ordinary clause. `unwind:`
+    /// must therefore name a positive integer or the function is `Skipped`.
+    #[test]
+    fn a_non_numeric_or_zero_unwind_is_refused() {
+        for bad in ["unwind: 0", "unwind: abc", "unwind: -1", "unwind: 1.5"] {
+            let src = format!("/// {bad}\npub fn f(n: u8) -> u8 {{ n }}\n");
+            let specs = extract(&src);
+            let c = specs.by_fn.get("f").expect("the item is still read");
+            assert!(
+                c.unwind.is_none(),
+                "`{bad}` must not become a bound; got {:?}",
+                c.unwind
+            );
+        }
     }
 
     /// The measure is evaluated against the arguments, and its signedness travels

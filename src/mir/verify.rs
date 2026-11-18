@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::mir::exec;
-use crate::mir::parse::{self, MirFn, MirProgram, Ty};
+use crate::mir::parse::{self, MirFn, MirProgram, Ty, USIZE_WIDTH};
 
 // The report types are part of the public verdict surface -- `FnOutcome`
 // carries a `MirReport` -- so they are re-exported here rather than leaving a
@@ -24,6 +24,267 @@ use crate::mir::parse::{self, MirFn, MirProgram, Ty};
 pub use crate::mir::exec::{MirReport, Obligation, ObligationKind};
 use crate::mir::spec::{self, SpecError, Specs};
 use crate::smt::{self, Verdict};
+
+/// The Rust edition a file is compiled under.
+///
+/// The frontend has to compile *the program the user ships*, and that program's
+/// edition lives in its `Cargo.toml`. Pinning one edition unconditionally is the
+/// mistake this type exists to fix: `--edition=2024` refuses a valid 2021 crate
+/// (`extern "C" { … }` must be `unsafe` there) and lowers some code differently
+/// from the edition that ships, so a verdict could be about a program nobody
+/// built. The edition is therefore *resolved* (see [`resolve_edition`]), never
+/// assumed, and it is recorded on every report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Edition {
+    /// Rust 2015, `rustc`'s own default.
+    Rust2015,
+    /// Rust 2018.
+    Rust2018,
+    /// Rust 2021.
+    Rust2021,
+    /// Rust 2024, the crate's own edition.
+    Rust2024,
+}
+
+impl Edition {
+    /// The spelling `rustc --edition=` takes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Edition::Rust2015 => "2015",
+            Edition::Rust2018 => "2018",
+            Edition::Rust2021 => "2021",
+            Edition::Rust2024 => "2024",
+        }
+    }
+
+    /// Parse a manifest or override spelling.
+    ///
+    /// Only the four numeric forms are accepted, so a typo is an error rather
+    /// than a silent fallback to an edition the program does not use.
+    pub fn parse(s: &str) -> Option<Edition> {
+        match s.trim() {
+            "2015" => Some(Edition::Rust2015),
+            "2018" => Some(Edition::Rust2018),
+            "2021" => Some(Edition::Rust2021),
+            "2024" => Some(Edition::Rust2024),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Edition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "edition {}", self.as_str())
+    }
+}
+
+/// Options that shape a frontend run.
+#[derive(Clone, Debug, Default)]
+pub struct MirOptions {
+    /// The Rust edition to compile under.
+    ///
+    /// `None` resolves it: from the nearest `Cargo.toml`'s `package.edition`
+    /// first, then `VERIF_EDITION`. A file with neither is an *error*, never a
+    /// silent default -- see [`resolve_edition`].
+    pub edition: Option<Edition>,
+}
+
+/// Resolve the edition to compile `file` under: explicit first, then
+/// `VERIF_EDITION`, then the nearest `Cargo.toml`.
+///
+/// There is deliberately no silent default for a *loose* file -- a `.rs` with no
+/// manifest above it has no crate edition to infer, and compiling it under an
+/// edition the program does not use is the exact mismatch this resolution removes.
+/// A real package, however, *does* have a default: Cargo assigns edition 2015 to a
+/// `[package]` that omits `edition`, so a manifest that declares a package without
+/// the key resolves to 2015 rather than to an error. The two are different
+/// questions -- "what edition is this crate?" and "what edition is this file?" --
+/// and only the second has no answer.
+pub fn resolve_edition(file: &Path, explicit: Option<Edition>) -> Result<Edition, String> {
+    if let Some(e) = explicit {
+        return Ok(e);
+    }
+    if let Ok(v) = std::env::var("VERIF_EDITION") {
+        if !v.is_empty() {
+            return Edition::parse(&v).ok_or_else(|| {
+                format!(
+                    "VERIF_EDITION is `{v}`, which is not an edition; use 2015, 2018, 2021 or 2024"
+                )
+            });
+        }
+    }
+    if let Some(e) = edition_from_manifest(file) {
+        return Ok(e);
+    }
+    Err(format!(
+        "no Rust edition for {}: it has no `Cargo.toml` and `VERIF_EDITION` is unset. The \
+         edition is what the program is compiled under, so it is never guessed -- set \
+         `VERIF_EDITION` to 2015, 2018, 2021 or 2024",
+        file.display()
+    ))
+}
+
+/// The edition a file's crate declares, read from the nearest `Cargo.toml`.
+///
+/// `package.edition` is read directly; `edition.workspace = true` (or
+/// `edition = { workspace = true }`) is resolved against the workspace root's
+/// `[workspace.package]`. A `[package]` that *omits* `edition` resolves to 2015,
+/// which is Cargo's default for a package that does not state one -- so a valid
+/// 2015 package is verified, not refused. A manifest the reader cannot parse
+/// yields `None`, so the caller reports "no edition" rather than a wrong one.
+///
+/// Public because it is the manifest half of [`resolve_edition`]: a caller may
+/// want to ask what a manifest declares without the environment fallbacks.
+pub fn edition_from_manifest(file: &Path) -> Option<Edition> {
+    let manifest = nearest_manifest(file)?;
+    let text = std::fs::read_to_string(&manifest).ok()?;
+    match manifest_value(&text, "package", "edition") {
+        // `edition.workspace = true` / `edition = { workspace = true }`: the value
+        // lives in the workspace root.
+        Some(v) if v == "workspace" => {
+            let root = workspace_root(&manifest, &text)?;
+            let root_text = std::fs::read_to_string(&root).ok()?;
+            Edition::parse(&manifest_value(&root_text, "workspace.package", "edition")?)
+        }
+        Some(v) => Edition::parse(&v),
+        // No `edition` key. Cargo defaults a `[package]` to edition 2015, so a
+        // real package resolves to 2015; a manifest with no `[package]` at all
+        // (a pure virtual workspace) declares no crate, so it yields `None` and
+        // the caller reports "no edition" as before.
+        None => declares_package(&text).then_some(Edition::Rust2015),
+    }
+}
+
+/// Whether a manifest declares a `[package]` table.
+///
+/// This is the tell between "a package that omitted `edition`" (Cargo's 2015
+/// default applies) and "a manifest with no package" (nothing to default).
+fn declares_package(text: &str) -> bool {
+    text.lines().any(|raw| {
+        let line = strip_toml_comment(raw).trim();
+        line.strip_prefix('[')
+            .and_then(|l| l.strip_suffix(']'))
+            .map(|inner| inner.trim() == "package")
+            .unwrap_or(false)
+    })
+}
+
+/// The nearest `Cargo.toml` at or above `file`, if any.
+fn nearest_manifest(file: &Path) -> Option<PathBuf> {
+    let abs = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    let mut dir: Option<&Path> = abs.parent();
+    while let Some(d) = dir {
+        let candidate = d.join("Cargo.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// The workspace root for a member manifest.
+///
+/// Cargo's `package.workspace` key names the root explicitly, and it may point
+/// *outside* the member's ancestor chain (`workspace = "../ws"`), so it is
+/// resolved first: searching ancestors only would fail a valid workspace member
+/// whose root is not above it. When the key is absent, the root is the nearest
+/// ancestor manifest that declares `[workspace]`.
+fn workspace_root(manifest: &Path, text: &str) -> Option<PathBuf> {
+    if let Some(rel) = manifest_value(text, "package", "workspace") {
+        if rel != "workspace" {
+            let dir = manifest.parent()?;
+            let candidate = dir.join(rel).join("Cargo.toml");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let mut dir = manifest.parent()?;
+    loop {
+        let candidate = dir.join("Cargo.toml");
+        if candidate.is_file() {
+            let text = std::fs::read_to_string(&candidate).ok()?;
+            if text.lines().any(|l| l.trim().starts_with("[workspace")) {
+                return Some(candidate);
+            }
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// The value of a scalar key in a table of a TOML-ish manifest.
+///
+/// This is a focused reader, not a TOML parser: it handles the spellings a
+/// `Cargo.toml` uses for an edition (`edition = "2024"`, `edition.workspace =
+/// true`, `edition = { workspace = true }`) and returns `Some("workspace")` for
+/// the two inherited forms. Anything else it might read is something it could read
+/// *wrongly*, so it reads nothing else.
+fn manifest_value(text: &str, table: &str, key: &str) -> Option<String> {
+    let mut current = String::new();
+    for raw in text.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(inner) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            current = inner.trim().to_string();
+            continue;
+        }
+        if current != table {
+            continue;
+        }
+        let Some((lhs, rhs)) = line.split_once('=') else { continue };
+        // TOML permits a *quoted* key (`"edition" = "2024"`), which Cargo accepts
+        // and treats exactly as the bare spelling. Comparing the raw left-hand side
+        // missed it, so a quoted edition key read as *no* edition and the 2015
+        // default was applied -- verification then compiled a different edition
+        // from Cargo. A dotted key (`edition.workspace`) is not quoted as a whole,
+        // so only the bare key is unquoted here.
+        let lhs = unquote_toml_key(lhs.trim());
+        let rhs = rhs.trim();
+        if lhs == format!("{key}.workspace") {
+            return Some(if rhs == "true" { "workspace".into() } else { rhs.into() });
+        }
+        if lhs == key {
+            // `edition = { workspace = true }`
+            if rhs.starts_with('{') {
+                return Some(if rhs.contains("workspace") && rhs.contains("true") {
+                    "workspace".into()
+                } else {
+                    rhs.into()
+                });
+            }
+            return Some(rhs.trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+/// Strip surrounding double quotes from a TOML key, if present.
+///
+/// A TOML key may be quoted (`"edition" = "2024"`); Cargo reads it identically to
+/// the bare spelling. The reader compares keys as strings, so it has to normalise
+/// the spelling or a quoted key silently reads as absent.
+fn unquote_toml_key(k: &str) -> &str {
+    k.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(k)
+}
+
+/// Drop a trailing `#` comment, respecting string literals so a `#` inside one is
+/// not mistaken for a comment.
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_str = false;
+    let mut prev = '\0';
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' if prev != '\\' => in_str = !in_str,
+            '#' if !in_str => return &line[..i],
+            _ => {}
+        }
+        prev = c;
+    }
+    line
+}
 
 /// Where the MIR text came from, so failures can say so.
 #[derive(Clone, Debug)]
@@ -41,6 +302,33 @@ pub enum MirSource {
     Inline(String),
 }
 
+/// The extra environment for `rustc` when the source declares a crate-level
+/// `#![feature(…)]`.
+///
+/// A modelled shape may name a library method that is *stable* on the toolchain the
+/// crate is built with but *unstable* on the MSRV floor -- the C6 corpus's
+/// `cast_unsigned`/`cast_signed` (`integer_sign_cast`), `is_multiple_of`
+/// (`unsigned_is_multiple_of`) and signed `midpoint` (`num_midpoint_signed`) are
+/// stable from 1.87 and gated on 1.85. The corpus must compile on the floor (gate 14
+/// runs the frontend's own suite against it), so it carries a `#![feature(…)]`
+/// header, and `rustc` refuses a feature gate on a stable channel unless
+/// `RUSTC_BOOTSTRAP` is set.
+///
+/// The bootstrap is scoped to a source that *declares* a feature, never set
+/// globally: a file with no gate is compiled exactly as before, so this cannot
+/// change the lowering of ordinary code. It is inert on current stable too, where
+/// the features are already stable and the gate is a no-op warning.
+fn bootstrap_env(file: &Path) -> Vec<(&'static str, &'static str)> {
+    let declares_feature = std::fs::read_to_string(file)
+        .map(|s| s.lines().any(|l| l.trim_start().starts_with("#![feature(")))
+        .unwrap_or(false);
+    if declares_feature {
+        vec![("RUSTC_BOOTSTRAP", "1")]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Get MIR text for a Rust file, or explain why not.
 ///
 /// `rustc --emit=mir` is a *stable* flag -- `-Zunpretty=mir` is the nightly-only
@@ -49,14 +337,21 @@ pub enum MirSource {
 /// 1.85). The error is returned rather than papered over, because "the frontend
 /// could not run" and "the code is wrong" must never be reported the same way.
 ///
+/// The edition is *resolved*, never assumed: `VERIF_EDITION` first, then the
+/// nearest `Cargo.toml`'s `package.edition`. A file with neither is an error,
+/// because the edition changes the lowering -- `panic!("literal")` is one
+/// diverging call under 2015 but an `Arguments` chain plus `std::rt::panic_fmt`
+/// under 2024, and `extern "C" { … }` must be `unsafe` only from 2024 -- so a
+/// verdict under the wrong edition would be about a program nobody built. See
+/// [`resolve_edition`].
+///
 /// The compiler is taken from `VERIF_RUSTC` when set, and otherwise from
 /// `rustc` on `PATH`. The dedicated variable exists so that pointing this tool at
 /// a *different* compiler -- a nightly, or the rustc_public oracle's toolchain --
 /// does not disturb the `rustc` that cargo is using to build the test suite;
 /// setting `RUSTC` would do exactly that.
 pub fn emit_mir(file: &Path) -> Result<String, String> {
-    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
-    emit_mir_with(&rustc, file)
+    emit_mir_opts(file, &MirOptions::default()).map(|(text, _edition)| text)
 }
 
 /// [`emit_mir`] with the compiler named explicitly.
@@ -65,6 +360,29 @@ pub fn emit_mir(file: &Path) -> Result<String, String> {
 /// a nightly -- without mutating the process environment, which is a race when
 /// tests run in parallel.
 pub fn emit_mir_with(rustc: &str, file: &Path) -> Result<String, String> {
+    emit_mir_with_opts(rustc, file, &MirOptions::default()).map(|(text, _edition)| text)
+}
+
+/// [`emit_mir`] with the run's options, returning the resolved edition too.
+pub fn emit_mir_opts(
+    file: &Path,
+    opts: &MirOptions,
+) -> Result<(String, Edition), String> {
+    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
+    emit_mir_with_opts(&rustc, file, opts)
+}
+
+/// [`emit_mir_with`] with the run's options, returning the resolved edition too.
+///
+/// The edition is resolved before `rustc` is invoked, so a file whose edition
+/// cannot be determined fails with "no edition" rather than with a compiler error
+/// about a program compiled under the wrong one.
+pub fn emit_mir_with_opts(
+    rustc: &str,
+    file: &Path,
+    opts: &MirOptions,
+) -> Result<(String, Edition), String> {
+    let edition = resolve_edition(file, opts.edition)?;
     // `rustc` writes its intermediate artifacts next to the output path, so the
     // output goes to a temp file rather than to `/dev/stdout` -- pointing it at
     // `/dev` makes rustc try to create a temp directory there and fail.
@@ -80,36 +398,41 @@ pub fn emit_mir_with(rustc: &str, file: &Path) -> Result<String, String> {
         file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
     ));
     let out = Command::new(rustc)
+        .arg(format!("--edition={}", edition.as_str()))
         .arg("--crate-type=lib")
         .arg("--emit=mir")
         .arg("-o")
         .arg(&out_path)
         .arg(file)
+        .envs(bootstrap_env(file))
         .output()
         .map_err(|e| format!("could not run rustc: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "rustc failed on {}: {}",
+            "rustc failed on {} under {}: {}",
             file.display(),
+            edition,
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
     let text = std::fs::read_to_string(&out_path).map_err(|e| {
         format!(
-            "rustc produced no MIR for {} ({e}); `--emit=mir` is stable, so this is a \
+            "rustc produced no MIR for {} under {} ({e}); `--emit=mir` is stable, so this is a \
              missing output file rather than a toolchain problem",
-            file.display()
+            file.display(),
+            edition
         )
     })?;
     let _ = std::fs::remove_file(&out_path);
     if text.trim().is_empty() {
         return Err(format!(
-            "rustc produced empty MIR for {}; `--emit=mir` is stable, so check the \
+            "rustc produced empty MIR for {} under {}; `--emit=mir` is stable, so check the \
              file's crate type and that it defines an item with a body",
-            file.display()
+            file.display(),
+            edition
         ));
     }
-    Ok(text)
+    Ok((text, edition))
 }
 
 /// What happened to one function.
@@ -226,6 +549,23 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         return FnOutcome::Skipped { reason };
     }
     let arg_vars = spec::arg_vars_named(f, rename.as_ref());
+    // The *entry* value of each reference argument, keyed by the contract's name
+    // for it, for `old(c)` in a postcondition. A bare `c` in an `ensures` is the
+    // value at *return* (see the `post` closure), so this is the only route back to
+    // the input. Built once, from the same bindings `arg_vars` uses, so a name and
+    // its entry value cannot disagree.
+    let old_args_for_post: BTreeMap<String, smt::Var> = f
+        .arg_locals
+        .iter()
+        .filter_map(|&l| {
+            if !matches!(f.ty_of(l), Some(Ty::Ref(_))) {
+                return None;
+            }
+            let name = spec::arg_name_of(f, rename.as_ref(), l)?;
+            let v = *arg_vars.get(&name)?;
+            Some((name, v))
+        })
+        .collect();
     let signed = spec::signed_args_named(f, rename.as_ref());
     // Fields of struct-typed arguments, bound to their own symbolic inputs. The
     // same bindings are handed to the executor as seeds, so `c.lo` in a contract
@@ -290,6 +630,14 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             }
         },
     };
+
+    // The loop-unwinding bound, if the contract carries one. It applies to a
+    // function's loops whether or not it also has an `invariant:`: an invariant
+    // decides a loop by induction (no unwinding), but a *second* loop with no
+    // invariant is still unwound, and the bound governs it. It is not tied to the
+    // invariant the way `variant:` is, so a lone `unwind:` is honoured rather than
+    // refused.
+    let unwind: Option<u32> = contract.and_then(|c| c.unwind);
 
     // Build the precondition. No contract means `true`, which is the right
     // default: a function with no `requires` is checked for panic freedom on
@@ -437,6 +785,33 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         // word, so the aggregate message is the honest one here.
         let probe_absent =
             if probe_ret.is_some() { spec::RET_IS_UNKNOWN } else { spec::RET_IS_AGGREGATE };
+        // An enum return: bind the discriminant so `ret.is_ok()` and friends parse
+        // in the probe exactly as they will in the run. The tag is a `usize`-wide
+        // word (the enum's discriminant type), which is the width the run passes.
+        // The probe discards its result, so a throwaway variable is enough; it must
+        // only be the right *width* for `eq_const` to be well-formed.
+        //
+        // The *payload* bindings (`ret.Ok`, `ret.Run`) are probed too, and they are
+        // gated on the enum layout rather than on the success/failure pair: a user
+        // enum with neither `Ok` nor `Some` has no `is_ok`, but its payloads are
+        // still meaningful.
+        if spec::ret_enum_def(&f.ret_ty, &specs.enums).is_some() {
+            // A throwaway tag, above every slot the run will use so it cannot
+            // collide with a live variable (see `probe_ret_enum_slot`). The probe
+            // discards its result; it only has to be the right *width* for
+            // `eq_const` to be well-formed.
+            if let Some(tag) = probe_fields.probe_ret_enum_slot(USIZE_WIDTH) {
+                if let Some((ok, err)) = spec::enum_ret_discriminants(&f.ret_ty, &specs.enums) {
+                    probe_fields.bind_ret_enum(tag, ok, err);
+                }
+                // A contract naming a payload (`ret.Ok`, `ret.Some`, `ret.Err`,
+                // `ret.None`, `ret.Run`) binds a variable of the payload's own width
+                // and sign, guarded on the discriminant. The payload type comes from
+                // the enum's layout (`Result<u8, u8>` gives `Ok: u8`, `Err: u8`),
+                // which is the same table the run reads.
+                probe_fields.probe_ret_payloads(&f.ret_ty, &specs.enums, tag, &ensures);
+            }
+        }
         if let Some(err) = ensures.iter().find_map(|e| {
             spec::eval_ensures(
                 e,
@@ -446,6 +821,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
                 &signed,
                 ret_signed,
                 &probe_fields,
+                &old_args_for_post,
             )
             .err()
         }) {
@@ -454,6 +830,17 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     }
     let args_for_post = arg_vars.clone();
     let fields_for_post = fields.clone();
+    // The names bound to a reference-to-scalar argument. A bare one in an `ensures`
+    // means its value at *return*, so the `post` closure must rebind it to the final
+    // value -- and, when the final value is not known on this path, *remove* it, so
+    // the name is refused rather than silently read as the entry value. Falling back
+    // to the entry value is the false proof this shape closed.
+    let ref_arg_names: Vec<String> = f
+        .arg_locals
+        .iter()
+        .filter(|&&l| matches!(f.ty_of(l), Some(Ty::Ref(_))))
+        .filter_map(|&l| spec::arg_name_of(f, rename.as_ref(), l))
+        .collect();
     // The return type's components, for a postcondition that names `ret.N`. The
     // type comes from the MIR (`-> (u8, u8)`), so the binding is to the declared
     // shape rather than to whichever elements a particular path happened to
@@ -501,7 +888,32 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
     let post = if ensures.is_empty() {
         None
     } else {
-        Some(move |ret: Option<smt::Var>, projs: &[(u32, smt::Var)]| {
+        let enum_ret = spec::enum_ret_discriminants(&f.ret_ty, &specs.enums);
+        Some(move |ret: Option<smt::Var>,
+                   projs: &[(u32, smt::Var)],
+                   ret_payloads: &[(u64, smt::Var)],
+                   ref_final: &[(u32, smt::Var)]| {
+            // A reference argument's name denotes the value the body left at the
+            // target, so a bare `c` in the postcondition is bound to the *final*
+            // value. Binding it to the entry value instead (which `arg_vars` holds)
+            // was a false proof: `ensures: c == 0` on `*c = 5` verified, because
+            // `c` still named the input. The entry value stays reachable through
+            // `old(c)`, which is why the two maps are handed over separately.
+            //
+            // A reference argument whose final value is not known on this path is
+            // *removed* from the map rather than left at its entry value: a bare
+            // name that could not be read at return must be refused, never quietly
+            // resolved to the input. `old(name)` still works -- the entry value is
+            // known regardless of what the body did.
+            let mut args = args_for_post.clone();
+            for name in &ref_arg_names {
+                args.remove(name);
+            }
+            for (l, v) in ref_final {
+                if let Some(name) = spec::arg_name_of(f, rename.as_ref(), *l) {
+                    args.insert(name, *v);
+                }
+            }
             // Bind each declared component that this path actually produced.
             let mut fields = fields_for_post.clone();
             for (i, ty) in ret_components.iter().enumerate() {
@@ -514,6 +926,35 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
                     fields.bind_ret(i, ty, *v);
                 }
             }
+            // An enum return: bind the discriminant, so `ret.is_ok()` and friends
+            // read the tag the body produced. `ret` here is the tag variable the
+            // executor passed (the return word for an enum-returning function), and
+            // the discriminants are the same ones the body's `switchInt` compares.
+            if let Some(tag) = ret {
+                // `ret.is_ok()`/`is_some()` need a success/failure pair, which only
+                // `Result`/`Option` and a user enum with `Ok`/`Some` have. A user
+                // enum with neither is refused those methods, but its *payloads*
+                // (`ret.Run`) are still bound below: a payload is meaningful
+                // whenever the layout names the variant, regardless of the
+                // success/failure reading.
+                if let Some((ok, err)) = enum_ret {
+                    fields.bind_ret_enum(tag, ok, err);
+                }
+                // The payloads a contract names (`ret.Ok`, `ret.Some`, `ret.Run`),
+                // each bound to the variable the executor holds for it and guarded
+                // on the discriminant. The payload values come from `ret_payloads`,
+                // keyed by the payload's *discriminant* -- the executor writes a
+                // downcast payload under the variant's own number, so the two agree
+                // by construction.
+                spec::bind_ret_payloads(
+                    &mut fields,
+                    &f.ret_ty,
+                    &specs.enums,
+                    tag,
+                    ret_payloads,
+                    &ensures,
+                );
+            }
             // `ret` is `None` when the return value is an aggregate: there is no
             // single word to stand for it, and the parser refuses a bare `ret`
             // rather than checking it against a fabricated value. Components are
@@ -522,12 +963,13 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             for e in &ensures {
                 let p = spec::eval_ensures(
                     e,
-                    &args_for_post,
+                    &args,
                     ret,
                     ret_absent,
                     &signed,
                     ret_signed,
                     &fields,
+                    &old_args_for_post,
                 )
                 .map_err(|err| err.to_string())?;
                 acc = Some(match acc {
@@ -561,7 +1003,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         f,
         pre,
         post,
-        exec::LoopSpec { invariant, variant },
+        exec::LoopSpec { invariant, variant, unwind },
         &callees,
         &exec::Seeds {
             fields: fields.seeds.clone(),
@@ -587,9 +1029,17 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         // The diagnosis is per-kind: an `Unsat` postcondition holds for *no*
         // input, while a `Valid` panic fires on *every* input. Both leave no
         // witness, so the detail cannot be one shared string.
+        //
+        // The witness is rendered with the source names the `debug` bindings
+        // recorded, so a report says `x = 224` rather than `v1:u8 = 224`. A
+        // variable with no source name -- a temporary, a promoted constant --
+        // keeps its `v{index}:u{width}` spelling, so the fallback is exactly the
+        // old rendering.
+        let names: Vec<(&str, u32)> =
+            f.local_names.iter().map(|(&l, n)| (n.as_str(), l)).collect();
         return FnOutcome::Failed {
             kind: ob.kind.to_string(),
-            detail: ob.failure_detail(),
+            detail: ob.failure_detail_named(&names),
         };
     }
     if report.undecided() > 0 {
@@ -614,6 +1064,13 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
 pub struct FileReport {
     /// The file these results are about.
     pub source: PathBuf,
+    /// The edition the file was compiled under.
+    ///
+    /// A `verified` that does not say which edition it holds under is only half a
+    /// claim: the edition changes the lowering, so the verdict is about *this*
+    /// edition's program. It is `None` only for a run whose MIR text was supplied
+    /// directly (tests), where no edition was involved.
+    pub edition: Option<Edition>,
     /// One outcome per verified function, in contract order.
     pub outcomes: Vec<(String, FnOutcome)>,
     /// Functions that carried a contract but were not found in the MIR. A
@@ -661,8 +1118,17 @@ impl FileReport {
 /// contract test wants: verifying the whole file on every call would be slow and
 /// would report unrelated functions.
 pub fn verify_file(source: &Path, only: &[String]) -> Result<FileReport, String> {
+    verify_file_opts(source, only, &MirOptions::default())
+}
+
+/// [`verify_file`] with the run's options (currently the edition).
+pub fn verify_file_opts(
+    source: &Path,
+    only: &[String],
+    opts: &MirOptions,
+) -> Result<FileReport, String> {
     let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
-    verify_file_with(&rustc, source, only)
+    verify_file_with_opts(&rustc, source, only, opts)
 }
 
 /// [`verify_file`] with the compiler named explicitly. See [`emit_mir_with`].
@@ -671,15 +1137,30 @@ pub fn verify_file_with(
     source: &Path,
     only: &[String],
 ) -> Result<FileReport, String> {
+    verify_file_with_opts(rustc, source, only, &MirOptions::default())
+}
+
+/// [`verify_file_with`] with the run's options.
+pub fn verify_file_with_opts(
+    rustc: &str,
+    source: &Path,
+    only: &[String],
+    opts: &MirOptions,
+) -> Result<FileReport, String> {
     let text = std::fs::read_to_string(source)
         .map_err(|e| format!("could not read {}: {e}", source.display()))?;
     let specs = spec::extract(&text);
-    let mir = emit_mir_with(rustc, source)?;
+    let (mir, edition) = emit_mir_with_opts(rustc, source, opts)?;
     let prog =
         parse::parse_program_scoped(&mir, &enum_layouts(&specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners, &specs.impl_traits, &specs.impl_trait_args, &specs.declared_traits);
 
     let (targets, missing) = resolve_targets(&prog, &specs);
-    let mut report = FileReport { source: source.to_path_buf(), missing, ..Default::default() };
+    let mut report = FileReport {
+        source: source.to_path_buf(),
+        edition: Some(edition),
+        missing,
+        ..Default::default()
+    };
     for (key, f) in select(&prog, &targets, only) {
         let outcome = smt::with_fresh(|| verify_function(&prog, f, &specs));
         report.outcomes.push((key, outcome));
@@ -972,3 +1453,111 @@ pub fn decide(p: crate::smt::Pred) -> Verdict {
 
 /// Re-exported so a caller can name the error type without reaching into `spec`.
 pub type ContractError = SpecError;
+
+#[cfg(test)]
+mod edition_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A scratch directory unique per call, so tests can run in parallel.
+    fn scratch(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("verif-edition-unit-{}-{seq}-{tag}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// A `[package]` that omits `edition` is Cargo's 2015 default, not an error.
+    ///
+    /// Cargo assigns edition 2015 to a package that does not state one, so
+    /// refusing it would stop verification of a package that builds. The
+    /// distinction is between a real package (a default applies) and a loose file
+    /// (nothing to default) -- and the second must still be refused, or the tool
+    /// would compile under an edition the program may not use.
+    #[test]
+    fn a_package_without_an_edition_defaults_to_2015_but_a_loose_file_does_not() {
+        let dir = scratch("no-edition");
+        let manifest = dir.join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n").unwrap();
+        let src = dir.join("probe.rs");
+        std::fs::write(&src, "pub fn f() {}\n").unwrap();
+        assert_eq!(
+            edition_from_manifest(&src),
+            Some(Edition::Rust2015),
+            "a package that omits `edition` must resolve to Cargo's 2015 default"
+        );
+
+        // A manifest with no `[package]` (a pure virtual workspace) declares no
+        // crate, so there is nothing to default and the resolution is `None`.
+        std::fs::write(&manifest, "[workspace]\nmembers = [\"a\"]\n").unwrap();
+        assert_eq!(
+            edition_from_manifest(&src),
+            None,
+            "a manifest with no `[package]` has no crate edition to default"
+        );
+
+        // A loose file (no manifest above it) is still refused by `resolve_edition`
+        // when nothing else supplies the edition.
+        let loose = std::env::temp_dir().join(format!(
+            "verif-loose-{}-{}.rs",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&loose, "pub fn f() {}\n").unwrap();
+        // Only assert when no override is set, since the env is process-global.
+        if std::env::var("VERIF_EDITION").map(|v| v.is_empty()).unwrap_or(true) {
+            assert!(
+                resolve_edition(&loose, None).is_err(),
+                "a loose file with no edition anywhere must be refused, not defaulted"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&loose);
+    }
+
+    /// An explicit `package.edition` and a workspace-inherited one both resolve.
+    #[test]
+    fn a_stated_edition_and_a_workspace_inheritance_both_resolve() {
+        let dir = scratch("stated");
+        let src = dir.join("probe.rs");
+        std::fs::write(&src, "pub fn f() {}\n").unwrap();
+        let manifest = dir.join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"d\"\nedition = \"2021\"\n").unwrap();
+        assert_eq!(edition_from_manifest(&src), Some(Edition::Rust2021));
+
+        // `edition.workspace = true` reads the value from the workspace root.
+        let root = scratch("ws-root");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\n[workspace.package]\nedition = \"2018\"\n",
+        )
+        .unwrap();
+        let member = root.join("member");
+        let _ = std::fs::create_dir_all(&member);
+        let m_src = member.join("probe.rs");
+        std::fs::write(&m_src, "pub fn f() {}\n").unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"m\"\nedition.workspace = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            edition_from_manifest(&m_src),
+            Some(Edition::Rust2018),
+            "`edition.workspace = true` must resolve against the workspace root"
+        );
+
+        // An unparseable edition is a refusal, not a fallback.
+        std::fs::write(&manifest, "[package]\nname = \"d\"\nedition = \"2030\"\n").unwrap();
+        assert_eq!(edition_from_manifest(&src), None, "an unknown edition is refused");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

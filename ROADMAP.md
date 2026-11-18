@@ -1,0 +1,1221 @@
+# Roadmap
+
+The single place open work lives. `AGENTS.md` records what was *learned*; this
+file records what is *left*, in the order it blocks ordinary Rust. Every item has
+five fields, so "is this done?" is a check rather than an opinion:
+
+- **Priority** — P0 (blocks everyday code), P1 (needed to verify a real crate),
+  P2 (parity with the high end).
+- **Exit criterion** — a command whose output decides the item.
+- **Competitor** — the tool whose gap the item closes.
+- **Move** — **build** it, **bridge** to a tool that has it, or **won't do**.
+- **Status** — done / in progress / todo / won't do.
+
+A PR that closes an item updates its status here in the same PR.
+
+The corpus scoreboard, re-measured on this branch. Each row is a command whose
+output decides the number, so the table is a measurement rather than a claim:
+
+| Corpus | Command | Verified / total |
+|---|---|---|
+| `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 18 / 33 |
+| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 611 / 1119 |
+| `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **18 / 21 (86%)** |
+
+`everyday.rs` is the honest one: ordinary Rust written by an external reviewer,
+not shaped for the tool. `realistic.rs` is a regression corpus (about a third of
+it is adversarial fixtures), so its high percentage does not measure coverage of
+ordinary code. Phase 1 is defined on `everyday.rs`.
+
+**The three functions that remain `incomplete`** are each blocked by a distinct,
+confirmed-hard limitation — measured, not assumed. None is a bug, and none is a
+small change:
+
+- `div_unwrap` (`n.checked_div(d).unwrap()`, `ret <= n`) needs the **u32 divider**,
+  whose BDD is exponential at 32 bits. The same query is still undecided after
+  ~186 s with `MAX_APPLY_STEPS` raised 32× (to `1 << 24`) and after 5.7 s with the
+  SAT conflict budget raised to 20 000 000 — so it is an engine wall (C7), not a
+  budget knob. `n / d` at `u32` is equally undecided, which is the same fact.
+- `sum_iter` (`v.iter().sum()`) is **not verifiable at all**: an unbounded slice
+  sum can overflow, so the honest verdict for a total postcondition is a panic,
+  not `verified` — a bare `a + b` under `requires: true` fails the same way. The
+  `incomplete` is the unmodelled `iter`/`sum` (C10); modelling them would move the
+  entry to `FAILED`, never to `verified`, and so would not change this score.
+- `tri` (`s += i` over `0..=n`, `n <= 100`, `ret <= 5050`) needs an **inductive**
+  loop invariant, and the invariant that is inductive for a running sum is
+  *nonlinear* (`s <= i(i+1)/2`). `s <= 5050` is not inductive (from `s == 5050`
+  and `i == 100` the sum is `5150`), which is why the loop reports a spurious
+  panic rather than a missing contract. This is C12 (the contract language's
+  expressiveness), not a frontend gap.
+
+---
+
+## Phase 1 — everyday Rust (P0)
+
+Exit: `everyday.rs` at least **80% decided** (17 of 21 — **met**, at 18 of 21),
+and four weeks in a row with no new false proof while the independent corpus
+keeps growing.
+
+### The Rust edition (E items)
+
+- **E1. Use the crate's own edition.** · P0 · done · Kani (whole-crate builds)
+  - Gap: the frontend pinned `--edition=2024`, so a valid 2021 crate
+    (`extern "C" { … }` must be `unsafe` from 2024) was refused, and code that
+    lowers differently from the edition that ships could be verified as a program
+    nobody built.
+  - Exit: a 2021 `extern "C"` fixture produces MIR and verifies. ✅
+  - Move: **build** (read `package.edition` from the nearest `Cargo.toml`,
+    resolving `edition.workspace = true`). See `resolve_edition`.
+- **E2. An explicit override, and no silent default.** · P0 · done · —
+  - Exit: `MirOptions { edition }` and `VERIF_EDITION` override it; a loose file
+    with neither is an error naming the missing edition. ✅
+- **E3. Stamp the edition on every result.** · P0 · done · —
+  - Exit: `FileReport.edition` is recorded and `mir_coverage` prints it. ✅
+- **E4. An edition matrix in the gate.** · P1 · done · Kani
+  - Gap: nothing ran the corpus under 2015/2018/2021/2024 and required identical
+    verdicts, and no fixture pinned the per-edition lowering difference.
+  - Exit: `tests/mir.rs` runs `actuator.rs` under all four editions and requires
+    the *whole* outcome map to match (not just the decided count, so a
+    `verified`↔`failed` swap is caught), plus a 2021-only `extern "C"` fixture
+    that verifies under 2021 and is refused under 2024 — the evidence the edition
+    is *used*, not pinned. ✅
+  - Move: **build**.
+- **E5. One source for the edition.** · P1 · done · —
+  - Exit: `tools/mir-oracle` takes the edition from the frontend's resolver
+    (`emit_mir_opts` returns it) rather than repeating a literal. ✅
+- **E6. The misleading hint.** · P0 · done · —
+  - Exit: `mir_coverage` prints the frontend's error (which names the compiler, the
+    edition and the reason) instead of "set VERIF_RUSTC to a nightly". ✅
+
+### Coverage (C items)
+
+- **C1. `Drop` and cleanup edges.** · P0 · done · Kani, Prusti, Creusot,
+  Verus, SPARK
+  - Gap: `drop(_x) -> [return: bbN, unwind …]` is unmodelled, so any function with
+    an RAII local (`Vec`, `String`, `Box`, a lock guard, a user `Drop`) is
+    incomplete.
+  - **C1b (done):** a diverging call in its *cleanup* form
+    (`_4 = core::panicking::panic(…) -> bb4`, `bb4 (cleanup)`) was not recognised,
+    so an `assert!` in any function with a live `Drop` local was a dropped path.
+    Now read as a diverging call: `guard_misguarded` FAILED with a counterexample
+    (`x = 224`). ✅
+  - **`drop` (done):** `Term::Drop { place, target }` is parsed (its `drop(_2) ->
+    [return: …]` line prints like a call, and since it has no ` = ` destination the
+    call arm's fallback turned the whole line into `Unknown` — reported "unmodelled
+    terminator" — so without its own arm the path was dropped) and executed. Three
+    cases, and the middle one is the soundness boundary:
+    - **No drop glue** — an integer, `bool`, `()`, a reference, or an aggregate of
+      such (`[u8; N]`, a plain struct, a tuple). The terminator changes nothing, so
+      it is a no-op and the path continues. This arm is *defensive*: rustc emits no
+      `drop` at all for such a type (measured over `realistic.rs`: 0 of 6 `drop`
+      terms are glue-free — the other six are a user `Drop` or a container), so the
+      arm cannot be exercised through the frontend and its check lives in a unit
+      test on `drop_is_noop`. It is kept because the alternative to a no-op is a
+      refusal, and refusing a glue-free `drop` would lose a proof.
+    - **A user `impl Drop`** — its body is in the dump, so it is executed through
+      the same inliner a method call uses (`self` is `&mut T`, so the dropped place
+      is the argument and the write-back carries the destructor's effects).
+      `destructor_panic_cannot_prove_this` is refuted with a witness (`v = 16`) and
+      its guarded twin verifies.
+    - **An unmodellable container** — a `Vec`, `String`, `Box`, or a struct whose
+      field has a user destructor. **Refused, not no-oped.** The MIR probe that
+      decided this: `fn g(w: Wrapper)` with `struct Wrapper { v: Vec<u8> }` and
+      `fn f()` with `struct Outer { i: Inner }` where `Inner: Drop` both lower to
+      the *same* `drop(_2) -> [return: bb1, unwind continue]` line — the dump does
+      not distinguish a container from a struct holding a user destructor. So the
+      review's suggested "std container is a no-op that changes no scalar state" is
+      unsound for the aggregate case (a `Vec<PanicOnDrop>`, or any struct wrapping
+      one, panics in its destructor). The honest answer is a refusal: a lost proof,
+      never a false one.
+    - A *projected* place (`drop(_2.0)`) is refused for the same reason: the
+      reference write-back is keyed on a whole local, so a projection would land
+      the post-state on the wrong storage. rustc does not emit that shape for a
+      glue-bearing place.
+    - **R5 (done): the struct layout is keyed by its module path.** The layout
+      table was keyed by the bare struct name, so `m::Outer` and `n::Outer` collided
+      and the drop-glue check read whichever was recorded last — when that one is
+      glue-free, a panicking field destructor vanishes and the function is a false
+      `Verified`. Layouts are now keyed by the module-qualified path, with a bare
+      key back-inserted only when the bare name is unique crate-wide; a shared name
+      makes the bare lookup miss, so the glue check reports the shape unmodelled
+      rather than reading the wrong layout (`two_same_named_structs_do_not_share_a_
+      layout`).
+    - **R6 (done): a unit struct is a zero-field layout.** `struct Guard;` was not
+      read as a struct at all, so the drop-glue check saw an unknown type and
+      refused the function. A unit struct now has an empty layout, so its `Drop`
+      body is the only glue — and a panicking one is a real obligation
+      (`a_unit_struct_runs_its_destructor`).
+  - Exit (done): `guard_guarded` / `guard_is_dropped_cleanly` verified,
+    `guard_misguarded` FAILED with a counterexample. ✅
+  - Who has it: Kani, Prusti, Creusot, Verus, SPARK (finalization).
+  - Move: **build**.
+- **C2. `Option`/`Result` and `?`.** · P0 · in progress · Kani, Verus, Prusti, Creusot
+  - Gap: `?`, `map`/`map_err`/`and_then`/`unwrap_or_else` (closures) are
+    unmodelled; `unwrap`, `unwrap_or`, `expect`, `ok_or`/`ok`/`err`, `is_some`,
+    the enum-return discriminant methods and bare payload reads are modelled (see
+    the progress notes). Evidence: `checked_or_max` verified, `div_unwrap`
+    incomplete (the divider wall, not the `Option`).
+  - Approach: the enum payload/discriminant model exists; add a **contract library
+    for std/core** in the spirit of Prusti `#[extern_spec]` / Verus `vstd`, each
+    spec differential-tested against the real implementation.
+  - Exit: `checked_or_max` and `div_unwrap` verified; a misused `unwrap` refuted
+    with a counterexample.
+  - Move: **build**.
+  - Progress: the `Option` and `Result` *methods* are modelled. `unwrap`,
+    `unwrap_or`, `expect`, `is_some`/`is_none` and `is_ok`/`is_err` read the
+    receiver's tag and payload from the executor's discriminant/payload stores —
+    the first modelled calls whose input is an *enum* rather than a bit-vector
+    operand. `unwrap`/`expect` report a **panic** on the failure variant (the same
+    reachable-failure obligation `abs`/`clamp` carry), so
+    `if x.is_some() { x.unwrap() }` verifies with the panic ruled out;
+    `unwrap_or(default)` is total. `Option` and `Result` are one shape with the
+    payload on the other discriminant (`Some` = tag 1, `Ok` = tag 0), so one
+    executor arm answers both with the payload variant read off the method name.
+    `checked_or_max` (`checked_add(..).unwrap_or(u32::MAX)`) now **verifies** —
+    `everyday.rs` 14/21 -> **15/21**. `div_unwrap` is still incomplete, but the gap
+    is the *divider* wall (`n / d <= n` at `u32`), not the `Option`; the same body
+    decides at `u8`. Sixteen fixtures (true/tripwire/panic pairs, both families) in
+    `realistic.rs` (**424 of 789**).
+  - Remaining: `map`/`map_err`/`and_then`/`unwrap_or_else` (closures). `ok_or`/`ok`/`err`
+    are now modelled (see below), and the `?` operator is modelled (see the last
+    progress note), so both are off this list.
+  - Progress (the `?` operator): `expr?` is modelled. The desugaring is
+    `<T as Try>::branch(expr)` producing a `ControlFlow<Residual, T>`, a
+    `switchInt` on its discriminant, and — on the `Break` arm — a
+    `FromResidual::from_residual` call that re-wraps the error as the function's
+    return enum. Both calls are modelled (`Intrinsic::TryBranch` /
+    `Intrinsic::FromResidual`, answered by the executor's `try_branch` /
+    `from_residual` from the receiver's enum stores, exactly as the `Option`
+    methods are). `branch` writes the `ControlFlow`'s tag — `Continue` iff the
+    receiver is on its success variant (`Ok` = 0, `Some` = 1) — and both payloads
+    (the success value, and the error value on the failure variant); the
+    `(_2 as Continue).0` / `(_2 as Break).0` downcasts then resolve through
+    `variant_index`'s `Continue`/`Break` numbering. The residual's own tag is fixed
+    by the receiver type (`Err`/`None`), so it is not stored; `from_residual`
+    re-numbers it for the *return* enum (read from the call's self type) and moves
+    the error value onto the `Err` payload. A locally constructed `Ok`/`Err`/`None`
+    receiver has a *known* tag, so the branch is decided statically (the
+    `smt::evaluate` known-tag arm). Nineteen fixtures in `realistic.rs`
+    (verify/tripwire pairs on both paths for both families, the three known-tag
+    receivers, a chained pair, a two-branch pair and a cross-error-type pair),
+    pinned by `the_try_operator_decides_on_both_paths`. `realistic.rs` **472 of
+    881 -> 491 of 918**.
+  - Progress (enum-return contract): a contract on an `Option`/`Result`-returning
+    function can now name the **discriminant** methods — `ret.is_ok()`,
+    `ret.is_some()`, `ret.is_err()`, `ret.is_none()`. A function returning an enum
+    has no single return *word*, so a bare `ret <= n` is refused; the four methods
+    read the return place's **tag**, which the executor now passes as the return
+    word (`Env::tag_value(0)`), and the discriminants come from the type
+    (`spec::enum_ret_discriminants`: `Ok` is 0 / `Err` is 1, `Some` is 1 / `None` is
+    0, or a declared enum's own layout). They are *total* over the tag, so unlike
+    `ret.Ok` — which names a payload that exists on only one variant, and so needs
+    the postcondition guarded on the discriminant — they are admitted without a
+    payload guard. A non-enum return refuses them (a skip, never a verdict against
+    a fabricated tag). This also needed the parser to accept a variant name with a
+    generic list containing a space (`Result::<u8, u8>::Ok`, which rustc prints with
+    a space after the comma). The same four methods also read an enum-typed
+    **argument** (`requires: r.is_ok()`), from the tag the binder records under
+    `r__tag` and the discriminants it records as variant constants. Nineteen
+    fixtures in `realistic.rs` (true/tripwire pairs on both tags for `ret` and for an
+    argument, a pass-through, a `match`, and the non-enum refusal), pinned by
+    `an_enum_return_contract_can_name_the_discriminant_methods` and by two
+    toolchain-free `spec` unit tests. `realistic.rs` **439 of 813 -> 448 of 832**.
+  - Progress (the `Option`↔`Result` conversions): `Option::ok_or`,
+    `Result::ok` and `Result::err` are modelled. Each is *total* for a scalar
+    payload and moves one payload across the tag: the result's tag is the
+    receiver's reinterpreted (`Ok` and `Some` are discriminants 0 and 1, so
+    `1 - tag` for `ok_or`/`ok`), while `err` *keeps* the tag (`Err` is already the
+    payload-carrying variant of a `Result`, and the result is an `Option` whose
+    `Some` is that discriminant). The moved payload is recorded under the
+    discriminant the consuming `switchInt` selects -- `ok_or` writes *both*
+    payloads, `Some`'s onto `Ok` and the error argument onto `Err`, because
+    `ok_or` is the one conversion with two inputs. Each reads the type it *drops*
+    (the `ok_or` argument, `ok`'s `Err` payload, `err`'s `Ok` payload) through the
+    same `has_drop_glue` check `unwrap_or` uses, so a type with an unmodelled
+    destructor is refused rather than assumed harmless. One parser-side finding:
+    `ok_or` is printed with a *method* turbofish (`Option::<u8>::ok_or::<i32>`), so
+    the classifier's last-segment read had to skip a `<…>` segment to find the
+    method name -- without that the call was reported unmodelled, and the fix is
+    strictly safer because a method name never begins with `<`. The first cut of
+    the executor also stored the *error argument* as the `Ok` payload (it read the
+    single "moved" operand), which made the payload's width 32 for a `u8` receiver
+    and refuted every true payload contract; the fixtures' `_moves_the_payload`
+    pairs are what caught it. Eighteen fixtures in `realistic.rs` (true/tripwire
+    pairs on both tags for each of the three, and a payload round-trip through
+    `unwrap` for each), pinned by
+    `the_option_result_conversions_decide_and_move_the_payload` and by a
+    toolchain-free `classify` unit test (including the turbofish).
+    `realistic.rs` **448 of 832 -> 457 of 850**.
+  - Progress (PR #8 review round: three findings). Each was reproduced against
+    real rustc before being fixed, and each fix is pinned by a true/tripwire pair.
+    - **A `&mut bool` postcondition lost its value.** A `bool` target is a
+      `Val::Bool` *predicate*, not a `Val::Sym` word, and the reference-final
+      collection kept only the `Sym` arm -- so `ensures: c == true` after
+      `*c = true` was refused as an *unknown name*. The predicate is now widened to
+      a one-bit word, exactly as a `bool` `ret` is. Three fixtures
+      (`set_bool_ref`, `keep_bool_ref`, and the false `a_bool_ref_write_cannot_prove_this`),
+      pinned by `a_mutable_bool_reference_postcondition_reads_its_final_value`.
+    - **A conversion over a *constructed* variant was refused.** A locally
+      constructed `None`/`Err`/`Ok` records only the payload that variant carries,
+      so `None::<u8>.ok_or(e)` had no `Some` payload to move and the call was
+      reported "on a receiver whose payload is not modelled". The inactive
+      variant's payload is unreachable on such a path (the tag is a *known*
+      discriminant), so it is now left *unbound* rather than refused -- the same
+      treatment a `None` construction gets. A *symbolic* tag still refuses, so no
+      fabricated value is bound on a path that could reach the payload. Eight
+      fixtures (both constructed directions for each of the three, true and
+      tripwire), pinned by
+      `the_option_result_conversions_handle_constructed_variants_and_grouping`.
+    - **Grouping and negation of an enum predicate was unreadable.** `(ret.is_ok())`
+      and `!x.is_none()` carry no comparator, so `paren_is_predicate_from` and
+      `bang_is_predicate` routed them into arithmetic and the contract was skipped.
+      Both lookaheads now recognise the `base.method()` shape; whether the base
+      really names an enum is still decided when the predicate is parsed. Eight
+      fixtures plus a toolchain-free `spec` unit test
+      (`a_grouped_or_negated_enum_method_is_a_predicate`).
+    `realistic.rs` **457 of 850 -> 467 of 869** (11 verify, 11 refute).
+  - Progress (a bare payload read on an enum return): `ret.Ok`, `ret.Some`,
+    `ret.Err` and a *user* enum's variant (`ret.Data`) are modelled. A payload
+    exists only on the variant's paths, so the clause naming it is **guarded on
+    the discriminant** (`tag == disc => clause`): on the other variant's paths it is
+    vacuously true, which is the only meaningful reading. Binding the payload with
+    no guard would compare it on *every* path, against a value it does not have —
+    a wrong value, not a weaker proof. The guard is applied per top-level `&&`
+    conjunct (`Parser::guard_ret_payloads`), so `ret.Ok <= n && ret.Err <= m`
+    checks each payload only on its own variant's paths. The payload variable is
+    the executor's own (`ret_payloads`, collected from `payloads`/`fields` under
+    local `_0` keyed by discriminant), so the contract's `ret.Ok` and the body's
+    `((_0 as Ok).0)` are one value; the layout is one lookup
+    (`spec::ret_enum_def`), shared with `ret.is_ok()` so the numbering and the
+    payload width cannot drift. The *probe* binds only the variants a contract
+    actually names (`names_ret_variant`), at a throwaway slot above the run's, so a
+    contract that never mentions a payload pays nothing and a payload with no
+    bit-vector width is refused only when it is asked for. Twelve fixtures in
+    `realistic.rs` (true/tripwire pairs for `Ok`/`Some`/`Err`/a user enum, a
+    branch-vacuity pair, and two refusals — a non-enum return and a unit variant),
+    pinned by `an_enum_return_contract_can_name_a_payload`. This closes the last
+    named C2 sub-item; `realistic.rs` **467 of 869 -> 472 of 881**.
+  - Progress (`unwrap_or_default`): `Option::unwrap_or_default` and
+    `Result::unwrap_or_default` are modelled. Both are `unwrap_or(T::default())`,
+    so they reuse the `unwrap_or` arm with the default supplied by the model
+    rather than by an argument: for every scalar payload the tool models,
+    `T::default()` is the zero of the payload's own width (`0u8`, `0i32`,
+    `false`), so the failure variant yields that word. A payload with no bit width
+    (a struct) is refused rather than given a zero it may not have. Both are
+    total -- no panic obligation -- and both are pinned by a `None`/`Err` true
+    entry and a false twin (the `Some`/`Ok` path can carry any payload, so a fixed
+    value is refuted). Four fixtures in `realistic.rs`, pinned by
+    `option_unwrap_or_default_is_the_payload_or_zero`; the corpus carries the
+    `Option` and `Result` directions.
+  - Guard (`str` shadowing): a user type may shadow a primitive name, and rustc
+    prints a crate-root type as the bare name, so `pub struct str { .. }` is
+    spelled `&str` exactly as the primitive is. The primitive `str` length is
+    therefore bound only when no declared layout names `str`
+    (`struct_lookup(..).is_none()`); a user `str` reaches the struct branch and
+    its fields bind. Pinned by `a_user_type_named_str_is_not_the_primitive_str`,
+    which asserts both directions -- the user field resolves and refutes a fixed
+    value, and the primitive length is still a symbolic input.
+  - `Option::or`/`Option::and`: total, closure-free. Each returns one of its two
+    `Option`s by the receiver's tag, so the result tag is an `ite` on it and both
+    payloads are carried; `or` is the receiver on `Some` and the argument on
+    `None`, `and` the mirror. The dropped operand's payload type drives the glue
+    check (the argument for `or`, the receiver for `and`), so a `T` with an
+    unmodelled destructor is refused. Eight fixtures (four true, four tripwires),
+    pinned by `option_or_and_are_total_and_select_the_right_operand`.
+  - **A chained `or`/`and` selected the wrong element (false proof, fixed).** The
+    element-identity store was *flat* — a combinator recorded one leaf or a
+    leaf-plus-condition — so `a.first().or(b.first()).or(c.first()).unwrap()` lost
+    the inner `or` and the outer combinator read the missing receiver identity as
+    permission to take the argument's element: with `a[0]==5`, `b[0]==7`, `c[0]==9`
+    it **verified** `ret == 9`, which Rust never returns (it returns `a[0] == 5`).
+    The identity is now a compositional tree (`ElemId::Leaf | Select`); a missing
+    operand identity is substituted **only** when the receiver's tag proves that
+    operand is not the selected one, so a symbolic tag with a missing identity
+    leaves the deref unknown rather than wrong. The tree also carries the element's
+    **sign**, so a conditional choice between `&[i8]` elements compares and divides
+    signed (the old code hard-coded `Sign::Unsigned`). Fixtures `chained_or_selects_the_first`,
+    `and_with_a_conditional_argument`, `signed_or_element_is_signed` and their
+    `_cannot_prove_this` twins.
+  - **`and` with a different-width argument (ill-formed query, fixed).** `Option<T>::and<U>`
+    permits a different payload type and returns the *argument* on `Some`, so its result
+    element is always the argument's. Building a `Select` over the receiver's (`u8`) and
+    the argument's (`u16`) slice elements asked `smt::ite` for equal widths and marked the
+    query ill-formed, so `*a.first().and(b.first()).unwrap()` was `incomplete` even with
+    both slices nonempty. `and` now carries the argument's identity alone (exact and
+    width-safe), which also fixes the scalar-receiver case (`Option<u8>.and(&[u8])`), where
+    the old `(None, Some(a))` arm applied `or`'s "only when the tag proves it" rule to a
+    combinator that selects the argument unconditionally. Fixtures
+    `and_different_width_deref`, `and_scalar_receiver_ref_argument` and their twins.
+  - Remaining: `map`/`map_err`/`and_then`/`unwrap_or_else` (closures). The `?`
+    operator is modelled (see the `?` progress note above).
+- **C3. Ranges and `for` loops.** · P0 · done · Kani, Verus, Prusti
+  - Gap: `RangeInclusive::new`, `Range`, `Iterator::next` unmodelled, so the
+    commonest loop in Rust is out of reach. Evidence: `tri` incomplete.
+  - Approach: model `Range`/`RangeInclusive` as structs, `next` as a modelled
+    intrinsic, recognise the `for` desugaring, reuse the loop machinery.
+  - Exit: a `for` loop over a range verified with an `invariant:`; a missing
+    invariant reported as *a missing invariant*, not "unmodelled". ✅ (The
+    invariant must be inductive — see the progress note; `tri`'s own contract is
+    not, so `tri` stays `incomplete` for that honest reason rather than for an
+    unmodelled construct.)
+  - Move: **build**.
+  - Progress: the desugaring is **built**. `RangeInclusive::new`/`Range::new`,
+    `IntoIterator::into_iter` and `Iterator::next` are modelled
+    (`intrinsics::Range`/`RangeMethod`, answered by `range_method` from the
+    range's struct fields, with `core`'s `forward_overflowing` boundary
+    reproduced exactly), and a `for` loop now decides through the existing
+    machinery — `for i in 0..=n { s += i }` verifies with `unwind: 4`, and a loop
+    whose body is decided by an **inductive** invariant (`s = i.min(5050)`)
+    verifies with `invariant: s <= 5050`, its false twin refuted
+    (`the_for_loop_range_desugaring_is_modelled`).
+  - The invariant has to be **inductive**, and `everyday.rs`'s `tri` is not.
+    `invariant: s <= 5050` over a body doing `s += i` is not inductive (from
+    `s == 5050` and `i == 100` the sum is `5150`), so a loop whose carried state is
+    the *running sum* cannot be proved with a constant bound. The fixture that
+    exercises the invariant path uses `s = i.min(5050)` (inductive); `tri` stays
+    `incomplete` for the honest reason that no contract it declares is inductive.
+    See `AGENTS.md` ("The `tri_invariant` fixture had been passing *because of*
+    the bug") for why the first version of this note was wrong.
+  - The second exit half is met too: a loop with no `invariant:` or `unwind:` is
+    reported as a *missing loop contract* naming the remedy, not as an unmodelled
+    construct — `loop unwound past 9 at bb8 of tri; assuming it exited would be
+    unsound -- this is a missing loop contract, not an unmodelled construct:
+    declare `invariant:` or `unwind:` to decide it`
+    (`a_loop_without_a_contract_names_the_missing_contract`).
+  - A boundary that remains, and is *not* a gap in the desugaring: an invariant
+    that *names* the loop element (`s <= i`) is refused as `unknown name i`. The
+    element is a `debug` binding inside a nested `scope` block (`debug i => _9;`
+    at `scope 3`) that is genuinely **not live at the loop header** — `next` has
+    not returned on entry, so `_9` has no value there. Resolving the name would
+    mean reading a variable the header state does not contain, which is a wrong
+    value rather than a missing one, so the refusal is correct. A `for`-loop
+    invariant is written over the loop's *carried* state (`s <= 5050`), which is
+    exactly the state the header havocs and the invariant is quantified over.
+    `tri` in `everyday.rs` declares no loop contract, so it stays `incomplete`
+    with the honest missing-contract reason.
+  - Boundary hardening from the PR #8 review round (R1, R4). Both are cases where
+    the range model *decided*, so a wrong value was a wrong verdict, not a refusal:
+    - **R1: the successor's overflow flag must test the *signed* `MIN`.** The flag
+      was `succ == 0`, the unsigned rule. On a signed inclusive range it never
+      fires, so `127i8..=127i8` kept yielding past `127` (into `-128`, `-127`, …)
+      until the `unwind:` bound — a true contract became a bound failure. The flag
+      is now `succ == (1 << (w-1))` for a signed range.
+    - **R4: `next` leaves an empty range unchanged.** The advance was unguarded, so
+      `255u8..=254u8` (empty) had its `start` wrapped to `0` and the *second* `next`
+      returned `Some(0)` — an element Rust never yields. The advance is now guarded
+      by `!empty`.
+    - Validated by a differential oracle: 23 ranges at the `u8`/`i8` boundaries
+      (every combination of `MIN`/`MAX`/`0`) counted against a compiled `rustc`
+      execution, all agreeing (`a_signed_inclusive_range_stops_at_its_boundary`,
+      `an_empty_inclusive_range_stays_empty`).
+- **C4. Loops without path explosion.** · P0 · done · Kani (unwinding),
+  Verus, Creusot, Prusti, SPARK (`Loop_Invariant`/`Loop_Variant`), Flux
+  - Gap: a 4-iteration loop over an array exhausts the 64-path budget. Evidence:
+    `max_of` was incomplete (`path budget exhausted after 64 paths`).
+  - (a) `invariant:`/`variant:` clauses inside the MIR frontend — **built** (the
+    `Cut` machinery, loop obligations, and the `an_invariant_decides_a_loop_that_
+    unwinding_could_not` regression). (b) a bounded-unrolling mode whose bound is
+    *reported*: `unwind:` raises the loop bound **and** the path budget (a
+    declared bound means "unwind each loop N times", and a branching body yields
+    a path per branch per iteration), and a *declared* bound that is too small is
+    Kani's **unwinding assertion** — a `Failed` obligation
+    (`ObligationKind::UnwindBound`), not an incompleteness, so a bound can never
+    cut a path off silently. A loop with **no** `unwind:` still cuts off at
+    `DEFAULT_UNWIND` and reports that honestly. (c) merge states at joins
+    (ite-merging) instead of enumerating paths — not done.
+  - Exit: **met** — `max_of` verified with `unwind: 5`, refuted with `unwind: 3`
+    by the unwinding check (`max_of_verifies_with_a_sufficient_unwind_bound_and_
+    fails_with_a_small_one`); the invariant half is pinned by
+    `an_invariant_decides_a_loop_that_unwinding_could_not`. `everyday.rs` scores
+    16 of 21 (up from 9).
+  - **R2/R3 (done): the bound counts the *loop*, not one latch.** The counter was
+    keyed by the source block holding the back edge, so a loop body that reaches
+    its header from two latches (an `if` whose arms both loop, two `continue`s) had
+    each counted separately and the combined trip count could exceed a declared
+    `unwind:` while neither latch's own count did — a two-iteration loop verified
+    under `unwind: 1`. A `switchInt` block additionally reset the count on every
+    arm it took, which is where a `while` header hid the bug. The counter is now
+    keyed by the loop *header* (merged latches), the switch reset is removed, and
+    `unwind: N` means `N` iterations of the loop however the body reaches the back
+    edge (`the_unwind_bound_counts_the_whole_loop_not_one_latch`).
+  - Move: **build**.
+  - Follow-up (not in the exit criterion): a *sufficient* invariant for `max_of`
+    needs an implication in the contract language (`i > k => m >= a[k]`), which
+    is C12 (a specification language that can say more). Until then the fixture
+    proves a loop by unwinding.
+- **C5. Enums with payloads and match guards.** · P0 · done · Kani
+  - Gap: `match m { Run(n) if n < 10 => … }` gave "unmodelled switch
+    discriminant". Evidence: `next_mode` was incomplete.
+  - Cause: the guard reads the payload through a borrow of a downcast place,
+    `_4 = &((_1 as Run).0: u8)`, and the rvalue contains the word ` as ` inside
+    its parentheses. `parse_rvalue` checked for a cast *before* a reference, so it
+    split the borrow at that ` as `, the address was lost, and the guard's
+    `copy (*_4)` read `Unknown`. The reference arm now runs first, which a real
+    cast cannot be mistaken for (`&…` is not a place).
+  - Exit: `next_mode` decided (`verified`), plus the refuted fixture
+    `guarded_match_tripwire` in `realistic.rs`.
+  - Move: **built**.
+- **C6. The everyday `core` surface.** · P0 · in progress · Kani, Verus (`vstd`)
+  - Gap: `Ord::min/max/clamp`, `PartialEq`/`PartialOrd` comparisons,
+    `iN::abs`, `abs_diff`, `rotate_*`, `is_ascii_*`,
+    `is_negative`/`is_positive`, `<[T]>::len/is_empty/first/get`. Evidence:
+    `abs_small`, `clamp_builtin`, `digit`, `first_or` incomplete. All but
+    `first_or` are now modelled (`min`/`max`, `From`/`Into`, `clamp`,
+    `abs`, `abs_diff`, `rotate_*`, the `is_ascii_*` classes, the sign predicates,
+    `slice::len`/`is_empty`, and `slice::first`/`get`). `first_or` now decides
+    too: it is *generic* (`<T: Copy>`), and the earlier note that a generic slice
+    needs monomorphisation was wrong for the *length* half — `v.len()`/`v.is_empty()`
+    read only the length, which is a `usize` input whatever `T` is, so the length is
+    bound even when the element width is unknown (the `0` sentinel in
+    `exec::Indexed::elem_w`). Every *element* operation on a `&[T]` stays refused,
+    which is the honest split; see the progress note below.
+  - Also modelled since: `signum`, `div_euclid`/`rem_euclid`, `div_ceil`,
+    `midpoint`, `next_multiple_of`, `ilog2`/`ilog10`, the `next_power_of_two`
+    pair, and `str::len`/`str::is_empty` — see the progress notes below.
+  - Approach: the C2 contract library, plus a published list of the modelled
+    `core` items with each item's oracle.
+  - Exit: `abs_small`, `clamp_builtin`, `digit`, `first_or` verified; the list is
+    in the docs.
+  - Move: **build**.
+  - Progress: `iN::abs` and `Ord::clamp` are modelled. They are the first modelled
+    methods whose failure is a **panic**, so the model carries a value and a
+    `fails` predicate, and the executor emits the predicate as a panic obligation
+    (`abs` fails at `MIN`, `clamp` at `lo > hi`; an out-of-range `x` is clamped,
+    not an error — the probe corpus caught the first version that got this wrong).
+    `everyday.rs` moved 10/21 -> 12/21 (`abs_small`, `clamp_builtin` verified);
+    `realistic.rs` 399/739 -> 402/746 with the true/tripwire/panic fixtures.
+  - Progress (cont.): `is_ascii_*` are modelled. They are the first modelled
+    methods whose receiver is `&self`, so the operand is the *referent* of a
+    reference the body materialises (`_3 = &_1`); the executor follows the
+    reference for them and only them. All ten classes are `core`'s own range
+    tests (`is_ascii_digit` is `b'0'..=b'9'`, `is_ascii` is `b < 128`), checked
+    exhaustively against Rust's own `u8` methods. `digit` in `everyday.rs` moved
+    to verified (10/21 -> **13/21**), and six fixtures with their tripwires are in
+    `realistic.rs` (**405 of 752**).
+  - Progress (cont.): `abs_diff` and `rotate_left`/`rotate_right` are modelled.
+    `abs_diff`'s result is the *unsigned* magnitude even on a signed type
+    (`i8::abs_diff(-128, 127)` is `255u8`), so the model widens both operands by
+    their own sign to `w + 1` bits, subtracts there, and takes the absolute value
+    with a *signed* sign test (the `w + 1`-bit range is exactly a signed one). The
+    rotations reduce the amount modulo the width the way `core` does — a rotation
+    by the width is the identity and by `w + 1` is by `1` — and since a modelled
+    width is a power of two the reduction is one `and`, not a divider. Both are
+    total (no panic), so they are plain values. Checked exhaustively over `u8`/`i8`
+    against Rust's own methods (`abs_diff_and_rotations_agree_with_rust`), with
+    three verified fixtures and two tripwires in `realistic.rs` (**409 of 758**).
+  - Progress (cont.): `is_negative`/`is_positive` are modelled. Both are `bool`
+    predicates, and the model is `core`'s own definition — `x < 0` and `x > 0`
+    read *signed*. The signedness is the whole content: `i8::MIN` (`0x80`) is the
+    largest unsigned byte, so an unsigned reading of the top bit would call it
+    positive. They exist only on the signed types, so an unsigned receiver is
+    refused rather than read. Checked exhaustively over `i8`/`i16` against Rust's
+    own methods (`the_sign_predicates_agree_with_rust`), with `i8::MIN` named as
+    the point an unsigned reading gets wrong; six fixtures with their tripwires
+    are in `realistic.rs` (**433 of 803**).
+  - Progress (cont.): `<[T]>::first` and `<[T]>::get` are modelled for a
+    *concrete* slice. They produce `Option<&T>`, so the payload is a reference,
+    not a value: the model writes the `Option`'s tag as a *predicate* (`len == 0`
+    for `first`, `k >= len` for `get(k)`, so `unwrap`'s panic obligation is real)
+    and records the payload as the slice's *own* element variable — the same one
+    `xs[k]` names — so `*xs.first().unwrap()` and `xs[0]` agree by construction.
+    The reference's deref (`*_2`) resolves through a new `Env::slice_elem_ref`
+    store; both `unwrap` and the `match` desugaring (which reads the payload
+    through a downcast temp, `_4 = copy ((_2 as Some).0)`) carry the element to
+    their destination, so the two spellings decide alike. `get`'s index must
+    be a *constant* (a slice's length is symbolic, so a symbolic index has no
+    finite domain and reading "some element" would be a wrong proof). `first_or`
+    stays incomplete because it is *generic* (`<T: Copy>`) — that is C10, not this
+    item — and the earlier note that `first`/`get` were "blocked on
+    monomorphisation" was wrong for a concrete `&[u8]`. Seven fixtures (four true,
+    two tripwires, one panic) plus three `match`-form fixtures are in
+    `realistic.rs` (**496 of 927**), pinned by
+    `slice_first_and_get_reach_the_slices_own_element` in `tests/mir.rs`.
+  - Progress (cont.): the remaining total `core` value methods are modelled:
+    `signum` (`-1`/`0`/`1`, signed-only — the signedness is the content, since
+    `i8::MIN`'s `0x80` is the largest *unsigned* byte); `reverse_bits` (a shift-OR
+    fold, both signednesses); `swap_bytes` (a rotation by `w/2` *bits*, which is
+    the byte reversal — the first cut used `w/2 * 8` and the differential test
+    caught it); `to_be`/`to_le` (a byte swap or the identity according to the
+    *target's* endianness, read from `cfg!(target_endian)`; `core` has no `to_ne`
+    *value* method, only `to_ne_bytes`, so only two variants exist); the ASCII case
+    conversions `to_ascii_uppercase`/`to_ascii_lowercase` (`u8`-only, a range test,
+    and `&self`, so the executor follows the reference as it does for `is_ascii_*`);
+    and `is_multiple_of` (unsigned-only, `a % b == 0` with `b == 0` defined as `a ==
+    0`, so both the `b != 0` guard and the `|| a == 0` disjunct carry — the engine's
+    `urem(x, 0)` is a *defined* value, not a hole, so the guard is what makes the
+    corner exact). The `_bytes` byte-order forms return an array, not an integer, so
+    they stay unmodelled rather than written as a word. `div_euclid`/`rem_euclid`
+    and `div_ceil` (unsigned) are the division shapes that are not the truncating
+    `/`/`%`; each is a *value-and-panic* pair, because each panics on a zero
+    divisor (`div_euclid`/`rem_euclid` also on `MIN / -1`), and modelling it as
+    total would hide a panic. The Euclidean quotient adjusts the *other* way from
+    the truncating one when the remainder is negative (`-7.div_euclid(3)` is `-3`),
+    which the first cut got backwards and the differential test caught. On an
+    *unsigned* receiver the remainder is never negative, so the Euclidean and
+    truncating forms coincide and the model falls back to the plain unsigned
+    divider — the sign is the whole difference, so the unsigned spelling is now
+    modelled rather than refused. All are
+    checked against Rust's own method over the whole `u8`/`i8` domain, with the
+    panic predicate compared at *every* input. Twenty-six fixtures (fifteen true,
+    eleven tripwires) are in `realistic.rs` (**553 of 1019**), pinned by
+    `the_next_core_value_methods_are_modelled_with_their_tripwires` in
+    `tests/mir.rs` and by `the_new_shapes_are_modelled_only_on_the_types_that_have_them`
+    (the type-membership directions) in `src/mir/intrinsics.rs`.
+  - Progress (cont.): `midpoint`, `next_multiple_of`, `ilog2` and `ilog10` are
+    modelled. `midpoint` is total and computed *without* a sum at the operand
+    width — unsigned `(a & b) + ((a ^ b) >> 1)`, and for the signed case that same
+    form plus a `+1` correction when the result is negative and `(a ^ b)` is odd,
+    which is the truncation toward zero Rust's `iN::midpoint` documents (the floor
+    would give `-4` for `(-5).midpoint(-2)` where Rust gives `-3`). Checked
+    exhaustively against `core` over all of `u8`/`i8`. `next_multiple_of` is
+    unsigned-only (the signed spelling is unstable on this toolchain, so a signed
+    receiver is refused) and is a *value-and-panic* pair: the value is
+    `a + (b - a % b) % b` and the panic fires where `checked_next_multiple_of`
+    returns `None` (a zero divisor, or an overflow), checked together over the
+    whole `u8` domain. `ilog2`/`ilog10` exist on both signednesses and are
+    value-and-panic too: the value is built at the operand width and zero-extended
+    to the `u32` result, and the panic fires on a non-positive argument. The
+    executor labels an `ilog` result *unsigned* — its type is `u32` whatever the
+    operand's — and gives the panic a kind-specific message rather than calling a
+    logarithm an "overflow". Twenty-six fixtures (sixteen true, seven tripwires,
+    three panic) are in `realistic.rs` (**525 of 975**), pinned by
+    `the_new_num_methods_verify_and_their_tripwires_refute` in `tests/mir.rs` and
+    by `the_new_shapes_are_modelled_only_on_the_types_that_have_them` in
+    `src/mir/intrinsics.rs`.
+  - Progress (cont.): `next_power_of_two` and `checked_next_power_of_two` are
+    modelled — the rounding sibling of the already-modelled `is_power_of_two`, and
+    the second half of the `next_multiple_of` family. Both are unsigned-only (the
+    signed types have no such method) and both are built by the classic
+    smear-and-add: `p = x - 1` with the `x <= 1` case forced to `0` (core's own
+    pre-step), `p |= p >> 1; p |= p >> 2; …` to smear the highest set bit down,
+    then `p + 1`. The `- 1` is load-bearing — without it an *already*-power-of-two
+    input would smear to `2^w - 1` and round to `0` instead of staying itself — and
+    the `x <= 1` guard is what keeps `0.next_power_of_two()` at `1` rather than the
+    all-ones wrap of an unguarded `x - 1`. `next_power_of_two` is a
+    `ValueOrPanic` (the result does not fit for `x > 2^(w-1)`, so `129u8` panics in
+    a checked build and wraps to `0` otherwise); `checked_next_power_of_two` is
+    the `Option` counterpart, whose tag is a *term* (`1` where the value fits, `0`
+    where it does not), so the `switchInt` consuming it takes the right arm on each
+    path. The failure predicate is written as `value == 0` on the *computed value*,
+    which is exact at the boundary (`x == 2^(w-1)` fits and yields `2^(w-1)`, not
+    `0`). Checked exhaustively against Rust at 1/4/8/16 bits
+    (`the_next_power_of_two_pair_agrees_with_rust`), with the oracle computed at
+    the *model's* width (a `u8` oracle has a different overflow boundary from a
+    four-bit model — the first cut used the host method and failed at 4 bits).
+    Eleven fixtures (seven true, three tripwires, one panic) are in `realistic.rs`
+    (**532 of 986**), pinned by `the_new_num_methods_verify_and_their_tripwires_refute`
+    in `tests/mir.rs`.
+  - Progress (cont.): `iN::unsigned_abs` is modelled — the same magnitude `abs`
+    computes, read as the *unsigned* type (`i8::unsigned_abs(-128)` is `128u8`),
+    and *total* where `abs` panics: at `MIN` the truncating `0 - x` is exactly the
+    magnitude, the bit pattern the signed `abs` cannot represent. So it is a plain
+    value with no failure predicate, labelled unsigned on the way out so `128` is
+    not read back as `-128`; a model that gave it `abs`'s panic, or read the
+    magnitude signed, fails at the `MIN` fixture. Checked exhaustively against
+    Rust at 1/4/8/16 bits (`the_unsigned_abs_agrees_with_rust`), with five fixtures
+    (three true, one tripwire, one `requires: true` panic-freedom control) in
+    `realistic.rs` (**535 of 990**), pinned by
+    `abs_and_clamp_are_modelled_with_their_panics` in `tests/mir.rs`.
+  - Progress (cont.): `iN::checked_next_multiple_of` is modelled — the `Option`
+    counterpart of the panicking `next_multiple_of`, with `None` exactly where the
+    plain call would panic (a zero divisor, or an overflow), so its tag is the
+    negation of the same failure predicate and no panic obligation is emitted. Four
+    fixtures (three true, one tripwire) in `realistic.rs` (**538 of 994**), pinned
+    by `the_new_num_methods_verify_and_their_tripwires_refute`; checked
+    exhaustively against `core`'s own `checked_next_multiple_of` over the whole
+    `u8` domain (`checked_next_multiple_of_agrees_with_rust`).
+  - Progress (cont.): `iN::checked_ilog2`/`checked_ilog10` are modelled — the
+    `Option` counterpart of the panicking logarithms, with `None` exactly where the
+    plain call would panic (a non-positive argument), and the same `u32` payload as
+    the plain form (so the payload is zero-extended to the destination's width, the
+    one `checked_*` shape whose result width differs from the operand's). Seven
+    fixtures (five true, two tripwires) in `realistic.rs` (**543 of 1001**), pinned
+    by `the_new_num_methods_verify_and_their_tripwires_refute`; checked
+    exhaustively against `core`'s own `checked_ilog2`/`checked_ilog10` over the
+    whole `u8`/`i8` domain, tag and payload together
+    (`the_checked_logs_agree_with_rust`).
+  - Progress (cont.): `iN::cast_unsigned`/`uN::cast_signed` are modelled. The
+    value is the operand unchanged — a same-width signedness cast is a
+    re-interpretation, not a conversion — so the model carries only the *type*:
+    it is the one shape whose result sign is the *opposite* of the operand's, and
+    the executor reads it from the call's destination type rather than deriving it
+    from the operand. Five fixtures (three true, two tripwires) in `realistic.rs`
+    (**546 of 1006**), pinned by
+    `the_next_core_value_methods_are_modelled_with_their_tripwires`; the value is
+    checked exhaustively against Rust's own methods over the whole `u8`/`i8`
+    domain (`the_signedness_casts_agree_with_rust`).
+  - Progress (cont.): the inherent `iN::pow` is modelled as `Intrinsic::PowPanic`.
+    The four *families* (`wrapping_pow`/`saturating_pow`/`checked_pow`/
+    `overflowing_pow`) express overflow as a value, but the plain `pow` **panics**
+    (`assert!` on overflow) and has no family-prefixed spelling to fall back on, so
+    it is its own shape yielding a reachable-panic obligation. A model that wrapped
+    or clamped would *hide the panic* — the one thing this frontend must never do —
+    so the fixtures pin the polarity: two verify (in-range and exact boundary), two
+    must fail on the `pow` overflow panic. Checked exhaustively against Rust's own
+    `checked_pow` over the whole `u8`/`i8` base domain (`the_plain_pow_agrees_with_rust`),
+    and pinned end to end by `the_plain_pow_panics_where_it_overflows`.
+  - Progress (cont.): `iN::from_be`/`iN::from_le` are modelled — the associated
+    functions that invert `to_be`/`to_le` on the same target, so they classify to
+    the same byte-order shapes (`from_be` on a little-endian target is the same
+    swap as `to_be`, and the `to_be`/`from_be` round trip is the identity). Six
+    fixtures (three true, three tripwires) in `realistic.rs` (**551 of 1015**),
+    pinned by `the_next_core_value_methods_are_modelled_with_their_tripwires`.
+  - Progress (cont.): `PartialEq::eq`/`ne` and `PartialOrd::lt`/`le`/`gt`/`ge` are
+    modelled — the six comparison operators in their *trait-method* spelling, the
+    same shape of exception as `Ord::min`/`max`. The dump spells a call `<u8 as
+    PartialOrd>::lt` (no `core::num::<impl …>` path), so the model is a *fallback*
+    behind the same-dump lookup, admitted only when the trait path is the standard
+    library's and the self type is a primitive; a local trait in a module
+    (`cmp_shim::PartialOrd`) is refused by the path, and a crate-root trait that
+    prints bare is answered by its own body first. Both operands are taken by
+    reference (`&self`/`&other`), so the executor follows the references to their
+    referents, the same step the `is_ascii_*` receivers already take. The value is
+    exactly the comparison the operator builds, so a method call and its operator
+    form cannot disagree; the ordering picks `slt`/`sle`/`sgt`/`sge` on a signed
+    type and `ult`/`ule` on an unsigned one, with `i8::MIN` as the separating
+    point. Checked exhaustively against the operators over all of `u8`/`i8`
+    (`the_partial_cmp_methods_agree_with_the_operators`), with eight fixtures
+    (five true, one local-trait pair, two tripwires) in `realistic.rs` (**559 of
+    1027**), pinned by
+    `partial_cmp_methods_are_modelled_and_a_local_trait_still_wins`.
+  - Progress (cont.): `Ord::cmp` is modelled — the third method on the same
+    `Ord` trait, admitted by the same narrow rule (`is_ord_callee`: the standard
+    library's `Ord` path and a primitive self type), and the *first* modelled
+    shape whose result is a three-variant enum rather than a value, an `Option` or
+    a `(value, flag)` tuple. Its result is `core::cmp::Ordering`, whose
+    discriminants are the *signed* `i8` values `Less` = -1, `Equal` = 0, `Greater`
+    = 1, so the executor writes the destination's *discriminant* (the variants are
+    unit, so there is no payload) and the `switchInt` on `discriminant(_)` decides.
+    A three-way comparison is the sign of `x - y`, so the tag is
+    `ite(slt(x, y), Less, ite(sgt(x, y), Greater, Equal))` — the two comparisons the
+    `PartialOrd` operators already build, at the operands' common width and sign —
+    and the tag is built from the *eight-bit two's-complement pattern* of the
+    constants, because `smt::word` refuses the out-of-range `-1`. Both operands are
+    `&Self`, so the executor follows both references to their referents, the same
+    step the `PartialEq`/`PartialOrd` receivers take; an operand whose sign cannot
+    be read is *refused*, because ordering `i8::MIN` unsigned places it above every
+    other value (a wrong ordering, not a weaker proof). The tag width is
+    `Ordering`'s own `i8` discriminant, not the destination local's declared width,
+    so a locally built `Ordering` and a `switchInt` against rustc's `-1`/`0`/`1`
+    arm constants agree. Six fixtures (five true, one tripwire) in `realistic.rs`
+    (**564 of 1035**), pinned by `ord_cmp_returns_the_ordering_enum` in
+    `tests/mir.rs`; the classify guard (the standard paths admitted, a foreign
+    `m::Ord`/`MyOrd`/`ord_shim::Ord` refused, and `cmp` not mistaken for `min`) is
+    pinned by `the_ord_names_classify_and_their_neighbours_do_not` in
+    `src/mir/intrinsics.rs`.
+  - Progress (cont.): a `PartialEq`/`PartialOrd` comparison against a *constant*
+    operand is decided. The gap was not in the model but in the frontend: an
+    unoptimised dump promotes a literal operand to its own item
+    (`x.eq(&5)` lowers to `_3 = const F::promoted[0]; … Eq(copy _1, copy _3)`,
+    where `const F::promoted[0]: &u8 = { _1 = const 5_u8; _0 = &_1; }`), and the
+    parser recorded only the *string-array* promoted constants (`panic!` messages),
+    never a scalar one. So the operand place named a constant the table did not
+    hold, the reference's referent was unknown, and every comparison against a
+    literal bound -- `x.ge(&0)`, `x.lt(&100)`, `x.eq(&i8::MIN)`, an everyday idiom
+    -- came back `unmodelled argument to <u8 as PartialEq>::eq`. The parser now
+    records a promoted body whose sole value statement is a scalar literal as a
+    `const` (an array or struct-literal body still has no single word and is left
+    to `promoted_strs`). The `&self`/`&other` reference-following was already
+    there; only the value it reached was missing. Three fixtures (two true, one
+    tripwire) in `realistic.rs` (**566 of 1036**, from 564 of 1033), pinned by
+    `partial_cmp_methods_are_modelled_and_a_local_trait_still_wins` and by the
+    parser unit test `a_scalar_promoted_constant_is_collected_as_a_const`. The
+    exec arm that reads a *bare* `Const` operand is kept as a defensive path (no
+    current dump prints it) with a comment saying so.
+  - Remaining: the *element* half of a *generic* `<[T]>::first/get` needs a
+    monomorphised element type, which is C10: `first_or<T>`'s element has no width,
+    so `v[0]` stays refused. The *length* half does not need it, and now decides:
+    `v.len()`/`v.is_empty()` read only the length, which is a `usize` input whatever
+    `T` is, so a generic slice's length is bound even when the element width is
+    unknown (`bind_indexed_len` accepts the `0` sentinel). `first_or` in `everyday.rs`
+    verifies because its guard is `is_empty` — the bounds check on `v[0]` is
+    discharged from the length — even though the `v[0]` arm itself is an unmodelled
+    element read. A *locally constructed* `Ordering` (a `cmp` body that returns
+    `Ordering::Greater`) is also still unmodelled — the executor resolves an
+    enum-variant path constant through `variant_index`, which knows
+    `Option`/`Result`/`ControlFlow` but not `Ordering` — so a local trait's `cmp`
+    body is `incomplete` even though a `core` `Ord::cmp` call decides. That is a
+    `variant_index` gap, not a `cmp` one, and is scheduled with the
+    enum-construction work rather than here.
+  - Progress (cont.): **the generic slice's length is modelled.** `first_or` in
+    `everyday.rs` moved from `incomplete` to `verified`, taking the file to
+    **17/21 (81%)** — Phase 1's 80% exit criterion is met. The change is the `0`
+    sentinel in `exec::Indexed::elem_w` (the element width is *not modelled* for a
+    `&[T]`), with `bind_indexed_len` accepting it and every element path
+    (`index_elem`, `index_chain`, the slice intrinsic read) refusing it. The length
+    functions (`len`, `is_empty`) and a length-guarded element read decide; a
+    contract that *names* a generic element is a refusal, never a proof. Pinned by
+    `a_generic_slices_length_is_modelled_but_its_element_is_not` and six corpus
+    fixtures (three verify, one refutes, one skips on purpose, one refutes the
+    element claim is not proved).
+  - Progress (cont.): `iN::wrapping_shl`/`wrapping_shr` are modelled. `core`
+    reduces the amount modulo the width (`1u8.wrapping_shl(8)` is `1`), which is
+    exactly the reduction a rotation does — the low `log2(w)` bits, one `and` and
+    no divider — so the two share the amount computation and the power-of-two
+    width requirement. `wrapping_shl` fills with zeros; `wrapping_shr` is
+    *arithmetic* on a signed receiver (`-8i8.wrapping_shr(1)` is `-4`) and
+    *logical* on an unsigned one, so the sign decides the engine's shift kind.
+    These are the *only* shift spellings the model takes: the plain families
+    genuinely disagree (`checked_shl` returns `None` past the width,
+    `overflowing_shl` reports a flag, and the engine's own variable shift
+    saturates to zero), so `checked_shl`/`overflowing_shl`/`saturating_shl` stay
+    refused rather than guessed at. Checked exhaustively against Rust's own
+    methods over the whole `u8`/`i8` operand domain
+    (`wrapping_shifts_agree_with_rust`). The corpus pairs are *discriminating*: the
+    left-shift pair pins the amount reduction (the true entry claims `1`, its twin
+    the saturated `0`, so only a reducing model proves one and refutes the other --
+    a `ret <= 255` bound would satisfy both), the signed right-shift pair pins the
+    shift kind (`-4` vs the logical `124`), and the unsigned right-shift entry pins
+    both at once (`64`). Five fixtures (three true, two tripwires) in
+    `realistic.rs` (**583 of 1065**), pinned by
+    `wrapping_shifts_are_modelled_with_the_amount_reduced_modulo_the_width`; the
+    no-reduction mutation flips both left-shift verdicts and fails that test.
+  - Progress (cont.): `str::len`/`str::is_empty` are modelled. A `str` is unsized
+    exactly as `[T]` is, so its length is the same kind of symbolic input and the
+    *same two intrinsics* answer it — only the path differs
+    (`core::str::<impl str>::len`). The `&str` argument's length is bound by the
+    contract binder with the unmodelled-width sentinel (the same `bind_indexed_len`
+    a generic `&[T]` uses), so `s.len()` in a contract and `PtrMetadata` in the
+    body name one variable and a `requires: s.len() == 3` pins the body's read.
+    `String` is deliberately not covered: it is a different type
+    (`alloc::string::String`), so `String::len` stays an honest refusal rather than
+    being answered with a length the model does not hold — a `String::len` call has
+    no `str::<impl str>` in its path. Five fixtures in `realistic.rs` (three true,
+    two tripwires), pinned by `a_str_length_is_a_symbolic_input`; reverting either
+    the binding or the classifier fails that test. `realistic.rs`
+    **583 of 1065 -> 586 of 1070**.
+  - Progress (cont.): `Option<&T>::copied`/`cloned` are modelled — the everyday
+    `v.first().copied().unwrap_or(0)` idiom, and the two closure-free methods that
+    turn a `slice::first`/`get` result into the element's own value. The model
+    stores a `&T` payload as the value it addresses (the single-owner reading every
+    reference here takes), so the result's payload *is* the receiver's and only the
+    tag passes through unchanged; the element identity is dropped, because the
+    result is a value rather than a reference, so a later `*` on it is not a
+    modelled read. A receiver with no payload on some path is refused (the rule
+    `or`/`and` already apply), and `copied`/`cloned` share one arm because `Copy`
+    and `Clone` both copy the referent. Six fixtures in `realistic.rs` (four true,
+    two tripwires), pinned by
+    `option_copied_and_cloned_copy_the_payload_with_the_tag`; the tag half is what
+    the `copied_empty_is_none` fixture pins (a model that fixed the tag to `Some`
+    would panic on `unwrap_or`), and the payload half is what the two tripwires
+    pin (a claim about a different element refutes). `realistic.rs`
+    **615 of 1125** (from **611 of 1119**; six new fixtures, four verified and two
+    refuted).
+  - Progress (cont.): `char` is modelled. A `char` is a 32-bit unsigned value, so
+    `Ty::Char` parses to width 32 and `c as u8` truncates to the low byte. The
+    `is_ascii_*` predicates (`is_ascii_digit`, `is_ascii_alphabetic`,
+    `is_ascii_alphanumeric`, `is_ascii_whitespace`, `is_ascii_uppercase`,
+    `is_ascii_lowercase`, `is_ascii_punctuation`, `is_ascii_hexdigit`, `is_ascii`)
+    are exact at width 32, because every range they test lies inside `0..=0x7f`
+    and a value at or above `0x100` is outside all of them — which is what
+    `char::is_ascii_digit` means too (`'\u{130}'.is_ascii_digit()` is `false`,
+    though its low byte is `'0'`). The `is_modelled` guard for the ASCII classes
+    therefore drops its `w == 8` clause: a `char` receiver is the same byte test
+    applied to the whole value, verified against `core` over the whole 32-bit
+    domain. A `char` *literal* is read in a contract as its Unicode scalar value
+    (`'0'` is `0x30`, `'\n'` is `0x0a`, `'\u{1F600}'` is `0x1F600`), and it is
+    *typed*: `'0' == 0u8` is `E0308` in Rust, so `Sign::Unsigned` (which does not
+    adapt) makes `align_widths` refuse the mismatch rather than resize the literal.
+    Unicode methods (`is_alphanumeric`, `to_ascii_uppercase`, `to_lowercase`) are
+    still refused — they are not ASCII byte tests. Eight fixtures in
+    `realistic.rs` (six true, two tripwires), pinned by
+    `char_literals_and_ascii_predicates_are_modelled` and the spec unit tests
+    `a_char_literal_is_read_as_its_scalar_value_or_refused` /
+    `a_char_literal_does_not_resize_to_a_narrower_operand` /
+    `the_ascii_classes_agree_with_char_over_the_whole_domain`. `realistic.rs`
+    **621 of 1133** (from **615 of 1125**; eight new fixtures, six verified and two
+    refuted).
+  - Progress (cont.): `slice::last` is modelled. A slice's length is symbolic, so
+    `xs.last()` names no index the store can pin; the element is a *fresh* variable
+    per slice (keyed by a sentinel index), which is the sound over-approximation —
+    a contract true of every element holds of the last one, and a claim that the
+    last element is a particular value is refuted, because a slice holding it can
+    exist. An *array*'s length is its type's constant, so `a.last()` is the exact
+    element `a[N-1]` and is modelled as that element, so a contract about `a[N-1]`
+    decides. Four fixtures in `realistic.rs` (two true, two tripwires), pinned by
+    `slice_last_is_an_element_and_array_last_is_exact`. `realistic.rs`
+    **623 of 1137** (from **621 of 1133**; four new fixtures, two verified and two
+    refuted).
+  - Progress (cont.): `u8::from(bool)` (and the wider integer destinations) is
+    modelled. A `bool` source has no integer width, so the integer-conversion model
+    would refuse it; the conversion is the *zero-extension of the one-bit value*
+    (`false` -> 0, `true` -> 1), the same step a `bool` `ret` takes, so the executor
+    answers it directly. `u32::from(char)` stays a refusal -- a `char` conversion is
+    not one of the integer widenings. Four fixtures in `realistic.rs` (three true,
+    one tripwire), pinned by `a_bool_conversion_is_the_zero_extended_bit`.
+    `realistic.rs` **626 of 1141** (from **623 of 1137**; four new fixtures, three
+    verified and one refuted).
+- **C7. Arithmetic scale and speed.** · P0 · in progress · Kani, Boolector,
+  Bitwuzla
+  - Gap: `u32::wrapping_mul` is past the 32-bit model; `clamp_std` takes 9.9 s.
+    Evidence: `hash_step` incomplete; `clamp_std` verified in 9.89 s.
+  - Approach: word-level preprocessing before bit-blasting (rewriting, constant
+    propagation, lazy multiplication abstraction), a better SAT encoding for
+    multipliers, and a per-function **time** budget beside the size budget so a
+    slow shape is reported rather than waited out.
+  - Exit: `hash_step` decided; `clamp_std` under 0.5 s.
+  - Move: **build**.
+  - Progress: the exit criterion is **half met**, and the two halves are now
+    clearly separable.
+
+    *The coverage half is done.* `u32::wrapping_mul` was past the model because
+    `MUL_MAX_WIDTH` was 16, so `hash_step` — the flagship `u32` example — was
+    `incomplete`. Raised to 32, and the two costs were measured apart: the
+    *value* (`wrapping_*`, which builds no predicate) is a plain `w`-bit multiply
+    and settles in milliseconds, so `hash_step` now **verifies in 0.00 s** and
+    every `u32` value product (`x * y`, `(x*y)*z`, `x * x`) verifies in under
+    50 ms; the *widened* `2w == 64` failure predicate is built only where a family
+    needs it, where a constant multiplier folds it (`x.saturating_mul(3)` verifies
+    in 0.01 s) and a fully symbolic one answers `Unknown` after ~5 s rather than
+    hanging. The bound is 32 and not 64 because `2w == 128` cannot be held — a
+    `u64` product's predicate is refused, and a `u64` `wrapping_mul` is past the
+    BDD wall anyway. See [`MUL_MAX_WIDTH`] and the `u32` product fixtures in
+    `examples/mir_targets/realistic.rs`.
+
+    *The latency half is not.* Measured on the release build, `clamp_std`
+    (`x.max(lo).min(hi)`) still verifies in **9.8 s** (the criterion is "under
+    0.5 s") while `clamp_builtin_reads` — the same 32-bit three-operand `clamp`
+    query — verifies in **0.74 s**. So the `u32` three-operand shape remains the
+    workload to profile, and the item stays open on that half: the approach is the
+    word-level preprocessing and a per-function *time* budget named above.
+
+    The third exit criterion, **"`u32` multiply-overflow guards decided at full
+    width"**, is likewise open but *bounded*: the saturation idiom
+    (`if b != 0 && a > u32::MAX / b { u32::MAX } else { a * b }`) and a plain
+    `a * b` under a guard both report `incomplete` after ~4 s — the plain-`*`
+    path's exact-division form at `u32` is past the diagram budget — rather than
+    hanging. A per-function time budget is what would turn that ~4 s into a
+    reported `incomplete` the caller can act on.
+
+    *The `u32` **divider** is a wall, not a budget knob* — the concrete blocker on
+    `everyday.rs`'s `div_unwrap` (`n.checked_div(d).unwrap()`). Measured on the
+    release build: `n / d` at `u32` is undecided after **~186 s** with
+    `MAX_APPLY_STEPS` raised 32× (to `1 << 24`), and still undecided after 5.7 s
+    with `MAX_CONFLICTS` raised to 20 000 000 (the SAT fallback cannot decide it
+    either). So the restoring divider's BDD at 32 bits is exponential and no
+    budget reaches it; `div_unwrap`, `plain_div` and a guarded `u32` `/` all fail
+    identically. The `u8`/`u16` cases decide (`div_u8` verifies in 0.57 s,
+    `div_u16` is undecided at 0.32 s and is the next width the diagram cannot
+    hold). The fix is word-level preprocessing (the approach above), not a raised
+    cap.
+
+
+### Trust tracking (A1, tracked from Phase 1)
+
+- **A1. Track the false-proof rate.** · P0 · **done** · —
+  - Data: at least 11 false proofs were fixed between 2025-11-04 and 2025-11-12.
+    All were caught, but at that rate a `verified` is not yet evidence to rely on.
+  - Approach: a `SOUNDNESS.md` listing every false proof with date, commit,
+    root-cause class and fixture. Pause feature work on any layer that produced a
+    false proof in the last two weeks.
+  - Exit for "beta": four weeks in a row with no new false proof, while the
+    independent corpus keeps growing.
+  - Move: **build**. `SOUNDNESS.md` carries the ledger: 41 MIR-frontend rows and
+    16 engine/imperative rows — 57 in all, so the review's "at least eleven
+    earlier false proofs" is now that many *dated rows* rather than a count (the
+    seven commits the review named each contribute their own row). Every row has a
+    **commit**, a **date** and a fixture. `tests/soundness.rs` checks it
+    mechanically — every fixture must be a `#[test]` (not a same-named helper), in
+    the file the cell names, every row must carry a commit and a `YYYY-MM-DD`
+    date, and no date may be in the future. The clock restarts on each row; the
+    most recent is 2026-11-18.
+
+---
+
+## Phase 2 — real crates (P1)
+
+Exit: one real `no_std` crate with a dependency verified end to end with
+`cargo verif`; Kani agrees on every function both tools decide.
+
+- **C8. Cargo, multi-module crates and dependencies.** · P1 · todo · Kani
+  (`cargo kani`)
+  - Gap: the frontend runs `rustc --crate-type=lib` on one file, without
+    `--extern`, so a crate that `use`s another crate, or a file whose
+    crate-relative paths only resolve inside the crate, cannot be verified.
+  - Approach: a `cargo verif` subcommand through `cargo rustc`/`RUSTC_WRAPPER`,
+    emitting MIR for the target crate with its real flags. Dependency calls are
+    answered through contracts (C2), not bodies.
+  - Exit: one function in a real `no_std` crate with at least one dependency
+    (an `embedded-hal` driver, say) verified end to end with `cargo verif`.
+  - Move: **build**.
+- **C9. References and aliasing.** · P1 · **done** (scalar referents) · Prusti
+    (ownership), Creusot (prophecies)
+  - Gap: reference arguments are refused ("no aliasing model"), yet `&`/`&mut`
+    are the norm. **Built:** `&T`/`&mut T` arguments, writes through them,
+    returned references and two-reference targets are modelled (see the `AGENTS.md`
+    sections on the call boundary). A **scalar referent named in a contract** is
+    now modelled too: a `&mut u16` argument's name denotes the value it addresses,
+    the postcondition's name is the *final* value, and `old(name)` / `old(*name)`
+    reaches the entry value (`*c` and `c` are one binding). What remains is the
+    *general* case the ownership model buys (a reference to an aggregate named as a
+    whole, aliasing between two arguments that may point at one place).
+  - Exit: `fn bump(c: &mut u16)` with `ensures: *c == old(*c) + 1` verified and
+    its caller verified modularly. **Met** -- `bump_scalar_ref_star` and
+    `a_scalar_ref_caller` in `examples/mir_targets/realistic.rs`, pinned by
+    `a_scalar_reference_argument_is_named_in_a_contract`.
+  - Move: **done**.
+- **C10. Generics, traits, closures and `dyn`.** · P1 · in progress · Kani
+  (monomorphised instances)
+  - Gap: generics are partly supported; "indirect call not modelled" ends the
+    path; closures are out of reach. Trait-method identity and contract
+    inheritance have started.
+  - Exit: a closure-taking function (`v.iter().map(|x| …).sum()`) decided for a
+    monomorphised instance.
+  - Move: **build**.
+  - Note on `everyday.rs`'s `sum_iter` (`v.iter().sum()`): modelling `iter`/`sum`
+    would decide the *path*, but the entry would become `FAILED`, not `verified` —
+    an unbounded slice sum can overflow, so the honest verdict for its total
+    postcondition is a panic (a bare `a + b` under `requires: true` fails the same
+    way). So `sum_iter` is not a target that moves the `everyday.rs` *score*; it is
+    a shape whose modelling would show a real panic. Worth doing, but it is not a
+    route to 21/21.
+- **C11. Heap containers.** · P1 · in progress · Kani, Verus (`Seq`), Creusot
+  - Gap: `Vec`, `String`, `Box`, symbolic-length slices. Evidence: `make`
+    incomplete.
+  - Approach: a bounded *sequence* model (length plus element array, from `mem`),
+    exposed through contracts for `Vec::{new, push, pop, len, get, index}`.
+  - Exit: `make` verified. **Met** — `make` verifies (18 of 21 in `everyday.rs`).
+  - Done: the **length** half. `Vec::{new, push, len}` are modelled from a
+    per-local length the executor tracks (`Env::vec_len`), since a `Vec`'s fields
+    (a heap pointer, a length, a capacity) are not printed by the dump. The
+    length is `usize` and `push` is `+ 1`, which cannot overflow at 64 bits, so it
+    is exact rather than saturating. `drop` of a `Vec<T>` is a no-op exactly when
+    `T` is glue-free (`Vec<u8>` yes, `Vec<String>` no). The length crosses a call
+    boundary in both directions (`&mut Vec<u8>` carry-in and write-back), so
+    `push_helper` verifies and its false twin is refuted; a `Vec` *argument*'s
+    length is never invented — `v.len()` on an unmodelled receiver is a refusal.
+    A user type spelled `Vec` in a local module is not the standard one (the
+    same-dump lookup answers its own body first, `classify` refuses `m::Vec`).
+  - Three soundness holes in this model were found by review and fixed in
+    `8dd4d21` (ledger rows 34–36): the container identity is the *full* path
+    (`std::vec::Vec` / `alloc::vec::Vec`), so a user `struct Vec<T>` with a
+    panicking `Drop` is no longer treated as glue-free; the loop-header havoc
+    refreshes the tracked length to a fresh `usize`, so an inductive pushing loop
+    no longer reads the entry length at the exit (`ret == 0` for `ret == 3`); and
+    a `Vec` move (`let w = v`) and a returned vector transfer the length to the
+    destination rather than dropping it.
+  - Remaining: the **element** model (`get`/`index`, so a `push`ed value can be
+    read back), `String`, `Box`, and symbolic-length slices. (`pop` and `is_empty`
+    are done — see the progress note below.)
+  - Progress (`pop`, `is_empty`): `Vec::is_empty` reads the tracked length;
+    `Vec::pop` returns `None` iff the length is zero and decrements it on the
+    non-empty path (the popped element is not modelled, so no payload is
+    fabricated). Fixtures `vec_is_empty_new`, `vec_not_empty_after_push`,
+    `vec_pop_empty_then_len`, `vec_pop_one_is_some` and their twins.
+  - Move: **build**.
+- **C12. A specification language that can say more.** · P1 · in progress · Verus,
+  Creusot, Prusti, SPARK
+  - `old(x)` in contracts; quantifiers; mathematical integers (a spec must not
+    overflow itself); pure spec functions; ghost code and lemmas; `modifies`/frame
+    clauses; type invariants. **Partly built:** `old` via a caller snapshot and a
+    `wp::unchanged` query (the wp layer), and now in the **MIR frontend** too:
+    `old(name)` / `old(*name)` reads a reference argument's *entry* value while a
+    bare name reads its *final* value, so a two-state spec over a `&mut` argument
+    is expressible (see C9). Bounded quantifiers in `quant`, frames derived by
+    `wp::writes`.
+  - Exit: a contract with a `forall i < n: a[i] <= m` verified.
+  - Move: **build** (the `old` sub-item is done).
+  - The concrete blocker on `everyday.rs`'s `tri` (`s += i` over `0..=n`): the
+    loop needs an **inductive** invariant, and the invariant that is inductive for
+    a running sum is *nonlinear* (`s <= i(i+1)/2`), which the expression language
+    has no multiplication in a loop-invariant position to express. The *linear*
+    candidate that does exist — `s <= i` — is rejected (`unknown name i`: the
+    `for`-loop element is a `debug` binding not live at the header, see C3), and
+    the constant bound `s <= 5050` is not inductive, so the loop reports a spurious
+    panic. Inferring the invariant is a separate, larger item than the language
+    extension; both are recorded here rather than under C3.
+- **C13. Rust's own contract attributes as input.** · P1 · todo · the `contracts`
+    crate
+  - Approach: read `#[core::contracts::requires/ensures]`
+    (rust-lang/rust#128044) as well as doc comments, keeping doc comments as the
+    stable fallback.
+  - Exit: a function carrying the attribute instead of a doc comment is verified.
+  - Move: **build**. Without it, a home-grown syntax risks being absorbed by the
+    language's own — the risk the README already names.
+
+### Usability (U items, Phase 2 subset)
+
+- **U1. Publish to crates.io, or stop saying `cargo add verif`.** · P1 · done
+  (the honest half) · —
+  - Gap: the README's Installation section said `cargo add verif`, but the crates
+    are not on crates.io (the API answers "does not exist"). The packaging work is
+    done (`scripts/publish.py`, `scripts/check_package.sh`, a tag-driven
+    `.github/workflows/release.yml`), so what remains is the human step: create the
+    `CARGO_REGISTRY_TOKEN` secret and push a `verif-arithmetic-v0.1.0` tag, then
+    `verif-v0.1.0`.
+  - Fix: the README's Installation section now depends on the git repository by tag
+    (`verif = { git = "https://github.com/cipansor/verif", tag = "verif-v0.1.0" }`),
+    with a note that the crates are not on the registry yet. That is the "or"
+    branch of the exit criterion, so it is met without the human upload step, and
+    it stops the README claiming a command that fails. The dependency snippets are
+    pinned by `readme_install_is_a_git_dependency_until_published` in
+    `tests/readme.rs`, so publishing later is a deliberate edit to that test rather
+    than silent drift.
+  - Exit: `cargo add verif` works, or the README points at a git dependency. ✅
+    (the second).
+  - Move: **build**.
+- **U2. `cargo verif`.** · P1 · todo · Kani (`cargo kani`)
+  - Exit: `cargo verif --format json|sarif` plus a GitHub Action that annotates a
+    PR.
+  - Move: **build**.
+- **U3. A counterexample becomes a test.** · P1 · in progress · Kani (concrete
+    playback)
+  - Gap: the replay machinery exists in `tests/mir.rs`; make it a user feature
+    that emits a `#[test]`.
+  - Exit: a reported counterexample is emitted as a compiling, failing-then-fixed
+    `#[test]`.
+  - Move: **build**.
+- **U4. Readable counterexamples.** · P1 · in progress · —
+  - Gap: a report says `v1:u8 = 224`, not `x = 224`. The `debug x => _1` names
+    exist; the stable text dump has no per-statement spans, so line numbers come
+    from the source scanner or the `rustc_public` path.
+  - Exit: `x = 224` in a report. **Met** — the witness is rendered with the
+    `debug` names (`a = 32768`, `n = 16`, `d = 0`), and a variable with no source
+    name keeps its `v{index}:u{width}` spelling, so naming is a readability
+    improvement and never a loss. See [`Cex::render_named`] and
+    [`Obligation::failure_detail_named`]; pinned by
+    `a_counterexample_is_rendered_with_source_names`. The README's `mir_demo`
+    transcript is regenerated from the run.
+  - What remains: source *line* numbers in the report (the second half of the
+    exit). The stable text dump has none, so this needs the source scanner or the
+    `rustc_public` path; the name half is done.
+  - Move: **build**.
+- **U5. A test harness that never passes vacuously.** · P0 · done · —
+  - Gap: about 21 tests in `tests/mir.rs` use
+    `let Some(report) = verify_all() else { return }`, so without `VERIF_RUSTC`
+    they *passed while checking nothing* (a skipped test reports `ok`).
+  - Fix: the `rustc()` helper falls back to the `rustc` on `PATH`, because
+    `--emit=mir` is a *stable* flag; `VERIF_RUSTC` still wins when set, so CI
+    keeps exercising a nightly's dump format. The skip is reserved for a machine
+    with no compiler at all. Measured: `env -u VERIF_RUSTC cargo test --features
+    std --test mir` is the same 289 passed as with the variable set, so the 21
+    tests run either way. ✅
+  - Exit: `cargo test --features std` never passes vacuously.
+  - Move: **build**.
+- **U6. Documentation size.** · P1 · todo · —
+  - Gap: the README is ~166 KB and `AGENTS.md` ~586 KB. Split into a short README,
+    a user guide, `ROADMAP.md` (this file), `SOUNDNESS.md`, and design notes.
+  - Exit: a README under ~30 KB with links to the rest.
+  - Move: **build**.
+- **U7. Proof caching.** · P1 · todo · —
+  - Exit: unchanged MIR plus unchanged contracts reuses the verdict across runs.
+  - Move: **build**.
+- **U8. A public scoreboard.** · P1 · todo · Kani
+  - Exit: `everyday.rs`, an SV-COMP-style set, and `verify-rust-std` functions
+    scored for verif **and** Kani on the same inputs, updated by CI.
+  - Move: **build**.
+
+---
+
+## Phase 3 — trust (P0 for adoption)
+
+Exit: every `Unsat` behind a `verified` carries a checked certificate; the public
+scoreboard against Kani is live.
+
+- **A2. A certificate for every `Unsat`.** · P0 · todo · Kani, Verus, Prusti,
+    Creusot (all trust their solver)
+  - Approach: emit LRAT/DRAT from the CDCL solver and check it with an independent
+    checker (`drat-trim`, ideally the verified `cake_lpr`); in CI re-derive BDD
+    verdicts through the certifying SAT path.
+  - Exit: a `verified` verdict whose SAT certificate is re-checked by an external
+    tool.
+  - Move: **build**. This is a way to be *ahead* of the competition on trust, not
+    just catch up.
+- **A3. Re-check selected obligations in Coq or Lean.** · P1 · todo · Coq/Rocq,
+    Lean
+  - Approach: `examples/comparison` already has Coq and Lean files; make "export
+    this obligation as a Lean/Coq goal" a user-facing option.
+  - Exit: one obligation from `everyday.rs` re-checked by a kernel.
+  - Move: **bridge**.
+- **A4. A trusted computing base and a semantics.** · P1 · todo · —
+  - Write down what is trusted (parser, MIR-printer stability, executor, blasters,
+    solvers), a short formal semantics of the supported MIR subset, and back both
+    with mutation testing (exists) and external review before any 1.0 claim.
+  - Exit: a `SECURITY.md`-style TCB document and an external review.
+  - Move: **build**.
+- **A5. A qualification path.** · P2 · todo · SPARK (the only one with
+    qualification kits)
+  - Approach: draft Tool Operational Requirements and a DO-330 TQL-5 / ISO 26262
+    TCL plan. Together with Ferrocene, this is the most credible embedded-safety
+    differentiator.
+  - Exit: a drafted TOR and qualification plan.
+  - Move: **build** (long term).
+- **A6. Kani as a standing oracle for the frontend.** · P1 · todo · Kani
+  - Approach: run Kani on every function in `everyday.rs` and `realistic.rs` in
+    CI and require agreement whenever both decide. The engine already has Kani and
+    Verus oracles; extend to whole-function verdicts.
+  - Exit: a CI job that fails on any disagreement.
+  - Move: **build**.
+
+---
+
+## Phase 4 — the high end (P2)
+
+Exit: float and ISR fixtures verified; TOR and a qualification plan drafted.
+
+- **C14. Floating point.** · P2 · todo · Kani, SPARK
+  - Approach: bit-blast IEEE-754 `+ - * / < ==` with round-to-nearest-even; check
+    exhaustively on a small format first. Freedom from NaN/Inf becomes an
+    obligation. Matters because the flagship example is *flight control*.
+  - Exit: an `f32` fixture verified.
+  - Move: **build**.
+- **C15. Unbounded proofs.** · P2 · todo · Verus, Creusot, Coq
+  - Approach: **pick one and write it here.** (a) a small embedded SMT core with
+    linear integer arithmetic, arrays and uninterpreted functions, or (b) a
+    **bridge** that sends the obligation to Z3/CVC5 (the SMT-LIB export exists) or
+    to Lean/Coq as an optional host-side path.
+  - Exit: a "for all n" obligation decided.
+  - Move: **bridge** (b) is the honest choice for a bit-blasting engine; (a) is a
+    research project.
+- **C16. `unsafe` and raw pointers.** · P2 · todo · Kani, VeriFast, RefinedRust,
+    Verus
+  - Target: *bounded* reads and writes through raw pointers within one allocation,
+    plus obligations that a contracted `unsafe fn`'s preconditions hold at each
+    call site.
+  - Exit: a bounded raw-pointer fixture verified.
+  - Move: **build** (the bounded subset only; **won't do** the separation-logic
+    general case).
+- **C17. Concurrency and interrupts.** · P2 · todo · SPARK (Ravenscar/Jorvik),
+    Verus
+  - Target: for the `no_std`/MCU story, the *interrupt handler* with shared state
+    behind `critical_section` or atomics, not threads. Start with "a
+    read-modify-write on an `Atomic*` preserves invariant I when interleaved at ISR
+    boundaries", for a bounded number of interleavings.
+  - Exit: an ISR fixture verified.
+  - Move: **build**.
+- **C18. Flow analysis (SPARK's other half).** · P2 · todo · SPARK
+  - Gap: `gnatprove` checks data/information flow (`Global`, `Depends`,
+    initialisation) before any proof. `rustc` covers initialisation; `Depends`
+    does not exist in Rust.
+  - Approach: cheap on top of symbolic execution — check that an input the contract
+    declares independent does not appear in the support of the output term.
+  - Exit: a `Depends`-style contract checked.
+  - Move: **build**.
+
+---
+
+## Won't do
+
+Stated plainly so the boundary is a decision rather than an omission. These are
+reproducible inside verif only by becoming a different tool.
+
+- **Arbitrary mathematics and induction (Coq/Lean parity).** Bit-blasting cannot
+  reach it. **Bridge** through A3/C15b instead.
+- **A general separation-logic heap model (`unsafe` at large).** VeriFast and
+  RefinedRust do it; verif's bounded `unsafe` subset (C16) is the target.
+- **Thread concurrency as a general problem.** The embedded shape (C17) is the
+  one that matters for a `no_std` verifier.
+- **Qualification *evidence* without a plan.** A5 drafts the plan; shipping the
+  evidence is a multi-year activity and is not claimed.
+
+---
+
+## Where this comes from
+
+The items and their exit criteria are the review on PR #8
+(`analisaperlengkapan`, 2026-11-13): editions (§2, E items), coverage in priority
+order (§3, C items), trust (§4, A items), usability (§5, U items), the per-competitor
+gap table (§6), and the phased exit criteria (§7). The comparison to Kani, Verus,
+Prusti, Creusot, Coq/Rocq, Lean, SPARK, Flux, VeriFast/RefinedRust/ESBMC and the
+`contracts` crate is in §6 of that review and is summarised in the **Competitor**
+field of each item.

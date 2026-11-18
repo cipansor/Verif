@@ -68,6 +68,39 @@ pub const DEFAULT_INLINE_DEPTH: u32 = 4;
 /// no invariant to prove them with.
 pub const DEFAULT_PATH_BUDGET: usize = 64;
 
+/// The largest path budget a declared `unwind:` may buy.
+///
+/// The budget grows with the declared bound (see [`path_budget`]) because a
+/// caller who asks for more iterations is asking for more paths. The cap keeps
+/// that growth from becoming a hang: measured, a two-branch loop body explores
+/// its paths in under half a second at this budget, so a bound large enough to
+/// reach it is still bounded in time, and a caller who needs more than this is
+/// told the budget was exhausted rather than waited out.
+pub const MAX_PATH_BUDGET: usize = 4096;
+
+/// The path budget for a function whose loops are unwound to `unwind`, or the
+/// default when the source declared no bound.
+///
+/// A declared bound says "unwind each loop up to `n` iterations", and a loop body
+/// with a branch yields a path per branch per iteration, so the number of paths
+/// grows with the bound. The default budget is calibrated for [`DEFAULT_UNWIND`];
+/// a caller who asks for more iterations is asking for more paths, and the budget
+/// has to grow with the request or the clause is unusable. Measured: `max_of` (a
+/// four-iteration loop over a `[u8; 4]` with one `if`) explores 199 paths -- above
+/// the default 64 -- so `unwind: 5`, the very clause that should decide it, would
+/// otherwise still hit the budget. `unwind: 5` buys 320 paths, which covers it.
+///
+/// The growth is linear in the bound and capped at [`MAX_PATH_BUDGET`], so a large
+/// bound cannot turn into a hang.
+pub fn path_budget(unwind: Option<u32>) -> usize {
+    match unwind {
+        Some(n) => DEFAULT_PATH_BUDGET
+            .saturating_mul(n as usize)
+            .clamp(DEFAULT_PATH_BUDGET, MAX_PATH_BUDGET),
+        None => DEFAULT_PATH_BUDGET,
+    }
+}
+
 /// A symbolic value.
 ///
 /// `Unknown` propagates: any operation on it stays unknown, and a path that
@@ -200,6 +233,93 @@ pub enum ObligationKind {
     /// refusing is what keeps "the program cannot get past this call" from being
     /// read as a proof of what follows it.
     CalleeDiverges,
+    /// A call that never returns, reached on this path.
+    ///
+    /// `panic!`, `assert!`, `unwrap`, the bounds checks rustc inserts, and any
+    /// user function returning `!` all lower to a call with no `[return: bbN]`
+    /// arm: the path ends there. It is a *reachable failure*, so the obligation is
+    /// "is this call reachable", discharged by `Unsat`. Treating it as a dropped
+    /// line instead lost the whole path -- an `assert!` was never checked, and a
+    /// function whose safety rested on one came back `Incomplete`.
+    DivergingCall {
+        /// What kind of divergence it is, so the report does not call a clean
+        /// `std::process::exit` a panic. See the `Divergence` enum.
+        kind: Divergence,
+        /// The message, when the dump passed one as a string literal; the
+        /// callee's name otherwise. It is what names the failure in the report.
+        message: String,
+    },
+    /// A loop the caller bounded with `unwind:` was unwound that many times and its
+    /// exit edge was never reached, so the path after the loop cannot be explored.
+    ///
+    /// This is Kani's *unwinding assertion*: when the bound is explicit it is a
+    /// claim ("this loop finishes within N iterations"), and a path that runs off
+    /// the end of the bound *falsifies* it. Making it an obligation rather than a
+    /// silent cutoff is what stops a too-small bound from turning into a weaker
+    /// proof -- a `verified` under `unwind: 3` would be a statement about the first
+    /// three iterations only, which is exactly the soundness hole the clause exists
+    /// to avoid.
+    ///
+    /// It is a failure, not an incompleteness. Its verdict is the reachability of
+    /// the cutoff (the same query shape as a diverging call), so a reachable cutoff
+    /// comes back as a `Counterexample` naming an input that runs off the bound. A
+    /// loop with *no* `unwind:` still cuts off at `DEFAULT_UNWIND` as a plain
+    /// `unknown_paths` entry: the default is not a claim the caller made, so it is
+    /// reported as incompleteness rather than refuted.
+    UnwindBound {
+        /// The bound the caller declared.
+        bound: u32,
+    },
+}
+
+/// What a diverging call does, for the report's label.
+///
+/// A call that never returns is a reachable end of the path whatever it does, so
+/// all three kinds carry the same obligation. They differ in what the label should
+/// *say*: reporting `std::process::exit(0)` as `panic: exit` tells a reader the
+/// program crashed when it exited cleanly. The kind is read from the callee's
+/// name -- the dump prints `exit(…)`, `std::process::abort()` and
+/// `core::panicking::panic(…)` distinctly -- and an unrecognised `!`-returning
+/// function falls to [`Divergence::Never`], which is honest about not knowing
+/// which it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Divergence {
+    /// A panic or an assert: `core::panicking::panic(…)`, `std::rt::panic_fmt`,
+    /// `core::panicking::panic_nounwind`, `assert`, `unwrap`, a bounds check.
+    Panic,
+    /// A clean process exit: `std::process::exit` (printed `exit(…)`).
+    Exit,
+    /// An abnormal termination: `std::process::abort`.
+    Abort,
+    /// A user function that returns `!`, or any divergence the name does not
+    /// classify. It still ends the path; only the label is unspecified.
+    Never,
+}
+
+impl Divergence {
+    /// Classify a diverging call from the callee's printed name.
+    pub fn of(name: &str) -> Divergence {
+        let tail = path_tail(name);
+        if tail == "exit" || name.ends_with("process::exit") {
+            Divergence::Exit
+        } else if tail == "abort" || name.ends_with("process::abort") {
+            Divergence::Abort
+        } else if name.contains("panic") || name.contains("assert") {
+            Divergence::Panic
+        } else {
+            Divergence::Never
+        }
+    }
+
+    /// The word the report uses before the message.
+    pub fn label(self) -> &'static str {
+        match self {
+            Divergence::Panic => "panic",
+            Divergence::Exit => "exit",
+            Divergence::Abort => "abort",
+            Divergence::Never => "diverges",
+        }
+    }
 }
 
 impl std::fmt::Display for ObligationKind {
@@ -223,6 +343,20 @@ impl std::fmt::Display for ObligationKind {
             }
             ObligationKind::CalleeDiverges => {
                 write!(f, "the callee's postcondition is unsatisfiable")
+            }
+            ObligationKind::UnwindBound { bound } => {
+                write!(f, "loop exceeded the declared `unwind: {bound}` bound")
+            }
+            ObligationKind::DivergingCall { kind, message } => {
+                // `exit`/`abort` carry the callee's tail as their message, which
+                // is the label already; printing `exit: exit` reads as a stutter,
+                // so the label stands alone when there is no real message.
+                let label = kind.label();
+                if message == label {
+                    write!(f, "{label}")
+                } else {
+                    write!(f, "{label}: {message}")
+                }
             }
         }
     }
@@ -278,9 +412,15 @@ impl Obligation {
             | ObligationKind::RecursiveDecreases
             | ObligationKind::CalleePrecondition
             | ObligationKind::CalleeDiverges => self.verdict.is_proved(),
-            ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
-                matches!(self.verdict, Verdict::Unsat)
-            }
+            ObligationKind::Panic { .. }
+            | ObligationKind::Unreachable
+            | ObligationKind::DivergingCall { .. } => matches!(self.verdict, Verdict::Unsat),
+            // The unwinding assertion asks "is the cutoff reachable"; like a panic
+            // query it is discharged by `Unsat`. It is only *created* on a path that
+            // has reached the cutoff, so it is a failure in practice -- but the
+            // polarity still has to be right, or a future caller that checks an
+            // un-reached bound would read the wrong way round.
+            ObligationKind::UnwindBound { .. } => matches!(self.verdict, Verdict::Unsat),
             ObligationKind::VacuousPrecondition => {
                 !matches!(self.verdict, Verdict::Unsat | Verdict::Unknown)
             }
@@ -313,13 +453,29 @@ impl Obligation {
     /// an impossible postcondition as a universal truth, which is the opposite of
     /// the finding. So the string is built per kind and per verdict, and the
     /// `Unsat` postcondition says what actually happened.
+    ///
+    /// A counterexample is rendered with the source names the MIR `debug` bindings
+    /// recorded (`x = 224` rather than `v1:u8 = 224`); see [`Self::failure_detail_named`].
     pub fn failure_detail(&self) -> String {
+        self.failure_detail_named(&[])
+    }
+
+    /// [`Self::failure_detail`], but a counterexample is rendered with `names`.
+    ///
+    /// `names` is `(source name, variable index)`, the frontend's `debug` bindings.
+    /// A variable with no name keeps its `v{index}:u{width}` spelling, so naming is
+    /// a readability improvement and never a loss: the fallback is exactly what the
+    /// unnamed rendering prints.
+    pub fn failure_detail_named(&self, names: &[(&str, u32)]) -> String {
         match &self.verdict {
-            Verdict::Counterexample(c) => c.to_string(),
+            Verdict::Counterexample(c) => c.render_named(names),
             Verdict::Valid => match self.kind {
                 // A panic query is `path => can_happen`; `Valid` means it always
                 // happens, and there is no single witness to name.
-                ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
+                ObligationKind::Panic { .. }
+                | ObligationKind::Unreachable
+                | ObligationKind::DivergingCall { .. }
+                | ObligationKind::UnwindBound { .. } => {
                     "holds for every input (the failure fires on all of them)".to_string()
                 }
                 // A postcondition or invariant query is `path => P`; `Valid` is
@@ -360,7 +516,15 @@ impl Obligation {
                         .to_string()
                 }
                 // The good answer for a reachability query, so this is a discharge.
-                ObligationKind::Panic { .. } | ObligationKind::Unreachable => {
+                ObligationKind::Panic { .. }
+                | ObligationKind::Unreachable
+                | ObligationKind::DivergingCall { .. } => {
+                    "invalid: an `Unsat` verdict is a discharge for this kind".to_string()
+                }
+                // The unwinding assertion is discharged by `Unsat` too, so an
+                // `Unsat` here would be the pass case; reaching this arm means the
+                // obligation was recorded without a discharge, which is a bug.
+                ObligationKind::UnwindBound { .. } => {
                     "invalid: an `Unsat` verdict is a discharge for this kind".to_string()
                 }
                 // The precondition describes no input, so the contract is vacuous.
@@ -456,6 +620,55 @@ impl std::fmt::Display for MirReport {
 // ---------------------------------------------------------------------------
 // Environment
 // ---------------------------------------------------------------------------
+
+/// A slice element named by the `(slice local, index)` pair its `&T` points at.
+type ElemRef = (u32, u64);
+
+/// The pseudo-index `slice::last` keys its fresh element variable by.
+///
+/// A slice's length is symbolic, so `s[len - 1]` names no index the store can
+/// pin. The element is a single fresh variable per slice, and this sentinel is
+/// the key that makes every `last()` call on the same slice read the *same*
+/// variable. It cannot collide with a real index: an array's elements are below
+/// `MAX_INDEX_CHAIN`, and a `get(k)` index is a literal far below this.
+const LAST_INDEX: u64 = u64::MAX;
+
+/// The slice element an `Option<&T>` payload names, carried *compositionally* so a
+/// chain of combinators composes rather than each step reading only the operands'
+/// leaf identities.
+///
+/// `slice::first`/`get` produce a leaf; `or`/`and` build a `Select` over their two
+/// operands. Keeping the tree (rather than flattening each combinator's result to a
+/// single leaf) is what makes `a.first().or(b.first()).or(c.first())` select the
+/// *first* element on `Some`: a flat representation loses the inner `or`, and the
+/// outer combinator then reads a missing identity as permission to take the
+/// argument's element -- a false proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ElemId {
+    /// A concrete `(slice, index)` the reference was built from.
+    Leaf(ElemRef),
+    /// `cond` selects the first child on true, the second on false. Either child
+    /// may itself be a `Select`, so the tree is not flattened.
+    Select(Pred, Box<ElemId>, Box<ElemId>),
+}
+
+/// Fold an element identity into an `ite` over the element words it names, or
+/// `None` when any leaf is missing or poisoned. `read` resolves a leaf to its word
+/// *and sign*, so a signed slice element keeps its signedness (a conditional choice
+/// between two elements of one slice has one shared sign, which must survive).
+fn eval_elem_id(id: &ElemId, read: &impl Fn(ElemRef) -> Option<Val>) -> Option<Val> {
+    match id {
+        ElemId::Leaf(e) => read(*e),
+        ElemId::Select(c, t, f) => {
+            let then = eval_elem_id(t, read)?;
+            let els = eval_elem_id(f, read)?;
+            match (then, els) {
+                (Val::Sym(a, sa), Val::Sym(b, _)) => Some(Val::Sym(smt::ite(*c, a, b), sa)),
+                _ => None,
+            }
+        }
+    }
+}
 
 /// Local-to-symbolic environment, with side maps for aggregate parts.
 #[derive(Clone, Debug)]
@@ -570,6 +783,24 @@ struct Env {
     /// distinct inputs per index, so `xs[0]` and `xs[1]` are two values and
     /// `xs[0] == xs[1]` is not provable; see `Indexed::elems`.
     indexed: BTreeMap<u32, Indexed>,
+    /// A local that carries a reference to a slice *element* (`slice::first`/`get`
+    /// produce `Option<&T>`), mapped to the element it names: `(indexed local,
+    /// index)`.
+    ///
+    /// Two locals share one entry: the `Option` local the call wrote, and -- once
+    /// `unwrap` moves the payload out -- the reference local the payload moved to.
+    /// The payload is a *place*, not a value, and the shape the caller reads it
+    /// through is `*_2`, a dereference. Recording the element lets `Env::get`
+    /// answer `*_2` with the slice's own element variable (the same one a `s[0]`
+    /// read names), so the payload is not a fresh value the slice never holds. A
+    /// reference this store has no entry for is read as `Unknown` by the deref,
+    /// which is the honest answer rather than a wrong element.
+    ///
+    /// The identity is *compositional* ([`ElemId`]), so a chain of `or`/`and`
+    /// composes rather than each step reading only its operands' leaves -- a flat
+    /// representation made `a.first().or(b.first()).or(c.first())` select `c`'s
+    /// element on the `Some` path, a false proof.
+    slice_elem_ref: BTreeMap<u32, ElemId>,
     /// The program's enum layouts, so a variant *construction* constant
     /// (`Mode::Idle`) resolves to its discriminant.
     ///
@@ -588,6 +819,39 @@ struct Env {
     /// contract's comparison was checked at, instead of widening a small tag to
     /// 64.
     tag_widths: BTreeMap<u32, u8>,
+    /// The rendered `format_args!` message each local holds, keyed by local.
+    ///
+    /// A `panic!` message is not a literal in edition 2024: it is a
+    /// `fmt::Arguments` value built by a chain of `core::fmt` calls, and the
+    /// `panic_fmt` that consumes it is a *diverging* call whose only argument is a
+    /// local. Without a store for the message the report could only name the
+    /// mangled callee, so this carries the finished message from where it is built
+    /// to where it is consumed. Only string-valued locals are ever inserted.
+    strs: BTreeMap<u32, String>,
+    /// The *pieces* each local holds, keyed by local, for a local that carries a
+    /// promoted `&[&str]`.
+    ///
+    /// The pieces are kept apart from [`Self::strs`] because the number of
+    /// placeholders is not known until the `Arguments` call that consumes them
+    /// says how many arguments it was given: the same pieces render `"zero "` for
+    /// `new_const` and `"zero {}"` for `new_v1::<1, 1>`. Joining early would bake
+    /// in the wrong count.
+    piece_sets: BTreeMap<u32, Vec<String>>,
+    /// The `b"…"` template each local holds, keyed by local, for the `new::<LEN, A>`
+    /// spelling. Kept raw -- not decoded -- because the decode needs the argument
+    /// count, which only the consuming call knows.
+    tmpl_bytes: BTreeMap<u32, Vec<u8>>,
+    /// The string pieces of each `promoted` constant, copied from
+    /// [`crate::mir::parse::MirProgram::promoted_strs`] so `eval_rvalue` can read
+    /// a `const NAME::promoted[0]` operand without the whole program in hand.
+    promoted: BTreeMap<String, Vec<String>>,
+    /// The tracked length of a `Vec<T>` local, keyed by local.
+    ///
+    /// A `Vec`'s fields are not printed by the dump, so the only thing the model
+    /// can hold is the length `Vec::new`/`Vec::push` set and `Vec::len` reads.
+    /// The element type is not stored: no element operation is modelled, so
+    /// there is nothing to size.
+    vec_len: BTreeMap<u32, Var>,
 }
 
 /// A modelled value with a length and elements: a slice or an array.
@@ -599,6 +863,12 @@ struct Indexed {
     /// The width of one element, which is the *referent's* width (`u8` for
     /// `&[u8]` or `[u8; 4]`), not the length's. Taking it from `len` would make
     /// every element 64 bits wide and mis-size every read.
+    ///
+    /// `0` means the width is **not modelled** — a generic `&[T]`, where `T` is
+    /// an unbound type parameter. The length is still a real value (`len` and
+    /// `is_empty` read only the length), so the store exists and those answer;
+    /// every *element* operation refuses `0` rather than inventing a width, so
+    /// `v[0]` on a `&[T]` is a missing value, never a wrong one.
     elem_w: u8,
     /// The signedness of one element. Every element of an array or slice has the
     /// same type, so one sign serves them all; an element read out of this store
@@ -655,17 +925,29 @@ impl Env {
             ref_origin: BTreeMap::new(),
             arg_source: BTreeMap::new(),
             indexed: BTreeMap::new(),
+            slice_elem_ref: BTreeMap::new(),
+
             whole_writes: BTreeSet::new(),
             enums: BTreeMap::new(),
             consts: BTreeMap::new(),
             tag_widths: BTreeMap::new(),
+            strs: BTreeMap::new(),
+            piece_sets: BTreeMap::new(),
+            tmpl_bytes: BTreeMap::new(),
+            promoted: BTreeMap::new(),
+            vec_len: BTreeMap::new(),
         }
     }
 
-    /// Same as [`Env::new`], with the program's enum layouts and `const` items
-    /// attached.
-    fn with_enums(enums: &BTreeMap<String, EnumLayout>, consts: &BTreeMap<String, Const>) -> Env {
-        Env { enums: enums.clone(), consts: consts.clone(), ..Env::new() }
+    /// [`Env::new`] plus the program's enum layouts, `const` items and promoted
+    /// `&[&str]` pieces, so the `core::fmt` model can read a `panic!` message back.
+    fn with_prog(prog: &MirProgram) -> Env {
+        Env {
+            enums: prog.enums.clone(),
+            consts: prog.consts.clone(),
+            promoted: prog.promoted_strs.clone(),
+            ..Env::new()
+        }
     }
 
     /// The element variable for `index` of an indexed value (slice or array)
@@ -677,6 +959,13 @@ impl Env {
     fn index_elem(&mut self, local: u32, index: u64) -> Option<(Var, Sign)> {
         let s = self.indexed.get_mut(&local)?;
         if s.poisoned {
+            return None;
+        }
+        // An unmodelled element width (a generic `&[T]`) has no element variable
+        // to create: a width is what makes the variable a value, and inventing one
+        // would mis-size every read. Refusing keeps an element read a missing
+        // value; the *length* is unaffected, so `len`/`is_empty` still answer.
+        if s.elem_w == 0 {
             return None;
         }
         let sign = Sign::of_bool(s.elem_signed);
@@ -708,6 +997,10 @@ impl Env {
     fn index_chain(&mut self, local: u32, index: Var) -> Option<Val> {
         let (n, elem_w, elem_signed) = {
             let s = self.indexed.get(&local)?;
+            // An unmodelled element width has no elements to build a chain from.
+            if s.elem_w == 0 {
+                return None;
+            }
             // An array's steps come from its type; a slice's from the contract.
             (s.fixed_len.or(s.slice_steps)?, s.elem_w, s.elem_signed)
         };
@@ -1096,6 +1389,11 @@ impl Env {
             self.payloads.iter().filter(|((l, _), _)| *l == s).map(|((_, k), v)| (*k, *v)).collect();
         let disc = self.discriminants.get(&s).copied();
         let indexed = self.indexed.get(&s).cloned();
+        // A tracked `Vec` length is part of the value too: `let w = v` moves the
+        // vector, so the destination has to inherit the length or `w.len()` reads a
+        // receiver with no modelled length. The length is a `usize` word, so it
+        // copies like a part rather than being dropped.
+        let vec_len = self.vec_len.get(&s).copied();
         // Nested paths are parts too, keyed by the local *and* the chain. A copy
         // that moved only the single-field parts would leave `c`'s own `c.i.v`
         // seed in place after `c = d`, so a later `c.i.v` would read `c`'s
@@ -1132,7 +1430,8 @@ impl Env {
             || !path_elems.is_empty()
             || !elem_parts.is_empty()
             || disc.is_some()
-            || indexed.is_some();
+            || indexed.is_some()
+            || vec_len.is_some();
         self.forget_parts(dst);
         for (k, chain, v) in elem_parts {
             self.elem_parts.insert((dst, k, chain), v);
@@ -1157,6 +1456,9 @@ impl Env {
         }
         if let Some(ix) = indexed {
             self.indexed.insert(dst, ix);
+        }
+        if let Some(len) = vec_len {
+            self.vec_len.insert(dst, len);
         }
         any
     }
@@ -1351,6 +1653,27 @@ impl Env {
                     // the field's). Letting that through would read the field as
                     // though it were the argument's referent, which is a wrong
                     // value rather than a missing one.
+                    // A reference to a slice *element* (`slice::first`/`get`):
+                    // `*_2` names the element the reference was built from, so it
+                    // reads the slice's own element variable rather than a fresh
+                    // one. This is checked *before* the `deref_ok` gate, because
+                    // the reference is a local the call produced, not an argument,
+                    // and the store is authoritative for it. `unwrap` moves the
+                    // payload out and records the element under the destination
+                    // local, so the lookup is by this local.
+                    if i == 0 {
+                        if let Some(id) = self.slice_elem_ref.get(&p.local) {
+                            let read = |(sl, k): ElemRef| -> Option<Val> {
+                                let s = self.indexed.get(&sl)?;
+                                if s.poisoned {
+                                    return Some(Val::Unknown);
+                                }
+                                let sign = Sign::of_bool(s.elem_signed);
+                                s.elems.get(&k).map(|v| Val::Sym(*v, sign))
+                            };
+                            return eval_elem_id(id, &read).unwrap_or(Val::Unknown);
+                        }
+                    }
                     if i != 0 || !self.deref_ok.contains_key(&p.local) {
                         return Val::Unknown;
                     }
@@ -1614,6 +1937,86 @@ impl Env {
         self.elems_path.retain(|(l, chain, _), _| *l != local || !chain.starts_with(prefix));
     }
 
+    /// Replace every *part* of an aggregate local with a fresh value.
+    ///
+    /// A loop that writes an aggregate -- the `RangeInclusive` a `for` loop
+    /// advances through `&mut`, or a struct whose field the body assigns -- leaves
+    /// its parts at the values they held at entry. The loop header must instead be
+    /// an *arbitrary* value of the local's type, so each part is replaced: a word
+    /// part by a fresh variable of its own width and sign (so a model that reads
+    /// it, a range's `start`/`end`, still resolves), and anything the store cannot
+    /// represent as a word by dropping it. Dropping is the sound direction -- a
+    /// stale part is a wrong value, a missing one is a refusal.
+    fn havoc_parts(&mut self, local: u32) {
+        fn refresh(v: &Val) -> Option<Val> {
+            match v {
+                Val::Sym(x, s) => Some(Val::Sym(smt::var(smt::bits(*x)), *s)),
+                Val::Bool(_) => Some(Val::Bool(smt::var(1).eq_val(1))),
+                Val::Agg | Val::Unknown => None,
+            }
+        }
+        for ((l, _), v) in self.fields.iter_mut() {
+            if *l == local {
+                match refresh(v) {
+                    Some(nv) => *v = nv,
+                    None => *v = Val::Unknown,
+                }
+            }
+        }
+        for ((l, _), v) in self.nested.iter_mut() {
+            if *l == local {
+                match refresh(v) {
+                    Some(nv) => *v = nv,
+                    None => *v = Val::Unknown,
+                }
+            }
+        }
+        for ((l, _), v) in self.elems.iter_mut() {
+            if *l == local {
+                match refresh(v) {
+                    Some(nv) => *v = nv,
+                    None => *v = Val::Unknown,
+                }
+            }
+        }
+        for ((l, _, _), v) in self.elems_path.iter_mut() {
+            if *l == local {
+                match refresh(v) {
+                    Some(nv) => *v = nv,
+                    None => *v = Val::Unknown,
+                }
+            }
+        }
+        for ((l, _, _), v) in self.elem_parts.iter_mut() {
+            if *l == local {
+                match refresh(v) {
+                    Some(nv) => *v = nv,
+                    None => *v = Val::Unknown,
+                }
+            }
+        }
+        // A payload, tag or element store has no per-word refresh this run can
+        // trust, so it is dropped: an aggregate the loop wrote is now an arbitrary
+        // value, and a part the store cannot re-randomise must not be readable.
+        self.payloads.retain(|(l, _), _| *l != local);
+        self.discriminants.remove(&local);
+        self.tag_widths.remove(&local);
+        // A tracked `Vec` length is part of the value the header havocs, so it is
+        // replaced by a fresh `usize`. Leaving it at the entry length would let the
+        // *exit* edge read a length the loop no longer has: an inductive loop that
+        // pushes three times would prove `ret == 0` for the real `ret == 3` -- a
+        // false proof. The fresh variable is the "arbitrary length at the header"
+        // the invariant did not constrain.
+        if let Some(len) = self.vec_len.get_mut(&local) {
+            *len = smt::var(USIZE_WIDTH);
+        }
+        if let Some(s) = self.indexed.get_mut(&local) {
+            s.elems.clear();
+            s.poisoned = true;
+        }
+        self.elems.retain(|(l, _), v| *l != local || !matches!(v, Val::Unknown));
+    }
+
     fn forget_parts(&mut self, local: u32) {
         self.fields.retain(|(l, _), _| *l != local);
         self.nested.retain(|(l, _), _| *l != local);
@@ -1628,6 +2031,13 @@ impl Env {
         self.payloads.retain(|(l, _), _| *l != local);
         self.discriminants.remove(&local);
         self.tag_widths.remove(&local);
+        self.strs.remove(&local);
+        self.piece_sets.remove(&local);
+        self.tmpl_bytes.remove(&local);
+        // A `Vec` local overwritten as a whole place is no longer the value the
+        // length was tracking, so the length is dropped rather than kept: a
+        // `v = other_vec` must not leave the old length readable.
+        self.vec_len.remove(&local);
         if let Some(s) = self.indexed.get_mut(&local) {
             s.elems.clear();
             // The seeded elements are gone, so a later read must not find them.
@@ -1654,6 +2064,29 @@ impl Env {
         match self.indexed.get_mut(&local) {
             Some(s) => match v {
                 Val::Sym(x, _) => {
+                    // A slice's `last()` element is one fresh variable keyed by the
+                    // `LAST_INDEX` sentinel rather than by a real index, so a write
+                    // to a concrete index does not reach it through
+                    // `elems.insert(index, x)`: the sentinel keeps its pre-write
+                    // value and a later `last()` reads it. That is a false proof --
+                    // `let before = *xs.last().unwrap(); xs[0] = 1; before ==
+                    // *xs.last().unwrap()` was *proved* for a one-element slice,
+                    // though the write replaced the only element. The write *can*
+                    // reach the last element, so the sentinel is refreshed with the
+                    // exact relationship: the last element is `x` exactly when this
+                    // write's index *is* the last one (`len == index + 1`), and the
+                    // old element otherwise. The sentinel is created here if the
+                    // write precedes any `last()` read, so the relationship holds
+                    // whichever order the body uses. An array's `last()` is the
+                    // concrete `N-1` (no sentinel), so this is skipped for it.
+                    if s.fixed_len.is_none() && s.elem_w != 0 {
+                        let old = *s.elems.entry(LAST_INDEX).or_insert_with(|| smt::var(s.elem_w));
+                        if smt::bits(old) == smt::bits(x) {
+                            let is_last = smt::eq_const(s.len, index.wrapping_add(1));
+                            let merged = smt::ite(is_last, x, old);
+                            s.elems.insert(LAST_INDEX, merged);
+                        }
+                    }
                     s.elems.insert(index, x);
                 }
                 // An aggregate element, or an unmodelled one. The element is no
@@ -1854,6 +2287,20 @@ impl Env {
     /// `Option` tag does not and falls back to the payload's width.
     fn tag_width(&self, local: u32) -> Option<u8> {
         self.tag_widths.get(&local).copied()
+    }
+
+    /// The symbolic discriminant of a modelled enum local, when its tag is a
+    /// symbol (a seeded argument's, or one a variant construction wrote).
+    ///
+    /// This is what an enum-returning function's `ret` is: the return place's tag,
+    /// which `ret.is_ok()` and friends read. A tag that is not a `Val::Sym` -- an
+    /// unmodelled enum -- yields `None`, so the postcondition refuses the method
+    /// rather than testing a value it does not have.
+    fn tag_value(&self, local: u32) -> Option<Var> {
+        match self.discriminants.get(&local) {
+            Some(Val::Sym(v, _)) => Some(*v),
+            _ => None,
+        }
     }
 
     /// The width of a modelled `Option` local, from its payload.
@@ -2129,12 +2576,61 @@ pub struct CalleeEnv<'a> {
     prog: &'a MirProgram,
     /// The contracts read from the source.
     specs: &'a spec::Specs,
+    /// For each function index, a map from each block that holds a back edge (a
+    /// jump to a block that appears no later in layout order) to the *header* that
+    /// edge returns to.
+    ///
+    /// The unwind bound counts *these* rather than raw block entries. Counting
+    /// entries to the loop header counts it once more than the loop runs (the last
+    /// entry evaluates the guard and exits), so `unwind: N` rejected a loop that
+    /// runs exactly `N` times. The latch is executed once per iteration, which is
+    /// the quantity the bound is about. Precomputed because it is consulted on
+    /// every state and `is_latch` is a hot path.
+    ///
+    /// The value is the *header*, not just a flag, so the counter can be keyed by
+    /// the loop rather than by the source block. A loop whose body branches can
+    /// reach its header from two different latches (two `continue`s, or an `if`
+    /// whose arms both loop); counting each block separately lets the combined
+    /// iteration count exceed a declared bound while neither block's own count
+    /// does. Keying by the header merges them, so `unwind: N` means `N` iterations
+    /// of the *loop*, however the body reaches the back edge.
+    latches: BTreeMap<usize, BTreeMap<usize, usize>>,
 }
 
 impl<'a> CalleeEnv<'a> {
     /// Build for one program and its specs.
     pub fn new(prog: &'a MirProgram, specs: &'a spec::Specs) -> Self {
-        CalleeEnv { prog, specs }
+        let mut latches: BTreeMap<usize, BTreeMap<usize, usize>> = BTreeMap::new();
+        for (i, f) in prog.fns.iter().enumerate() {
+            let position: BTreeMap<usize, usize> =
+                f.blocks.iter().enumerate().map(|(k, b)| (b.id, k)).collect();
+            let mut set = BTreeMap::new();
+            for b in &f.blocks {
+                let Some(&from) = position.get(&b.id) else { continue };
+                // The earliest backward target is the loop header, matching
+                // `detect_loop`'s choice so the two agree on which loop a latch
+                // belongs to.
+                let mut header: Option<usize> = None;
+                for t in successors(&b.term) {
+                    if position.get(&t).is_some_and(|&to| to <= from) {
+                        match header {
+                            Some(h) if position[&h] <= position[&t] => {}
+                            _ => header = Some(t),
+                        }
+                    }
+                }
+                if let Some(h) = header {
+                    set.insert(b.id, h);
+                }
+            }
+            latches.insert(i, set);
+        }
+        CalleeEnv { prog, specs, latches }
+    }
+
+    /// The loop header `block` of `func` returns to, if `block` holds a back edge.
+    fn latch_header(&self, func: usize, block: usize) -> Option<usize> {
+        self.latches.get(&func).and_then(|m| m.get(&block)).copied()
     }
 
     /// The contract for a call, or `None` when there is none to assume.
@@ -2162,6 +2658,16 @@ impl<'a> CalleeEnv<'a> {
             ret_signed: c.ret.as_ref().map(|t| t.is_signed()).unwrap_or(false),
         })
     }
+
+    /// The declared struct layouts, read from the same source as the contracts.
+    ///
+    /// The `drop` handler needs these to decide whether an aggregate has drop glue
+    /// in a field: the MIR carries no field types for a `drop` terminator, so the
+    /// layout has to come from the source, exactly as a contract's field access
+    /// does.
+    pub fn structs(&self) -> &BTreeMap<String, spec::StructDef> {
+        &self.specs.structs
+    }
 }
 
 /// The loop clauses a function carries: its invariant, and its optional measure.
@@ -2178,6 +2684,12 @@ pub struct LoopSpec<'a> {
     pub invariant: Option<&'a str>,
     /// The `variant:` text, or `None` for partial correctness only.
     pub variant: Option<&'a str>,
+    /// The `unwind:` bound, or `None` to use [`DEFAULT_UNWIND`].
+    ///
+    /// A loop with no `invariant:` is unwound; this is how far. Raising it lets a
+    /// loop too long for the default be decided, and a bound that is still too
+    /// small is *reported* (the path becomes unknown), never silently cut.
+    pub unwind: Option<u32>,
 }
 
 /// Symbolic inputs a contract names, handed to the executor so that the
@@ -2314,7 +2826,7 @@ pub fn verify_fn<F>(
     rec: Option<Recursion>,
 ) -> MirReport
 where
-    F: Fn(Option<Var>, &[(u32, Var)]) -> Result<Pred, String>,
+    F: Fn(Option<Var>, &[(u32, Var)], &[(u64, Var)], &[(u32, Var)]) -> Result<Pred, String>,
 {
     let mut report = MirReport { function: f.name.clone(), ..Default::default() };
 
@@ -2340,7 +2852,7 @@ where
         }
     };
 
-    let mut env = Env::with_enums(&prog.enums, &prog.consts);
+    let mut env = Env::with_prog(prog);
     // A pinned variable takes the literal its precondition fixes it to, so the
     // body's operations fold instead of building a circuit over an input that has
     // only one value. The pin is keyed by *variable index*, so it applies wherever
@@ -2360,7 +2872,13 @@ where
         smt::word(k & mask, w)
     };
     for &l in &f.arg_locals {
-        let ty = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
+        let decl = f.ty_of(l).cloned().unwrap_or(Ty::Other("?".into()));
+        // `Ty::Ref` is modelled as its referent, so a `&u16` argument is seeded at
+        // the *referent's* width and sign -- the same variable the contract's `c`
+        // binds to (see `arg_vars_named`). Seeding it `Unknown` instead made a
+        // contract that names a scalar reference argument unreadable, which is the
+        // C9 exit shape (`bump(c: &mut u16)` with `ensures: c == old(c) + 1`).
+        let ty = decl.referent().clone();
         let v = match ty.width() {
             Some(w) => {
                 let sym = smt::var_named(l, w);
@@ -2378,7 +2896,7 @@ where
         env.locals.insert(l, v);
         // A `&T` argument may be dereferenced: `Ty::Ref` is modelled as its
         // referent, so `*_1` names the same value `_1` does.
-        if matches!(ty, Ty::Ref(_)) {
+        if matches!(decl, Ty::Ref(_)) {
             env.deref_ok.insert(l, ());
         }
     }
@@ -2510,11 +3028,12 @@ where
     // the walk starts, and a function with an invariant but no detectable back
     // edge is refused rather than silently unwound: the contract made a claim
     // and the tool must either honour it or say it could not.
+    let unwind = loops.unwind.unwrap_or(DEFAULT_UNWIND);
     let cut = match loops.invariant {
         None => None,
         Some(text) => match detect_loop(f) {
             Some((header, back_edges)) => {
-                let havoc = loop_writes(f, header);
+                let havoc = loop_writes(prog, f, header);
                 Some(Cut {
                     func: root,
                     header,
@@ -2576,20 +3095,35 @@ where
     }];
 
     let mut explored: usize = 0;
+    // The path budget grows with a *declared* bound: a caller who asks for more
+    // iterations is asking for more paths. See [`path_budget`].
+    let budget = path_budget(loops.unwind);
     while let Some(st) = work.pop() {
         // Bound the *number of paths*, not just each loop. A branch inside an
         // unwound loop multiplies paths without any single loop exceeding
         // `DEFAULT_UNWIND`, so this is the guard that makes the search
         // terminate; see [`DEFAULT_PATH_BUDGET`]. Stopping here is reported, not
         // hidden: the function becomes incomplete and says why.
-        if explored >= DEFAULT_PATH_BUDGET {
+        if explored >= budget {
             report.unknown_paths.push(format!(
-                "path budget exhausted after {DEFAULT_PATH_BUDGET} paths; the remainder was not explored"
+                "path budget exhausted after {budget} paths; the remainder was not explored"
             ));
             break;
         }
         explored += 1;
-        run_state(prog, st, &post, &mut report, &mut work, &seeds.pins, root, &rec_ctx, callees);
+        run_state(
+            prog,
+            st,
+            &post,
+            &mut report,
+            &mut work,
+            &seeds.pins,
+            root,
+            &rec_ctx,
+            callees,
+            unwind,
+            loops.unwind.is_some(),
+        );
     }
     report
 }
@@ -2639,6 +3173,47 @@ fn detect_loop(f: &MirFn) -> Option<(usize, Vec<usize>)> {
     header.map(|h| (h, back_edges))
 }
 
+/// What a diverging call's report should say it was.
+///
+/// The dump passes the panic message as a string literal
+/// (`core::panicking::panic(const "assertion failed: x <= 200")`), so a report can
+/// name the failed assertion instead of the mangled path. When there is no message
+/// at all -- `panic!("{}", x)` prints `panic_display::<u8>`, `unwrap` on a `None`
+/// prints `unwrap_failed` -- the callee's own name is the honest fallback, read
+/// through its generics so the report says `panic_display`, not `<u8>`.
+fn panic_message(name: &str, args: &[Operand], env: &Env) -> String {
+    for a in args {
+        // A literal message, as edition 2015/2021 prints it.
+        if let Operand::Const(Const::Str(s)) = a {
+            return s.clone();
+        }
+        // Edition 2024: the message is a local the `core::fmt` chain built, so it
+        // is read from the string store rather than from an operand.
+        if let Operand::Move(p) | Operand::Copy(p) = a {
+            if p.proj.is_empty() {
+                if let Some(s) = env.strs.get(&p.local) {
+                    return s.clone();
+                }
+            }
+        }
+    }
+    // A recent nightly lowers `unreachable!()`/`todo!()`/`unimplemented!()`/
+    // `panic!()` with no message to a dedicated `*_default_msg` callee that takes
+    // no literal, where stable passes the text as `panic(const "…")`. The text is
+    // the same on both toolchains, so it is spelled here rather than read: a
+    // report whose message depended on the compiler version would be a claim the
+    // toolchain half-decides. An unrecognised name still falls back to the callee.
+    let tail = path_tail(name);
+    match tail {
+        "panic_default_msg" => "explicit panic",
+        "unreachable_default_msg" => "internal error: entered unreachable code",
+        "todo_default_msg" => "not yet implemented",
+        "unimplemented_default_msg" => "not implemented",
+        _ => tail,
+    }
+    .to_string()
+}
+
 /// Every block a terminator can jump to.
 fn successors(t: &Term) -> Vec<usize> {
     match t {
@@ -2648,8 +3223,14 @@ fn successors(t: &Term) -> Vec<usize> {
             v.push(*otherwise);
             v
         }
+        // A diverging call has no normal successor. Reporting `target` (which the
+        // parser leaves at `usize::MAX`) would send the walk to a block that does
+        // not exist and turn the path into a "missing block" unknown; reporting
+        // none says what is true -- the path ends here.
+        Term::Call { diverges: true, .. } => Vec::new(),
         Term::Call { target, .. } => vec![*target],
         Term::Assert { target, .. } => vec![*target],
+        Term::Drop { target, .. } => vec![*target],
         Term::Return | Term::Unreachable | Term::Unknown(_) => Vec::new(),
     }
 }
@@ -2666,7 +3247,62 @@ fn successors(t: &Term) -> Vec<usize> {
 /// return value (`s` in `sum_to` is `_0`), and leaving it out would leave the
 /// exit edge holding the *pre-loop* return value -- which is precisely the hole
 /// this set exists to close.
-fn loop_writes(f: &MirFn, header: usize) -> Vec<u32> {
+///
+/// "Write" is an *effect*, not a syntax: a write through a reference reaches the
+/// referent, and a call reaches whatever the callee writes through its reference
+/// arguments. The header havoc replaces every local in this set with a fresh
+/// value, so an under-approximation keeps the entry value in the header state and
+/// the exit guard can fold -- a false proof. Two ways that happened, both fixed
+/// here: a `&mut` destination (`*p = v`) whose referent was not followed, and a
+/// call (`bump(x)` where `bump(c: &mut u8)`) whose write-through was invisible
+/// because only the call's *destination* was collected.
+///
+/// A callee is looked up through `resolve_callee` (the same rule the inliner uses)
+/// and, if found, every local it writes is folded back onto the argument the call
+/// passed it -- an argument that is a reference (`&mut u8`) is modelled as its
+/// referent, so the caller local that argument names is the one to havoc. A callee
+/// that is not in this program (a `core` intrinsic, an unmodelled call) contributes
+/// nothing here: its effects are the executor's to model, and the loop's own writes
+/// are still collected. Recursion is bounded by the `visited` set.
+fn loop_writes(prog: &MirProgram, f: &MirFn, header: usize) -> Vec<u32> {
+    let mut visiting: BTreeSet<usize> = BTreeSet::new();
+    if let Some(i) = prog.fns.iter().position(|g| std::ptr::eq(g, f)) {
+        visiting.insert(i);
+    }
+    collect_writes(prog, f, header, &mut visiting)
+}
+
+/// The body of [`loop_writes`], threading the set of functions on the *call
+/// stack*.
+///
+/// The block walk is bounded by `seen` (per function), but the interprocedural
+/// step -- following a callee to find what it writes through a reference -- needs
+/// its own guard: a loop that calls a *recursive* function would otherwise follow
+/// the self-call forever. Each `collect_writes` invocation allocates a fresh
+/// `seen`, which stops a CFG cycle within one function and cannot stop a call
+/// cycle between invocations, so `loop_calls_recursive` overflowed the stack.
+/// `visiting` is what makes the traversal terminate.
+///
+/// A function already on the stack is a cycle we cannot summarise exactly. Rather
+/// than skip it (which *could* drop reference writes propagated around the cycle),
+/// the call's *reference arguments* are added directly: a callee can only affect
+/// caller storage through a reference, so those are exactly the caller locals a
+/// cycle could reach. A recursive callee with no reference argument (`count_down(n:
+/// u8)`) therefore contributes nothing.
+///
+/// Measured: this inclusion is a *conservative superset*, not the load-bearing
+/// path. For every fixture in the corpus the reference write is already carried by
+/// the callee's own direct scan (the deref store names the argument local) folded
+/// back positionally below; deleting the inclusion changes no verdict, while
+/// deleting the *termination* guard reproduces the overflow. It is kept because it
+/// is the sound direction (it can only add locals to havoc) and because it holds
+/// for a cycle whose write the fold cannot map back.
+fn collect_writes(
+    prog: &MirProgram,
+    f: &MirFn,
+    header: usize,
+    visiting: &mut BTreeSet<usize>,
+) -> Vec<u32> {
     let mut writes: BTreeMap<u32, ()> = BTreeMap::new();
     writes.insert(0, ());
     let mut seen: BTreeMap<usize, ()> = BTreeMap::new();
@@ -2677,8 +3313,17 @@ fn loop_writes(f: &MirFn, header: usize) -> Vec<u32> {
         }
         let Some(block) = f.block(b) else { continue };
         for s in &block.stmts {
-            if let Stmt::Assign(dest, _) = s {
+            if let Stmt::Assign(dest, rv) = s {
                 writes.insert(dest.local, ());
+                // A reference taken inside the loop may be written *through*:
+                // `let p = &mut x; *p += 1` writes `x`, but the syntactic
+                // destination is `p`. Treat the referent as written so the havoc
+                // reaches it. This is an over-approximation -- a shared `&x` is
+                // included too -- which is the safe direction: havocing a local
+                // the loop never writes loses information, never soundness.
+                if let Rvalue::Ref(place) = rv {
+                    writes.insert(place.local, ());
+                }
             }
         }
         // A call writes its destination too, and that write is not a statement:
@@ -2688,8 +3333,60 @@ fn loop_writes(f: &MirFn, header: usize) -> Vec<u32> {
         // had when the header was first entered. The induction step then proved the
         // invariant for that one value rather than for the loop, and a postcondition
         // that only holds on the first iteration came back `Verified`.
-        if let Term::Call { dest, .. } = &block.term {
+        if let Term::Call { callee, args, dest, .. } = &block.term {
             writes.insert(dest.local, ());
+            // ...and whatever the callee writes *through* a reference argument.
+            // `while i < 3 { bump(x); i += 1 }` with `bump(c: &mut u8)` writes
+            // `x` on every iteration, but the call's destination is `bump`'s
+            // return local, not `x`: the write-through was invisible, `x` kept
+            // its entry value, the exit guard folded and `ensures: ret == 0`
+            // was `Verified` for a body returning 3.
+            if let Callee::Name(name) = callee {
+                if let Some(k) = resolve_callee(prog, name) {
+                    if visiting.contains(&k) {
+                        // A call cycle: this traversal cannot summarise the callee
+                        // exactly, so add its reference arguments directly -- the
+                        // only caller storage a callee can reach. A conservative
+                        // superset: it can only add locals to havoc. See the note
+                        // on `collect_writes` for why it is not the load-bearing
+                        // path but is kept anyway.
+                        for a in args {
+                            if let Operand::Copy(p) | Operand::Move(p) = a {
+                                if matches!(f.ty_of(p.local), Some(Ty::Ref(_))) {
+                                    writes.insert(p.local, ());
+                                }
+                            }
+                        }
+                    } else {
+                        let callee_fn = &prog.fns[k];
+                        let Some(entry) = callee_fn.blocks.first().map(|b| b.id) else {
+                            continue;
+                        };
+                        visiting.insert(k);
+                        let callee_writes = collect_writes(prog, callee_fn, entry, visiting);
+                        visiting.remove(&k);
+                        for w in callee_writes {
+                            // The callee local `w` is written; the call passed it
+                            // `args[i]`, so the caller local that argument names is
+                            // what the write reaches. The mapping is positional:
+                            // `callee_fn.arg_locals[i]` is the callee's local for
+                            // the call's `args[i]`.
+                            if let Some(i) = callee_fn.arg_locals.iter().position(|&l| l == w) {
+                                if let Some(Operand::Copy(p) | Operand::Move(p)) = args.get(i) {
+                                    // Only a *reference* argument shares storage
+                                    // with the caller; a by-value argument is the
+                                    // callee's own copy and its writes die with
+                                    // the frame -- the boundary the inliner's
+                                    // `by_value_indexed` keeps.
+                                    if matches!(f.ty_of(p.local), Some(Ty::Ref(_))) {
+                                        writes.insert(p.local, ());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         for t in successors(&block.term) {
             stack.push(t);
@@ -2871,6 +3568,25 @@ fn is_ord_callee(name: &str) -> bool {
         | "i32" | "i64" | "i128" | "isize")
 }
 
+/// Whether a name is `core`'s own `PartialEq`/`PartialOrd` comparison for a
+/// primitive type.
+///
+/// The comparison twin of [`is_ord_callee`]: `eq`/`ne`/`lt`/`le`/`gt`/`ge` are
+/// trait methods, so their dump spelling carries no `<impl` -- `<u8 as
+/// PartialEq>::eq` -- and the executor's guard has to admit them by name. The same
+/// narrow rules apply: the trait path must be the standard library's (see
+/// [`intrinsics::names_cmp_trait`]), and the self type must be a primitive, so a
+/// user type's comparison is refused rather than read. A crate-root trait that
+/// prints bare is closed by the caller's same-dump lookup, as for `Ord`.
+fn is_cmp_callee(name: &str) -> bool {
+    if !intrinsics::names_cmp_trait(name) {
+        return false;
+    }
+    let self_ty = call_type(name).unwrap_or_default();
+    matches!(self_ty.as_str(), "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16"
+        | "i32" | "i64" | "i128" | "isize")
+}
+
 /// Answer a widening conversion (`From::from`/`Into::into`), or report why not.
 ///
 /// The two types come from the call's *name* (`<u16 as From<u8>>::from`), because
@@ -2896,6 +3612,25 @@ fn convert(
     let Some((src_ty, dst_ty)) = intrinsics::conversion_types(name, kind) else {
         return Err(format!("unmodelled conversion `{name}`"));
     };
+    // `u8::from(b)` / `u32::from(b)`: a `bool` source is a one-bit value, and its
+    // conversion is the zero-extension of that bit (`false` -> 0, `true` -> 1). A
+    // `bool` has no integer width, so `int_width` would refuse it; it is answered
+    // here instead. The source is a *predicate* (`Val::Bool`), so it is widened to
+    // the one-bit word the destination holds -- the same step a `bool` `ret` takes.
+    if src_ty == Ty::Bool {
+        let Some(dst_w) = intrinsics::int_width(&dst_ty) else {
+            return Err(format!("`{name}` converts a type the model does not hold"));
+        };
+        let Some(arg) = args.first() else {
+            return Err(format!("unmodelled arity for `{name}`"));
+        };
+        let Val::Bool(p) = operand(env, arg) else {
+            return Err(format!("unmodelled argument to `{name}`"));
+        };
+        let bit = smt::ite(p, smt::word(1, 1), smt::word(0, 1));
+        env.set(dest, Val::Sym(smt::truncate(bit, dst_w), Sign::of(&dst_ty)));
+        return Ok(());
+    }
     let (Some(src_w), Some(dst_w)) =
         (intrinsics::int_width(&src_ty), intrinsics::int_width(&dst_ty))
     else {
@@ -3023,6 +3758,74 @@ fn call_trait_args(name: &str) -> Option<String> {
     let (trait_ty, _) = after.split_once(">::")?;
     let inner = crate::mir::spec::angle_inner(trait_ty)?;
     (!inner.is_empty()).then(|| inner.to_string())
+}
+
+/// The string pieces of the promoted constant a `const <…>::promoted[N]` operand
+/// names, reconciling the use-site spelling with the definition's.
+///
+/// rustc prints a promoted constant's *definition* and its *use* with different
+/// paths on the MSRV (1.85): a `panic!` inside a trait default body defines
+/// `const a::Custom::into_iter::promoted[0]` but uses
+/// `const <Self as range_shim::a::Custom>::into_iter::promoted[0]`. An exact
+/// lookup misses, so the `Arguments::new_const` call is reported unmodelled and a
+/// function that only panics comes back `incomplete` instead of refuted -- an
+/// MSRV-only failure that current stable hides (it prints a plain `from_str`).
+///
+/// The two names share the `::promoted[N]` tail, and the owner before it is the
+/// same trait or item. A suffix match on the whole name is not enough
+/// (`a::Custom::into_iter::promoted[0]` is not a suffix of the use), so the tail
+/// is stripped and the *owner* paths compared: the use's owner is its `<T as
+/// Trait>` projection when it has one (`range_shim::a::Custom`), else the whole
+/// qualifier, and a definition whose owner is a `::`-aligned suffix of it
+/// (`a::Custom`) is the one the use names. Comparing owners rather than the last
+/// segment is what keeps two sibling traits of the same method (`a::Custom` and
+/// `b::Custom`, each with its own `into_iter`) from answering for one another.
+/// Only `promoted[…]` names are reconciled -- an ordinary `const NAME` keeps the
+/// exact-match rule, because a name that does not resolve exactly is a name this
+/// model does not hold.
+fn lookup_promoted(promoted: &BTreeMap<String, Vec<String>>, use_name: &str) -> Option<Vec<String>> {
+    if let Some(v) = promoted.get(use_name) {
+        return Some(v.clone());
+    }
+    // `qualifier::promoted[N]` -> `(qualifier, "promoted[N]")`.
+    let (use_qual, use_tail) = use_name.rsplit_once("::")?;
+    if !use_tail.starts_with("promoted[") {
+        return None;
+    }
+    let use_owner = call_trait_path(use_name).unwrap_or_else(|| use_qual.to_string());
+    // The *method* segment the use names: the last `::` component of its
+    // qualifier. A trait default's promoted constant is spelled
+    // `<Self as Trait>::method::promoted[N]`, so the method is the piece that
+    // distinguishes two defaults on the same trait.
+    let use_method = use_qual.rsplit_once("::").map(|(_, m)| m).unwrap_or(use_qual);
+    let mut found: Option<Vec<String>> = None;
+    for (def, pieces) in promoted {
+        let Some((def_qual, def_tail)) = def.rsplit_once("::") else { continue };
+        if def_tail != use_tail {
+            continue;
+        }
+        // The definition's owner is its qualifier minus the method/item segment.
+        let (def_owner, def_method) = match def_qual.rsplit_once("::") {
+            Some((o, m)) => (o, m),
+            None => (def_qual, def_qual),
+        };
+        // The *method* must match too. `Custom::aaa::promoted[0]` and
+        // `Custom::zzz::promoted[0]` share an owner and a promotion index, so a
+        // lookup that compared only those returned the first method's message for
+        // the second method's panic -- a report naming a line the caller never ran.
+        if def_method != use_method {
+            continue;
+        }
+        if use_owner == def_owner || crate::mir::spec::is_path_suffix(&use_owner, def_owner) {
+            // Two definitions still match: refuse rather than pick one, because
+            // either could be the one the use names.
+            if found.is_some() {
+                return None;
+            }
+            found = Some(pieces.clone());
+        }
+    }
+    found
 }
 
 /// Whether a local method candidate may answer a *trait* call.
@@ -3222,6 +4025,18 @@ fn resolve_callee(prog: &MirProgram, name: &str) -> Option<usize> {
     }
     let tail = name.rsplit("::").next()?;
     let want_ty = call_type(name)?;
+    // A call whose receiver is literally `Self` is made from inside a trait's
+    // *default* body, where the concrete type is not known. Resolving it to the
+    // right body would need the `Self` type the enclosing call was made with,
+    // which this resolver does not carry; resolving it to the *default* method
+    // would be a false proof whenever an impl overrides it. So it is refused
+    // rather than guessed. This is the `range_shim` hole: a user trait's default
+    // `into_iter` that calls `self.set(42)`, with `set` overridden by the impl,
+    // had the *default* (no-op) `set` inlined, so a caller's contract about the
+    // override's effect was *proved* against a body that does nothing.
+    if want_ty == "Self" {
+        return None;
+    }
     // The trait the call names, when it is a trait call (`<T as Trait<..>>::m`).
     // `None` for a bare `Type::m`, which rustc prints for both an inherent method
     // and a trait method in scope, so no trait check applies there.
@@ -3443,6 +4258,7 @@ fn try_callee_contract(
             &cc.signed,
             cc.ret_signed,
             &fields,
+            &BTreeMap::new(),
         ) {
             Ok(p) => post = Some(match post {
                 None => p,
@@ -3695,6 +4511,7 @@ fn try_recursive_call(
             &rc.rec.signed,
             ret_signed,
             &fields,
+            &BTreeMap::new(),
         ) {
             Ok(p) => post_assumed = Some(match post_assumed {
                 None => p,
@@ -3819,9 +4636,35 @@ fn advance(
     // invariant is assumed over those. Only then does the exit edge carry
     // `I && !guard`, which is what lets a postcondition be proved for every state
     // the loop can leave rather than for the one state the first pass produced.
+    // Resolve each written place through the run's reference map first: a loop
+    // that writes `*p` (where `p = &mut x` was taken *before* the loop) writes
+    // `x`, but the syntactic destination is `p`. Without this the header kept
+    // `x`'s entry-state value, the exit guard `x > 100` folded to `false`, the
+    // exit edge was pruned as unreachable, and the postcondition was never
+    // checked -- a false proof. `place.local` and `resolve`'s target are the same
+    // local for every non-reference write, so this only widens the set.
+    let mut havoc: BTreeSet<u32> = BTreeSet::new();
     for &l in &cut.havoc {
+        havoc.insert(l);
+        // The referent of a reference the loop wrote through. `pointee` follows
+        // one level of value indirection (`_2 = &mut _1` records `2 -> _1`), which
+        // `resolve` does not for a bare local: the write `(*_2) = v` names `_2`,
+        // and without this the havoc missed `_1` and its entry-state value kept
+        // the exit guard folded to `false` -- a false proof.
+        let resolved = st.env.pointee(&Place { local: l, proj: Vec::new() });
+        havoc.insert(resolved.local);
+    }
+    for &l in &havoc {
         if let Some(ty) = cur.ty_of(l) {
-            if let Some(w) = ty.width() {
+            // A reference local's value *is* its referent's (`Ty::Ref` is modelled
+            // as the referent), so it is havoced at the referent's width -- the
+            // width it was seeded at. Reading `ty.width()` on the `Ty::Ref` itself
+            // gives `None`, which sent a written-through reference argument to the
+            // aggregate branch and left its referent at the entry value: the exit
+            // guard then folded and a false postcondition was `Verified` (`w_false`
+            // below). A `&mut u8` argument is the commonest shape of this.
+            let inner = ty.referent();
+            if let Some(w) = inner.width() {
                 // `var`, not `var_named`: a fresh variable is the point. A named
                 // one would return the very variable being replaced, and the
                 // havoc would be a no-op.
@@ -3830,9 +4673,23 @@ fn advance(
                 } else {
                     // A havoced local is a fresh *input* of the same type, so it
                     // keeps the type's sign.
-                    Val::Sym(smt::var(w), Sign::of(ty))
+                    Val::Sym(smt::var(w), Sign::of(inner))
                 };
                 st.env.locals.insert(l, fresh);
+            } else {
+                // A local with no bit width is an aggregate (a struct, tuple or
+                // array), whose value lives in the parts stores rather than in
+                // `locals`. A loop that writes it -- the `RangeInclusive` a `for`
+                // loop advances through `&mut`, or a `c.lo = ..` field write --
+                // left those parts at the value they had at entry, so the header
+                // state was over-constrained, the exit guard folded, and the
+                // postcondition was never checked: a false proof. Replacing the
+                // whole value is what "an arbitrary value of this type" means, and
+                // dropping the parts is the sound direction -- a word part is
+                // replaced by a fresh variable of its own width so a model that
+                // reads it (a range's `start`/`end`) still resolves, while a
+                // non-word part is dropped to `Unknown`.
+                st.env.havoc_parts(l);
             }
         }
     }
@@ -3873,6 +4730,1249 @@ fn eval_measure_here(f: &MirFn, env: &Env, text: &str) -> Result<(Var, bool), St
         .map_err(|e| e.to_string())
 }
 
+/// The last segment of a path, with any generic arguments stripped.
+///
+/// The dump spells a call with its generics (`Arguments::<'_>::new_const::<1>`,
+/// `new_v1::<1, 1>`, `rt::Argument::<'_>::new_display::<T>`,
+/// `std::rt::panic_display::<u8>`), so the bare last segment is `<1>`/`<T>`/`<u8>`
+/// rather than the name. The `::<…>` groups are skipped as *balanced* brackets --
+/// a group can nest (`Argument::<&'_ str>`) -- and the last `::`-segment of what is
+/// left is the name. A path with no generics (`std::rt::panic_fmt`) is returned
+/// unchanged. Both the `core::fmt` model's dispatch and a panic report's fallback
+/// name go through this, so a name is never reported as its type arguments.
+fn path_tail(name: &str) -> &str {
+    // The last `::` at generic-depth zero that is not the `::` of a `::<…>`
+    // bracket, so the method name is what follows it up to the first `<`.
+    let b = name.as_bytes();
+    let mut depth = 0i32;
+    let mut last_sep: Option<usize> = None;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b':' if depth == 0
+                && i + 1 < b.len()
+                && b[i + 1] == b':'
+                && b.get(i + 2) != Some(&b'<') =>
+            {
+                last_sep = Some(i + 2);
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let rest = match last_sep {
+        Some(k) => &name[k..],
+        None => name,
+    };
+    let head = match rest.find('<') {
+        Some(k) => &rest[..k],
+        None => rest,
+    };
+    // `new_const::<1>` leaves `new_const::` once the `<…>` is cut, so the
+    // separator that introduced the generic goes with it.
+    head.strip_suffix("::").unwrap_or(head)
+}
+
+/// The `i`-th argument of the last `::<…>` group in a path, parsed as a `usize`.
+///
+/// `Arguments::<'_>::new_v1::<2, 1>` has `("_", "2", "1")` as its groups, so index
+/// `1` is the argument count. A missing or non-numeric item returns `None`, which
+/// the caller turns into "unmodelled" -- a printer change is refused rather than
+/// guessed at.
+fn generic_arg(name: &str, i: usize) -> Option<usize> {
+    let open = name.rfind("::<")?;
+    let rest = &name[open + 3..];
+    let close = rest.find('>')?;
+    let item = rest[..close].split(',').nth(i)?;
+    item.trim().parse().ok()
+}
+
+/// Whether `name` is a call the `core::fmt` model answers, and the model's
+/// `Result` for it.
+///
+/// Edition 2024 builds a `panic!`/`assert!` message out of `core::fmt` calls
+/// rather than a single literal, so a panic's message has to be *recovered* from
+/// the chain rather than read off one operand. The chain is small and fixed:
+///
+/// * `core::fmt::rt::Argument::<'_>::new_display::<T>(&v)` -- wraps one argument
+///   for display. Its payload is the argument's *value*, which this model does
+///   not need (the message keeps the `{}` placeholder), so it is a no-op.
+/// * `Arguments::<'_>::from_str(const "…")` -- the whole message is one literal.
+/// * `Arguments::<'_>::new_const::<N>(&PIECES)` -- `N` literal pieces and no
+///   arguments.
+/// * `Arguments::<'_>::new_v1::<P, A>(&PIECES, &ARGS)` -- `P` pieces and `A`
+///   arguments, which render as the pieces joined by `{}`.
+/// * `Arguments::<'_>::new::<LEN, A>(const b"…", &ARGS)` -- the newer spelling
+///   with the template in one byte string.
+/// * `std::rt::panic_fmt(args)` -- the diverging consumer; its message is
+///   whatever the `Arguments` local holds.
+///
+/// Anything not on this list returns `None`, so a `core::fmt` call this model
+/// does not know stays "unmodelled" rather than becoming a wrong message.
+///
+/// The placeholder count is the *argument* count, which is why the pieces are
+/// joined by the consuming call and not by the builder: see
+/// [`crate::mir::parse::join_format_pieces`].
+fn try_fmt_call(
+    name: &str,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+    dest_ty: Option<&Ty>,
+) -> Option<Result<(), String>> {
+    use crate::mir::parse::{decode_format_template, join_format_pieces};
+    // The `Arguments`-building calls are printed *unqualified*
+    // (`Arguments::<'_>::new_const::<1>`), so a name cannot tell them from a local
+    // item of the same name. The destination's *type* can: `new_const`/`new_v1`/
+    // `new`/`from_str` all return `core::fmt::Arguments<'_>`, and no other call
+    // does. That is what this guard keys on -- a local function named `new` whose
+    // destination is not an `Arguments` is left to its own body, and a call this
+    // model does not know stays "unmodelled" rather than becoming a wrong message.
+    let makes_args = dest_ty.is_some_and(|t| match t {
+        Ty::Other(s) => s.contains("fmt::Arguments"),
+        _ => false,
+    });
+    // The `rt::Argument` wrappers are printed qualified (`core::fmt::rt::Argument`),
+    // so their own guard is on the name. A user item cannot be spelled in someone
+    // else's crate, so a name with one of these prefixes is `core`'s -- and a local
+    // `Argument` is answered by its body in the same dump first.
+    let qualified = ["std::fmt::", "core::fmt::"]
+        .iter()
+        .any(|p| name.starts_with(p) || name.contains(&format!("::{p}")));
+    if !makes_args && !qualified {
+        return None;
+    }
+    // The pieces an operand names: either a promoted `const NAME::promoted[0]`
+    // (recorded on the local it was assigned to) or a local that already carries
+    // them.
+    let pieces_of = |env: &Env, o: &Operand| -> Option<Vec<String>> {
+        match o {
+            Operand::Const(Const::Other(n)) => lookup_promoted(&env.promoted, n),
+            Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => {
+                env.piece_sets.get(&p.local).cloned()
+            }
+            _ => None,
+        }
+    };
+    let tail = path_tail(name);
+    // There is deliberately no arm for `panic_fmt` / `panic_nounwind_fmt` here.
+    // Those are the *consumers* of the `Arguments` chain, and they return `!`, so
+    // the executor reaches them as a diverging call (see `Divergence`) before this
+    // function is ever consulted -- `try_fmt_call` is called only on the
+    // non-diverging path. The message is recovered from the `Arguments` local's
+    // string store by `panic_message` instead. A branch that recorded the message
+    // here would be dead code; it was, and the review caught it.
+    if tail == "from_str" {
+        // `Arguments::from_str("literal")`: the message is the literal itself.
+        let lit = args.iter().find_map(|a| match a {
+            Operand::Const(Const::Str(s)) => Some(s.clone()),
+            _ => None,
+        })?;
+        env.strs.insert(dest.local, lit);
+        return Some(Ok(()));
+    }
+    if tail == "new_const" {
+        // `new_const::<P>(&PIECES)`: `P` literal pieces and no arguments, so the
+        // pieces are the message as they stand.
+        let pieces = args.iter().find_map(|a| pieces_of(env, a))?;
+        env.strs.insert(dest.local, join_format_pieces(&pieces, 0));
+        return Some(Ok(()));
+    }
+    if tail == "new_v1" {
+        // `new_v1::<P, A>(&PIECES, &ARGS)`: `P` pieces and `A` arguments. The
+        // argument count is what says how many placeholders the message has, so it
+        // is read from the generic list rather than guessed from the pieces.
+        let pieces = args.iter().find_map(|a| pieces_of(env, a))?;
+        let n = generic_arg(name, 1)?;
+        env.strs.insert(dest.local, join_format_pieces(&pieces, n));
+        return Some(Ok(()));
+    }
+    if tail == "new" {
+        // `Arguments::new::<LEN, A>(const b"…", &ARGS)`: the template is one byte
+        // string, decoded to pieces. It can be a direct operand or -- as stable
+        // prints it -- a local it was assigned to first.
+        let bytes = args
+            .iter()
+            .find_map(|a| match a {
+                Operand::Const(Const::Bytes(b)) => Some(b.clone()),
+                Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => {
+                    env.tmpl_bytes.get(&p.local).cloned()
+                }
+                _ => None,
+            })?;
+        let pieces = decode_format_template(&bytes)?;
+        let n = generic_arg(name, 1)?;
+        env.strs.insert(dest.local, join_format_pieces(&pieces, n));
+        return Some(Ok(()));
+    }
+    // `rt::Argument::<'_>::new_display::<T>(&v)` and its siblings wrap one
+    // argument; the message keeps the placeholder, so the wrapper is a no-op. The
+    // destination stays a non-string local, which is what it is.
+    if name.contains("core::fmt::rt::Argument") && tail.starts_with("new_") {
+        env.set(dest, Val::Unknown);
+        return Some(Ok(()));
+    }
+    None
+}
+
+/// Answer a modelled `for`-loop range method from the receiver's struct fields.
+///
+/// The `for` desugaring lowers to `RangeInclusive::new(start, end)` (or
+/// `Range::new`), an `IntoIterator::into_iter` identity, and a loop that calls
+/// `<Range as Iterator>::next(&mut range)` until it yields `None`. Those three are
+/// the whole of it, and modelling them makes the commonest loop in Rust reachable
+/// through the existing loop machinery: an `invariant:` decides the loop, and
+/// without one it is unwound like any other.
+///
+/// # Where the state lives
+///
+/// A range is a struct, so its fields are in the environment's `fields` store, keyed
+/// by `(local, field index)`, exactly as any struct literal's are. `new` writes
+/// `start` (0), `end` (1) and, for `RangeInclusive`, `exhausted` (2); `next` reads
+/// and advances them. The field *index* is the declaration order, which is the order
+/// the dump's `_1.0`/`_1.1`/`_1.2` projections count in -- `RangeInclusive { start,
+/// end, exhausted }` and `Range { start, end }`.
+///
+/// # The receiver is `&mut`
+///
+/// `next` takes `&mut self`, so the dump prints `_6 = &mut _3; next(copy _7)`. The
+/// reference is followed with `pointee`, so the fields read and written are `_3`'s,
+/// the same ones the loop's own `_3.0` reads would name.
+///
+/// # What is refused
+///
+/// A receiver whose range state is not in the store -- one the frontend never
+/// modelled -- is refused rather than guessed, and so is a `next` whose element
+/// width or sign cannot be read from the destination's `Option<Idx>`. Reading a
+/// fresh variable would be a wrong value, not a weaker proof.
+fn range_method(
+    name: &str,
+    kind: intrinsics::RangeMethod,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+) -> Result<Vec<Obligation>, String> {
+    use intrinsics::RangeMethod;
+    // The exclusive `Range` has no `exhausted` field and yields `None` at
+    // `start >= end`; the inclusive `RangeInclusive` has the field and yields
+    // `None` once it is exhausted. The `name` says which: only `RangeInclusive`
+    // carries `RangeInclusive` in its path.
+    let inclusive = name.contains("RangeInclusive");
+    // The element width and sign, from the destination's `Option<Idx>` (for
+    // `next`) or the range's own type. `next`'s destination is the `Option<Idx>`
+    // the loop matches on, and `Idx`'s width is what the `start`/`end` words were
+    // built at.
+    match kind {
+        RangeMethod::New => {
+            // `new(start, end)` writes the two bounds and, for the inclusive
+            // range, `exhausted = false`.
+            let start = match args.first().map(|a| operand(env, a)) {
+                Some(Val::Sym(v, s)) => (v, s),
+                _ => return Err(format!("unmodelled argument to `{name}`")),
+            };
+            let end = match args.get(1).map(|a| operand(env, a)) {
+                Some(Val::Sym(v, s)) => (v, s),
+                _ => return Err(format!("unmodelled argument to `{name}`")),
+            };
+            let field = |i: u32| Place { local: dest.local, proj: vec![Proj::Field(i)] };
+            env.set(&field(0), Val::Sym(start.0, start.1));
+            env.set(&field(1), Val::Sym(end.0, end.1));
+            if inclusive {
+                // `exhausted: false`. A one-bit word, so it is a plain `Val::Sym`
+                // at width 1 rather than a `Val::Bool`: the body compares it with
+                // `!=`/`==` in `next`, and a predicate would not fit that store.
+                env.set(&field(2), Val::Sym(smt::word(0, 1), Sign::Unsigned));
+            }
+            Ok(Vec::new())
+        }
+        RangeMethod::IntoIter => {
+            // `into_iter` is the identity the desugaring wraps the range in: it
+            // copies the receiver and returns it. Every field the source holds is
+            // copied to the destination, so the loop's `next` reads the same state
+            // `new` wrote.
+            let src = match args.first() {
+                Some(Operand::Copy(p)) | Some(Operand::Move(p)) => p.clone(),
+                _ => return Err(format!("unmodelled receiver for `{name}`")),
+            };
+            let src = env.pointee(&src);
+            // The fields present: `RangeInclusive` has three, `Range` two.
+            let n = if inclusive { 3 } else { 2 };
+            let mut vals = Vec::new();
+            for i in 0..n {
+                let p = Place { local: src.local, proj: vec![Proj::Field(i as u32)] };
+                vals.push(env.get(&p));
+            }
+            for (i, v) in vals.into_iter().enumerate() {
+                let p = Place { local: dest.local, proj: vec![Proj::Field(i as u32)] };
+                env.set(&p, v);
+            }
+            Ok(Vec::new())
+        }
+        RangeMethod::Next => {
+            // `next(&mut range) -> Option<Idx>`. The receiver is the `&mut` the
+            // desugaring passes, so `pointee` follows it to the range local the
+            // fields live on. The element width and sign come from the destination's
+            // `Option<Idx>`, which is the type the `switchInt` reads.
+            let recv = match args.first() {
+                Some(Operand::Copy(p)) | Some(Operand::Move(p)) => p.clone(),
+                _ => return Err(format!("unmodelled receiver for `{name}`")),
+            };
+            let range = env.pointee(&recv);
+            let start_p = Place { local: range.local, proj: vec![Proj::Field(0)] };
+            let end_p = Place { local: range.local, proj: vec![Proj::Field(1)] };
+            let (start, start_sign) = match env.get(&start_p) {
+                Val::Sym(v, s) => (v, s),
+                _ => return Err(format!("`{name}` on a range whose start is not modelled")),
+            };
+            let (end, end_sign) = match env.get(&end_p) {
+                Val::Sym(v, s) => (v, s),
+                _ => return Err(format!("`{name}` on a range whose end is not modelled")),
+            };
+            let w = smt::bits(start);
+            // The `exhausted` flag, for the inclusive range. A range whose field is
+            // not modelled is refused rather than treated as not-exhausted.
+            let exhausted = if inclusive {
+                let ex_p = Place { local: range.local, proj: vec![Proj::Field(2)] };
+                match env.get(&ex_p) {
+                    Val::Sym(v, _) => Some(v),
+                    _ => return Err(format!("`{name}` on a range whose exhausted flag is not modelled")),
+                }
+            } else {
+                None
+            };
+            // The predicate for "the range is empty" (`is_empty`):
+            //
+            // * exclusive `Range`: `start >= end`;
+            // * inclusive `RangeInclusive`: `exhausted || start > end`.
+            //
+            // The comparison is the element type's own, so a signed range reads
+            // `i8::MIN` as below `0`. A mismatch between the two bounds' signs is a
+            // dump shape the model does not hold, so it is refused rather than read
+            // as either one.
+            let Some(signed) = start_sign.known().or(end_sign.known()) else {
+                return Err(format!("`{name}` on a range whose element sign is not modelled"));
+            };
+            if let (Some(a), Some(b)) = (start_sign.known(), end_sign.known()) {
+                if a != b {
+                    return Err(format!("`{name}` on a range whose bounds have different signs"));
+                }
+            }
+            let empty = match (signed, exhausted) {
+                (true, Some(ex)) => {
+                    smt::or(smt::eq_const(ex, 1), smt::slt(end, start))
+                }
+                (false, Some(ex)) => {
+                    smt::or(smt::eq_const(ex, 1), smt::ult(end, start))
+                }
+                (true, None) => smt::sle(end, start),
+                (false, None) => smt::ule(end, start),
+            };
+            // `start + 1`, and whether it overflowed. `forward_overflowing(start, 1)`
+            // is `overflowing_add(start, 1)`, so the successor is `start + 1` and the
+            // overflow flag is "the result is the type's `MIN`". The inclusive range
+            // marks itself exhausted exactly when the successor overflows, and the
+            // last element (the `end` value) is yielded on the pass where `start ==
+            // end` before that flag is set.
+            //
+            // The `MIN` depends on the sign: for an *unsigned* range the successor
+            // wraps to `0`, but for a *signed* one `MAX + 1` wraps to `MIN` (`1 <<
+            // (w-1)`), not to zero. Testing only for zero is the unsigned rule, and on
+            // a signed inclusive range it never fires: `127i8..=127i8` would keep
+            // yielding past `127` (into `-128`, `-127`, ...) and the loop would run to
+            // the `unwind:` bound instead of ending after one iteration, turning a
+            // true contract into a bound failure.
+            let one = smt::word(1, w);
+            let succ = smt::add(start, one);
+            let min = if signed { 1u64 << (w - 1) } else { 0 };
+            let overflowed = smt::eq_const(succ, min);
+            // The yielded value is `start` (both ranges yield `start`), the tag is
+            // `Some` unless the range is empty. The tag is a term at width 1: the
+            // loop's `switchInt` on the `Option<Idx>` discriminant compares it
+            // against `SOME_TAG`/`NONE_TAG`, so it must be a value the discriminant
+            // store can hold and the switch can read.
+            let tag = smt::ite(empty, smt::word(0, 1), smt::word(1, 1));
+            env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+            env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(start, start_sign), w);
+            // Advance the range *in place*: `start := start + 1`, and for the
+            // inclusive range `exhausted := overflowed`. This is the mutation the
+            // `&mut self` performs, and it is what makes the loop progress -- and
+            // what a `variant:` can be proved against.
+            //
+            // Rust's `Iterator::next` leaves the range *unchanged* when it returns
+            // `None`, so the advance is guarded by `!empty`. Advancing an empty range
+            // would let a later call resurrect an element Rust never yields: an
+            // exclusive `255u8..255` is empty (`start >= end`), and wrapping its start
+            // to `0` would make the *next* call return `Some(0)`. Both calls return
+            // `None` in Rust.
+            let start_next = smt::ite(empty, start, succ);
+            env.set(&start_p, Val::Sym(start_next, start_sign));
+            if inclusive {
+                let ex_p = Place { local: range.local, proj: vec![Proj::Field(2)] };
+                let ex = exhausted.expect("inclusive range carries an exhausted flag");
+                let ex_next = smt::ite(
+                    empty,
+                    ex,
+                    smt::ite(overflowed, smt::word(1, 1), smt::word(0, 1)),
+                );
+                env.set(&ex_p, Val::Sym(ex_next, Sign::Unsigned));
+            }
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// Answer a modelled `Option`/`Result` method from the receiver's tag and payload.
+///
+/// These are the first modelled calls that read an *enum* rather than a bit-vector
+/// operand. `unwrap`/`unwrap_or` return the payload (or a default), the two
+/// predicates return a `bool` about the tag. The receiver is `self` for the value
+/// methods and `&self` for the predicates, so it is followed through a reference
+/// exactly as the ASCII tests are -- `_2 = &_1; is_some(move _2)` must read `_1`'s
+/// tag, and the `&Option` local has no bit-vector meaning of its own.
+///
+/// # The two families are one shape
+///
+/// `Option` and `Result` differ only in *which* variant carries the payload and in
+/// the tag the predicates test: `Option` puts the payload on `Some` (tag
+/// [`intrinsics::SOME_TAG`]) and `is_some` tests that tag, `Result` puts it on `Ok`
+/// (tag [`intrinsics::OK_TAG`]) and `is_ok` tests *that* tag. The method name says
+/// which, so one arm answers both: the payload variant is `Some` for an `Option`
+/// method and `Ok` for a `Result` one, read off `name`.
+///
+/// # What is read, and what is refused
+///
+/// The tag and payload come from the environment's `discriminants`/`payloads`
+/// stores, which the model's own `checked_*` family writes (`checked_add` on a
+/// `u8` writes the tag and payload of an `Option<u8>`) and which a `Option`/
+/// `Result` argument a contract bound also fills. A receiver whose enum state is
+/// *not* in those stores -- a `Vec::pop` result, an enum a body built by hand -- is
+/// refused rather than guessed: reading a fresh variable would be a wrong value,
+/// not a weaker proof.
+///
+/// # The tag's width
+///
+/// A `checked_*` tag is a term at the *operand's* width (`ite(fails, 0, 1)` at
+/// `w`), and a contract-bound enum argument's tag is seeded at its discriminants'
+/// width. Both are recorded, so the comparison against the variant constants is
+/// made at the width the tag was actually built at; reading it at the dump's
+/// `isize` would widen a two-bit tag to 64 and the `switchInt` would compare the
+/// wrong word. This is the same width rule `Rvalue::Discriminant` uses, and it is
+/// deliberately read the same way so the two cannot disagree.
+#[allow(clippy::too_many_arguments)]
+fn enum_method(
+    name: &str,
+    kind: intrinsics::OptionMethod,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+    path: Pred,
+    pins: &[(u32, u64)],
+    cur: &MirFn,
+    prog: &MirProgram,
+    callees: &CalleeEnv<'_>,
+) -> Result<Vec<Obligation>, String> {
+    use intrinsics::OptionMethod;
+    let receiver = args
+        .first()
+        .ok_or_else(|| format!("`{name}` has no receiver"))?;
+    let p = match receiver {
+        Operand::Copy(p) | Operand::Move(p) => p,
+        Operand::Const(_) => return Err(format!("unmodelled argument to `{name}`")),
+    };
+    // `&self` for the predicates, `self` for the rest; `pointee` follows the
+    // reference either way and is a no-op for a by-value receiver.
+    let opt = env.pointee(p);
+    let Some(tag) = env.discriminants.get(&opt.local).copied() else {
+        return Err(format!("`{name}` on a receiver whose enum state is not modelled"));
+    };
+    let Val::Sym(tag, _) = tag else {
+        return Err(format!("`{name}` on a receiver whose tag is not a value"));
+    };
+    // `Result`'s payload is on `Ok` (tag 0), `Option`'s on `Some` (tag 1).
+    let payload_variant = if intrinsics::names_result_impl(name) {
+        intrinsics::OK_TAG
+    } else {
+        intrinsics::SOME_TAG
+    };
+    // `unwrap_or` on a `Result` is *total* only if destroying the error value on
+    // the `Err` branch cannot be observed. The model checks only that the payload
+    // and the default are scalar values, and Rust destroys `E` inside `unwrap_or`,
+    // so an error type with a panicking destructor would make the call panic while
+    // the model reports no obligation -- a false proof. The error type is read from
+    // the receiver's own type (`Result<T, E>`), and a type whose glue this tool
+    // cannot establish is refused rather than assumed harmless.
+    //
+    // `unwrap_or_default` consumes the same receiver and destroys the same error on
+    // the `Err` branch, so it is guarded identically -- excluding it was a false
+    // proof for a `Result<u8, Boom>` whose `Boom` destructor panics.
+    if let OptionMethod::UnwrapOr | OptionMethod::UnwrapOrDefault = kind {
+        if intrinsics::names_result_impl(name) {
+            if let Some(err) = receiver_error_type(cur, &opt) {
+                match has_drop_glue(prog, callees.structs(), &err) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        return Err(format!(
+                            "`{name}` destroys an error value whose destructor is not modelled"
+                        ));
+                    }
+                    Err(e) => return Err(format!("`{name}`: {e}")),
+                }
+            }
+        }
+    }
+    // The `Option`↔`Result` conversions move one payload into the result and
+    // *drop* the other, so a type whose destructor this tool cannot establish is
+    // refused rather than assumed harmless -- the same reasoning as `unwrap_or`'s
+    // error check. Each reads the type that gets dropped: `ok_or`'s argument, the
+    // `Err` payload of `ok()`, the `Ok` payload of `err()`.
+    let dropped_ty = match kind {
+        OptionMethod::OkOr => args.get(1).and_then(|a| operand_ty(cur, a)),
+        OptionMethod::Ok => receiver_error_type(cur, &opt),
+        OptionMethod::Err => receiver_ok_type(cur, &opt),
+        OptionMethod::And => receiver_some_type(cur, &opt),
+        OptionMethod::Or => receiver_some_type(cur, &opt),
+        _ => None,
+    };
+    if matches!(
+        kind,
+        OptionMethod::OkOr | OptionMethod::Ok | OptionMethod::Err | OptionMethod::And
+            | OptionMethod::Or
+    ) {
+        if let Some(ty) = dropped_ty {
+            match has_drop_glue(prog, callees.structs(), &ty) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(format!(
+                        "`{name}` destroys a value whose destructor is not modelled"
+                    ));
+                }
+                Err(e) => return Err(format!("`{name}`: {e}")),
+            }
+        }
+    }
+    // The tag's width: the seeded/enum width where there is one, else the
+    // payload's, exactly as `Rvalue::Discriminant` reads it.
+    let tag_w = env.tag_width(opt.local).or_else(|| env.option_width(opt.local)).unwrap_or(64);
+    let tag = smt::truncate(tag, tag_w);
+    Ok(match kind {
+        // `is_some`/`is_ok` is `tag == success`, `is_none`/`is_err` is
+        // `tag == failure`. The destination is a `bool`, so the result is a
+        // predicate and not a one-bit word -- the `if` that consumes it reads a
+        // predicate.
+        OptionMethod::IsSuccess => {
+            env.set(dest, Val::Bool(smt::eq_const(tag, payload_variant)));
+            Vec::new()
+        }
+        OptionMethod::IsFailure => {
+            env.set(dest, Val::Bool(smt::eq_const(tag, 1 - payload_variant)));
+            Vec::new()
+        }
+        // `Option::ok_or(err)` and `Result::ok()`/`err()` convert between the two
+        // enums. `ok_or`/`ok` reinterpret the receiver's tag (`Ok` and `Some` are
+        // discriminants 0 and 1, so `1 - tag`); `err` keeps it, because `Err` is
+        // already the payload-carrying variant of a `Result` and `Some` of an
+        // `Option`. The payload a variant *carries* is recorded under the
+        // discriminant rustc's `switchInt` selects, and the other variant's is
+        // left unset -- the consuming `switchInt` only reads the payload in the
+        // arm whose tag matched, so a read of the unset one never happens.
+        OptionMethod::OkOr => {
+            // The error argument is always present and always needed: it becomes
+            // the result's `Err` payload (discriminant 1). `Some`'s payload
+            // becomes the result's `Ok` payload (discriminant 0).
+            let (err, err_sign) = match args.get(1).map(|d| operand(env, d)) {
+                Some(Val::Sym(v, s)) => (v, s),
+                Some(_) => return Err(format!("unmodelled argument to `{name}`")),
+                None => return Err(format!("`{name}` has no error argument")),
+            };
+            let err_w = smt::bits(err);
+            // The `Ok` payload exists only on the `Some` path. A receiver whose
+            // tag is a *known* non-`Some` discriminant (`None::<u8>.ok_or(e)`)
+            // cannot reach the `Ok` result on this path, so the payload is left
+            // *unbound* rather than refused -- exactly as a `None` construction
+            // leaves it. A symbolic or `Some` tag still requires the payload:
+            // binding a fabricated value there would be a value the receiver never
+            // holds.
+            let ok_payload = match env.payloads.get(&(opt.local, intrinsics::SOME_TAG)).copied() {
+                Some((Val::Sym(ok, ok_sign), ok_w)) => Some((ok, ok_sign, ok_w)),
+                Some(_) => {
+                    return Err(format!("`{name}` on a receiver whose payload is not modelled"))
+                }
+                None => match smt::evaluate(tag, |_| None) {
+                    Some(v) if v != intrinsics::SOME_TAG => None,
+                    _ => {
+                        return Err(format!(
+                            "`{name}` on a receiver whose payload is not modelled"
+                        ))
+                    }
+                },
+            };
+            let result_tag = smt::truncate(smt::sub(smt::word(1, tag_w), tag), tag_w);
+            env.set_discriminant(dest.local, Val::Sym(result_tag, Sign::Unsigned));
+            if let Some((ok, ok_sign, ok_w)) = ok_payload {
+                env.set_payload(dest.local, intrinsics::OK_TAG, Val::Sym(ok, ok_sign), ok_w);
+            }
+            env.set_payload(dest.local, 1, Val::Sym(err, err_sign), err_w);
+            Vec::new()
+        }
+        OptionMethod::Ok | OptionMethod::Err => {
+            // `ok()` moves the `Ok` payload onto `Some`; `err()` moves the `Err`
+            // payload onto `Some`. Both results are `Option`s, whose payload
+            // variant is `Some`.
+            let src = match kind {
+                OptionMethod::Ok => intrinsics::OK_TAG,
+                _ => 1 - intrinsics::OK_TAG,
+            };
+            // The source variant has no payload on this path (`Err::<u8,u8>(e).ok()`
+            // reaches the `Ok` result on no path). Sound to leave unbound only when
+            // the tag is a *known* other discriminant; a symbolic tag still requires
+            // the payload.
+            let payload = match env.payloads.get(&(opt.local, src)).copied() {
+                Some((Val::Sym(payload, sign), pw)) => Some((payload, sign, pw)),
+                Some(_) => {
+                    return Err(format!("`{name}` on a receiver whose payload is not modelled"))
+                }
+                None => match smt::evaluate(tag, |_| None) {
+                    Some(v) if v != src => None,
+                    _ => {
+                        return Err(format!(
+                            "`{name}` on a receiver whose payload is not modelled"
+                        ))
+                    }
+                },
+            };
+            let result_tag = match kind {
+                // `Ok`(0) -> `Some`(1), `Err`(1) -> `None`(0): `1 - tag`.
+                OptionMethod::Ok => smt::truncate(smt::sub(smt::word(1, tag_w), tag), tag_w),
+                // `err()` keeps the tag: `Err` is the `Option::Some` result.
+                _ => tag,
+            };
+            env.set_discriminant(dest.local, Val::Sym(result_tag, Sign::Unsigned));
+            if let Some((payload, sign, pw)) = payload {
+                env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(payload, sign), pw);
+            }
+            Vec::new()
+        }
+        OptionMethod::Or | OptionMethod::And => {
+            // `or`/`and` take a second `Option` of the same type and return one of
+            // the two by the receiver's tag:
+            //   `or`:  `Some` -> the receiver, `None` -> `other`
+            //   `and`: `Some` -> `other`,    `None` -> the receiver (`None`)
+            // The result's tag is an `ite` on the receiver's tag, and *both*
+            // payloads are carried unconditionally -- each is read only on the path
+            // whose tag selects it, so a path that does not select a payload never
+            // reads it. That is what makes the shape total and lossless: no branch
+            // of the `switchInt` that consumes the result finds an unbound payload.
+            // The receiver's own payload, and the argument's tag/payload. The
+            // argument is an `Option` by value, so its parts live on its local.
+            //
+            // A payload is required only when the operand can be `Some` on some
+            // path. A *constructed* `None` records no payload; when its tag is a
+            // known non-`Some` discriminant the payload is absent and irrelevant,
+            // exactly as the `ok`/`err` conversions handle it. A symbolic tag
+            // still requires the payload, because a fabricated value there would
+            // be one the operand never holds.
+            let arg_opt = match args.get(1).and_then(|d| match d {
+                Operand::Copy(p) | Operand::Move(p) => Some(env.pointee(p)),
+                _ => None,
+            }) {
+                Some(a) => a,
+                None => return Err(format!("`{name}` on an argument that is not a place")),
+            };
+            let Some(Val::Sym(arg_tag, _)) = env.discriminants.get(&arg_opt.local).copied() else {
+                return Err(format!("`{name}` on an argument whose enum state is not modelled"));
+            };
+            let recv_payload =
+                payload_if_some(env, opt.local, tag, payload_variant, "a receiver", name)?;
+            let arg_payload =
+                payload_if_some(env, arg_opt.local, arg_tag, payload_variant, "an argument", name)?;
+            // The two tags can come from *different* origins -- a seeded enum
+            // argument's tag is one bit (`bind_enum`), a `checked_*` result's tag
+            // is the operand's width -- so they are normalised to a common width
+            // before the `ite`, or the branches mismatch and the query is refused
+            // as ill-formed.
+            let common_w = smt::bits(tag).max(smt::bits(arg_tag));
+            let tag = smt::truncate(tag, common_w);
+            let arg_tag = smt::truncate(arg_tag, common_w);
+            let is_some = smt::eq_const(tag, payload_variant);
+            let (result_tag, result_payload) = match kind {
+                // `or` is `Option<T>` on both sides, so the two payloads have the
+                // same type: the receiver's on `Some`, the argument's on `None`. An
+                // absent payload (a known `None` operand) needs no `ite` -- the
+                // other operand is the whole result.
+                OptionMethod::Or => {
+                    let payload = match (recv_payload, arg_payload) {
+                        (Some((r, rs, rw)), Some((a, _, _))) => {
+                            Some((smt::ite(is_some, r, a), rs, rw))
+                        }
+                        (Some((r, rs, rw)), None) => Some((r, rs, rw)),
+                        (None, Some((a, as_, aw))) => Some((a, as_, aw)),
+                        (None, None) => None,
+                    };
+                    (smt::ite(is_some, tag, arg_tag), payload)
+                }
+                // `and` is `Option<T>::and<U> -> Option<U>`: on `Some` the result is
+                // the *argument* (`Option<U>`), and on `None` it is `None`, whose
+                // payload is never read. So the result's payload is the argument's
+                // unconditionally -- `ite`-ing it with the receiver's `T` payload
+                // would demand equal widths for two unrelated types.
+                _ => (smt::ite(is_some, arg_tag, tag), arg_payload),
+            };
+            env.set_discriminant(dest.local, Val::Sym(result_tag, Sign::Unsigned));
+            if let Some((payload, sign, w)) = result_payload {
+                env.set_payload(dest.local, payload_variant, Val::Sym(payload, sign), w);
+            }
+            // Carry the selected reference's *element identity*, *compositionally*.
+            // `slice::first`/`get` produce an `Option<&T>` whose payload names a
+            // slice element through `slice_elem_ref`, and a later `*` deref reads
+            // it. Each combinator builds a node over its operands' own identities
+            // rather than reading a leaf, so a chain composes:
+            //
+            //   `or`:  result = `is_some ? recv : arg`
+            //   `and`: result = `is_some ? arg : recv`
+            //
+            // A missing operand identity is substituted only when that operand
+            // cannot be the one selected -- the receiver's tag proves it. Reading a
+            // missing identity as the *other* operand's on a path that could select
+            // it was the false proof (`a.first().or(b.first()).or(c.first())` took
+            // `c`'s element); a symbolic tag with a missing operand identity is
+            // therefore left unset, which makes the deref unknown rather than wrong.
+            env.slice_elem_ref.remove(&dest.local);
+            let cond = smt::eq_const(tag, payload_variant);
+            let r = env.slice_elem_ref.get(&opt.local).cloned();
+            let a = env.slice_elem_ref.get(&arg_opt.local).cloned();
+            let is_and = matches!(kind, OptionMethod::And);
+            let composed = if is_and {
+                // `Option<T>::and<U>` returns `Some(arg)` on a `Some` receiver and
+                // `None` otherwise, so the *result's* element -- read only on the
+                // `Some` path -- is always the argument's. The receiver's element is
+                // never the result, and its type may differ (`Option<&u8>` receiver,
+                // `Option<&u16>` argument), so a `Select` over both would demand
+                // equal widths for unrelated types and mark the query ill-formed.
+                // Carrying the argument identity alone is both exact and
+                // width-safe.
+                a
+            } else {
+                // `Some(v)` when the receiver's tag is a known discriminant, so the
+                // `is_some` test is decided and one operand is provably not selected.
+                let known_tag = smt::evaluate(tag, |_| None);
+                // Whether the receiver is selected: `or` selects it on `Some`.
+                let recv_selected_known = known_tag.map(|v| v == payload_variant);
+                match (r, a) {
+                    (Some(r), Some(a)) => {
+                        Some(ElemId::Select(cond, Box::new(r), Box::new(a)))
+                    }
+                    // The receiver's identity is missing: usable only when the tag
+                    // says the receiver is not the selected operand.
+                    (None, Some(a)) => match recv_selected_known {
+                        Some(false) => Some(a),
+                        _ => None,
+                    },
+                    // The argument's identity is missing: usable only when the tag
+                    // says the receiver *is* the selected operand.
+                    (Some(r), None) => match recv_selected_known {
+                        Some(true) => Some(r),
+                        _ => None,
+                    },
+                    (None, None) => None,
+                }
+            };
+            if let Some(id) = composed {
+                env.slice_elem_ref.insert(dest.local, id);
+            }
+            Vec::new()
+        }
+        // `Option<&T>::copied()`/`cloned()`: the value the payload reference
+        // addresses, with the receiver's tag unchanged. The model stores a `&T`
+        // payload as the value it addresses, so the result's payload *is* the
+        // receiver's -- `v.first().copied()` and `*v.first().unwrap()` name one
+        // word. Only the tag passes through; the element identity is dropped,
+        // because the result is a value, not a reference, so a later `*` on it is
+        // not a modelled read. A receiver with no payload on some path is refused
+        // (the same rule `or`/`and` apply), because the copied value would be one
+        // the receiver never holds.
+        OptionMethod::Copied => {
+            let payload =
+                payload_if_some(env, opt.local, tag, payload_variant, "a receiver", name)?;
+            env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+            if let Some((payload, sign, w)) = payload {
+                env.set_payload(dest.local, payload_variant, Val::Sym(payload, sign), w);
+            }
+            Vec::new()
+        }
+        // `unwrap`/`unwrap_or` read the payload, which `checked_*` recorded
+        // *unconditionally* -- it is only ever read on a path whose tag is the
+        // success variant, which rustc guarantees by emitting the downcast
+        // projection only inside that arm. So the payload is written without a
+        // guard here; the tag's `switchInt` is what keeps a failure path from
+        // reaching this read.
+        OptionMethod::Unwrap | OptionMethod::Expect | OptionMethod::UnwrapOr
+        | OptionMethod::UnwrapOrDefault => {
+            let Some((Val::Sym(payload, sign), _)) =
+                env.payloads.get(&(opt.local, payload_variant)).copied()
+            else {
+                return Err(format!("`{name}` on a receiver whose payload is not modelled"));
+            };
+            let value = match kind {
+                OptionMethod::UnwrapOr => {
+                    // `unwrap_or(default)`: the payload on the success variant, the
+                    // default on the failure one. The default is the second argument
+                    // (`Option::unwrap_or(self, default)`), so a failure receiver
+                    // yields it and the method is *total* -- no panic obligation.
+                    let default = match args.get(1) {
+                        Some(d) => match operand(env, d) {
+                            Val::Sym(v, _) => v,
+                            _ => return Err(format!("unmodelled default argument to `{name}`")),
+                        },
+                        None => return Err(format!("`{name}` has no default argument")),
+                    };
+                    smt::ite(smt::eq_const(tag, payload_variant), payload, default)
+                }
+                OptionMethod::UnwrapOrDefault => {
+                    // `unwrap_or_default()`: the payload on the success variant,
+                    // `T::default()` on the failure one. For every scalar payload
+                    // this tool models, `Default` is the zero of the payload's own
+                    // width -- `0u8`, `0i32`, `false` -- so the default is that
+                    // word, not a fresh input. The width is the payload's own (not
+                    // the destination's, which is the same type here but a
+                    // different local), and a payload with no bit width (a struct)
+                    // is refused rather than given a zero it may not have.
+                    let w = payload.width();
+                    if w == 0 {
+                        return Err(format!(
+                            "`{name}` on a payload whose default value is not modelled"
+                        ));
+                    }
+                    let default = smt::word(0, w);
+                    smt::ite(smt::eq_const(tag, payload_variant), payload, default)
+                }
+                _ => payload,
+            };
+            env.set(dest, Val::Sym(value, sign));
+            if matches!(kind, OptionMethod::Unwrap | OptionMethod::Expect) {
+                // If the payload was a reference to a slice element
+                // (`slice::first`/`get` produce `Option<&T>`), the element the
+                // reference names travels with the payload, so `*_2` on the
+                // destination reads the slice's own element. `unwrap`/`expect`
+                // panic on the failure variant, so the payload here is always the
+                // `Some` element -- no path reaches the deref without it. The
+                // identity may be conditional (a chain of `or`/`and`), and it
+                // travels as-is.
+                if let Some(e) = env.slice_elem_ref.get(&opt.local).cloned() {
+                    env.slice_elem_ref.insert(dest.local, e);
+                }
+                // `unwrap`/`expect` **panic** on the failure variant. The failure
+                // is `tag == failure`, a reachable-failure obligation of the same
+                // polarity as a rustc-inserted `assert`: the call is safe exactly
+                // where `path ∧ tag == failure` is unsatisfiable. `unwrap_or` has
+                // no such obligation -- it is total.
+                return Ok(vec![Obligation {
+                    kind: ObligationKind::Panic {
+                        message: if payload_variant == intrinsics::OK_TAG {
+                            format!("`{name}` on an `Err` value")
+                        } else {
+                            format!("`{name}` on a `None` value")
+                        },
+                    },
+                    verdict: find_obligation(
+                        smt::and(path, smt::eq_const(tag, 1 - payload_variant)),
+                        pins,
+                    ),
+                }]);
+            }
+            Vec::new()
+        }
+    })
+}
+
+/// Answer `slice::first`/`slice::get`, which produce `Option<&T>`.
+///
+/// The element is the executor's own `s[0]`/`s[k]` variable -- the same one a
+/// `s[0]` read names -- so the `Option`'s payload *is* that element and not a
+/// fresh value the slice never holds. The `Option`'s tag is a *predicate*
+/// (`len == 0` for `first`, `k >= len` for `get`), so the arm is decided by the
+/// caller's `switchInt` on the discriminant, and the payload is recorded under the
+/// `Some` discriminant so a `(_2 as Some).0` downcast -- or the reference's deref
+/// -- reads it. The element is also recorded in `slice_elem_ref`, so `*_2` on the
+/// returned reference reads the slice's element rather than the reference local's
+/// absent value.
+fn slice_element(
+    name: &str,
+    op: intrinsics::Intrinsic,
+    receiver: &Place,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+    f: &MirFn,
+) -> Result<Vec<Obligation>, String> {
+    use intrinsics::Intrinsic;
+    let recv = env.pointee(receiver);
+    let Val::Sym(len, _) = length_of(env, f, receiver) else {
+        return Err(format!("`{name}` on a receiver whose length is not modelled"));
+    };
+    let Some(s) = env.indexed.get(&recv.local) else {
+        return Err(format!("`{name}` on a receiver whose elements are not modelled"));
+    };
+    let (sl, elem_w, fixed_len) = (recv.local, s.elem_w, s.fixed_len);
+    // `first` names element 0; `get(k)` names element `k`. The index must be a
+    // *constant*: a slice's length is symbolic, so a symbolic index has no finite
+    // domain and reading "some element" would make `s[i]` a different value per
+    // read -- a wrong proof, not a missing one. A literal index is exact.
+    let (index, failure) = match op {
+        Intrinsic::SliceFirst => (0u64, smt::eq_const(len, 0)),
+        Intrinsic::SliceLast => {
+            // An array's length is its type's constant, so `last` names the exact
+            // element `N-1`. A slice's length is symbolic, so there is no index to
+            // pin; the element is a single fresh variable per slice, keyed by a
+            // sentinel so every `last()` call on the same slice reads the *same*
+            // value (a fresh variable per call would let two `last()` reads
+            // disagree -- a wrong value, not a missing one).
+            let idx = match fixed_len {
+                Some(0) => 0,
+                Some(n) => n - 1,
+                None => LAST_INDEX,
+            };
+            (idx, smt::eq_const(len, 0))
+        }
+        _ => {
+            let k = match args.get(1) {
+                Some(Operand::Const(Const::UInt(v, _))) => u64::try_from(*v).ok(),
+                Some(Operand::Copy(p) | Operand::Move(p)) => match env.locals.get(&p.local) {
+                    Some(Val::Sym(v, _)) => smt::evaluate(*v, |_| None),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(k) = k else {
+                return Err(format!(
+                    "`{name}` with an index that is not a constant is not modelled"
+                ));
+            };
+            // `get(k)` is `None` exactly when `k >= len`, which is `len <= k`.
+            (k, smt::ule_const(len, k))
+        }
+    };
+    let (elem, elem_sign) = env
+        .index_elem(sl, index)
+        .ok_or_else(|| format!("`{name}` on a receiver whose elements are not modelled"))?;
+    // `Some` when the access is in range, `None` otherwise. The tag is one bit
+    // (the discriminants are `0`/`1`), and it is a predicate, not a constant.
+    let tag = smt::ite(
+        failure,
+        smt::word(0, 1),
+        smt::word(intrinsics::SOME_TAG, 1),
+    );
+    env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+    env.set_payload(
+        dest.local,
+        intrinsics::SOME_TAG,
+        Val::Sym(elem, elem_sign),
+        elem_w,
+    );
+    env.slice_elem_ref.insert(dest.local, ElemId::Leaf((sl, index)));
+    Ok(Vec::new())
+}
+
+/// The element type of a `Vec<T>`, from its printed name.
+///
+/// rustc prints the standard container's *type* as `std::vec::Vec<u8>` (or
+/// `alloc::vec::Vec<u8>`) -- never as a bare `Vec<u8>` -- so the identity is the
+/// full path, not the last segment. This matters for soundness: a user type
+/// spelled `Vec` (`mod m { struct Vec<T>(..) }`, printed `m::Vec<u8>`, or a
+/// crate-root `Vec<u8>`) must **not** be read as the standard container, or a
+/// destructor this model skips would be skipped for a type that is not a `Vec`
+/// at all. So the module path is checked, not discarded.
+///
+/// `None` for a name that is not the standard `Vec`, or one whose arguments
+/// cannot be read.
+fn vec_elem_ty(name: &str) -> Option<Ty> {
+    // The head before the generic arguments is the path; the standard container's
+    // is `std::vec::Vec` or `alloc::vec::Vec`. A bare `Vec` is a user type (rustc
+    // always qualifies the standard one), so it is refused.
+    let head = name.split('<').next().unwrap_or(name);
+    if head != "std::vec::Vec" && head != "alloc::vec::Vec" {
+        return None;
+    }
+    crate::mir::spec::angle_inner(name).map(Ty::parse)
+}
+
+/// The `Vec<T>` length model: `new` sets the length to zero, `push` adds one,
+/// `len` reads it.
+///
+/// A `Vec`'s fields (a heap pointer, a length, a capacity) are not printed by
+/// the dump, so the length is all the model holds (see `Env::vec_len`).
+/// `new`/`push`/`len` are the calls the corpus uses; every other `Vec` method
+/// stays unmodelled rather than being guessed.
+///
+/// The receiver of `push`/`len` is a reference, so the length lives on the
+/// *referent* local -- `pointee` follows `&mut v`/`&v` to the storage the caller
+/// owns, which is the same local `new` wrote. A receiver whose length the run
+/// never set (a `Vec` argument, or one built by an unmodelled call) is refused,
+/// never given an invented number.
+fn vec_method(
+    name: &str,
+    kind: intrinsics::VecMethod,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+) -> Result<Vec<Obligation>, String> {
+    use intrinsics::VecMethod;
+    // The storage the receiver names, following one reference. `new` is the
+    // exception: it is an associated function with no receiver, so its length is
+    // written to the destination.
+    let receiver = |env: &Env| -> Result<u32, String> {
+        match args.first() {
+            Some(Operand::Copy(p)) | Some(Operand::Move(p)) => Ok(env.pointee(p).local),
+            _ => Err(format!("unmodelled receiver for `{name}`")),
+        }
+    };
+    match kind {
+        VecMethod::New => {
+            env.vec_len.insert(dest.local, smt::word(0, USIZE_WIDTH));
+            Ok(Vec::new())
+        }
+        VecMethod::Push => {
+            let l = receiver(env)?;
+            let Some(len) = env.vec_len.get(&l).copied() else {
+                return Err(format!("`{name}` on a receiver whose length is not modelled"));
+            };
+            // The length is a `usize` and `+ 1` cannot overflow at 64 bits for any
+            // vector a program can build, so this is exact rather than saturating.
+            env.vec_len.insert(l, smt::add(len, smt::word(1, USIZE_WIDTH)));
+            Ok(Vec::new())
+        }
+        VecMethod::Len => {
+            let l = receiver(env)?;
+            let Some(len) = env.vec_len.get(&l).copied() else {
+                return Err(format!("`{name}` on a receiver whose length is not modelled"));
+            };
+            env.set(dest, Val::Sym(len, Sign::Unsigned));
+            Ok(Vec::new())
+        }
+        VecMethod::IsEmpty => {
+            let l = receiver(env)?;
+            let Some(len) = env.vec_len.get(&l).copied() else {
+                return Err(format!("`{name}` on a receiver whose length is not modelled"));
+            };
+            env.set(dest, Val::Bool(smt::eq_const(len, 0)));
+            Ok(Vec::new())
+        }
+        VecMethod::Pop => {
+            let l = receiver(env)?;
+            let Some(len) = env.vec_len.get(&l).copied() else {
+                return Err(format!("`{name}` on a receiver whose length is not modelled"));
+            };
+            // `pop` returns `None` exactly when the vector is empty, and decrements
+            // the length otherwise. The popped element is not modelled (the dump
+            // prints no elements), so no payload is recorded: a `Some` payload read
+            // downstream is unknown, never a fabricated element.
+            let empty = smt::eq_const(len, 0);
+            let nonempty = smt::not(empty);
+            env.set_discriminant(
+                dest.local,
+                Val::Sym(
+                    smt::ite(
+                        nonempty,
+                        smt::word(intrinsics::SOME_TAG, 1),
+                        smt::word(intrinsics::NONE_TAG, 1),
+                    ),
+                    Sign::Unsigned,
+                ),
+            );
+            env.vec_len
+                .insert(l, smt::ite(nonempty, smt::sub(len, smt::word(1, USIZE_WIDTH)), len));
+            Ok(Vec::new())
+        }
+    }
+}
+
+
+/// Answer `Try::branch`, the first call of the `?` desugaring.
+///
+/// `expr?` is `<T as Try>::branch(expr)`, producing a
+/// `ControlFlow<Residual, T>`. `branch` *is* `Continue(expr)` on the success
+/// variant and `Break(residual)` on the failure one, so the model writes the
+/// `ControlFlow`'s tag and both payloads into the destination's stores and lets
+/// the `switchInt` on `discriminant(_)` -- and the `(_ as Continue).0` /
+/// `(_ as Break).0` downcasts -- decide:
+///
+/// * tag `Continue` ([`intrinsics::CONTINUE_TAG`]) on the receiver's success
+///   variant, carrying the success payload, which is what the `?` *yields*;
+/// * tag `Break` ([`intrinsics::BREAK_TAG`]) on the receiver's failure variant,
+///   carrying the *error value*. The residual the desugaring builds from it is
+///   always `Err(e)` (for a `Result`) or `None` (for an `Option`) -- `branch`
+///   only breaks on failure -- so the residual's own tag is fixed by the receiver
+///   type and does not have to be stored. [`from_residual`] re-wraps the error
+///   under the return enum's numbering.
+///
+/// The receiver is a `Result` or an `Option` (the two the desugaring's `Try`
+/// impls are modelled for), so the success variant is `Ok` (tag 0) or `Some`
+/// (tag 1), and the failure variant is the other. A receiver whose enum state is
+/// not modelled is refused rather than given an invented tag.
+fn try_branch(name: &str, args: &[Operand], dest: &Place, env: &mut Env) -> Result<(), String> {
+    let receiver = args.first().ok_or_else(|| format!("`{name}` has no receiver"))?;
+    let p = match receiver {
+        Operand::Copy(p) | Operand::Move(p) => p,
+        Operand::Const(_) => return Err(format!("unmodelled argument to `{name}`")),
+    };
+    let opt = env.pointee(p);
+    // The receiver's type: `Result` or `Option`, read from the call's self type
+    // (`<Result<u8, u8> as Try>::branch` -> `Result`). Only these two have a
+    // modelled `Try`.
+    let (is_result, success_disc) = match call_type(name).as_deref() {
+        Some(t) if t.starts_with("Result") => (true, intrinsics::OK_TAG),
+        Some(t) if t.starts_with("Option") => (false, intrinsics::SOME_TAG),
+        _ => return Err(format!("`{name}` is not a modelled `Try`")),
+    };
+    let Some(Val::Sym(tag, _)) = env.discriminants.get(&opt.local).copied() else {
+        return Err(format!("`{name}` on a receiver whose enum state is not modelled"));
+    };
+    let tag_w = env.tag_width(opt.local).or_else(|| env.option_width(opt.local)).unwrap_or(64);
+    let tag = smt::truncate(tag, tag_w);
+    let is_success = smt::eq_const(tag, success_disc);
+    // The success value: the payload on the receiver's success variant. A receiver
+    // whose tag is a *known* non-success discriminant cannot reach the `Continue`
+    // arm, so leaving it unbound is exact (the read never happens on that path); a
+    // symbolic or success tag still needs it.
+    let success_payload = match env.payloads.get(&(opt.local, success_disc)).copied() {
+        Some((Val::Sym(v, s), w)) => Some((v, s, w)),
+        Some(_) => return Err(format!("`{name}` on a receiver whose payload is not modelled")),
+        None => match smt::evaluate(tag, |_| None) {
+            Some(v) if v != success_disc => None,
+            _ => return Err(format!("`{name}` on a receiver whose payload is not modelled")),
+        },
+    };
+    // The `ControlFlow`'s tag: `Continue` iff the receiver is on its success
+    // variant, `Break` otherwise. The arm constants are small, so the word is the
+    // tag's own width -- the same width `discriminant(_)` will read it back at.
+    let cf_tag = smt::ite(
+        is_success,
+        smt::word(intrinsics::CONTINUE_TAG, tag_w),
+        smt::word(intrinsics::BREAK_TAG, tag_w),
+    );
+    env.set_discriminant(dest.local, Val::Sym(cf_tag, Sign::Unsigned));
+    if let Some((v, s, w)) = success_payload {
+        env.set_payload(dest.local, intrinsics::CONTINUE_TAG, Val::Sym(v, s), w);
+    }
+    // The `Break` payload is the error value, which `from_residual` re-wraps. It is
+    // read off the receiver's failure variant; a receiver that cannot reach the
+    // failure path leaves it unbound, and the `from_residual` call refuses if that
+    // arm is actually taken. An `Option`'s `None` carries no payload.
+    if is_result {
+        if let Some((Val::Sym(v, s), w)) = env.payloads.get(&(opt.local, 1)).copied() {
+            env.set_payload(dest.local, intrinsics::BREAK_TAG, Val::Sym(v, s), w);
+        }
+    }
+    Ok(())
+}
+
+/// Answer `FromResidual::from_residual`, the second call of the `?` desugaring.
+///
+/// On the `Break` arm the residual (the error value `branch` recorded) is
+/// converted back into the function's return enum: `Result::Err(e)` for a `Result`
+/// return, `Option::None` for an `Option` return. The return type is read from the
+/// call's own self type (`<Result<u8, u8> as FromResidual<…>>::from_residual`), so
+/// the destination's tag is the failure variant's -- `Err` (1) for a `Result`,
+/// `None` (0) for an `Option` -- and the error value, when there is one, becomes
+/// the `Err` payload. The destination is the function's return place, so this is
+/// what the postcondition's `ret.is_err()` / `ret.Err` reads.
+fn from_residual(name: &str, args: &[Operand], dest: &Place, env: &mut Env) -> Result<(), String> {
+    // The return enum's kind, from the call's self type. `Result`'s residual
+    // carries an error value; `Option`'s is the unit `None`.
+    let is_result = match call_type(name).as_deref() {
+        Some(t) if t.starts_with("Result") => true,
+        Some(t) if t.starts_with("Option") => false,
+        _ => return Err(format!("`{name}` is not a modelled `FromResidual`")),
+    };
+    let dest_w = env.tag_width(dest.local).unwrap_or(8);
+    if !is_result {
+        // `Option`'s `?` returns `None` early; the residual is the unit `None`.
+        env.set_discriminant(dest.local, Val::Sym(smt::word(0, dest_w), Sign::Unsigned));
+        return Ok(());
+    }
+    // `Result`'s `?` returns `Err(e)`; the residual argument (the `Break` payload
+    // `branch` recorded, copied into a local) is the error value.
+    let err = match args.first() {
+        Some(Operand::Copy(p) | Operand::Move(p)) => operand(env, &Operand::Copy(env.pointee(p))),
+        Some(Operand::Const(_)) | None => Val::Unknown,
+    };
+    env.set_discriminant(dest.local, Val::Sym(smt::word(1, dest_w), Sign::Unsigned));
+    match err {
+        Val::Sym(v, s) => env.set_payload(dest.local, 1, Val::Sym(v, s), smt::bits(v)),
+        _ => return Err(format!("`{name}` on a residual whose payload is not modelled")),
+    }
+    Ok(())
+}
+
+/// Answer `Ord::cmp`, whose result is a `core::cmp::Ordering` enum.
+///
+/// The sibling of [`Intrinsic::MinMax`] -- the same trait-method spelling
+/// (`<u8 as Ord>::cmp`) admitted by the same narrow rule -- and the first modelled
+/// shape whose result is a *three-variant enum* rather than a value or an
+/// `Option`. So the executor writes the destination's *discriminant* (and no
+/// payload: `Ordering`'s variants are unit) rather than a value, and the
+/// `switchInt` on `discriminant(_)` that follows decides.
+///
+/// A three-way comparison is the sign of `x - y`, so the tag is `Less` where
+/// `x < y`, `Greater` where `x > y`, and `Equal` otherwise -- one `ite` over the
+/// two comparisons the `PartialOrd` operators already build, at the operands'
+/// common width and sign. The tag's width is `Ordering`'s own `i8` discriminant,
+/// so the switch compares against the `-1`/`0`/`1` constants rustc prints (the
+/// negative one as its eight-bit two's-complement pattern, which is why the tag
+/// is built from the pattern and not through `word`, which refuses an
+/// out-of-range value).
+fn ord_cmp(name: &str, args: &[Operand], dest: &Place, env: &mut Env) -> Result<(), String> {
+    use intrinsics::{Intrinsic, Outcome, PartialCmpKind};
+    let (Some(a), Some(b)) = (args.first(), args.get(1)) else {
+        return Err(format!("unmodelled arity for `{name}`"));
+    };
+    // Both operands are `&Self` (`&self` and `&other`), so the *referent* is the
+    // value; a pointer has no bit-vector meaning, exactly as for the
+    // `PartialEq`/`PartialOrd` comparisons. `pointee` follows the reference and is
+    // a no-op for a by-value operand.
+    let value = |env: &Env, op: &Operand| match op {
+        Operand::Copy(p) | Operand::Move(p) => match env.get(&env.pointee(p)) {
+            Val::Sym(v, s) => Some((v, s)),
+            _ => None,
+        },
+        Operand::Const(_) => None,
+    };
+    let (Some((x, sx)), Some((y, _))) = (value(env, a), value(env, b)) else {
+        return Err(format!("unmodelled argument to `{name}`"));
+    };
+    let w = smt::bits(x);
+    // The sign is a refusal when it could not be read: ordering `i8::MIN`
+    // unsigned would place it above every other value, a wrong ordering rather
+    // than a weaker proof.
+    let signed = sx
+        .known()
+        .ok_or_else(|| format!("`{name}` on an operand whose sign is not modelled"))?;
+    let bool_of = |kind: PartialCmpKind| -> Result<Pred, String> {
+        match intrinsics::eval(Intrinsic::Cmp(kind), x, y, w, signed, w) {
+            Some(Outcome::Bool(p)) => Ok(p),
+            _ => Err(format!("`{name}` past what the model covers at {w} bits")),
+        }
+    };
+    let lt = bool_of(PartialCmpKind::Lt)?;
+    let gt = bool_of(PartialCmpKind::Gt)?;
+    let tag_w = 8u8;
+    let bits = |d: i64| (d as u64) & ((1u64 << tag_w) - 1);
+    let tag = smt::ite(
+        lt,
+        smt::word(bits(intrinsics::ORDERING_LESS), tag_w),
+        smt::ite(
+            gt,
+            smt::word(bits(intrinsics::ORDERING_GREATER), tag_w),
+            smt::word(bits(intrinsics::ORDERING_EQUAL), tag_w),
+        ),
+    );
+    env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+    Ok(())
+}
+
 /// Answer a modelled `core::num` call, if the callee is one.
 ///
 /// `None` means the callee is not a modelled intrinsic, and the caller falls
@@ -3881,6 +5981,7 @@ fn eval_measure_here(f: &MirFn, env: &Env, text: &str) -> Result<(Var, bool), St
 /// [`intrinsics::DIV_MAX_WIDTH`] -- and the path is reported unknown. The
 /// distinction matters: refusing to model a call and refusing to inline it are
 /// different answers, and only the first is a coverage gap in `intrinsics`.
+#[allow(clippy::too_many_arguments)]
 fn try_intrinsic(
     prog: &MirProgram,
     func: usize,
@@ -3888,7 +5989,10 @@ fn try_intrinsic(
     args: &[Operand],
     dest: &Place,
     env: &mut Env,
-) -> Option<Result<(), String>> {
+    path: Pred,
+    pins: &[(u32, u64)],
+    callees: &CalleeEnv<'_>,
+) -> Option<Result<Vec<Obligation>, String>> {
     let op = intrinsics::classify(name)?;
     // A modelled method is only ever `core`'s own, and rustc prints a `core`
     // integer method's call with the `<impl …>` projection (`core::num::<impl
@@ -3922,8 +6026,24 @@ fn try_intrinsic(
     // widening between modelled integers (see the branch below). The crate-root
     // collision -- a user `From` that prints as the bare `From` -- is again closed
     // by the same-dump lookup, not by the name.
-    let trait_method =
-        is_ord_callee(name) || matches!(op, intrinsics::Intrinsic::Conversion(_));
+    //
+    // The `Option` methods are the same shape once more: rustc prints
+    // `Option::<u32>::unwrap`, an inherent method on the `Option` type rather than
+    // a `core::num::<impl u32>` path, so there is no `<impl` to match. `classify`
+    // accepts them only for the standard library's `Option` (see
+    // `names_option_impl`), and the same-dump lookup answers a real `Option` body
+    // first, which is what keeps a local type spelled `Option` out.
+    let trait_method = is_ord_callee(name)
+        || is_cmp_callee(name)
+        || matches!(
+            op,
+            intrinsics::Intrinsic::Conversion(_)
+                | intrinsics::Intrinsic::OptionMethod(_)
+                | intrinsics::Intrinsic::Range(_)
+                | intrinsics::Intrinsic::TryBranch
+                | intrinsics::Intrinsic::FromResidual
+                | intrinsics::Intrinsic::VecMethod(_)
+        );
     if !name.contains("<impl") && !trait_method {
         return None;
     }
@@ -3960,26 +6080,157 @@ fn try_intrinsic(
     // and it is answered before the generic operand read below (which assumes one
     // width for every operand).
     if let intrinsics::Intrinsic::Conversion(kind) = op {
-        return Some(convert(name, kind, args, dest, env));
+        return Some(convert(name, kind, args, dest, env).map(|()| Vec::new()));
+    }
+    // The `Vec` methods. They read a length the executor tracks, not a bit-vector
+    // operand, so they are answered before the generic operand read below -- a
+    // `Vec` receiver has no width to read, and `Vec::new()` has *no* argument at
+    // all, so it must run before the `args.first()?` that the operand read needs.
+    if let intrinsics::Intrinsic::VecMethod(kind) = op {
+        return Some(vec_method(name, kind, args, dest, env));
     }
     let cur = &prog.fns[func];
     // The operand width, from the first argument's declared type. It is not the
     // destination's: `checked_add` on a `u8` writes an `Option<u8>`, and taking
     // the width from there would ask the engine for a 64-bit overflow test.
     let first = args.first()?;
-    let w = operand_width(cur, first)?;
+    // `slice::len`/`is_empty`. The receiver is a `&[T]`, whose *length* is the one
+    // symbolic input the frontend already binds for the bounds checks, so the
+    // model is that variable and not a fresh one. The length is a `usize`, which
+    // is why the width is not read from the receiver -- a reference has no
+    // bit-vector width -- and why this is handled before the generic operand read.
+    if matches!(op, intrinsics::Intrinsic::SliceLen | intrinsics::Intrinsic::SliceIsEmpty) {
+        let p = match first {
+            Operand::Copy(p) | Operand::Move(p) => p,
+            Operand::Const(_) => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        };
+        // `length_of` follows the reference to the slice local the frontend bound a
+        // length for. A receiver whose length is not modelled (a `Vec`, or a slice
+        // the contract never bound) is refused here rather than given an invented
+        // number.
+        let Val::Sym(len, _) = length_of(env, cur, p) else {
+            return Some(Err(format!("`{name}` on a receiver whose length is not modelled")));
+        };
+        return Some(match op {
+            intrinsics::Intrinsic::SliceLen => {
+                env.set(dest, Val::Sym(len, Sign::Unsigned));
+                Ok(Vec::new())
+            }
+            // `is_empty` is `len == 0`, on the *same* variable `len` reads, so the
+            // two cannot disagree. The destination is a `bool`, so it is a
+            // predicate and not a one-bit word.
+            _ => {
+                env.set(dest, Val::Bool(smt::eq_const(len, 0)));
+                Ok(Vec::new())
+            }
+        });
+    }
+    // `slice::first`/`get`: `Option<&T>`. The element is the executor's own
+    // `s[0]`/`s[k]` variable -- the same one a `s[0]` read names -- so the
+    // `Option`'s payload *is* that element rather than a fresh value the slice
+    // never holds. The `Option` tag is a predicate (`len == 0` for `first`,
+    // `k >= len` for `get`), so the arm is decided by the caller's `switchInt`,
+    // and the payload is recorded under the `Some` discriminant so a `(_2 as
+    // Some).0` downcast -- or the reference's deref -- reads it.
+    if matches!(
+        op,
+        intrinsics::Intrinsic::SliceFirst
+            | intrinsics::Intrinsic::SliceGet
+            | intrinsics::Intrinsic::SliceLast
+    ) {
+        let p = match first {
+            Operand::Copy(p) | Operand::Move(p) => p,
+            Operand::Const(_) => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        };
+        return Some(slice_element(name, op, p, args, dest, env, cur));
+    }
+    // The standard library's `Option`/`Result` methods. The receiver is an
+    // `Option<T>`/`Result<T, E>` whose tag and payload the model's own
+    // `checked_*` family (or an argument the contract bound) recorded in the
+    // environment's discriminant and payload stores. The receiver is `self` for
+    // `unwrap`/`unwrap_or` and `&self` for the predicates, so it is followed
+    // through a reference the same way the ASCII tests are -- `_2 = &_1;
+    // is_some(move _2)` reads `_1`.
+    if let intrinsics::Intrinsic::OptionMethod(kind) = op {
+        return Some(enum_method(name, kind, args, dest, env, path, pins, &prog.fns[func], prog, callees));
+    }
+    // The `for`-loop range methods. Their receiver is a `RangeInclusive`/`Range`
+    // struct whose `start`/`end`/`exhausted` fields the executor holds, so they are
+    // answered from that store rather than from an operand term. This is what makes
+    // the commonest loop in Rust reachable: the desugaring's `new`/`into_iter`/`next`
+    // are modelled, and the loop then decides by its `invariant:` (or is unwound
+    // like any other loop).
+    if let intrinsics::Intrinsic::Range(kind) = op {
+        return Some(range_method(name, kind, args, dest, env));
+    }
+    // The `?` operator's two calls. Like the `Option`/range methods they read the
+    // receiver's enum state from the executor's stores rather than from an operand
+    // term, so they are answered here. They run *before* the generic operand read
+    // below, which assumes a bit-vector operand and a single width.
+    if let intrinsics::Intrinsic::TryBranch = op {
+        return Some(try_branch(name, args, dest, env).map(|()| Vec::new()));
+    }
+    if let intrinsics::Intrinsic::FromResidual = op {
+        return Some(from_residual(name, args, dest, env).map(|()| Vec::new()));
+    }
+    // `Ord::cmp`: the three-way ordering, whose result is an `Ordering` enum. Like
+    // the `?` desugaring's calls it writes an enum's discriminant and payload
+    // rather than a single value, so it is answered here, before the generic
+    // operand read below.
+    if let intrinsics::Intrinsic::OrdCmp = op {
+        return Some(ord_cmp(name, args, dest, env).map(|()| Vec::new()));
+    }
+    // The ASCII class tests and the ASCII case conversions take `&self`, so the
+    // operand is a reference whose *referent* is the byte. rustc prints `_3 = &_1;
+    // is_ascii_digit(move _3)`, and the width and the value both have to come from
+    // `_1`, not from the `&u8` local (which is a pointer with no bit-vector
+    // meaning). Only these shapes need the step: every other modelled method takes
+    // `self` by value.
+    // The ASCII class tests, the ASCII case conversions and the `PartialEq`/
+    // `PartialOrd` comparisons take their operands by reference, so the operand is
+    // a reference whose *referent* is the value. rustc prints `_3 = &_1;
+    // is_ascii_digit(move _3)`, and the width and the value both have to come from
+    // `_1`, not from the `&u8` local (which is a pointer with no bit-vector
+    // meaning). Only these shapes need the step: every other modelled method takes
+    // `self` by value.
+    let ref_receiver = matches!(
+        op,
+        intrinsics::Intrinsic::Bool(intrinsics::BoolKind::Ascii(_))
+            | intrinsics::Intrinsic::AsciiCase(_)
+            | intrinsics::Intrinsic::Cmp(_)
+    )
+    .then(|| match first {
+        Operand::Copy(p) | Operand::Move(p) => Some(env.pointee(p)),
+        Operand::Const(_) => None,
+    })
+    .flatten();
+    let w = match &ref_receiver {
+        Some(p) => width_of(cur, p),
+        None => operand_width(cur, first),
+    }?;
     // The operand's signedness comes *from the value*. An operand whose type
     // could not be read was already refused when the value was built (it is
     // `Val::Unknown`, not a `Sym`), so there is no sign to guess here: guessing
     // would give `sdiv`/`srem` the unsigned meaning, which is a wrong value for
     // every negative operand rather than a weaker proof.
-    let (x, sign) = match operand(env, first) {
-        // The sign comes out of the value with the word, so the two cannot be
-        // read from different places and disagree.
-        Val::Sym(v, sign) => (v, sign),
-        // A `bool` operand has no bit-vector to hand the model, and an unknown
-        // one has no value at all. Either way there is nothing to compute with.
-        _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+    //
+    // The ASCII receiver is read through its reference: `operand` on the `&u8`
+    // local gives `Unknown` (a pointer has no bit-vector meaning), so the byte is
+    // read from the place `pointee` names instead. This is the same value the
+    // body's own `*_3` would read.
+    let (x, sign) = match &ref_receiver {
+        Some(p) => match env.get(p) {
+            Val::Sym(v, sign) => (v, sign),
+            _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        },
+        None => match operand(env, first) {
+            // The sign comes out of the value with the word, so the two cannot be
+            // read from different places and disagree.
+            Val::Sym(v, sign) => (v, sign),
+            // A `bool` operand has no bit-vector to hand the model, and an unknown
+            // one has no value at all. Either way there is nothing to compute with.
+            _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        },
     };
     // The unary shapes take one operand and no operator. They are handled here
     // rather than through a `BinOp`, because there is no second operand to read.
@@ -3992,7 +6243,20 @@ fn try_intrinsic(
         // refused there rather than guessed, and a printed *signed* one makes
         // `eval` decline, so a signed operand cannot be read as an unsigned one.
         let signed = match op {
-            intrinsics::Intrinsic::Unary(..) | intrinsics::Intrinsic::Bool(_) => sign.known()?,
+            intrinsics::Intrinsic::Unary(..)
+            | intrinsics::Intrinsic::Bool(_)
+            | intrinsics::Intrinsic::Abs
+            | intrinsics::Intrinsic::UnsignedAbs
+            | intrinsics::Intrinsic::SignednessCast
+            | intrinsics::Intrinsic::Signum
+            | intrinsics::Intrinsic::Ilog(_)
+            | intrinsics::Intrinsic::CheckedIlog(_)
+            | intrinsics::Intrinsic::NextPowerOfTwo
+            | intrinsics::Intrinsic::CheckedNextPowerOfTwo
+            | intrinsics::Intrinsic::BitReverse
+            | intrinsics::Intrinsic::ByteSwap
+            | intrinsics::Intrinsic::ByteOrder(_)
+            | intrinsics::Intrinsic::AsciiCase(_) => sign.known()?,
             _ => false,
         };
         // A bit count returns a type wider than its operand (`u8` -> `u32`), so
@@ -4010,19 +6274,49 @@ fn try_intrinsic(
                 // is unsigned and non-negative -- but it is the type's sign, and
                 // labelling it anything else would be a second opinion about a
                 // type this code already knows.
-                env.set(dest, Val::Sym(v, Sign::of_bool(signed)));
-                Ok(())
+                //
+                // `unsigned_abs` is the exception: its result type is the unsigned
+                // sibling of the operand's (`i32::unsigned_abs` is `u32`), so the
+                // label is unsigned. The value is the same magnitude, and reading
+                // `128` as `-128` would mis-type the very input the method exists
+                // for.
+                let sign = match op {
+                    intrinsics::Intrinsic::UnsignedAbs => Sign::Unsigned,
+                    // The signedness re-interpretation's result type is the
+                    // *opposite* of the operand's, so it is read from the call's
+                    // destination rather than derived from the operand. A
+                    // destination with no readable type is refused (the shape is
+                    // sign-reading for exactly this reason).
+                    intrinsics::Intrinsic::SignednessCast => match type_of_place(cur, dest) {
+                        Some(ty) => Sign::of(&ty),
+                        None => return Some(Err(format!("unmodelled destination of `{name}`"))),
+                    },
+                    _ => Sign::of_bool(signed),
+                };
+                env.set(dest, Val::Sym(v, sign));
+                Ok(Vec::new())
             }
             Outcome::Option { tag, payload } => {
-                // `checked_neg` and `checked_abs` return an `Option`.
+                // `checked_neg`, `checked_abs`, `checked_next_multiple_of` and the
+                // `checked_` logarithms return an `Option`. The payload's type is
+                // the operand's (`checked_next_multiple_of` returns `Option<T>`),
+                // so its sign and width follow the operand -- *except* for a
+                // `checked_ilog*`, whose payload is a `u32` whatever the operand's
+                // type (`i32::checked_ilog2` is `Option<u32>`), the same
+                // result-width rule the plain logarithm already follows.
+                let (payload_sign, payload_w) = if matches!(op, intrinsics::Intrinsic::CheckedIlog(_)) {
+                    (Sign::Unsigned, result_w)
+                } else {
+                    (Sign::of_bool(signed), w)
+                };
                 env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
                 env.set_payload(
                     dest.local,
                     intrinsics::SOME_TAG,
-                    Val::Sym(payload, Sign::of_bool(signed)),
-                    w,
+                    Val::Sym(payload, payload_sign),
+                    payload_w,
                 );
-                Ok(())
+                Ok(Vec::new())
             }
             Outcome::Tuple { value, overflowed } => {
                 // `overflowing_neg` and `overflowing_abs` return `(T, bool)`,
@@ -4032,7 +6326,7 @@ fn try_intrinsic(
                 let field = |i| Place { local: dest.local, proj: vec![Proj::Field(i)] };
                 env.set(&field(0), Val::Sym(value, Sign::of_bool(signed)));
                 env.set(&field(1), Val::Bool(overflowed));
-                Ok(())
+                Ok(Vec::new())
             }
             Outcome::Bool(p) => {
                 // `is_power_of_two` returns a `bool` and nothing else. The
@@ -4040,7 +6334,40 @@ fn try_intrinsic(
                 // one; a one-bit *word* here would leave the local readable only
                 // as a word, and the `if` that consumes it reads a predicate.
                 env.set(dest, Val::Bool(p));
-                Ok(())
+                Ok(Vec::new())
+            }
+            Outcome::ValueOrPanic { value, fails } => {
+                // `iN::abs` panics at `MIN`, where the magnitude is
+                // unrepresentable, and `ilog2`/`ilog10` panic on a non-positive
+                // argument. The value is written unconditionally -- a path where
+                // the call panics is reported by the obligation below, so the value
+                // it carries is never used on a live path -- and the panic is a
+                // *reachable-failure* obligation, the same polarity as a
+                // rustc-inserted `assert`: the call is safe exactly where
+                // `path ∧ fails` is unsatisfiable.
+                //
+                // The result's sign is the operand's, except for a logarithm,
+                // whose result is a `u32` whatever the operand's type
+                // (`i32::ilog2` is `u32`). Declaring the index with the operand's
+                // sign would be the wrong type even though the value is small
+                // enough that no obligation here observes the difference, and the
+                // declaration is what a later reader trusts.
+                let result_sign = if matches!(op, intrinsics::Intrinsic::Ilog(_)) {
+                    Sign::Unsigned
+                } else {
+                    Sign::of_bool(signed)
+                };
+                env.set(dest, Val::Sym(value, result_sign));
+                let message = match op {
+                    intrinsics::Intrinsic::Ilog(_) => {
+                        format!("`{name}` of a non-positive value")
+                    }
+                    _ => format!("`{name}` overflows"),
+                };
+                Ok(vec![Obligation {
+                    kind: ObligationKind::Panic { message },
+                    verdict: find_obligation(smt::and(path, fails), pins),
+                }])
             }
         });
     }
@@ -4048,13 +6375,42 @@ fn try_intrinsic(
     // `sdiv` on an `i8` read as unsigned returns a huge positive quotient for
     // every negative operand, which is a wrong value rather than a weaker proof.
     let signed = sign.known()?;
+    // `Ord::clamp` is the one three-operand shape, so it is evaluated by its own
+    // function rather than through `eval`'s two-operand signature. `x` is the
+    // receiver (the value to clamp), and `lo`/`hi` are the other two operands.
+    // The panic is `lo > hi || x < lo || x > hi`, reported the same way `abs`'s
+    // overflow is: a reachable-failure obligation, not a value.
+    if let intrinsics::Intrinsic::Clamp = op {
+        let (Some(lo_arg), Some(hi_arg)) = (args.get(1), args.get(2)) else {
+            return Some(Err(format!("unmodelled arity for `{name}`")));
+        };
+        let lo = match operand(env, lo_arg) {
+            Val::Sym(v, _) => v,
+            _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        };
+        let hi = match operand(env, hi_arg) {
+            Val::Sym(v, _) => v,
+            _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        };
+        let Some(outcome) = intrinsics::clamp(x, lo, hi, w, signed) else {
+            return Some(Err(format!("`{name}` past what the model covers at {w} bits")));
+        };
+        let intrinsics::Outcome::ValueOrPanic { value, fails } = outcome else {
+            unreachable!("clamp yields a value-or-panic outcome")
+        };
+        env.set(dest, Val::Sym(value, Sign::of_bool(signed)));
+        return Some(Ok(vec![Obligation {
+            kind: ObligationKind::Panic { message: format!("`{name}` out of range") },
+            verdict: find_obligation(smt::and(path, fails), pins),
+        }]));
+    }
     // `pow` reads two operands of *different* types: the base has the method's
     // width and sign, the exponent is the `u32` it is declared as. So the exponent
     // is read on its own -- a `Val::Sym` and its width from the argument's type --
     // and the fold is handed the two separately. Reading it as a second operand at
     // `w` bits would read an `i8` exponent for a `u8` base, or a `u8` exponent for
     // a `u32` one, and fold the wrong number of bits.
-    if let intrinsics::Intrinsic::Pow(_) = op {
+    if matches!(op, intrinsics::Intrinsic::Pow(_) | intrinsics::Intrinsic::PowPanic) {
         let Some(exp_arg) = args.get(1) else {
             return Some(Err(format!("unmodelled arity for `{name}`")));
         };
@@ -4077,25 +6433,60 @@ fn try_intrinsic(
         return Some(match outcome {
             Outcome::Value(v) => {
                 env.set(dest, Val::Sym(v, sign));
-                Ok(())
+                Ok(Vec::new())
             }
             Outcome::Option { tag, payload } => {
                 env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
                 env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(payload, sign), w);
-                Ok(())
+                Ok(Vec::new())
             }
             Outcome::Tuple { value, overflowed } => {
                 let field = |i| Place { local: dest.local, proj: vec![Proj::Field(i)] };
                 env.set(&field(0), Val::Sym(value, sign));
                 env.set(&field(1), Val::Bool(overflowed));
-                Ok(())
+                Ok(Vec::new())
             }
             // A `bool` predicate is unary (`is_power_of_two` is the only one),
             // so it never reaches the `pow` path.
             Outcome::Bool(_) => unreachable!("a bool predicate is unary"),
+            // The plain inherent `pow` panics on overflow, so its outcome is a
+            // value-or-panic. The value is written unconditionally -- a path where
+            // it panics is reported by the obligation below -- and the panic is the
+            // same reachable-failure obligation a family's `pow` debug-`assert!`
+            // would raise.
+            Outcome::ValueOrPanic { value, fails } => {
+                env.set(dest, Val::Sym(value, sign));
+                return Some(Ok(vec![Obligation {
+                    kind: ObligationKind::Panic { message: format!("`{name}` overflows") },
+                    verdict: find_obligation(smt::and(path, fails), pins),
+                }]));
+            }
         });
     }
     let y = match args.get(1) {
+        // A `PartialEq`/`PartialOrd` second operand is `&other`, so its *referent*
+        // is the value -- the same step the receiver takes above. Reading the
+        // `&u8` local directly gives `Unknown` (a pointer has no bit-vector
+        // meaning).
+        Some(a) if matches!(op, intrinsics::Intrinsic::Cmp(_)) => match a {
+            Operand::Copy(p) | Operand::Move(p) => match env.get(&env.pointee(p)) {
+                Val::Sym(v, _) => v,
+                _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+            },
+            // A *constant* second operand has no referent to follow, so it is read
+            // directly. This arm is defensive: an unoptimised dump promotes a
+            // literal operand to its own item and passes a reference to it
+            // (`x.eq(&5)` lowers to `_3 = const F::promoted[0]; … Eq(copy _1,
+            // copy _3)`), which the `Copy`/`Move` arm above resolves through the
+            // promoted constant the parser now records. A bare `const` operand is
+            // a shape no current dump prints, so refusing it would only refuse a
+            // term a future printer or a deserialised dump could hand in -- and the
+            // direct read is the honest one either way.
+            Operand::Const(_) => match operand(env, a) {
+                Val::Sym(v, _) => v,
+                _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
+            },
+        },
         Some(a) => match operand(env, a) {
             Val::Sym(v, _) => v,
             _ => return Some(Err(format!("unmodelled argument to `{name}`"))),
@@ -4109,8 +6500,18 @@ fn try_intrinsic(
     };
     // The result of an arithmetic intrinsic has the operand's type, so it has
     // the operand's sign -- `wrapping_sub(0, 1)` on a `u8` is `255` and on an
-    // `i8` is `-1`, the same bits read two ways.
-    let sign = Sign::of_bool(signed);
+    // `i8` is `-1`, the same bits read two ways. `abs_diff` is the exception: its
+    // result is the *unsigned* magnitude even on a signed operand
+    // (`i8::abs_diff(-128, 127)` is `255u8`), so it is written unsigned; labelling
+    // it with the operand's sign would read `255` as `-1`.
+    let sign = match op {
+        intrinsics::Intrinsic::AbsDiff => Sign::Unsigned,
+        // `ilog2`/`ilog10` return a `u32` whatever the operand's type
+        // (`i32::ilog2` is `u32`), so labelling the result with the operand's sign
+        // would read a non-negative index as signed.
+        intrinsics::Intrinsic::Ilog(_) => Sign::Unsigned,
+        _ => Sign::of_bool(signed),
+    };
     match outcome {
         Outcome::Value(v) => env.set(dest, Val::Sym(v, sign)),
         Outcome::Option { tag, payload } => {
@@ -4130,10 +6531,42 @@ fn try_intrinsic(
             env.set(&field(0), Val::Sym(value, sign));
             env.set(&field(1), Val::Bool(overflowed));
         }
-        // A `bool` predicate is unary, so it never reaches the two-operand path.
-        Outcome::Bool(_) => unreachable!("a bool predicate is unary"),
+        // A `bool` predicate: `is_power_of_two` and the ASCII classes are unary,
+        // but `is_multiple_of` reads two operands, so it reaches *this* path and
+        // its predicate is written as a `Val::Bool` -- the same value the `if`
+        // that consumes it branches on.
+        Outcome::Bool(p) => env.set(dest, Val::Bool(p)),
+        // The Euclidean pair and `div_ceil`: their *value* is written
+        // unconditionally, and the divide-by-zero (or `MIN / -1`) panic is a
+        // reachable-failure obligation, the same polarity as `abs`'s overflow --
+        // the call is safe exactly where `path ∧ fails` is unsatisfiable. Without
+        // this arm a `div_euclid(x, 0)` would be written as a plain value with no
+        // panic reported, which is exactly the hidden panic the model must not
+        // introduce.
+        Outcome::ValueOrPanic { value, fails } => {
+            env.set(dest, Val::Sym(value, sign));
+            // The message names what actually failed, because the shapes that
+            // reach here fail for different reasons: a division by zero or
+            // `MIN / -1`, a `next_multiple_of` overflow, a non-positive logarithm.
+            let message = match op {
+                intrinsics::Intrinsic::DivEuclid
+                | intrinsics::Intrinsic::RemEuclid
+                | intrinsics::Intrinsic::DivCeil => format!("`{name}` division overflow"),
+                intrinsics::Intrinsic::NextMultipleOf => {
+                    format!("`{name}` overflows or divides by zero")
+                }
+                intrinsics::Intrinsic::Ilog(_) => {
+                    format!("`{name}` of a non-positive value")
+                }
+                _ => format!("`{name}` overflow"),
+            };
+            return Some(Ok(vec![Obligation {
+                kind: ObligationKind::Panic { message },
+                verdict: find_obligation(smt::and(path, fails), pins),
+            }]));
+        }
     }
-    Some(Ok(()))
+    Some(Ok(Vec::new()))
 }
 
 /// The declared bit width of an operand, when it has one.
@@ -4143,6 +6576,236 @@ fn operand_width(f: &MirFn, o: &Operand) -> Option<u8> {
         Operand::Const(Const::UInt(_, ty)) => ty.as_ref().and_then(|t| t.width()),
         Operand::Const(_) => None,
     }
+}
+
+/// Seed a callee's environment from a call's arguments.
+///
+/// Shared by the inliner and by a `drop` of a user `impl Drop` -- both hand a
+/// place over to a callee's frame and need the same carried-in state, so a
+/// second copy would be a second chance to forget one of the stores.
+fn seed_callee_env(
+    prog: &MirProgram,
+    caller_env: &mut Env,
+    callee_fn: &MirFn,
+    args: &[Operand],
+) -> (Env, Vec<(Place, u32)>) {
+    let mut env = Env::with_prog(prog);
+    // Which caller locals were handed over through a reference, so the
+    // return path knows whose store the callee's post-state belongs to.
+    let mut by_ref: Vec<(Place, u32)> = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        let v = operand(caller_env, a);
+        let Some(&l) = callee_fn.arg_locals.get(i) else { continue };
+        env.locals.insert(l, v);
+        // A reference argument may be dereferenced inside the callee
+        // (`*_1 = 5`), and `Ty::Ref` is modelled as its referent, so `_1`
+        // *is* the value `*_1` names. `verify_fn` marks the root's
+        // reference arguments this way; the inliner builds the callee's
+        // env itself, so it has to mark them too, or the callee's
+        // `(*_1) = v` is treated as a deref with no recorded referent and
+        // the write is dropped -- which is how a `&mut u8` helper's write
+        // was lost and a false `ret == 0` contract was proved.
+        if matches!(callee_fn.ty_of(l), Some(Ty::Ref(_))) {
+            env.deref_ok.insert(l, ());
+        }
+        let Place { local: cl, proj } = match a {
+            Operand::Copy(p) | Operand::Move(p) => p,
+            Operand::Const(_) => continue,
+        };
+        if !proj.is_empty() {
+            continue;
+        }
+        // The *storage* the argument denotes, which is the caller's local
+        // itself for a by-value argument and the pointee for a reference.
+        //
+        // `pointee`, not `resolve`: `resolve` only follows an explicit
+        // `*_p` projection, and `set5(&mut x)` hands the callee a *temp*
+        // (`_5 = &mut _2; set5(_5)`) whose place has no projection at all.
+        // `pointee` follows the recorded address of an empty-projection
+        // local, which is what turns `_5` into the `_2` the caller reads.
+        //
+        // The whole argument's state -- its element store *and* its parts
+        // -- is carried in, keyed on the callee's local. A reference shares
+        // the caller's storage, so the callee's `a[0]`, `c.lo` and `o.i.v`
+        // must read the caller's values; without them a helper that indexes
+        // or reads a field has an unmodelled operand and the caller's
+        // contract stays unproved, while a read-modify-write helper
+        // (`c.lo = c.lo + d`) cannot be modelled at all.
+        //
+        // The state is *cloned*, never shared: the callee must not be able
+        // to write the caller's copy directly, or a by-value argument would
+        // behave like a reference. Only a reference argument's post-state
+        // is copied back (see the return path).
+        let is_ref = arg_is_ref(callee_fn, i);
+        let source = if is_ref {
+            caller_env.pointee(&Place { local: *cl, proj: Vec::new() })
+        } else {
+            Place { local: *cl, proj: Vec::new() }
+        };
+        let sl = source.local;
+        // The value *at the target*, and the target's parts. The value is
+        // read through `get`, not out of `locals`, because a sub-place
+        // target has no whole-local entry: `&mut c.lo` targets `c.0`, whose
+        // value lives in `fields`. Reading `locals[source.local]` there
+        // returned the *struct's* absent value, so the callee's `*v` was
+        // `Unknown` and a helper that *reads* through its argument (`*v`,
+        // `*v = *v + 1`, a two-reference `swap`) had an unmodelled operand --
+        // while a helper that only *wrote* (`*v = 5`) worked, because the
+        // write creates the value the copy-back then reads. `Ty::Ref` is
+        // modelled as its referent, so the callee's local *is* the target's
+        // value and this is a copy of what the caller holds, not an
+        // assumption about it.
+        //
+        // The part stores are copied only for a *whole-local* target, and
+        // they are keyed by `source.local` because that is the local that
+        // owns them. For a sub-place target the parts belong to the target's
+        // own type, which the value copy above already covers for a scalar;
+        // copying the enclosing local's parts instead would hand the callee
+        // a sibling field it does not own.
+        if is_ref {
+            let v = caller_env.get(&source);
+            env.locals.insert(l, v);
+        }
+        if source.proj.is_empty() {
+            if let Some(store) = caller_env.indexed.get(&sl).cloned() {
+                env.indexed.insert(l, store);
+            }
+            // A `Vec` argument's tracked length, carried in for the same reason
+            // the element store is: a helper that reads `v.len()` through its
+            // argument (`&Vec<u8>`) must see the caller's length. Without this the
+            // callee read `Unknown` and its contract was unreadable.
+            if let Some(len) = caller_env.vec_len.get(&sl).copied() {
+                env.vec_len.insert(l, len);
+            }
+            for ((l0, f), v) in caller_env.fields.iter() {
+                if *l0 == sl {
+                    env.fields.insert((l, *f), *v);
+                }
+            }
+            for ((l0, chain), v) in caller_env.nested.iter() {
+                if *l0 == sl {
+                    env.nested.insert((l, chain.clone()), *v);
+                }
+            }
+            for ((l0, k), v) in caller_env.elems.iter() {
+                if *l0 == sl {
+                    env.elems.insert((l, *k), *v);
+                }
+            }
+            // Elements of field-path arrays (`o.a[0]`) are carried in for the
+            // same reason the plain elements are: the callee's `(_1.0)[k]` is
+            // the caller's `o.a[k]`, so a helper that *reads* one has to see
+            // the caller's seed. Without this the callee read `Unknown`, and a
+            // helper that wrote the element had its write die with the frame --
+            // the caller read its own seed, so `requires: x.a[0] == 5;
+            // ensures: ret == 5` on `set_first(x); x.a[0]` was **proved**
+            // against a body that returns 9.
+            for ((l0, chain, k), v) in caller_env.elems_path.iter() {
+                if *l0 == sl {
+                    env.elems_path.insert((l, chain.clone(), *k), *v);
+                }
+            }
+            // The leaves *inside* those elements (`o.a[0].v`), keyed
+            // index-first. A helper that reads a leaf through its argument
+            // (`a[0].v`) otherwise saw `Unknown`; and one that wrote it had
+            // the write die with the frame, so the caller read the leaf its
+            // literal had before the call.
+            for ((l0, k, chain), v) in caller_env.elem_parts.iter() {
+                if *l0 == sl {
+                    env.elem_parts.insert((l, *k, chain.clone()), *v);
+                }
+            }
+            // An already-poisoned array stays poisoned in the callee: its
+            // elements are unknown, so carrying them in would hand over
+            // values the caller's own write already invalidated.
+            if caller_env.poisoned_elems.contains(&sl) {
+                env.poisoned_elems.insert(l);
+            }
+        } else if is_ref {
+            // A sub-place target whose own type is an aggregate: `&mut
+            // o.i`. The callee's `i.v` is the caller's `o.i.v`, so the
+            // target's parts are carried in *re-based* -- the target's
+            // chain is dropped from the front of each key and the callee's
+            // local takes its place. This is the exact inverse of the
+            // re-based copy-back, and it is what lets a helper *read* a
+            // nested aggregate it was handed (`read_inner(&o.i)`), which is
+            // otherwise an unmodelled operand.
+            let mut rc = Vec::with_capacity(source.proj.len());
+            let ok = source.proj.iter().all(|p| match p {
+                Proj::Field(i) => {
+                    rc.push(*i);
+                    true
+                }
+                _ => false,
+            });
+            if ok {
+                // A remainder of one step is a *field* in this store's
+                // spelling (`fields` is keyed by a single index, `nested` by
+                // a chain of two or more), so the two lengths have to be
+                // routed apart or the callee's `_1.0` -- a lone field read --
+                // would consult `fields` and miss.
+                for ((l0, chain), v) in caller_env.nested.iter() {
+                    if *l0 != sl || !chain.starts_with(&rc) {
+                        continue;
+                    }
+                    let rem = &chain[rc.len()..];
+                    match rem {
+                        [f] => {
+                            env.fields.insert((l, *f), *v);
+                        }
+                        [] => {}
+                        _ => {
+                            env.nested.insert((l, rem.to_vec()), *v);
+                        }
+                    }
+                }
+                // Elements of field-path arrays under a sub-place target, the
+                // same re-basing as the nested parts above: `&mut o.i` makes the
+                // caller's `o.i.a[0]` the callee's `_1.a[0]`, so the chain has
+                // the target's prefix dropped. Without this a helper that only
+                // *reads* the element through its argument (`read_inner(&o.i)` ->
+                // `i.a[0]`) saw `Unknown` and its contract was unreadable -- an
+                // incompleteness where the true contract should decide.
+                for ((l0, chain, k), v) in caller_env.elems_path.iter() {
+                    if *l0 != sl || !chain.starts_with(&rc) {
+                        continue;
+                    }
+                    let rem = &chain[rc.len()..];
+                    if rem.is_empty() {
+                        // The target *is* the array (`peek_of(&x.a)`): in the
+                        // callee's terms its argument is a whole local, so the
+                        // callee's `_1[k]` read consults the *plain* element store,
+                        // not the field-path one. Without this the callee read
+                        // `Unknown` and a read-only helper's contract was
+                        // unreadable -- an incompleteness where the true contract
+                        // should decide. This is the exact inverse of the write-back
+                        // arm that re-bases a whole-array target's element.
+                        env.elems.insert((l, *k), *v);
+                    } else {
+                        env.elems_path.insert((l, rem.to_vec(), *k), *v);
+                    }
+                }
+            }
+        }
+        if is_ref {
+            by_ref.push((source.clone(), l));
+        }
+        // The origin local of a reference argument, in the *caller's*
+        // frame, so a reference the callee returns can be resolved once it
+        // is back in the caller. A `&mut x` argument is passed through a
+        // temp (`_5 = &mut _2; set5(_5)`), so the origin is `_5`'s origin --
+        // `_2` -- not `_5` itself.
+        if matches!(callee_fn.ty_of(l), Some(Ty::Ref(_))) {
+            // The argument denotes `source` in the caller's frame, and
+            // inside the callee it is the local `l` itself. Recording both
+            // is what lets a reference the callee returns be translated
+            // back: the callee's `_0` names `l` (or a projection of it),
+            // and `arg_source` turns that into the caller's place.
+            env.arg_source.insert(l, source.clone());
+            env.ref_origin.insert(l, Place { local: l, proj: Vec::new() });
+        }
+    }
+    (env, by_ref)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4156,11 +6819,23 @@ fn run_state<F>(
     root: usize,
     rec: &Option<RecCtx>,
     callees: &CalleeEnv<'_>,
+    unwind: u32,
+    unwind_declared: bool,
 )
 where
-    F: Fn(Option<Var>, &[(u32, Var)]) -> Result<Pred, String>,
+    F: Fn(Option<Var>, &[(u32, Var)], &[(u64, Var)], &[(u32, Var)]) -> Result<Pred, String>,
 {
     let cur = &prog.fns[st.frame.func];
+    // A path that cannot be taken is not a path. Pruning it is what lets
+    // unwinding stop at a loop's real trip count instead of at the bound: once a
+    // guard folds to a constant, the impossible edge is dropped rather than
+    // explored. It is sound -- an unsatisfiable path condition describes no
+    // execution -- and it keeps dead paths from spending the path budget and from
+    // reporting spurious "unmodelled" reasons. A feasible path is untouched, so
+    // every obligation a real run reaches is still recorded.
+    if matches!(find_obligation(st.path, pins), Verdict::Unsat) {
+        return;
+    }
     let block: Block = match cur.block(st.block) {
         Some(b) => b.clone(),
         None => {
@@ -4169,16 +6844,63 @@ where
         }
     };
 
-    // Unwind bound: count visits, and stop the path rather than assume exit.
-    let key = (st.frame.func, st.block);
-    let n = st.visits.entry(key).or_insert(0);
-    *n += 1;
-    if *n > DEFAULT_UNWIND {
-        report.unknown_paths.push(format!(
-            "loop unwound past {DEFAULT_UNWIND} at bb{} of {}; assuming it exited would be unsound",
-            st.block, cur.name
-        ));
-        return;
+    // Unwind bound: count *back-edge traversals*, and stop the path rather than
+    // assume exit.
+    //
+    // Counting entries to a block counts the loop header once more than the loop
+    // runs -- the last entry evaluates the guard and takes the exit -- so a loop
+    // that runs exactly `N` iterations needs `N + 1` header entries, and
+    // `unwind: N` was rejected: `for i in 0..3` under `unwind: 3` came back
+    // `FAILED` (the `while` spelling only passed by accident, because its header
+    // ends in a `switchInt` that zeroes its own count). The *latch* -- the block
+    // holding the edge back to the header -- is executed exactly once per
+    // iteration, so it is the quantity the bound is about.
+    if let Some(header) = callees.latch_header(st.frame.func, st.block) {
+        // Count by the *loop* (its header), not by the source block, so a loop
+        // whose body reaches its back edge from two different latches is counted
+        // once per iteration rather than once per latch. Keying by block let the
+        // combined trip count exceed a declared bound while neither latch's own
+        // count did.
+        let key = (st.frame.func, header);
+        let n = st.visits.entry(key).or_insert(0);
+        *n += 1;
+        if *n > unwind {
+            if unwind_declared {
+                // A *declared* bound is a claim ("this loop finishes within N
+                // iterations"), so running off the end of it is Kani's *unwinding
+                // assertion*: a failure, not an incompleteness. Recording it as a
+                // failure rather than an `unknown_paths` entry is what stops a
+                // too-small bound from turning into a weaker proof: `verified` under
+                // `unwind: 3` would be a statement about the first three iterations
+                // only, which is exactly the soundness hole the clause exists to
+                // avoid. The verdict is the reachability of the cutoff -- the same
+                // query shape as a diverging call, and for the same reason -- so a
+                // reachable cutoff comes back as a `Counterexample` naming an input
+                // that runs off the bound, and one reached on every input as `Valid`.
+                // `Unsat` would be a discharge, but the path was already pruned when
+                // unsatisfiable, so the cutoff is a failure on every input that reaches
+                // it.
+                report.obligations.push(Obligation {
+                    kind: ObligationKind::UnwindBound { bound: unwind },
+                    verdict: find_obligation(st.path, pins),
+                });
+            } else {
+                // No bound was declared, so the cutoff is the default, which is not a
+                // claim anyone made. It stays an honest incompleteness -- but it is a
+                // *missing loop contract*, not an unmodelled construct, and the
+                // message says so: the loop is understood, and the tool is declining
+                // to unwind it past the default because assuming an exit would be
+                // unsound. A reader who wants a verdict here declares an `invariant:`
+                // (which cuts the loop at the header) or an `unwind:` bound.
+                report.unknown_paths.push(format!(
+                    "loop unwound past {unwind} at bb{} of {}; assuming it exited would be \
+                     unsound -- this is a missing loop contract, not an unmodelled \
+                     construct: declare `invariant:` or `unwind:` to decide it",
+                    st.block, cur.name
+                ));
+            }
+            return;
+        }
     }
 
     // Statements.
@@ -4239,6 +6961,23 @@ where
                     }
                 }
                 st.env.set(dest, v);
+                // A promoted `&[&str]` constant (`_4 = const f::promoted[0]`) is the
+                // format-piece array a `panic!`/`assert!` message is built from on
+                // edition 2024. Its pieces are recorded *here*, after `set`, because
+                // a whole-place write forgets the destination's parts -- recording
+                // them inside `eval_rvalue` would have them cleared by the very
+                // `set` that follows. The value itself is not a bit-vector.
+                if let Rvalue::Use(Operand::Const(Const::Other(n))) = rv {
+                    if let Some(pieces) = lookup_promoted(&st.env.promoted, n) {
+                        st.env.piece_sets.insert(dest.local, pieces);
+                    }
+                }
+                // The `b"…"` template of `Arguments::new` reaches the call through a
+                // local (`_9 = const b"…"` then `new::<7, 1>(move _9, …)`), so it is
+                // recorded the same way and for the same reason.
+                if let Rvalue::Use(Operand::Const(Const::Bytes(b))) = rv {
+                    st.env.tmpl_bytes.insert(dest.local, b.clone());
+                }
                 // A *nested* aggregate assignment moves the source's parts under the
                 // destination's path. Two shapes need it: a struct literal into a nested field
                 // (`o.i = Inner { v: 9 }` -> `(_1.0) = move _2`), and a nested-to-nested move
@@ -4352,7 +7091,78 @@ where
                             Val::Bool(rp) => Some(smt::ite(rp, smt::word(1, 1), smt::word(0, 1))),
                             _ => None,
                         };
-                        match post(rv, &projs) {
+                        // An enum return: the *tag* is what `ret.is_ok()` and
+                        // friends read, so it is passed as the return word. The
+                        // tag lives in the discriminant store (written by a variant
+                        // construction, or seeded for an enum argument), not in the
+                        // local's value -- `_0` for `Some(x)` has no whole-local
+                        // entry at all. Reading it here is what makes the method
+                        // read the discriminant the body's `switchInt` compares.
+                        let rv = st.env.tag_value(0).or(rv);
+                        // An enum return's payloads, keyed by their *discriminant*,
+                        // so a contract can name `ret.Ok` / `ret.Some`. A payload is
+                        // stored by a variant construction or a modelled call under
+                        // the variant's discriminant, and a payload *read* through a
+                        // downcast lands in `fields` keyed by the same number. A
+                        // `bool` payload is widened to a one-bit word, like any
+                        // other boolean value handed to the postcondition.
+                        let ret_payloads: Vec<(u64, Var)> = st
+                            .env
+                            .payloads
+                            .iter()
+                            .filter(|((l, _), _)| *l == 0)
+                            .filter_map(|((_, k), (v, _))| match v {
+                                Val::Sym(x, _) => Some((*k, *x)),
+                                Val::Bool(p) => {
+                                    Some((*k, smt::ite(*p, smt::word(1, 1), smt::word(0, 1))))
+                                }
+                                _ => None,
+                            })
+                            .chain(
+                                st.env
+                                    .fields
+                                    .iter()
+                                    .filter(|((l, _), _)| *l == 0)
+                                    .filter_map(|((_, k), v)| match v {
+                                        Val::Sym(x, _) => Some((*k as u64, *x)),
+                                        Val::Bool(p) => Some((
+                                            *k as u64,
+                                            smt::ite(*p, smt::word(1, 1), smt::word(0, 1)),
+                                        )),
+                                        _ => None,
+                                    }),
+                            )
+                            .collect();
+                        // The *final* value of each reference argument, so an
+                        // `ensures` that names one means what the body left there
+                        // and `old(name)` reaches the entry value. A reference
+                        // shares the caller's storage, so the value at return is
+                        // the post-state one. Only reference-to-scalar arguments
+                        // are collected: a reference to an aggregate has no single
+                        // word, and a by-value argument cannot be written by the
+                        // body, so neither needs a second binding.
+                        let mut ref_final: Vec<(u32, Var)> = Vec::new();
+                        for &l in &cur.arg_locals {
+                            if !matches!(cur.ty_of(l), Some(Ty::Ref(_))) {
+                                continue;
+                            }
+                            if cur.ty_of(l).and_then(|t| t.referent().width()).is_none() {
+                                continue;
+                            }
+                            // A `&mut bool` target is a `Val::Bool` predicate, not a
+                            // `Val::Sym` word. Dropping it left `c` unbound, so
+                            // `ensures: c == true` after `*c = true` was refused as an
+                            // unknown name -- the same final-value loss the `Sym` arm
+                            // exists to prevent. Widen the predicate to a one-bit
+                            // word, exactly as the return word does for a `bool` `ret`.
+                            match st.env.get(&Place::new(l)) {
+                                Val::Sym(v, _) => ref_final.push((l, v)),
+                                Val::Bool(p) => ref_final
+                                    .push((l, smt::ite(p, smt::word(1, 1), smt::word(0, 1)))),
+                                _ => {}
+                            }
+                        }
+                        match post(rv, &projs, &ret_payloads, &ref_final) {
                             Ok(p) => {
                                 report.obligations.push(Obligation {
                                     kind: ObligationKind::Postcondition,
@@ -4420,6 +7230,16 @@ where
                         if rest.is_empty() {
                             if let Some(s) = st.env.indexed.get(cal) {
                                 env.indexed.insert(cl, s.clone());
+                            }
+                        }
+                        // A `Vec` length the callee changed through a reference
+                        // (`push(&mut v)`). Only a *whole-local* target: a sub-place
+                        // target (`&mut v.len()`) is not a shape a `Vec` length is
+                        // ever handed over as, and re-keying an unrepresentable
+                        // length would invent a key.
+                        if rest.is_empty() {
+                            if let Some(len) = st.env.vec_len.get(cal).copied() {
+                                env.vec_len.insert(cl, len);
                             }
                         }
                         // A whole-referent write (`*v = x`). The whole place was
@@ -4707,6 +7527,25 @@ where
                             }
                         }
                         env.set(dest, ret);
+                        // A returned `Vec` carries its tracked length in the
+                        // callee's `_0`, and the value itself is `Val::Unknown`
+                        // (a `Vec`'s fields are not printed), so this is *not*
+                        // inside the `Val::Agg` guard below. Without the transfer
+                        // `let v = mk(); v.len()` reads a receiver with no modelled
+                        // length -- the same hole the move path (`copy_parts`) had.
+                        // Only a whole-local destination can hold a `Vec`, and a
+                        // returned value replaces what the destination held, so the
+                        // destination's old length is dropped rather than kept.
+                        if dest.proj.is_empty() {
+                            match st.env.vec_len.get(&0).copied() {
+                                Some(len) => {
+                                    env.vec_len.insert(dest.local, len);
+                                }
+                                None => {
+                                    env.vec_len.remove(&dest.local);
+                                }
+                            }
+                        }
                         // A tuple return has components, and the callee stored
                         // them in its *own* return place (`_0.0`, `_0.1`). The
                         // caller's `min2(a, b).0` reads `_2.0`, so the components
@@ -4815,6 +7654,114 @@ where
                 }
             }
         }
+        Term::Drop { place, target } => {
+            // `drop(place)` runs `place`'s destructor, then continues. Three
+            // cases, and the middle one is the soundness boundary:
+            //
+            // * A type with no drop glue -- an integer, `bool`, `()`, a reference,
+            //   or a plain aggregate of such -- runs nothing, so the terminator is
+            //   a no-op. rustc does not emit a `drop` for such a type, so this arm
+            //   is *defensive*: it is kept so that a malformed or future dump shape
+            //   is answered correctly rather than refused, not because it is the
+            //   common case. Measured over `realistic.rs`: 0 of 6 `drop` terms are
+            //   glue-free; the other six are a user `Drop` or a container.
+            // * A *user* `impl Drop` has a body in the dump, so it is executed in
+            //   the place's own frame -- the same inliner a method call uses, so a
+            //   destructor that reads or writes its `self` fields is modelled.
+            // * A container whose destructor this tool cannot represent (`Vec`,
+            //   `String`, `Box`, a `MutexGuard`) has no `Drop` body in the dump, so
+            //   it is refused. Assuming such a `drop` changes nothing is a *false
+            //   proof* whenever the destructor is observable, which is the one
+            //   outcome this crate must never produce -- and the dump cannot tell a
+            //   container apart from a struct that holds a user-`Drop` field, since
+            //   both print `drop(_x) -> [return: …]`.
+            //
+            // A projected place (`drop(_2.0)`) is refused for the same reason: the
+            // write-back a reference argument performs is keyed on a whole local, so
+            // a projection would land the destructor's post-state on the wrong
+            // storage. rustc does not emit that shape for a glue-bearing place, so
+            // the refusal loses no proof.
+            let f = &prog.fns[st.frame.func];
+            let Some(ty) = type_of_place(f, place) else {
+                report.unknown_paths.push("drop of a place with no modelled type".into());
+                return;
+            };
+            if drop_is_noop(&ty) {
+                let next = State { block: *target, ..st };
+                advance(prog, next, *target, report, work, pins);
+                return;
+            }
+            // rustc's `drop` destroys the *whole* value: the user destructor, then
+            // the fields. Running only the user destructor skips a field's, and an
+            // empty outer destructor then hides a panicking inner one -- a false
+            // proof. A field that itself has glue (its own `Drop`, or a field of
+            // one) is refused unless it can be destroyed; only an all-glue-free
+            // field set is continued as a no-op.
+            match has_field_glue(prog, callees.structs(), &ty) {
+                Ok(true) => {
+                    report.unknown_paths.push(format!(
+                        "drop of `{}` destroys a field with its own destructor, which is not modelled",
+                        ty_label(&ty)
+                    ));
+                    return;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    report.unknown_paths.push(format!("drop of `{}`: {e}", ty_label(&ty)));
+                    return;
+                }
+            }
+            let Some(idx) = (if place.proj.is_empty() { drop_destructor(prog, &ty) } else { None })
+            else {
+                report
+                    .unknown_paths
+                    .push(format!("drop of `{}` is not modelled", ty_label(&ty)));
+                return;
+            };
+            let callee_fn = &prog.fns[idx];
+            let Some(b0) = callee_fn.blocks.first() else {
+                report.unknown_paths.push("destructor has no body".into());
+                return;
+            };
+            // The destructor's `self` is `&mut T`, and the place being dropped is
+            // the storage it borrows, so the argument is that place itself.
+            let arg = Operand::Copy(place.clone());
+            let (env, by_ref) =
+                seed_callee_env(prog, &mut st.env, callee_fn, std::slice::from_ref(&arg));
+            let caller = Frame {
+                func: st.frame.func,
+                ret_target: *target,
+                // A destructor returns `()`: there is no value to hand back, only
+                // the writes through `self`, which the `by_ref` copy-back carries.
+                ret_dest: None,
+                saved_env: Some(st.env.clone()),
+                saved_cut: st.cut.clone(),
+                saved_variant: st.variant_entry,
+                by_ref,
+                caller: st.frame.caller.clone(),
+            };
+            let mut visits = st.visits;
+            visits.insert((idx, b0.id), 0);
+            work.push(State {
+                frame: Frame {
+                    func: idx,
+                    ret_target: usize::MAX,
+                    ret_dest: None,
+                    saved_env: None,
+                    saved_cut: None,
+                    saved_variant: None,
+                    by_ref: Vec::new(),
+                    caller: Some(Box::new(caller)),
+                },
+                block: b0.id,
+                path: st.path,
+                env,
+                visits,
+                depth: st.depth + 1,
+                cut: None,
+                variant_entry: None,
+            });
+        }
         Term::Unreachable => {
             report.obligations.push(Obligation {
                 kind: ObligationKind::Unreachable,
@@ -4876,13 +7823,17 @@ where
                     report.unknown_paths.push("unmodelled switch discriminant".into());
                     return;
                 };
-                let mut visits = st.visits.clone();
-                visits.insert(key, 0);
+                // The visit counts carry through the switch unchanged. They used to
+                // be reset for this block here, which cleared a latch's count on every
+                // branch it took: a `switchInt` block can itself hold the back edge
+                // (an `if` whose arms both loop), and clearing the count on each arm
+                // let the loop re-enter with a fresh count, so a declared `unwind:`
+                // never fired.
                 let next = State {
                     block: *target,
                     path: smt::and(st.path, cond),
                     env: st.env.clone(),
-                    visits,
+                    visits: st.visits.clone(),
                     frame: st.frame.clone(),
                     depth: st.depth,
                     cut: st.cut.clone(),
@@ -4898,13 +7849,11 @@ where
                 };
                 negs.push(n);
             }
-            let mut visits = st.visits.clone();
-            visits.insert(key, 0);
             let next = State {
                 block: *otherwise,
                 path: smt::and(st.path, smt::all(&negs)),
                 env: st.env.clone(),
-                visits,
+                visits: st.visits.clone(),
                 frame: st.frame.clone(),
                 depth: st.depth,
                 cut: st.cut.clone(),
@@ -4912,11 +7861,34 @@ where
             };
             advance(prog, next, *otherwise, report, work, pins);
         }
-        Term::Call { callee, args, dest, target } => {
+        Term::Call { callee, args, dest, diverges, target } => {
             let Callee::Name(name) = callee else {
                 report.unknown_paths.push("indirect call not modelled".into());
                 return;
             };
+            // A call that never returns is a reachable failure, not a line to skip.
+            //
+            // `panic!`, `assert!`, `unwrap`, and the bounds and slice checks rustc
+            // inserts lower to a diverging call into `core::panicking`: the path
+            // ends there, with no normal successor. What the caller must prove is
+            // that the call cannot be reached -- `assert!(x <= 200)` is a promise,
+            // and dropping the path silently would let a caller keep a postcondition
+            // the assert was there to guarantee. So the obligation is `path` itself,
+            // "is this call reachable", discharged by `Unsat`: the same polarity as
+            // an `assert` terminator and for the same reason. Nothing is assumed
+            // afterwards, because there is no afterwards. The block the `switchInt`
+            // routes here already carries `!guard` in its path, so the guard is what
+            // the query is really about.
+            if *diverges {
+                report.obligations.push(Obligation {
+                    kind: ObligationKind::DivergingCall {
+                        kind: Divergence::of(name),
+                        message: panic_message(name, args, &st.env),
+                    },
+                    verdict: find_obligation(st.path, pins),
+                });
+                return;
+            }
             // A self-call is answered by the function's own contract when it
             // carries a `decreases:` measure, rather than inlined: inlining it
             // would only unroll once and hit the depth bound. See
@@ -4961,11 +7933,45 @@ where
             // half of the guard.
             let same_dump = resolve_callee(prog, name);
             if same_dump.is_none() {
+                // The `core::fmt` chain behind a `panic!`/`assert!` message. It
+                // runs before `try_intrinsic` because these are not integer
+                // intrinsics, and it answers only the exact shapes it knows; every
+                // other `core::fmt` call still falls through to "unmodelled".
                 if let Some(done) =
-                    try_intrinsic(prog, st.frame.func, name, args, dest, &mut st.env)
+                    try_fmt_call(name, args, dest, &mut st.env, type_of_place(cur, dest).as_ref())
                 {
                     let next = match done {
                         Ok(()) => State { block: *target, ..st },
+                        Err(e) => {
+                            report.unknown_paths.push(e);
+                            return;
+                        }
+                    };
+                    advance(prog, next, *target, report, work, pins);
+                    return;
+                }
+                if let Some(done) = try_intrinsic(
+                    prog,
+                    st.frame.func,
+                    name,
+                    args,
+                    dest,
+                    &mut st.env,
+                    st.path,
+                    pins,
+                    callees,
+                ) {
+                    let next = match done {
+                        // A modelled call can contribute obligations of its own:
+                        // `iN::abs` and `Ord::clamp` panic on some inputs, and
+                        // that panic is a reachable failure, exactly like the
+                        // `assert` terminator rustc inserts. The obligations are
+                        // discharged inside `try_intrinsic` (where the operand
+                        // terms are live) and pushed here.
+                        Ok(obligations) => {
+                            report.obligations.extend(obligations);
+                            State { block: *target, ..st }
+                        }
                         Err(e) => {
                             report.unknown_paths.push(e);
                             return;
@@ -5041,215 +8047,7 @@ where
                 report.unknown_paths.push(format!("callee `{name}` has no body"));
                 return;
             };
-            let mut env = Env::with_enums(&prog.enums, &prog.consts);
-            // Which caller locals were handed over through a reference, so the
-            // return path knows whose store the callee's post-state belongs to.
-            let mut by_ref: Vec<(Place, u32)> = Vec::new();
-            for (i, a) in args.iter().enumerate() {
-                let v = operand(&mut st.env, a);
-                let Some(&l) = callee_fn.arg_locals.get(i) else { continue };
-                env.locals.insert(l, v);
-                // A reference argument may be dereferenced inside the callee
-                // (`*_1 = 5`), and `Ty::Ref` is modelled as its referent, so `_1`
-                // *is* the value `*_1` names. `verify_fn` marks the root's
-                // reference arguments this way; the inliner builds the callee's
-                // env itself, so it has to mark them too, or the callee's
-                // `(*_1) = v` is treated as a deref with no recorded referent and
-                // the write is dropped -- which is how a `&mut u8` helper's write
-                // was lost and a false `ret == 0` contract was proved.
-                if matches!(callee_fn.ty_of(l), Some(Ty::Ref(_))) {
-                    env.deref_ok.insert(l, ());
-                }
-                let Place { local: cl, proj } = match a {
-                    Operand::Copy(p) | Operand::Move(p) => p,
-                    Operand::Const(_) => continue,
-                };
-                if !proj.is_empty() {
-                    continue;
-                }
-                // The *storage* the argument denotes, which is the caller's local
-                // itself for a by-value argument and the pointee for a reference.
-                //
-                // `pointee`, not `resolve`: `resolve` only follows an explicit
-                // `*_p` projection, and `set5(&mut x)` hands the callee a *temp*
-                // (`_5 = &mut _2; set5(_5)`) whose place has no projection at all.
-                // `pointee` follows the recorded address of an empty-projection
-                // local, which is what turns `_5` into the `_2` the caller reads.
-                //
-                // The whole argument's state -- its element store *and* its parts
-                // -- is carried in, keyed on the callee's local. A reference shares
-                // the caller's storage, so the callee's `a[0]`, `c.lo` and `o.i.v`
-                // must read the caller's values; without them a helper that indexes
-                // or reads a field has an unmodelled operand and the caller's
-                // contract stays unproved, while a read-modify-write helper
-                // (`c.lo = c.lo + d`) cannot be modelled at all.
-                //
-                // The state is *cloned*, never shared: the callee must not be able
-                // to write the caller's copy directly, or a by-value argument would
-                // behave like a reference. Only a reference argument's post-state
-                // is copied back (see the return path).
-                let is_ref = arg_is_ref(callee_fn, i);
-                let source = if is_ref {
-                    st.env.pointee(&Place { local: *cl, proj: Vec::new() })
-                } else {
-                    Place { local: *cl, proj: Vec::new() }
-                };
-                let sl = source.local;
-                // The value *at the target*, and the target's parts. The value is
-                // read through `get`, not out of `locals`, because a sub-place
-                // target has no whole-local entry: `&mut c.lo` targets `c.0`, whose
-                // value lives in `fields`. Reading `locals[source.local]` there
-                // returned the *struct's* absent value, so the callee's `*v` was
-                // `Unknown` and a helper that *reads* through its argument (`*v`,
-                // `*v = *v + 1`, a two-reference `swap`) had an unmodelled operand --
-                // while a helper that only *wrote* (`*v = 5`) worked, because the
-                // write creates the value the copy-back then reads. `Ty::Ref` is
-                // modelled as its referent, so the callee's local *is* the target's
-                // value and this is a copy of what the caller holds, not an
-                // assumption about it.
-                //
-                // The part stores are copied only for a *whole-local* target, and
-                // they are keyed by `source.local` because that is the local that
-                // owns them. For a sub-place target the parts belong to the target's
-                // own type, which the value copy above already covers for a scalar;
-                // copying the enclosing local's parts instead would hand the callee
-                // a sibling field it does not own.
-                if is_ref {
-                    let v = st.env.get(&source);
-                    env.locals.insert(l, v);
-                }
-                if source.proj.is_empty() {
-                    if let Some(store) = st.env.indexed.get(&sl).cloned() {
-                        env.indexed.insert(l, store);
-                    }
-                    for ((l0, f), v) in st.env.fields.iter() {
-                        if *l0 == sl {
-                            env.fields.insert((l, *f), *v);
-                        }
-                    }
-                    for ((l0, chain), v) in st.env.nested.iter() {
-                        if *l0 == sl {
-                            env.nested.insert((l, chain.clone()), *v);
-                        }
-                    }
-                    for ((l0, k), v) in st.env.elems.iter() {
-                        if *l0 == sl {
-                            env.elems.insert((l, *k), *v);
-                        }
-                    }
-                    // Elements of field-path arrays (`o.a[0]`) are carried in for the
-                    // same reason the plain elements are: the callee's `(_1.0)[k]` is
-                    // the caller's `o.a[k]`, so a helper that *reads* one has to see
-                    // the caller's seed. Without this the callee read `Unknown`, and a
-                    // helper that wrote the element had its write die with the frame --
-                    // the caller read its own seed, so `requires: x.a[0] == 5;
-                    // ensures: ret == 5` on `set_first(x); x.a[0]` was **proved**
-                    // against a body that returns 9.
-                    for ((l0, chain, k), v) in st.env.elems_path.iter() {
-                        if *l0 == sl {
-                            env.elems_path.insert((l, chain.clone(), *k), *v);
-                        }
-                    }
-                    // The leaves *inside* those elements (`o.a[0].v`), keyed
-                    // index-first. A helper that reads a leaf through its argument
-                    // (`a[0].v`) otherwise saw `Unknown`; and one that wrote it had
-                    // the write die with the frame, so the caller read the leaf its
-                    // literal had before the call.
-                    for ((l0, k, chain), v) in st.env.elem_parts.iter() {
-                        if *l0 == sl {
-                            env.elem_parts.insert((l, *k, chain.clone()), *v);
-                        }
-                    }
-                    // An already-poisoned array stays poisoned in the callee: its
-                    // elements are unknown, so carrying them in would hand over
-                    // values the caller's own write already invalidated.
-                    if st.env.poisoned_elems.contains(&sl) {
-                        env.poisoned_elems.insert(l);
-                    }
-                } else if is_ref {
-                    // A sub-place target whose own type is an aggregate: `&mut
-                    // o.i`. The callee's `i.v` is the caller's `o.i.v`, so the
-                    // target's parts are carried in *re-based* -- the target's
-                    // chain is dropped from the front of each key and the callee's
-                    // local takes its place. This is the exact inverse of the
-                    // re-based copy-back, and it is what lets a helper *read* a
-                    // nested aggregate it was handed (`read_inner(&o.i)`), which is
-                    // otherwise an unmodelled operand.
-                    let mut rc = Vec::with_capacity(source.proj.len());
-                    let ok = source.proj.iter().all(|p| match p {
-                        Proj::Field(i) => {
-                            rc.push(*i);
-                            true
-                        }
-                        _ => false,
-                    });
-                    if ok {
-                        // A remainder of one step is a *field* in this store's
-                        // spelling (`fields` is keyed by a single index, `nested` by
-                        // a chain of two or more), so the two lengths have to be
-                        // routed apart or the callee's `_1.0` -- a lone field read --
-                        // would consult `fields` and miss.
-                        for ((l0, chain), v) in st.env.nested.iter() {
-                            if *l0 != sl || !chain.starts_with(&rc) {
-                                continue;
-                            }
-                            let rem = &chain[rc.len()..];
-                            match rem {
-                                [f] => {
-                                    env.fields.insert((l, *f), *v);
-                                }
-                                [] => {}
-                                _ => {
-                                    env.nested.insert((l, rem.to_vec()), *v);
-                                }
-                            }
-                        }
-                        // Elements of field-path arrays under a sub-place target, the
-                        // same re-basing as the nested parts above: `&mut o.i` makes the
-                        // caller's `o.i.a[0]` the callee's `_1.a[0]`, so the chain has
-                        // the target's prefix dropped. Without this a helper that only
-                        // *reads* the element through its argument (`read_inner(&o.i)` ->
-                        // `i.a[0]`) saw `Unknown` and its contract was unreadable -- an
-                        // incompleteness where the true contract should decide.
-                        for ((l0, chain, k), v) in st.env.elems_path.iter() {
-                            if *l0 != sl || !chain.starts_with(&rc) {
-                                continue;
-                            }
-                            let rem = &chain[rc.len()..];
-                            if rem.is_empty() {
-                                // The target *is* the array (`peek_of(&x.a)`): in the
-                                // callee's terms its argument is a whole local, so the
-                                // callee's `_1[k]` read consults the *plain* element store,
-                                // not the field-path one. Without this the callee read
-                                // `Unknown` and a read-only helper's contract was
-                                // unreadable -- an incompleteness where the true contract
-                                // should decide. This is the exact inverse of the write-back
-                                // arm that re-bases a whole-array target's element.
-                                env.elems.insert((l, *k), *v);
-                            } else {
-                                env.elems_path.insert((l, rem.to_vec(), *k), *v);
-                            }
-                        }
-                    }
-                }
-                if is_ref {
-                    by_ref.push((source.clone(), l));
-                }
-                // The origin local of a reference argument, in the *caller's*
-                // frame, so a reference the callee returns can be resolved once it
-                // is back in the caller. A `&mut x` argument is passed through a
-                // temp (`_5 = &mut _2; set5(_5)`), so the origin is `_5`'s origin --
-                // `_2` -- not `_5` itself.
-                if matches!(callee_fn.ty_of(l), Some(Ty::Ref(_))) {
-                    // The argument denotes `source` in the caller's frame, and
-                    // inside the callee it is the local `l` itself. Recording both
-                    // is what lets a reference the callee returns be translated
-                    // back: the callee's `_0` names `l` (or a projection of it),
-                    // and `arg_source` turns that into the caller's place.
-                    env.arg_source.insert(l, source.clone());
-                    env.ref_origin.insert(l, Place { local: l, proj: Vec::new() });
-                }
-            }
+            let (env, by_ref) = seed_callee_env(prog, &mut st.env, callee_fn, args);
             let caller = Frame {
                 func: st.frame.func,
                 ret_target: *target,
@@ -5295,6 +8093,350 @@ where
     }
 }
 
+/// True when a `drop` of this type runs nothing.
+///
+/// A type with no drop glue -- an integer, `bool`, `()`, a reference, a function
+/// pointer, or an aggregate of such -- has no destructor, so its `drop`
+/// terminator changes no state and the executor skips it. This is the common
+/// case: `let v = [1u8, 2];` lowers to a `drop(_2)` on the array, and before this
+/// was recognised every function holding such a local was `incomplete`.
+///
+/// An `Other` type is the unknown case, and it is *not* a no-op: it may name a
+/// `Vec`, a `String`, a `Box`, a guard, or a user struct with a `Drop` field, any
+/// of which has a destructor. Treating it as nothing to run would be a false
+/// proof whenever that destructor is observable, so it is refused instead. A
+/// user `impl Drop` for it is found by [`drop_destructor`] and executed; a
+/// container is refused. See the `Term::Drop` executor arm.
+fn drop_is_noop(ty: &Ty) -> bool {
+    match ty {
+        Ty::Bool
+        | Ty::Char
+        | Ty::U8
+        | Ty::U16
+        | Ty::U32
+        | Ty::U64
+        | Ty::U128
+        | Ty::Usize
+        | Ty::I8
+        | Ty::I16
+        | Ty::I32
+        | Ty::I64
+        | Ty::I128
+        | Ty::Isize
+        | Ty::Unit
+        | Ty::Ref(_) => true,
+        Ty::Tuple(ts) => ts.iter().all(drop_is_noop),
+        Ty::Array(inner, _) => drop_is_noop(inner),
+        Ty::Slice(inner) => drop_is_noop(inner),
+        // A `Vec<T>` is glue-free exactly when `T` is: the container's own
+        // destructor only runs `T`'s, so a `Vec<u8>` runs nothing observable. The
+        // `T` is read from the printed name; a `T` that is itself an unmodelled
+        // type (`Ty::Other`) is *not* glue-free by this test, which is the
+        // conservative direction -- it is refused by the `has_field_glue` check
+        // rather than assumed to be a no-op.
+        Ty::Other(name) => match vec_elem_ty(name) {
+            Some(elem) => drop_is_noop(&elem),
+            None => false,
+        },
+    }
+}
+
+/// A short, printable name for a type, for a refusal message.
+fn ty_label(ty: &Ty) -> String {
+    match ty {
+        Ty::Bool => "bool".into(),
+        Ty::Char => "char".into(),
+        Ty::U8 => "u8".into(),
+        Ty::U16 => "u16".into(),
+        Ty::U32 => "u32".into(),
+        Ty::U64 => "u64".into(),
+        Ty::U128 => "u128".into(),
+        Ty::Usize => "usize".into(),
+        Ty::I8 => "i8".into(),
+        Ty::I16 => "i16".into(),
+        Ty::I32 => "i32".into(),
+        Ty::I64 => "i64".into(),
+        Ty::I128 => "i128".into(),
+        Ty::Isize => "isize".into(),
+        Ty::Unit => "()".into(),
+        Ty::Ref(inner) => format!("&{}", ty_label(inner)),
+        Ty::Tuple(ts) => {
+            let parts: Vec<String> = ts.iter().map(ty_label).collect();
+            format!("({})", parts.join(", "))
+        }
+        Ty::Array(inner, n) => format!("[{}; {}]", ty_label(inner), n),
+        Ty::Slice(inner) => format!("[{}]", ty_label(inner)),
+        Ty::Other(s) => s.clone(),
+    }
+}
+
+/// The index of the `impl Drop` body for a type, if the dump has one.
+///
+/// A user `impl Drop for T` prints its definition as `<impl at FILE:L:C: L:C>::drop`,
+/// so the *owner* of the impl block -- not the type's name spelling -- is what
+/// identifies it: `Ty::Other("Guard")` names the type, and the impl block whose
+/// owner is `Guard` holds the destructor. A type with no `impl Drop` in the dump
+/// -- a `Vec`, a `String`, a `Box`, or any struct with no explicit destructor --
+/// has no candidate here, which is what lets the caller refuse it rather than
+/// treat the drop as a no-op.
+///
+/// More than one candidate is refused (the caller gets `None`): two `impl Drop`
+/// blocks for one owner is not something a valid crate contains, and picking one
+/// would be a guess.
+fn drop_destructor(prog: &MirProgram, ty: &Ty) -> Option<usize> {
+    let Ty::Other(name) = ty else { return None };
+    // The impl's owner is stored bare (`Guard`); the type is too, but it may carry
+    // a path (`m::Guard`) or generics (`Wrapper<u8>`) the owner does not, so the
+    // last `::` segment of the type is what is compared.
+    let bare = name.rsplit("::").next().unwrap_or(name);
+    let bare = bare.split('<').next().unwrap_or(bare);
+    let mut hit = None;
+    for (i, f) in prog.fns.iter().enumerate() {
+        if f.name.rsplit("::").next() != Some("drop") {
+            continue;
+        }
+        let Some(loc) = f.impl_loc else { continue };
+        // The *trait* has to be `Drop`. A method named `drop` on any other trait
+        // (`trait NotDrop { fn drop(&mut self); }`) is not Rust's destruction hook,
+        // and executing it as though it were hides the real field destruction --
+        // a false proof (`Outer { inner: Inner }` with an empty `NotDrop::drop` on
+        // `Outer` and a panicking `Inner::drop` came back `Verified`). The trait
+        // path rustc prints for the standard library's `Drop` is the bare `Drop`
+        // (a local trait is qualified with its own module, `m::NotDrop`), so the
+        // last `::` segment is what is compared, exactly as the owner is.
+        match prog.impl_traits.get(&loc) {
+            Some(t) if t.rsplit("::").next() == Some("Drop") => {}
+            _ => continue,
+        }
+        let Some(owner) = prog.impl_owners.get(&loc) else { continue };
+        let owner_bare = owner.split('<').next().unwrap_or(owner);
+        if owner_bare == bare {
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some(i);
+        }
+    }
+    hit
+}
+
+/// Whether a type has *any* drop glue -- a user `Drop` impl, or a field (at any
+/// depth) that does.
+///
+/// This is what makes the `drop` handler sound for an aggregate. rustc's `drop`
+/// terminator destroys the *whole* value, not only the user-written destructor:
+/// after `Outer::drop` returns, Rust also destroys `Outer`'s fields. A frontend
+/// that runs only the outer destructor therefore misses a field destructor that
+/// can panic, and an empty outer destructor *hides* it -- `Outer { inner: Inner }`
+/// with an empty `Outer::drop` and a panicking `Inner::drop` was reported
+/// `Verified`.
+///
+/// `Ok(false)` is "no glue anywhere"; `Ok(true)` is "some glue"; `Err` is a type
+/// this tool cannot decide (a container whose destructor it does not model), and
+/// the caller refuses rather than assuming. The layout comes from `structs`, read
+/// from the same source as the contracts; a type with no layout and no `Drop` impl
+/// is a container, which is the `Err` case.
+fn has_drop_glue(
+    prog: &MirProgram,
+    structs: &BTreeMap<String, spec::StructDef>,
+    ty: &Ty,
+) -> Result<bool, String> {
+    match ty {
+        Ty::Bool
+        | Ty::Char
+        | Ty::U8
+        | Ty::U16
+        | Ty::U32
+        | Ty::U64
+        | Ty::U128
+        | Ty::Usize
+        | Ty::I8
+        | Ty::I16
+        | Ty::I32
+        | Ty::I64
+        | Ty::I128
+        | Ty::Isize
+        | Ty::Unit
+        | Ty::Ref(_) => Ok(false),
+        Ty::Tuple(ts) => {
+            for t in ts {
+                if has_drop_glue(prog, structs, t)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Ty::Array(inner, _) | Ty::Slice(inner) => has_drop_glue(prog, structs, inner),
+        Ty::Other(name) => {
+            if drop_destructor(prog, ty).is_some() {
+                return Ok(true);
+            }
+            match spec::struct_lookup(structs, name) {
+                Some(def) => {
+                    for (_, fty) in &def.fields {
+                        if has_drop_glue(prog, structs, fty)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                // No layout and no `Drop` impl: a container (`Vec`, `String`, a
+                // guard) whose destructor this tool does not model. Whether it has
+                // observable glue is unknown, so the caller must refuse.
+                None => Err(format!("the drop glue of `{}` is not modelled", ty_label(ty))),
+            }
+        }
+    }
+}
+
+/// Whether destroying a value of `ty` also destroys a *field* (at any depth)
+/// whose own destructor would have to run.
+///
+/// The `drop` handler runs one destructor body per terminator. When a value's
+/// destruction also destroys a field -- `Outer { inner: Inner }` with a `Drop`
+/// for `Outer` destroys `inner` too -- running only the user destructor skips the
+/// field's, and an empty outer destructor *hides* a panicking inner one: that was
+/// a false proof (`Outer` came back `Verified`).
+///
+/// The layout comes from the source, exactly as [`has_drop_glue`]'s does. A type
+/// with no layout is a container or a unit-like item; a container's fields are
+/// unknown, so it is refused rather than assumed field-free.
+fn has_field_glue(
+    prog: &MirProgram,
+    structs: &BTreeMap<String, spec::StructDef>,
+    ty: &Ty,
+) -> Result<bool, String> {
+    match ty {
+        Ty::Bool
+        | Ty::Char
+        | Ty::U8
+        | Ty::U16
+        | Ty::U32
+        | Ty::U64
+        | Ty::U128
+        | Ty::Usize
+        | Ty::I8
+        | Ty::I16
+        | Ty::I32
+        | Ty::I64
+        | Ty::I128
+        | Ty::Isize
+        | Ty::Unit
+        | Ty::Ref(_) => Ok(false),
+        Ty::Tuple(ts) => {
+            for t in ts {
+                if has_drop_glue(prog, structs, t)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Ty::Array(inner, _) | Ty::Slice(inner) => has_drop_glue(prog, structs, inner),
+        Ty::Other(name) => {
+            match spec::struct_lookup(structs, name) {
+                Some(def) => {
+                    for (_, fty) in &def.fields {
+                        if has_drop_glue(prog, structs, fty)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                None => Err(format!("the fields of `{}` are not modelled", ty_label(ty))),
+            }
+        }
+    }
+}
+
+/// The error type of a `Result<T, E>` receiver, for the drop-glue check.
+///
+/// The receiver's type is printed as `Result<u8, E>` (or with a path prefix), and
+/// the error is the second top-level generic argument. A type that is not a
+/// `Result`, or whose arguments cannot be split, yields `None` -- the caller then
+/// does no glue check, which is the *unsound* direction only if the type really
+/// were a `Result` with an unmodelled error, and the receiver reaching this arm is
+/// already known to be a modelled `Result` (its tag and payload are in the store).
+fn receiver_error_type(f: &MirFn, p: &Place) -> Option<Ty> {
+    let Ty::Other(name) = f.ty_of(p.local)? else {
+        return None;
+    };
+    if !name.starts_with("Result") && !name.contains("::Result") {
+        return None;
+    }
+    let inner = spec::angle_inner(name)?;
+    let args = crate::mir::parse::split_top_level(inner, ',');
+    args.get(1).map(|e| Ty::parse(e.trim()))
+}
+
+/// The `T` of a `Result<T, E>` receiver's declared type, for the drop-glue check
+/// on `Result::err()` (which drops the `Ok` payload).
+fn receiver_ok_type(f: &MirFn, p: &Place) -> Option<Ty> {
+    let Ty::Other(name) = f.ty_of(p.local)? else {
+        return None;
+    };
+    if !name.starts_with("Result") && !name.contains("::Result") {
+        return None;
+    }
+    let inner = spec::angle_inner(name)?;
+    let args = crate::mir::parse::split_top_level(inner, ',');
+    args.first().map(|t| Ty::parse(t.trim()))
+}
+
+/// The `T` of an `Option<T>` receiver's declared type, for the drop-glue check on
+/// `Option::or`/`Option::and` (which drop one of the two payloads).
+fn receiver_some_type(f: &MirFn, p: &Place) -> Option<Ty> {
+    let Ty::Other(name) = f.ty_of(p.local)? else {
+        return None;
+    };
+    if !name.starts_with("Option") && !name.contains("::Option") {
+        return None;
+    }
+    let inner = spec::angle_inner(name)?;
+    Some(Ty::parse(inner.trim()))
+}
+
+/// An operand's `Some` payload, or `None` when the operand's tag is a *known*
+/// non-`Some` discriminant (a constructed `None`).
+///
+/// A payload is required only when the operand can be `Some` on some path. A
+/// constructed `None` records no payload, and its absence is not a modelling
+/// failure -- the result's tag is already known, so the missing payload is never
+/// read. A *symbolic* tag still requires the payload: a fabricated value there
+/// would be one the operand never holds, so the shape is refused.
+///
+/// `whose` names the operand ("a receiver"/"an argument") and `name` the method,
+/// so the refusal names what could not be read.
+fn payload_if_some(
+    env: &Env,
+    local: u32,
+    tag: Var,
+    payload_variant: u64,
+    whose: &str,
+    name: &str,
+) -> Result<Option<(Var, Sign, u8)>, String> {
+    match env.payloads.get(&(local, payload_variant)).copied() {
+        Some((Val::Sym(payload, sign), w)) => Ok(Some((payload, sign, w))),
+        Some(_) => Err(format!("`{name}` on {whose} whose payload is not a value")),
+        None => match smt::evaluate(tag, |_| None) {
+            // A known tag that is not the payload variant: the operand is `None`
+            // on every path, so there is no payload to carry.
+            Some(v) if v != payload_variant => Ok(None),
+            // A symbolic tag, or a known `Some` tag with no payload recorded: the
+            // payload may be read, so it must be modelled.
+            _ => Err(format!("`{name}` on {whose} whose payload is not modelled")),
+        },
+    }
+}
+
+/// The declared type of an operand, for the enum-method glue checks.
+fn operand_ty(f: &MirFn, o: &Operand) -> Option<Ty> {
+    match o {
+        Operand::Copy(p) | Operand::Move(p) => type_of_place(f, p),
+        Operand::Const(Const::UInt(_, Some(t))) => Some(t.clone()),
+        Operand::Const(_) => None,
+    }
+}
+
 /// Resolve an operand to a symbolic value.
 fn operand(env: &mut Env, o: &Operand) -> Val {
     match o {
@@ -5327,6 +8469,10 @@ fn operand(env: &mut Env, o: &Operand) -> Val {
                 None => Val::Unknown,
             },
             Const::Bool(b) => Val::Bool(smt::truth(*b)),
+            // A string or byte-string literal has no bit-vector, so it is not a
+            // `Val`; the `core::fmt` model reads it through the env's string store
+            // instead.
+            Const::Str(_) | Const::Bytes(_) => Val::Unknown,
             // An enum variant *construction*: `Mode::Idle`. The dump prints it as
             // a path constant, and it is the one place a tag is a *known* value
             // rather than an input -- a locally built enum then has a constant
@@ -5424,6 +8570,21 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
                     // leaving the contract `incomplete` in both directions.
                     if env.carry_elem_leaf_onto_local(q, dest.local) {
                         return Val::Agg;
+                    }
+                }
+            }
+            // A `&T` read out of a `first`/`get` Option's payload -- the `match`
+            // desugaring's `_4 = copy ((_2 as Some).0)`, as opposed to `unwrap`'s
+            // dedicated arm -- names the same slice element, so the reference's
+            // later deref (`*_4`) must resolve. Propagating the entry onto the
+            // destination is what lets the `match` form decide; without it the
+            // deref finds no entry and the postcondition is unreadable.
+            if dest.proj.is_empty() {
+                if let Operand::Copy(q) | Operand::Move(q) = o {
+                    if q.proj.iter().any(|p| matches!(p, Proj::Downcast(_))) {
+                        if let Some(e) = env.slice_elem_ref.get(&q.local).cloned() {
+                            env.slice_elem_ref.insert(dest.local, e);
+                        }
                     }
                 }
             }
@@ -5559,7 +8720,17 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             for (i, o) in ops.iter().enumerate() {
                 let v = operand(env, o);
                 let pw = operand_width(f, o).unwrap_or(0);
-                env.set_payload(dest.local, variant, v, pw);
+                // The payload store holds *one* value per variant -- the field a
+                // contract names as `ret.Variant` / `m.Variant`, which the binder
+                // reads as `payload.first()` (field 0). Writing every operand here
+                // left the *last* field, so `E::Pair(1, 2)` made `ret.Pair` denote
+                // field 1 and `ensures: ret.Pair == 2` was *verified* against a
+                // field-0 value of 1. Each field keeps its own identity in
+                // `fields` (below), so a downcast read of `.1` is unaffected; only
+                // the single-valued payload summary is pinned to field 0.
+                if i == 0 {
+                    env.set_payload(dest.local, variant, v, pw);
+                }
                 env.set(&Place { local: dest.local, proj: vec![Proj::Field(i as u32)] }, v);
             }
             Val::Agg
@@ -6455,6 +9626,14 @@ mod tests {
             (ObligationKind::Unreachable, Verdict::Unsat, true),
             (ObligationKind::Unreachable, cex, false),
             (ObligationKind::Unreachable, Verdict::Unknown, false),
+            // The unwinding assertion is a reachability query too: it asks "is the
+            // cutoff reachable", so `Unsat` discharges it. The engine records it
+            // with `Valid` on a path that *did* reach the cutoff, which is the
+            // failure case -- the row a too-small `unwind:` lands on.
+            (ObligationKind::UnwindBound { bound: 3 }, Verdict::Valid, false),
+            (ObligationKind::UnwindBound { bound: 3 }, Verdict::Unsat, true),
+            (ObligationKind::UnwindBound { bound: 3 }, cex, false),
+            (ObligationKind::UnwindBound { bound: 3 }, Verdict::Unknown, false),
             // A vacuity check is discharged when it is *refuted*: some input
             // satisfies the precondition. `Unsat` here is the finding.
             (ObligationKind::VacuousPrecondition, Verdict::Valid, true),
@@ -6653,10 +9832,15 @@ mod tests {
     /// pins the property that matters: the call returns, and the incompleteness
     /// is reported rather than hidden.
     ///
+    /// The cutoff *named* may be the path budget or the loop-unwind bound
+    /// depending on how far dead-path pruning gets before either fires; the test
+    /// accepts either, because both are honest cutoffs and the property under
+    /// test is that *a* cutoff is reported and the call returns.
+    ///
     /// The MIR is embedded so the test runs on stable. `tests/mir.rs` covers the
     /// same function end-to-end but skips itself without `VERIF_RUSTC`.
     #[test]
-    fn a_branching_loop_reports_a_path_budget_rather_than_running_forever() {
+    fn a_branching_loop_reports_a_cutoff_rather_than_running_forever() {
         const COUNT_EVENS_MIR: &str = r#"
 fn count_evens(_1: u8) -> u8 {
     debug n => _1;
@@ -6710,7 +9894,11 @@ fn count_evens(_1: u8) -> u8 {
         // the path condition, which is what makes each successive path cost more
         // than the last. A hand-built `verify_fn` call without it settles
         // quickly, so it would not reproduce the defect.
-        let src = "/// requires: n <= 8\n/// ensures: ret <= 8\npub fn count_evens(n: u8) -> u8 { n }\n";
+        // A *symbolic* bound, so the loop cannot be pruned to a small trip count.
+        // With `n <= 8` the guard folds and the loop now decides (the pruning in
+        // `run_state` drops the unsatisfiable exit edge); this regression needs the
+        // unbounded shape to keep exercising the path budget.
+        let src = "/// requires: true\n/// ensures: true\npub fn count_evens(n: u8) -> u8 { n }\n";
         let specs = crate::mir::spec::extract(src);
         // Run on a thread with a large stack. The engine recurses through the
         // BDD and the frontend recurses through the term graph, so this workload
@@ -6735,7 +9923,9 @@ fn count_evens(_1: u8) -> u8 {
             other => panic!("expected an incomplete outcome, got {other:?}"),
         };
         assert!(
-            reasons.iter().any(|r| r.contains("path budget exhausted")),
+            reasons
+                .iter()
+                .any(|r| r.contains("path budget exhausted") || r.contains("unwound past")),
             "the cutoff must be named; reasons were {reasons:?}"
         );
     }
@@ -7580,5 +10770,317 @@ fn count_via_helper(_1: u8) -> u8 {
 
         // An intrinsic call keeps its `<impl` projection, which marks it external.
         assert_eq!(call_type("core::num::<impl u8>::wrapping_add").as_deref(), Some("u8"));
+    }
+
+    /// The tail of a path is read through its generics.
+    ///
+    /// The dump spells these calls with their generics, so a naive last-segment
+    /// split gives `<1>`/`<T>` rather than the method name -- and the model would
+    /// then answer nothing at all, which is how the MSRV run reported
+    /// `Arguments::<'_>::new_const::<1>` as unmodelled while stable was green.
+    /// The turbofish separator (`new_const::<1>`) and a nested group
+    /// (`Argument::<&'_ str>`) are both covered.
+    #[test]
+    fn a_path_tail_is_read_through_its_generics() {
+        assert_eq!(path_tail("Arguments::<'_>::new_const::<1>"), "new_const");
+        assert_eq!(path_tail("Arguments::<'_>::new_v1::<2, 2>"), "new_v1");
+        assert_eq!(path_tail("Arguments::<'_>::new::<7, 1>"), "new");
+        assert_eq!(path_tail("Arguments::<'_>::from_str"), "from_str");
+        assert_eq!(path_tail("core::fmt::rt::Argument::<'_>::new_display::<u8>"), "new_display");
+        assert_eq!(path_tail("std::rt::panic_fmt"), "panic_fmt");
+        assert_eq!(path_tail("panic_fmt"), "panic_fmt");
+    }
+
+    /// The generic argument list is read as data, and a missing item is refused.
+    #[test]
+    fn a_generic_argument_is_read_or_refused() {
+        assert_eq!(generic_arg("Arguments::<'_>::new_v1::<2, 1>", 1), Some(1));
+        assert_eq!(generic_arg("Arguments::<'_>::new::<7, 1>", 1), Some(1));
+        // No turbofish, a missing index, and a non-numeric item are all `None`.
+        assert_eq!(generic_arg("Arguments::<'_>::new_const", 1), None);
+        assert_eq!(generic_arg("Arguments::<'_>::new_v1::<2>", 1), None);
+        assert_eq!(generic_arg("Arguments::<'_>::new_v1::<2, A>", 1), None);
+    }
+
+    /// A promoted constant's use-site spelling is reconciled with its definition's.
+    ///
+    /// On the MSRV rustc prints a trait default body's `panic!` promoted constant as
+    /// `const a::Custom::into_iter::promoted[0]` but uses it as
+    /// `const <Self as range_shim::a::Custom>::into_iter::promoted[0]`. An exact
+    /// lookup misses and the `new_const` call becomes unmodelled, so the function is
+    /// `incomplete` instead of refuted. The owner paths (the `<T as Trait>` projection
+    /// on the use side, the qualifier on the definition side) are what reconcile them,
+    /// and two sibling traits of the same method must not answer for each other.
+    #[test]
+    fn a_promoted_const_use_is_reconciled_with_its_definition() {
+        let mut m: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        m.insert("a::Custom::into_iter::promoted[0]".into(), vec!["from a".into()]);
+        m.insert("b::Custom::into_iter::promoted[0]".into(), vec!["from b".into()]);
+        m.insert("g::promoted[0]".into(), vec!["from g".into()]);
+        // The MSRV use spelling resolves to the trait it names, not its sibling.
+        assert_eq!(
+            lookup_promoted(&m, "<Self as range_shim::a::Custom>::into_iter::promoted[0]"),
+            Some(vec!["from a".to_string()])
+        );
+        assert_eq!(
+            lookup_promoted(&m, "<Self as range_shim::b::Custom>::into_iter::promoted[0]"),
+            Some(vec!["from b".to_string()])
+        );
+        // An exact match still wins, and an unrelated name resolves to nothing.
+        assert_eq!(lookup_promoted(&m, "g::promoted[0]"), Some(vec!["from g".to_string()]));
+        assert_eq!(lookup_promoted(&m, "z::promoted[0]"), None);
+        assert_eq!(lookup_promoted(&m, "SOME_CONST"), None);
+    }
+
+    /// A diverging call is labelled by *what* it does, not always `panic`.
+    ///
+    /// `std::process::exit(0)` and `std::process::abort()` end the path exactly as
+    /// a panic does, so all three carry the same obligation -- but calling a clean
+    /// `exit` a `panic` tells a reader the program crashed when it did not. The
+    /// kind is read from the callee's printed name; an unrecognised `!`-returning
+    /// function is `Never`, which is honest about not classifying it.
+    #[test]
+    fn a_diverging_call_is_labelled_by_its_kind() {
+        assert_eq!(Divergence::of("core::panicking::panic"), Divergence::Panic);
+        assert_eq!(Divergence::of("std::rt::panic_fmt"), Divergence::Panic);
+        assert_eq!(Divergence::of("core::panicking::panic_nounwind"), Divergence::Panic);
+        // `exit(…)` is printed with its tail alone (it is `std::process::exit`, but
+        // the dump elides the path).
+        assert_eq!(Divergence::of("exit"), Divergence::Exit);
+        assert_eq!(Divergence::of("std::process::exit"), Divergence::Exit);
+        assert_eq!(Divergence::of("std::process::abort"), Divergence::Abort);
+        // A user function returning `!` is not classified as any of the three.
+        assert_eq!(Divergence::of("my_crate::never_returns"), Divergence::Never);
+        assert_eq!(Divergence::Never.label(), "diverges");
+        assert_eq!(Divergence::Exit.label(), "exit");
+    }
+
+    /// Which types carry no drop glue, so a `drop` of one runs nothing.
+    ///
+    /// This is the *defensive* arm of the `Term::Drop` executor, not a live path:
+    /// rustc emits no `drop` for a type with no drop glue (measured -- 0 of 6
+    /// `drop` terms over `realistic.rs` are glue-free). So the arm cannot be
+    /// exercised through the frontend, and the check lives here where it can be
+    /// asserted directly. It matters because the alternative to a no-op is a
+    /// refusal, and a refusal of `drop(_2)` for an integer would lose a proof.
+    #[test]
+    fn a_glue_free_type_has_a_noop_drop() {
+        for ty in [
+            Ty::Bool, Ty::U8, Ty::U64, Ty::I8, Ty::I64, Ty::Usize, Ty::Unit,
+            Ty::Ref(Box::new(Ty::U8)),
+        ] {
+            assert!(drop_is_noop(&ty), "`{ty:?}` has no drop glue");
+        }
+        // An aggregate is glue-free exactly when every leaf is.
+        assert!(drop_is_noop(&Ty::Array(Box::new(Ty::U8), 4)));
+        assert!(drop_is_noop(&Ty::Tuple(vec![Ty::U8, Ty::Bool])));
+        // A nominal type is not known glue-free from the dump, so it is *not* a
+        // no-op -- it is resolved to a destructor or refused.
+        assert!(!drop_is_noop(&Ty::Other("Guard".into())));
+        // A `Vec<T>` is glue-free exactly when its element is: the container's own
+        // destructor only runs `T`'s, so `Vec<u8>` runs nothing observable while a
+        // `Vec<Guard>` (a nominal element) does not. The standard container's
+        // *type* is `std::vec::Vec<T>`; a bare `Vec<T>` is a *user* type, so it is
+        // not the container -- reading it as one would skip a user destructor.
+        assert!(drop_is_noop(&Ty::Other("std::vec::Vec<u8>".into())));
+        assert!(drop_is_noop(&Ty::Other("alloc::vec::Vec<u8>".into())));
+        assert!(!drop_is_noop(&Ty::Other("std::vec::Vec<Guard>".into())));
+        assert!(!drop_is_noop(&Ty::Other("std::vec::Vec<String>".into())));
+        assert!(!drop_is_noop(&Ty::Other("Vec<u8>".into())), "a bare `Vec` is a user type");
+        assert!(!drop_is_noop(&Ty::Other("m::Vec<u8>".into())), "a user `Vec` is not the container");
+        // A tuple/array with a nominal leaf inherits the nominal's glue.
+        assert!(!drop_is_noop(&Ty::Array(Box::new(Ty::Other("Guard".into())), 2)));
+        assert!(!drop_is_noop(&Ty::Tuple(vec![Ty::U8, Ty::Other("String".into())])));
+    }
+
+    /// A projected promoted-constant use resolves to *its own* method's pieces.
+    ///
+    /// Two trait defaults each own a `promoted[0]`; the use
+    /// `<Self as Custom>::zzz::promoted[0]` names the `zzz` method, but the
+    /// fallback compared only the trait owner and the promotion index, so it
+    /// returned `aaa`'s pieces (whichever the map iterated first) and the report
+    /// named a panic message the caller never reached.
+    #[test]
+    fn a_projected_promoted_use_resolves_its_own_method() {
+        let mut promoted: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        promoted.insert("Custom::aaa::promoted[0]".into(), vec!["from aaa".into()]);
+        promoted.insert("Custom::zzz::promoted[0]".into(), vec!["from zzz".into()]);
+
+        // Exact spellings resolve exactly.
+        assert_eq!(
+            lookup_promoted(&promoted, "Custom::zzz::promoted[0]"),
+            Some(vec!["from zzz".to_string()])
+        );
+        // The projected spelling `rustc` prints for a trait default's use resolves
+        // to the *same* method, not to whichever sibling the map yields first.
+        assert_eq!(
+            lookup_promoted(&promoted, "<Self as Custom>::zzz::promoted[0]"),
+            Some(vec!["from zzz".to_string()])
+        );
+        assert_eq!(
+            lookup_promoted(&promoted, "<Self as Custom>::aaa::promoted[0]"),
+            Some(vec!["from aaa".to_string()])
+        );
+
+        // Two definitions that share owner *and* method (a genuine ambiguity) are
+        // refused rather than answered with one of them. The use is a *projected*
+        // spelling (`call_trait_path` reduces its owner to `a::Custom`), and both
+        // candidates' owners match it -- `a::Custom` exactly and `Custom` as a
+        // `::`-aligned suffix -- so the only reason to return `None` is the
+        // ambiguity branch. The single-candidate control below returns `Some`, so
+        // the refusal is not merely "nothing matched".
+        let mut ambiguous: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        ambiguous.insert("a::Custom::m::promoted[0]".into(), vec!["one".into()]);
+        ambiguous.insert("Custom::m::promoted[0]".into(), vec!["two".into()]);
+        assert_eq!(
+            lookup_promoted(&ambiguous, "<Self as a::Custom>::m::promoted[0]"),
+            None,
+            "two candidates whose owner matches the use must be refused"
+        );
+        // The control: with only the exact-owner candidate, the same use resolves,
+        // so the `None` above is the ambiguity and not a failed match.
+        let mut single: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        single.insert("a::Custom::m::promoted[0]".into(), vec!["one".into()]);
+        assert_eq!(
+            lookup_promoted(&single, "<Self as a::Custom>::m::promoted[0]"),
+            Some(vec!["one".to_string()]),
+            "a single matching candidate must resolve"
+        );
+    }
+
+    /// A concrete-index write reaches the `last()` sentinel, so the pre-write
+    /// value cannot be read back after a write that *is* the last element.
+    ///
+    /// The sentinel (`LAST_INDEX`) is one variable per slice, so a write to a
+    /// concrete index used to leave it at its pre-write value. That was a false
+    /// proof: `let before = *xs.last().unwrap(); xs[0] = 1; before ==
+    /// *xs.last().unwrap()` was *proved* for a one-element slice, though the write
+    /// replaced the only element. The write now refreshes the sentinel with the
+    /// exact relationship `last == x` when `len == index + 1`, so the two facts
+    /// must hold together: after a write of `1` to index `0`, the sentinel is `1`
+    /// at `len == 1` and the *old* element otherwise. Reading the store directly is
+    /// what makes the check independent of the executor's path machinery.
+    #[test]
+    fn a_concrete_index_write_reaches_the_last_sentinel() {
+        smt::with_fresh(|| {
+            let mut env = Env::new();
+            let len = smt::var_named(0, 8);
+            let old = smt::var_named(1, 8);
+            let mut elems = BTreeMap::new();
+            elems.insert(LAST_INDEX, old);
+            env.indexed.insert(
+                2,
+                Indexed {
+                    len,
+                    elem_w: 8,
+                    elem_signed: false,
+                    elems,
+                    fixed_len: None,
+                    slice_steps: None,
+                    poisoned: false,
+                },
+            );
+            let one = smt::word(1, 8);
+            env.write_elem(2, 0, Val::Sym(one, Sign::Unsigned));
+            let merged = env.indexed.get(&2).and_then(|s| s.elems.get(&LAST_INDEX).copied());
+            let merged = merged.expect("the sentinel must still be present after a write");
+            assert_ne!(
+                merged, old,
+                "a write to index 0 must refresh the sentinel rather than leave it stale"
+            );
+            // The refreshed value is `1` exactly when the write index is the last
+            // one (`len == 1`), and the old element otherwise. Both readings are
+            // checked, so a merge that dropped either branch fails here.
+            let at_len_1 = smt::substitute_word(merged, &[(len, smt::word(1, 8))]);
+            assert_eq!(
+                smt::evaluate(at_len_1, |_| None),
+                Some(1),
+                "at `len == 1` the sentinel is the written value"
+            );
+            let at_len_2 = smt::substitute_word(merged, &[(len, smt::word(2, 8))]);
+            let old_val = smt::evaluate(old, |_| None);
+            assert_eq!(
+                smt::evaluate(at_len_2, |_| None),
+                old_val,
+                "at `len == 2` the write of index 0 is not the last element, so the \
+                 sentinel keeps the old element"
+            );
+        });
+    }
+
+    /// A call cycle in the write-set walk adds the call's reference arguments,
+    /// which is what terminates a recursive callee and keeps its write visible.
+    ///
+    /// This pins the *cycle branch* of [`collect_writes`] directly, because no
+    /// verdict-level fixture reaches it observably: for every corpus shape the
+    /// callee's own direct scan already names the written referent, so the
+    /// branch's inclusion is a conservative *superset* -- measured, deleting it
+    /// changes no verdict. A branch that is reached (35 times in the recursion
+    /// test) but never load-bearing is exactly the kind of guard the suite has
+    /// no teeth for, so it is pinned here on the traversal's own output.
+    ///
+    /// The shape is a *mutual* cycle that writes through a reference the fold
+    /// cannot map back: `a` calls `b` (a cycle, since `b` calls `a`), and `b`
+    /// takes `&mut u8`. `a`'s header walk enters `b`, finds `b`'s self-cycle
+    /// through `a`, and must add `b`'s reference argument to the write set.
+    #[test]
+    fn a_call_cycle_adds_its_reference_arguments_to_the_write_set() {
+        fn block(id: usize, stmts: Vec<Stmt>, term: Term) -> Block {
+            Block { id, stmts, term, cleanup: false }
+        }
+        // `b(c: &mut u8)`: calls `a` again, passing `c` -- and does *not* write
+        // `c` directly, so the only way `_1` enters the write set is the cycle
+        // branch. (With a direct write here the branch would be redundant and the
+        // test would pass even with it deleted.)
+        let b = MirFn {
+            name: "b".into(),
+            arg_locals: vec![1],
+            ret_ty: Ty::U8,
+            locals: [(0u32, Ty::U8), (1, Ty::Ref(Box::new(Ty::U8)))].into_iter().collect(),
+            local_names: Default::default(),
+            debug_bindings: Vec::new(),
+            blocks: vec![block(
+                0,
+                Vec::new(),
+                Term::Call {
+                    callee: Callee::Name("a".into()),
+                    args: vec![Operand::Copy(Place::new(1))],
+                    dest: Place::new(0),
+                    diverges: false,
+                    target: 1,
+                },
+            )],
+            written: [0u32].into_iter().collect(),
+            impl_loc: None,
+        };
+        // `a(x: &mut u8)`: calls `b` (so `b`'s walk sees `a` on the stack -> cycle).
+        let a = MirFn {
+            name: "a".into(),
+            arg_locals: vec![1],
+            ret_ty: Ty::U8,
+            locals: [(0u32, Ty::U8), (1, Ty::Ref(Box::new(Ty::U8)))].into_iter().collect(),
+            local_names: Default::default(),
+            debug_bindings: Vec::new(),
+            blocks: vec![block(
+                0,
+                Vec::new(),
+                Term::Call {
+                    callee: Callee::Name("b".into()),
+                    args: vec![Operand::Copy(Place::new(1))],
+                    dest: Place::new(0),
+                    diverges: false,
+                    target: 1,
+                },
+            )],
+            written: [0u32].into_iter().collect(),
+            impl_loc: None,
+        };
+        let prog = MirProgram { fns: vec![a, b], ..Default::default() };
+        // The walk starts at `a`'s header (block 0) with `a` already `visiting`.
+        let writes = loop_writes(&prog, &prog.fns[0], 0);
+        assert!(
+            writes.contains(&1),
+            "the cycle's reference argument (`_1`) must be in the write set, got: {writes:?}"
+        );
     }
 }

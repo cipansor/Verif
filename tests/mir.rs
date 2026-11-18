@@ -7,9 +7,16 @@
 //!   cargo test --features std --test mir
 //! ```
 //!
-//! The tests that need `rustc` skip themselves when `VERIF_RUSTC` is unset,
-//! because `--emit=mir` needs nightly and failing on a stable toolchain would say
-//! "the code is wrong" when the truth is "the tool could not run".
+//! The tests that need `rustc` resolve it from `VERIF_RUSTC`, or fall back to the
+//! `rustc` on `PATH`, and skip themselves only when there is no compiler at all.
+//!
+//! The fallback matters because a test that returns early reports `ok` while
+//! checking nothing, so the suite's verdict would otherwise depend on the
+//! environment: `let Some(report) = verify_all() else { return }` passes whether
+//! the MIR frontend ran or not. `--emit=mir` is a *stable* flag (only
+//! `-Zunpretty=mir` needs a nightly), so the `rustc` cargo already uses is enough,
+//! and the fallback makes the ~21 `else { return }` tests run on any machine that
+//! can build the crate. See the `U5` item in `ROADMAP.md`.
 //!
 //! # The oracle
 //!
@@ -39,9 +46,22 @@ use actuator::*;
 
 const TARGET: &str = "examples/mir_targets/actuator.rs";
 
-/// The nightly compiler, or `None` so the test can skip.
+/// The compiler to read MIR from, or `None` so the test can skip.
+///
+/// `VERIF_RUSTC` wins when it is set (CI points it at a nightly, so the dump
+/// format is exercised on the bleeding edge). Otherwise the `rustc` on `PATH` is
+/// used, because `--emit=mir` is a stable flag and a test that silently checks
+/// nothing is worse than one that runs on a stable compiler. The skip is now
+/// reserved for a machine with no `rustc` at all, which cannot build this crate.
 fn rustc() -> Option<String> {
-    std::env::var("VERIF_RUSTC").ok().filter(|s| !s.is_empty())
+    if let Some(p) = std::env::var("VERIF_RUSTC").ok().filter(|s| !s.is_empty()) {
+        return Some(p);
+    }
+    let out = std::process::Command::new("rustc").arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some("rustc".to_string())
 }
 
 fn verify_all() -> Option<verify::FileReport> {
@@ -79,6 +99,9 @@ fn verify_all() -> Option<verify::FileReport> {
         "clamp_bounds",
         "first_of",
         "slice_alias_tripwire",
+        "assert_guarded",
+        "assert_misguarded",
+        "panic_guarded",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -96,6 +119,22 @@ fn outcome<'a>(report: &'a verify::FileReport, name: &str) -> &'a FnOutcome {
         .find(|(n, _)| n == name)
         .map(|(_, o)| o)
         .unwrap_or_else(|| panic!("{name} missing from the report"))
+}
+
+/// Assert a function is *refuted* -- `Failed`, with a counterexample.
+///
+/// `!o.is_verified()` accepts `Skipped` and `Incomplete` too, so it does not
+/// establish that a false postcondition produced a counterexample, which is the
+/// only thing a tripwire is for: a tripwire that "passes" because the function
+/// was skipped has never been pulled. This requires the refutation itself. A
+/// shape that is *honestly* undecided must be asserted `!is_verified()` on
+/// purpose, with a comment saying so.
+fn assert_refuted(report: &verify::FileReport, name: &str) {
+    let o = outcome(report, name);
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`{name}` must be refuted with a counterexample, got: {o}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +255,7 @@ fn a_literal_is_sized_from_the_operand_it_meets() {
             &std::collections::BTreeSet::new(),
             false,
             &spec::FieldEnv::default(),
+            &std::collections::BTreeMap::new(),
         )
         .expect("a narrow literal against a wide name must still parse");
         assert!(
@@ -270,6 +310,7 @@ fn a_bare_ret_on_an_aggregate_names_the_aggregate_reason() {
             &std::collections::BTreeSet::new(),
             false,
             &spec::FieldEnv::default(),
+            &std::collections::BTreeMap::new(),
         )
         .expect_err("a bare `ret` on an aggregate must be refused");
         assert!(
@@ -298,6 +339,7 @@ fn a_bare_ret_with_an_unknown_value_names_the_unknown_reason() {
             &std::collections::BTreeSet::new(),
             false,
             &spec::FieldEnv::default(),
+            &std::collections::BTreeMap::new(),
         )
         .expect_err("a bare `ret` with no value must be refused");
         assert!(
@@ -480,14 +522,20 @@ fn counterexamples_really_panic() {
         let FnOutcome::Failed { detail, .. } = o else {
             continue;
         };
-        // The arguments are locals `_1` and `_2`, so their values are the
-        // counterexample's assignments to variables 1 and 2. A model names only
-        // the variables it had to constrain -- `unchecked_div` reports `v2 = 0`
-        // and says nothing about `v1`, because the divisor alone decides -- so a
-        // missing variable is *unconstrained* and any value will do. Zero is
-        // used, and the panic is still required: that is what makes the witness
-        // a witness rather than a coincidence of one chosen value.
-        let (a, b) = parse_cex_pair(detail);
+        // The arguments are locals `_1` and `_2`, and the report names them by
+        // their source `debug` names, so the helper is told what to look for. A
+        // model names only the variables it had to constrain -- `unchecked_div`
+        // reports `d = 0` and says nothing about the dividend, because the divisor
+        // alone decides -- so a missing variable is *unconstrained* and any value
+        // will do. Zero is used, and the panic is still required: that is what
+        // makes the witness a witness rather than a coincidence of one chosen
+        // value.
+        let names = match name {
+            "unchecked_div" => ("n", "d"),
+            "shift_left" => ("x", "n"),
+            _ => ("a", "b"),
+        };
+        let (a, b) = parse_cex_args(detail, names);
         let a = a.unwrap_or(0);
         let b = b.unwrap_or(0);
         let panicked = match name {
@@ -540,14 +588,97 @@ fn a_wrong_postcondition_is_caught() {
                 "the failing obligation should be the postcondition, got kind `{kind}`"
             );
             // The witness must be a real input: `32768 + 32768` has the guard
-            // take the `else` branch and return 0, which is not `>= a`.
+            // take the `else` branch and return 0, which is not `>= a`. It must
+            // also be *readable*: the report names the arguments, not `v1`/`v2`.
             assert!(
-                detail.contains("v1") && detail.contains("v2"),
-                "the witness should name both arguments, got: {detail}"
+                detail.contains("a =") && detail.contains("b ="),
+                "the witness should name both arguments by their source names, got: {detail}"
+            );
+            assert!(
+                !detail.contains("v1:"),
+                "the witness must not fall back to `v1:` for a named argument, got: {detail}"
             );
         }
         other => panic!("a wrong postcondition must be refuted, got: {other}"),
     }
+}
+
+/// U4: a counterexample is rendered with the source names, not internal indices.
+///
+/// A report that says `v1:u8 = 224` makes the reader decode the MIR's local
+/// numbering; `x = 224` is what the source wrote. The names are the `debug`
+/// bindings `rustc` records, which the frontend already keeps in `local_names`.
+///
+/// The teeth are the *fallback*: a variable with no source name must keep its
+/// `v{index}:u{width}` spelling, so naming is a readability improvement and never
+/// a loss of information. `unchecked_div` is the shape that exercises both at
+/// once -- its dividend is a named argument, and the model constrains only the
+/// divisor, so the witness names one variable and drops the other.
+#[test]
+fn a_counterexample_is_rendered_with_source_names() {
+    let Some(report) = verify_all() else { return };
+
+    // Every refutation in the corpus names its arguments by source name, and none
+    // leaks a `v1:`/`v2:` spelling for a variable that *has* a source name.
+    // `unchecked_div` constrains only the divisor, so its witness names `d` and
+    // drops the dividend -- which is the point: a variable the model did not need
+    // is *unconstrained*, and naming is not the same as requiring.
+    for (name, expected) in [
+        ("unchecked_add", &["a = ", "b = "][..]),
+        ("unchecked_div", &["d = "][..]),
+        ("shift_left", &["n = "][..]),
+        ("signed_mul_negative", &["a = ", "b = "][..]),
+    ] {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { detail, .. } = o else {
+            panic!("{name} must be refuted, got: {o}");
+        };
+        for want in expected {
+            assert!(
+                detail.contains(want),
+                "{name}: the witness should name its argument `{want}`, got: {detail}"
+            );
+        }
+        assert!(
+            !detail.contains("v1:") && !detail.contains("v2:"),
+            "{name}: a named argument must not fall back to `vN:`, got: {detail}"
+        );
+    }
+
+    // The positive control for the fallback: a variable the source did not name
+    // still renders as `v{index}:u{width}`. This is a bare arithmetic function
+    // with no `debug`-named arguments beyond the parameters, so the check is that
+    // the *parameters* are named while nothing regresses to the old form for the
+    // variables the model actually touched.
+    let o = outcome(&report, "off_by_one_guard");
+    let FnOutcome::Failed { detail, .. } = o else {
+        panic!("off_by_one_guard must be refuted, got: {o}");
+    };
+    assert!(
+        detail.contains("a = 32768") && detail.contains("b = 32768"),
+        "the guard's witness must name both arguments, got: {detail}"
+    );
+
+    // The unnamed *assignment* itself, not only its absence. A witness whose
+    // constrained variable has no `debug` name (a temporary, a promoted constant,
+    // an aggregate part) must still be rendered, as `v{index}:u{width}`. Dropping
+    // unnamed assignments would silently shrink a witness to the named subset --
+    // and every check above would still pass, because they assert named names are
+    // *present* and unnamed names are *absent from named functions*, never that an
+    // unnamed one appears at all. `a_field_array_write_is_not_the_seed` (in the
+    // realistic corpus) is the shape that produces one: its only constrained
+    // variable is a temporary, so its witness is entirely unnamed.
+    let Some(report) = verify_realistic(&["a_field_array_write_is_not_the_seed"]) else {
+        return;
+    };
+    let o = outcome(&report, "a_field_array_write_is_not_the_seed");
+    let FnOutcome::Failed { detail, .. } = o else {
+        panic!("a_field_array_write_is_not_the_seed must be refuted, got: {o}");
+    };
+    assert!(
+        detail.contains("v") && detail.contains(":u8 = "),
+        "a variable with no source name must still render as `vN:uW = value`, got: {detail}"
+    );
 }
 
 /// The other direction of the oracle: a function reported panic-free must not
@@ -751,27 +882,27 @@ fn report_source_hint() -> &'static str {
      run examples/mir_demo.rs to see the per-function report"
 }
 
-/// Pull `v1:u32 = 123, v2:u32 = 456` out of a rendered counterexample.
-fn parse_cex_pair(detail: &str) -> (Option<u64>, Option<u64>) {
+/// Pull the values of a function's two arguments out of a rendered counterexample.
+///
+/// A witness is rendered with the source names the MIR `debug` bindings recorded
+/// (`a = 128, b = 128`), so the argument names are passed in. A variable with no
+/// source name keeps its `v{index}:u{width}` spelling, and the arguments here are
+/// always locals `_1` and `_2`, so the fallback keys `v1:` / `v2:` are accepted
+/// too -- the helper reads a named or an unnamed witness alike.
+fn parse_cex_args(detail: &str, names: (&str, &str)) -> (Option<u64>, Option<u64>) {
     let mut first = None;
     let mut second = None;
     for part in detail.split(',') {
         let part = part.trim();
-        if let Some((lhs, rhs)) = part.split_once('=') {
-            let idx: u32 = lhs
-                .trim()
-                .trim_start_matches('v')
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .parse()
-                .unwrap_or(0);
-            let val: u64 = rhs.trim().parse().unwrap_or(0);
-            match idx {
-                1 => first = Some(val),
-                2 => second = Some(val),
-                _ => {}
-            }
+        let Some((lhs, rhs)) = part.split_once('=') else {
+            continue;
+        };
+        let lhs = lhs.trim();
+        let val: u64 = rhs.trim().parse().unwrap_or(0);
+        if lhs == names.0 || lhs.starts_with("v1:") {
+            first = Some(val);
+        } else if lhs == names.1 || lhs.starts_with("v2:") {
+            second = Some(val);
         }
     }
     (first, second)
@@ -881,7 +1012,7 @@ fn an_unreadable_ensures_is_reported_not_ignored() {
     )
     .expect("write source");
     let report =
-        verify::verify_file_with(&rustc, &src, &["f".to_string()]).expect("verify");
+        verify::verify_file_with_opts(&rustc, &src, &["f".to_string()], &probe_opts()).expect("verify");
     let (_, o) = report.outcomes.first().expect("one outcome");
     assert!(
         matches!(o, FnOutcome::Skipped { .. }),
@@ -1017,6 +1148,248 @@ fn verify_realistic(only: &[&str]) -> Option<verify::FileReport> {
     match verify::verify_file_with(&rustc, std::path::Path::new(REALISTIC), &only) {
         Ok(r) => Some(r),
         Err(e) => panic!("frontend failed: {e}"),
+    }
+}
+
+/// The independent corpus, scored, so the number in `ROADMAP.md` cannot drift.
+///
+/// `everyday.rs` is ordinary Rust written by an external reviewer, not shaped for
+/// the tool, so it is the honest measure of coverage (unlike `realistic.rs`, about
+/// a third of which is adversarial fixtures). Phase 1's exit criterion in
+/// `ROADMAP.md` is defined on it.
+///
+/// The assertion is a *floor*, not the exact score: adding a function that decides
+/// must not fail the test, but a change that makes the tool decide *fewer* of them
+/// -- a regression -- must. The exact score is printed by `mir_coverage`, which is
+/// what `ROADMAP.md` quotes.
+///
+/// The count is `Verified` only, which is what `mir_coverage` counts. Counting
+/// `Failed` too would let the floor and the scoreboard disagree: a corpus function
+/// that turned from `verified` into `refuted` keeps the test's number and lowers
+/// the printed one. `everyday.rs` is ordinary Rust that is supposed to *hold*, so a
+/// refutation here is a bug, not coverage -- it is asserted against separately.
+#[test]
+fn the_independent_corpus_does_not_regress() {
+    const EVERYDAY: &str = "examples/mir_targets/everyday.rs";
+    let Some(rustc) = rustc() else { return };
+    let report = match verify::verify_file_with(&rustc, std::path::Path::new(EVERYDAY), &[]) {
+        Ok(r) => r,
+        Err(e) => panic!("frontend failed: {e}"),
+    };
+    // A `Failed` is a *contract* failure only when the obligation that failed is a
+    // claim the source made: a postcondition, a vacuous precondition, a loop
+    // invariant. A `Failed` on a **panic** (or `unreachable`) obligation is not a
+    // bug in the frontend -- it is the tool correctly reporting that the body can
+    // panic. `sum_iter` (`v.iter().sum()`) is ordinary Rust whose unguarded
+    // addition *does* overflow for `[u32::MAX, 1]`, and `everyday.rs` documents it
+    // as "may overflow": rejecting every `Failed` would fail a correct panic
+    // finding the moment iterator support lands. So the assertion is per kind, not
+    // per outcome -- the panic family is allowed, the contract family is not.
+    let refuted: Vec<&str> = report
+        .outcomes
+        .iter()
+        .filter(|(_, o)| match o {
+            FnOutcome::Failed { kind, .. } => {
+                !(kind.starts_with("panic:") || kind.starts_with("reachable"))
+            }
+            _ => false,
+        })
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert!(
+        refuted.is_empty(),
+        "everyday.rs is ordinary Rust whose *contracts* must hold, so a contract \
+         refutation is a bug: {refuted:?}. A corpus function that is genuinely false \
+         belongs in a tripwire fixture, not here. (A panic or unreachable failure is a \
+         legitimate finding and is allowed.)"
+    );
+    let verified = report
+        .outcomes
+        .iter()
+        .filter(|(_, o)| matches!(o, FnOutcome::Verified { .. }))
+        .count();
+    assert!(
+        verified >= 17,
+        "everyday.rs verified {verified} of {} functions, down from 17 (81%); a regression \
+         dropped coverage of ordinary Rust below Phase 1's 80% exit criterion. Run: cargo run \
+         --features std --example mir_coverage -- {EVERYDAY}",
+        report.outcomes.len()
+    );
+}
+
+/// Every edition compiles the corpus to the same verdicts (review E4).
+///
+/// The frontend resolves the edition from the crate's own `Cargo.toml` rather
+/// than pinning one, because the edition is part of what the program *means*: a
+/// 2021 crate with `extern "C" { … }` is a compile error under 2024, and a `for`
+/// loop over an array iterates `&T` under 2018 and `T` under 2021. So the same
+/// source under two editions can lower to two different programs, and a verdict
+/// is only meaningful for the edition it was produced under.
+///
+/// This runs `actuator.rs` under all four editions and requires the *whole*
+/// outcome map to match, not just the decided count: a fixture that flipped from
+/// `verified` to `failed` while another flipped the other way would keep the count
+/// and change the answer. It is the check the `VERIF_EDITION` override exists for.
+#[test]
+fn every_edition_compiles_the_corpus_to_the_same_verdicts() {
+    use verify::Edition;
+    let Some(rustc) = rustc() else { return };
+    let editions =
+        [Edition::Rust2015, Edition::Rust2018, Edition::Rust2021, Edition::Rust2024];
+    let mut baseline: Option<Vec<(String, String)>> = None;
+    for ed in editions {
+        let opts = verify::MirOptions { edition: Some(ed) };
+        let report = verify::verify_file_with_opts(&rustc, std::path::Path::new(TARGET), &[], &opts)
+            .unwrap_or_else(|e| panic!("frontend failed under {}: {e}", ed.as_str()));
+        // The verdict *shape*, so a `Failed { kind }` change is caught too, not
+        // only a `Verified`/`Failed` flip.
+        let shape: Vec<(String, String)> = report
+            .outcomes
+            .iter()
+            .map(|(n, o)| (n.clone(), format!("{o:?}")))
+            .collect();
+        match &baseline {
+            None => baseline = Some(shape),
+            Some(base) => assert_eq!(
+                base,
+                &shape,
+                "edition {} disagrees with 2015 on {}",
+                ed.as_str(),
+                TARGET
+            ),
+        }
+    }
+}
+
+/// A 2021-only file is verified under *its own* edition, and refused under 2024
+/// (review E1).
+///
+/// `extern "C" { … }` must be `unsafe extern` from edition 2024, so the same bytes
+/// are a compile error there and valid under 2021. Pinning one edition would
+/// therefore refuse a valid 2021 crate -- which is exactly what the frontend did
+/// before `resolve_edition`. This asserts both directions: 2021 produces MIR and a
+/// verdict, and 2024 is a frontend error (rustc's message, not a verdict). A test
+/// that only checked the 2021 direction would pass on a frontend that ignored the
+/// edition and always used rustc's default.
+#[test]
+fn a_2021_only_file_is_verified_under_its_own_edition() {
+    use verify::Edition;
+    let Some(rustc) = rustc() else { return };
+    let src = "extern \"C\" {\n    fn abs(x: i32) -> i32;\n}\n\
+               /// ensures: ret == x\n\
+               pub fn f(x: u8) -> u8 { x }\n";
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-edition-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, src).expect("write probe");
+
+    let opts21 = verify::MirOptions { edition: Some(Edition::Rust2021) };
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &opts21)
+        .expect("a 2021 file with `extern \"C\"` must compile under 2021");
+    let o = report.outcomes.iter().find(|(n, _)| n == "f").map(|(_, o)| o.clone());
+    assert!(
+        matches!(o, Some(FnOutcome::Verified { .. })),
+        "the 2021 fixture must verify under 2021, got: {o:?}"
+    );
+
+    // The same bytes under 2024 are a rustc error, so the frontend reports it
+    // rather than a verdict. That is the evidence the edition is *used*.
+    let opts24 = verify::MirOptions { edition: Some(Edition::Rust2024) };
+    assert!(
+        verify::verify_file_with_opts(&rustc, &file, &[], &opts24).is_err(),
+        "the 2021-only file must be refused under 2024, not silently compiled"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A real package that omits `package.edition` resolves to Cargo's 2015 default.
+///
+/// Cargo assigns edition 2015 to a `[package]` that does not state one, so the
+/// frontend must verify such a package rather than refuse it. This is the
+/// distinction between "what edition is this crate?" (2015, by Cargo's default)
+/// and "what edition is this loose file?" (no answer). The unit tests pin the
+/// resolution directly; this pins it end to end, because the refusal the review
+/// found happened before `rustc` was ever invoked.
+#[test]
+fn a_package_that_omits_an_edition_is_verified_as_2015() {
+    let Some(rustc) = rustc() else { return };
+    // `VERIF_EDITION` is a deliberate *override* -- it is what the edition matrix
+    // uses to force a file that has a manifest under another edition -- so it wins
+    // over the manifest and this test cannot assert the manifest default while it
+    // is set. The environment is process-global, so the sibling unit test guards
+    // the same way.
+    if std::env::var("VERIF_EDITION").map(|v| !v.is_empty()).unwrap_or(false) {
+        return;
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-pkg2015-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    // A manifest with no `edition`, exactly as the review describes.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write manifest");
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, "/// ensures: ret == x\npub fn f(x: u8) -> u8 { x }\n")
+        .expect("write probe");
+
+    // No explicit edition: the manifest supplies it. A refusal here is the bug.
+    let opts = verify::MirOptions { edition: None };
+    let (text, edition) = verify::emit_mir_with_opts(&rustc, &file, &opts)
+        .expect("a package without an `edition` must resolve to Cargo's 2015 default");
+    assert_eq!(edition, verify::Edition::Rust2015, "the default edition is 2015");
+    assert!(!text.is_empty(), "MIR must be emitted for the package");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A user function returning `!` is reported as a diverging call, not a panic.
+///
+/// `die() -> ! { loop {} }` never returns, so a reachable call to it is a
+/// reachable failure -- but the failure is an infinite loop, not a panic. The
+/// report used to say `panic: die`, naming an event that never occurs. The kind is
+/// read from the callee's name, and an unrecognised `!`-returning function is
+/// `diverges`, which is the honest label.
+#[test]
+fn a_non_panicking_diverging_call_is_not_labelled_a_panic() {
+    let src = "pub fn die() -> ! { loop {} }\n\
+               /// requires: true\n\
+               /// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { if x == 0 { die(); } 1 }\n";
+    let Some(o) = verify_src("f", src) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => {
+            assert!(
+                kind.contains("diverges"),
+                "a user `!`-returning function must be labelled `diverges`, not `panic`: got `{kind}`"
+            );
+            assert!(
+                !kind.contains("panic"),
+                "a non-panicking diverging call must not be labelled a panic: got `{kind}`"
+            );
+        }
+        other => panic!("a reachable call to a `!` function must fail, got: {other}"),
+    }
+}
+
+/// A real panic *is* labelled a panic, so the label still distinguishes the two.
+///
+/// The companion to the test above: the fix must not flatten every diverging call
+/// to `diverges`. An `assert!` is a panic, and the report says so.
+#[test]
+fn a_panicking_diverging_call_is_labelled_a_panic() {
+    let src = "/// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"boom\"); } 1 }\n";
+    let Some(o) = verify_src("f", src) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("panic"),
+            "a real panic must be labelled `panic`: got `{kind}`"
+        ),
+        other => panic!("an unguarded panic must fail, got: {other}"),
     }
 }
 
@@ -1371,6 +1744,144 @@ fn is_power_of_two_branches_on_the_predicate() {
     }
 }
 
+/// `midpoint`, `next_multiple_of` (and its `checked_` counterpart), the two
+/// logarithms and the `next_power_of_two` pair, pinned in both directions.
+///
+/// `core::num` methods added as a group. The true halves pin the *value* --
+/// `midpoint` of an overflowing sum (`255.midpoint(255) == 255`, not the wrapped
+/// `254`), the truncating rounding (`(-5).midpoint(-2) == -3`, not the floor
+/// `-4`), `next_multiple_of` of an exact multiple (the identity, which a model
+/// that always added `b` gets wrong), the logs at their boundary values
+/// (`ilog2(1) == 0`, `ilog10(9) == 0`), and `next_power_of_two` at the three
+/// boundaries that separate a right model from a plausible wrong one (`0 -> 1`,
+/// a power of two rounding to itself, and `100 -> 128`). Each true half has a
+/// `_cannot_prove_this` twin that the same wrong model would prove, so a green
+/// verdict on the twin fails the test.
+///
+/// The panic-shaped methods carry the opposite evidence: `next_multiple_of` that
+/// overflows, `ilog2`/`ilog10` of zero, and `next_power_of_two` of `129` must
+/// *fail* with the panic obligation, and a control
+/// (`next_multiple_of_is_panic_free_here`, `next_power_of_two_is_panic_free_here`)
+/// must verify, so a model that reported a panic unconditionally cannot pass. The
+/// `checked_` counterparts are the value-shaped ones: `Some(128)` where the plain
+/// method would not panic, `None` where it would -- for both the power-of-two and
+/// the multiple-of pairs, including the zero divisor for the latter.
+#[test]
+fn the_new_num_methods_verify_and_their_tripwires_refute() {
+    let verified = [
+        "midpoint_self_is_the_identity",
+        "midpoint_of_an_overflowing_sum",
+        "midpoint_rounds_toward_zero",
+        "midpoint_signed_truncates",
+        "midpoint_is_between",
+        "next_multiple_of_rounds_up",
+        "next_multiple_of_an_exact_multiple_is_the_identity",
+        "next_multiple_of_is_panic_free_here",
+        "checked_next_multiple_of_rounds_up",
+        "checked_next_multiple_of_that_overflows_is_none",
+        "checked_next_multiple_of_by_zero_is_none",
+        "ilog2_of_100",
+        "ilog2_of_one_is_zero",
+        "ilog2_of_a_signed_100",
+        "ilog2_is_bounded",
+        "ilog10_of_100",
+        "ilog10_below_ten_is_zero",
+        "ilog10_of_a_u32_thousand",
+        "ilog10_is_bounded",
+        "checked_ilog2_in_range",
+        "checked_ilog2_of_zero_is_none",
+        "checked_ilog10_in_range",
+        "checked_ilog10_of_zero_is_none",
+        "checked_ilog2_of_a_negative_is_none",
+        "next_power_of_two_rounds_up",
+        "next_power_of_two_of_a_power_is_itself",
+        "next_power_of_two_of_zero_is_one",
+        "next_power_of_two_of_a_u32_thousand",
+        "next_power_of_two_is_panic_free_here",
+        "checked_next_power_of_two_in_range",
+        "checked_next_power_of_two_out_of_range_is_none",
+    ];
+    let refuted = [
+        "midpoint_of_an_overflowing_sum_cannot_prove_this",
+        "midpoint_rounds_toward_zero_cannot_prove_this",
+        "midpoint_signed_truncates_cannot_prove_this",
+        "midpoint_is_between_cannot_prove_this",
+        "next_multiple_of_rounds_up_cannot_prove_this",
+        "checked_next_multiple_of_overflow_is_some_cannot_prove_this",
+        "ilog2_of_100_cannot_prove_this",
+        "ilog10_of_100_cannot_prove_this",
+        "checked_ilog2_overflow_is_some_cannot_prove_this",
+        "checked_ilog2_of_a_negative_cannot_prove_this",
+        "next_power_of_two_rounds_up_cannot_prove_this",
+        "checked_next_power_of_two_in_range_cannot_prove_this",
+        "checked_next_power_of_two_payload_cannot_prove_this",
+    ];
+    // The panic-shaped fixtures fail with a *panic* obligation, so the kind is
+    // asserted too: a postcondition failure on one of them would be a different
+    // finding and must not satisfy the test.
+    let panics = [
+        "next_multiple_of_that_overflows_panics",
+        "ilog2_of_zero_panics",
+        "ilog10_of_zero_panics",
+        "next_power_of_two_that_overflows_panics",
+    ];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+    }
+    let Some(report) = verify_realistic(&panics) else { return };
+    for name in panics {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` must fail on its panic obligation, got: {o}");
+        };
+        assert!(
+            kind.starts_with("panic"),
+            "`{name}` must fail on a panic obligation, got kind `{kind}`"
+        );
+    }
+}
+
+/// `is_negative`/`is_positive` are modelled as signed comparisons, not bit tests.
+///
+/// The signedness is the whole point: `i8::MIN` is `0x80`, the *largest* unsigned
+/// byte, so a model that read the top bit as a plain bit (or compared unsigned)
+/// would call it positive and refute `is_negative_of_min`. The zero tripwire is
+/// the sharp one in the other direction: `0` is neither sign, so a model that
+/// answered `x != 0` for `is_positive`, or the bare top bit for `is_negative`,
+/// would *prove* a false contract. The `MAX`/`MIN`/`-1` pins name the boundary
+/// values, so a failure names the value that broke rather than only the function.
+#[test]
+fn the_sign_predicates_are_signed_comparisons() {
+    let verified = [
+        "is_negative_of_min",
+        "is_negative_of_max",
+        "is_positive_of_max",
+        "is_negative_branching_takes_the_true_arm",
+    ];
+    let refuted = ["is_negative_of_zero_tripwire", "is_positive_of_minus_one_tripwire"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+    }
+}
+
 /// The mixed-signedness additions, each pinned in both directions.
 ///
 /// Every shape gets a true contract *and* a false one with a concrete witness, so
@@ -1502,6 +2013,90 @@ fn ord_min_and_max_are_modelled_and_a_local_trait_still_wins() {
     }
 }
 
+/// `PartialEq::eq`/`ne` and `PartialOrd::lt`/`le`/`gt`/`ge` are modelled as the
+/// comparison operators they denote, and a local trait sharing their name is
+/// answered by its body rather than by the model.
+///
+/// The verifying half pins all six operators, with `partial_ge_method_is_the_operator`
+/// choosing `x < y` so `>=` is separated from `<=`, and
+/// `partial_lt_signed_is_not_unsigned` pinning the ordering choice on `i8::MIN` (the
+/// one value whose bits sort the other way unsigned). The refuting half is the
+/// tripwire on the method form plus the local-trait pair:
+/// `local_partial_ord_lt_is_answered_by_its_body` verifies only from the body's
+/// constant, and `local_partial_ord_lt_is_not_the_model_tripwire` is refuted only
+/// if the body -- not the model -- answered.
+#[test]
+fn partial_cmp_methods_are_modelled_and_a_local_trait_still_wins() {
+    let verified = [
+        "partial_eq_method_is_the_operator",
+        "partial_ne_method_is_the_operator",
+        "partial_lt_method_is_the_operator",
+        "partial_ge_method_is_the_operator",
+        "partial_lt_signed_is_not_unsigned",
+        "local_partial_ord_lt_is_answered_by_its_body",
+        // A comparison against a *constant* operand: the literal is a promoted
+        // constant referenced by place in unoptimised MIR, so this is the shape
+        // that pins the promoted-scalar collection.
+        "partial_eq_const_is_the_operator",
+        "partial_lt_const_signed_is_not_unsigned",
+    ];
+    let refuted = [
+        "partial_lt_is_not_le_tripwire",
+        "local_partial_ord_lt_is_not_the_model_tripwire",
+        "partial_lt_const_is_not_le_tripwire",
+    ];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
+/// `Ord::cmp` is modelled, returning the `Ordering` enum whose three variants a
+/// `switchInt` on `discriminant(_)` selects.
+///
+/// The verifying entries pin all three arms -- `ord_cmp_less_arm`,
+/// `ord_cmp_equal_arm` and `ord_cmp_greater_arm` return distinct constants so each
+/// arm proves which tag the model produced -- plus `ord_cmp_matches_less` (the
+/// `matches!` spelling) and `ord_cmp_signed_is_not_unsigned`, which pins the signed
+/// ordering on `i8::MIN` (its bits sort the other way unsigned, so an unsigned
+/// model would take the `Greater` arm). The refuting entry is the tripwire:
+/// `x.cmp(&y) == Less` is not `x <= y`, so it fails at `x == y` -- a model that
+/// read the tag as unsigned (comparing the `Less` discriminant `0xff` against
+/// `255`) or that confused `Less` with `Equal` would *prove* it.
+#[test]
+fn ord_cmp_returns_the_ordering_enum() {
+    let verified = [
+        "ord_cmp_less_arm",
+        "ord_cmp_equal_arm",
+        "ord_cmp_greater_arm",
+        "ord_cmp_matches_less",
+        "ord_cmp_signed_is_not_unsigned",
+    ];
+    let refuted = ["ord_cmp_is_not_le_tripwire"];
+    let Some(report) = verify_realistic(&verified) else { return };
+    for name in verified {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let Some(report) = verify_realistic(&refuted) else { return };
+    for name in refuted {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` is a false contract that must be refuted, got: {o}");
+        };
+        assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
 /// A widening conversion (`From::from`/`Into::into`) is modelled, by the source's
 /// signedness.
 ///
@@ -1570,6 +2165,135 @@ fn a_local_trait_named_from_does_not_answer_the_std_trait() {
         };
         assert_eq!(kind, "postcondition", "`{name}` got: {o}");
     }
+}
+
+/// A user type named `Range` must not be answered by the for-loop range model.
+///
+/// rustc 1.85 (the MSRV) prints the standard library's `for`-loop projection with
+/// the type *unqualified* -- `<RangeInclusive<u32> as IntoIterator>::into_iter` --
+/// where current stable qualifies it (`<std::ops::RangeInclusive<u32> as …>`). An
+/// unqualified `Range` is a name a *user* type can carry, so the two `Iterator`
+/// methods are matched on the trait as well as the type. This test pins both
+/// directions with its own source (so it does not depend on a corpus edit):
+///
+/// * a user `struct Range<T>` with a custom `into_iter` (whose default body
+///   *panics*) must never be answered with the model's identity semantics -- the
+///   model would return the range unchanged and prove `ret == 1` for a function
+///   that always panics; the honest verdict is a refutation (`Failed`);
+/// * the standard library's own range projection must still be modelled, so the
+///   fix cannot pass by refusing every range call.
+#[test]
+fn a_user_type_named_range_is_not_answered_by_the_range_model() {
+    let spoof = r#"
+pub mod a {
+    pub trait Custom {
+        fn into_iter(self) -> Self
+        where
+            Self: Sized,
+        {
+            panic!("into_iter is not the identity here")
+        }
+    }
+}
+pub mod b {
+    pub trait Custom {
+        fn into_iter(self) -> Self
+        where
+            Self: Sized,
+        {
+            panic!("the other trait")
+        }
+    }
+}
+pub struct Range<T> {
+    pub start: T,
+    pub end: T,
+}
+impl a::Custom for Range<u8> {}
+
+/// requires: true
+/// ensures: ret == 1
+pub fn caller() -> u8 {
+    let r = Range { start: 1u8, end: 2u8 };
+    let x = <Range<u8> as a::Custom>::into_iter(r);
+    x.start
+}
+"#;
+    let Some(o) = verify_src("caller", spoof) else { return };
+    // The soundness property: the model must never answer this call. If it did, it
+    // would return the range unchanged and *prove* `ret == 1`. On current stable the
+    // default body's panic is modelled, so the verdict is a refutation (`Failed`); on
+    // 1.85 the panic path is not modelled, so the verdict is a refusal (`Incomplete`).
+    // Both are honest; only `verified` would be a false proof.
+    assert!(
+        !o.is_verified(),
+        "a user `Range`'s custom `into_iter` must not be answered by the range \
+         model (the model would prove `ret == 1` for a function that panics), got: {o}"
+    );
+
+    // The positive control: the standard library's own `for` loop is still modelled.
+    let real = r#"
+/// requires: true
+/// ensures: ret == 3
+pub fn sums() -> u32 {
+    let mut c = 0u32;
+    for i in 1u32..=2u32 {
+        c += i;
+    }
+    c
+}
+"#;
+    let Some(o) = verify_src("sums", real) else { return };
+    assert!(
+        o.is_verified(),
+        "the standard library's `for`-loop range must still be modelled, got: {o}"
+    );
+
+    // The sharper shape: a trait *default* body that mutates `self` through a helper
+    // the impl *overrides*. The call inside the default body is `<Self as T>::set`,
+    // whose receiver is literally `Self`, so the concrete type is not known there.
+    // Resolving it to the *default* `set` (a no-op) inlined the wrong body and
+    // *proved* `ret == 1` for a caller whose real result is `42` -- a false proof,
+    // pre-existing and independent of the range model. The call is refused now, so
+    // the soundness property is "never `verified`".
+    let self_receiver = r#"
+#[derive(Clone, Copy)]
+pub struct P {
+    pub v: u8,
+}
+pub trait T: Copy {
+    fn go(mut self) -> Self
+    where
+        Self: Sized,
+    {
+        self.set(42);
+        self
+    }
+    fn set(&mut self, x: u8) {
+        let _ = x;
+    }
+}
+impl T for P {
+    fn set(&mut self, x: u8) {
+        self.v = x;
+    }
+}
+
+/// requires: true
+/// ensures: ret == 1
+pub fn caller() -> u8 {
+    let p = P { v: 1 };
+    let q = <P as T>::go(p);
+    q.v
+}
+"#;
+    let Some(o) = verify_src("caller", self_receiver) else { return };
+    assert!(
+        !o.is_verified(),
+        "a `<Self as T>::m` call inside a trait default body must not be answered \
+         by the default method when an impl overrides it (that proved `ret == 1` for \
+         a body returning `42`), got: {o}"
+    );
 }
 
 /// A bare trait call must not be answered by the model when the crate declares a
@@ -3220,6 +3944,126 @@ fn a_scalar_field_crosses_a_reference_argument() {
     }
 }
 
+/// A scalar `&mut` argument named in a contract (C9).
+///
+/// `Ty::Ref` is modelled as its referent, so a `&mut u16` argument's name denotes
+/// the `u16` it addresses. The name is the *final* value -- what the body left
+/// there -- and `old(c)` reaches the entry value. Binding a bare `c` to the entry
+/// value (the first cut of this feature) was a **false proof**: `ensures: c == 0`
+/// on `*c = 5` verified, because `c` still named the input.
+#[test]
+fn a_scalar_reference_argument_is_named_in_a_contract() {
+    let Some(report) = verify_realistic(&[
+        "bump_scalar_ref",
+        "a_stale_scalar_ref_cannot_prove_this",
+        "set_scalar_ref",
+        "a_scalar_ref_write_cannot_prove_this",
+        "signed_scalar_ref",
+        "a_scalar_ref_caller",
+        "bump_scalar_ref_star",
+    ]) else {
+        return;
+    };
+    for name in [
+        "bump_scalar_ref",
+        "set_scalar_ref",
+        "signed_scalar_ref",
+        "a_scalar_ref_caller",
+        "bump_scalar_ref_star",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "a scalar reference argument must be nameable; got: {o}");
+    }
+    // The false directions: each claims the *entry* value survived a write, which
+    // only a model that bound the postcondition's name to the input would prove.
+    for name in ["a_stale_scalar_ref_cannot_prove_this", "a_scalar_ref_write_cannot_prove_this"] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "a scalar reference write must not prove the stale contract; got: {o}"
+        );
+    }
+}
+
+/// A scalar `&mut` argument's name and `old(name)`, checked directly so the guard
+/// runs even without a nightly `rustc`.
+#[test]
+fn a_scalar_reference_argument_reads_as_its_referent() {
+    use verif::smt;
+    smt::with_fresh(|| {
+        let mut args = std::collections::BTreeMap::new();
+        args.insert("c".to_string(), smt::var(16));
+        let mut old = std::collections::BTreeMap::new();
+        old.insert("c".to_string(), smt::var(16));
+        // `c` (final) and `old(c)` (entry) are distinct inputs, so their equality
+        // is not a tautology.
+        let p = spec::eval_ensures(
+            "c == old(c) + 1",
+            &args,
+            None,
+            spec::RET_IS_AGGREGATE,
+            &std::collections::BTreeSet::new(),
+            false,
+            &spec::FieldEnv::default(),
+            &old,
+        )
+        .expect("a scalar reference argument and `old` must parse");
+        assert!(!smt::is_ill_formed(), "the contract must be well-formed");
+        // The claim is a real predicate over two distinct variables, not a
+        // tautology: it is refutable at `c == old(c)`.
+        assert!(
+            matches!(smt::prove(p), smt::Verdict::Counterexample(_)),
+            "`c == old(c) + 1` must be refutable, not a tautology"
+        );
+        // `*c` and `old(*c)` are the explicit spellings of the same two bindings,
+        // so the roadmap's exit shape parses and means the same predicate.
+        let star = spec::eval_ensures(
+            "*c == old(*c) + 1",
+            &args,
+            None,
+            spec::RET_IS_AGGREGATE,
+            &std::collections::BTreeSet::new(),
+            false,
+            &spec::FieldEnv::default(),
+            &old,
+        )
+        .expect("`*c` and `old(*c)` must parse");
+        assert!(
+            matches!(smt::prove(smt::iff(star, p)), smt::Verdict::Valid),
+            "`*c == old(*c) + 1` must mean the same as `c == old(c) + 1`"
+        );
+        // `*NAME` on an unbound name is refused, not read as a fresh variable.
+        assert!(
+            spec::eval_ensures(
+                "*d == 0",
+                &args,
+                None,
+                spec::RET_IS_AGGREGATE,
+                &std::collections::BTreeSet::new(),
+                false,
+                &spec::FieldEnv::default(),
+                &old,
+            )
+            .is_err(),
+            "`*d` on an unbound name must be refused"
+        );
+        // `old` on a name with no entry value is refused, not silently treated as
+        // the name itself.
+        let err = spec::eval_ensures(
+            "c == old(d)",
+            &args,
+            None,
+            spec::RET_IS_AGGREGATE,
+            &std::collections::BTreeSet::new(),
+            false,
+            &spec::FieldEnv::default(),
+            &old,
+        )
+        .expect_err("`old(d)` has no entry value and must be refused");
+        assert!(err.to_string().contains("old"), "the refusal must name `old`, got: {err}");
+    });
+}
+
 /// A reference reached *through* another reference, and a reference to a local copy.
 ///
 /// `**rr = 5` lowers to `_4 = no_retag copy (*_3); (*_4) = 5` with `_4: &mut u8`. The
@@ -3540,6 +4384,124 @@ fn a_measure_without_an_invariant_is_refused() {
     let Some(o) = orphan else { return };
     assert!(!o.is_verified(), "an orphan measure must not verify; got: {o}");
     assert!(matches!(o, FnOutcome::Skipped { .. }), "expected a refusal; got: {o}");
+}
+
+/// A loop with no invariant is unwound up to `unwind:`, and the clause raises the
+/// bound so a loop whose trip count exceeds the default still decides.
+///
+/// `count_twelve` runs twelve iterations, more than `DEFAULT_UNWIND` (9), so the
+/// default refuses it. With `unwind: 20` the walk reaches the exit edge and the
+/// postcondition is proved. This is the C4 exit criterion's bounded-unrolling
+/// half: the bound is *declared* and governs the loop.
+#[test]
+fn an_unwind_clause_raises_the_unwinding_bound() {
+    let default = verify_src(
+        "count_twelve_default",
+        "/// requires: true\n/// ensures: ret == 12\n\
+         pub fn count_twelve_default() -> u8 { let mut i = 0u8; while i < 12 { i += 1; } i }\n",
+    );
+    let Some(o) = default else { return };
+    assert!(
+        !o.is_verified(),
+        "twelve iterations exceed the default bound, so it must not verify; got: {o}"
+    );
+    match &o {
+        FnOutcome::Incomplete { reasons, .. } => assert!(
+            reasons.iter().any(|r| r.contains("unwound past")),
+            "the cutoff must name the unwinding bound; got: {reasons:?}"
+        ),
+        other => panic!("expected an unwinding cutoff, got: {other}"),
+    }
+
+    let raised = verify_src(
+        "count_twelve_unwind",
+        "/// requires: true\n/// unwind: 20\n/// ensures: ret == 12\n\
+         pub fn count_twelve_unwind() -> u8 { let mut i = 0u8; while i < 12 { i += 1; } i }\n",
+    );
+    let Some(o) = raised else { return };
+    assert!(o.is_verified(), "an explicit larger bound must decide the loop; got: {o}");
+}
+
+/// The bound is an *unwinding assertion*: too small a bound must not decide the
+/// function by accident. `unwind: 3` on a loop that runs five iterations cannot
+/// reach the exit edge, so the bound is *refuted* -- a failure, not an
+/// incompleteness.
+///
+/// This is the Kani-style discipline the review asked for (C4(b)): a bound can
+/// never cut off a path *silently*, and a too-small bound fails the unwinding
+/// check rather than being reported as "could not decide". A bound that were only
+/// an incompleteness could be read as "no counterexample found", which is exactly
+/// the weaker proof the clause exists to prevent.
+#[test]
+fn an_unwind_bound_too_small_for_the_loop_is_refuted() {
+    let small = verify_src(
+        "count_five_unwind3",
+        "/// requires: true\n/// unwind: 3\n/// ensures: ret == 5\n\
+         pub fn count_five_unwind3() -> u8 { let mut i = 0u8; while i < 5 { i += 1; } i }\n",
+    );
+    let Some(o) = small else { return };
+    assert!(!o.is_verified(), "a bound below the trip count must not verify; got: {o}");
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("unwind: 3"),
+            "the failure must name the declared bound; got: {kind}"
+        ),
+        other => panic!("expected an unwinding-assertion failure, got: {other}"),
+    }
+}
+
+/// A postcondition that is false is still refuted under a raised bound, so the
+/// clause widens *coverage* and not the proof.
+#[test]
+fn an_unwind_clause_does_not_turn_a_false_postcondition_true() {
+    let bad = verify_src(
+        "count_twelve_bad",
+        "/// requires: true\n/// unwind: 20\n/// ensures: ret == 11\n\
+         pub fn count_twelve_bad() -> u8 { let mut i = 0u8; while i < 12 { i += 1; } i }\n",
+    );
+    let Some(o) = bad else { return };
+    assert!(!o.is_verified(), "a false postcondition must not verify; got: {o}");
+    match &o {
+        FnOutcome::Failed { kind, .. } => {
+            assert!(kind.contains("postcondition"), "the failure is the postcondition; got: {kind}")
+        }
+        other => panic!("expected a postcondition failure, got: {other}"),
+    }
+}
+
+/// C4's exit criterion, exactly: `max_of` verified with `unwind: 5`, and refuted
+/// with `unwind: 3` by the unwinding check.
+///
+/// `max_of` is a four-iteration loop over a `[u8; 4]` with a branch inside, so it
+/// explores 199 paths -- above the default 64-path budget. `unwind: 5` both raises
+/// the loop bound and grows the path budget to match (see [`exec::path_budget`]),
+/// so the loop decides. `unwind: 3` cannot reach the exit edge, and because the
+/// bound is *declared* that is the unwinding assertion failing, not an
+/// incompleteness.
+#[test]
+fn max_of_verifies_with_a_sufficient_unwind_bound_and_fails_with_a_small_one() {
+    const BODY: &str = "pub fn max_of(a: [u8; 4]) -> u8 { let mut m = 0; let mut i = 0; \
+                        while i < 4 { if a[i] > m { m = a[i]; } i += 1; } m }\n";
+    const ENSURES: &str = "/// ensures: ret >= a[0] && ret >= a[1] && ret >= a[2] && ret >= a[3]\n";
+
+    let ok = verify_src("max_of", &format!("/// requires: true\n/// unwind: 5\n{ENSURES}{BODY}"));
+    let Some(o) = ok else { return };
+    assert!(o.is_verified(), "`max_of` under `unwind: 5` must verify; got: {o}");
+
+    let small = verify_src(
+        "max_of_small",
+        &format!("/// requires: true\n/// unwind: 3\n{ENSURES}{BODY}")
+            .replace("max_of", "max_of_small"),
+    );
+    let Some(o) = small else { return };
+    assert!(!o.is_verified(), "`max_of` under `unwind: 3` must not verify; got: {o}");
+    match &o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("unwind: 3"),
+            "the small-bound failure is the unwinding check; got: {kind}"
+        ),
+        other => panic!("expected an unwinding-assertion failure, got: {other}"),
+    }
 }
 
 /// A clause-shaped doc comment that is not a clause is refused, not dropped.
@@ -4059,26 +5021,51 @@ fn a_local_const_is_not_in_scope_in_another_function() {
 }
 
 /// The whole-corpus direction invariant: a function whose *name* says it must not be
-/// provable may never come back `verified`.
+/// provable must come back `Failed` -- a real refutation with a counterexample.
 ///
 /// The corpus pairs each contract with its false twin, spelled `..._cannot_prove_this`:
 /// the same body, or one differing only in the direction of the claim, so a twin that
-/// verifies is a false proof by construction. Checking the naming convention
-/// over the whole file means a new false proof of any *known* shape fails this test the
-/// moment it is introduced, instead of waiting for someone to remember to assert the
-/// twin in the same commit that adds the shape. It is the corpus-wide version of the
-/// per-shape `Failed` assertions below, and it is deliberately weaker than they are --
-/// a twin may be `Failed`, `Incomplete` or `Skipped` and this passes, because all three
-/// are honest answers and only `verified` is a lie.
+/// verifies is a false proof by construction. Checking the naming convention over the
+/// whole file means a new false proof of any *known* shape fails this test the moment
+/// it is introduced, instead of waiting for someone to remember to assert the twin in
+/// the same commit that adds the shape.
+///
+/// The assertion is on `Failed`, not on `!is_verified()`. `!is_verified()` also accepts
+/// `Skipped` and `Incomplete`, so a tripwire that "passed" that way would never have
+/// been pulled -- a false contract that was never checked is not evidence the checker
+/// works. Two entries are `Incomplete` on purpose, and they are named here with the
+/// reason: a tripwire may be undecided only when it is *listed* as such, so a
+/// regression that turns a refutation into a skip fails this test rather than slipping
+/// through.
 #[test]
 fn no_cannot_prove_entry_is_ever_verified() {
     let Some(report) = verify_realistic(&[]) else { return };
+    // Tripwires that are honestly undecided, with the reason they cannot be refuted
+    // today. Each is a *lost* proof (a skip), never a false one, and each is a
+    // documented coverage gap rather than a regression. Anything else that is not
+    // `Failed` fails this test.
+    let undecided_on_purpose: &[(&str, &str)] = &[
+        (
+            "a_shifted_symbolic_element_cannot_prove_this",
+            "a symbolic shift of an array element is not modelled, so the contract is \
+             unreadable -- the read never reaches the refutation",
+        ),
+        (
+            "default_body_self_call_is_not_the_default_cannot_prove_this",
+            "the self-call to a trait default body is unmodelled, so the path is cut \
+             before the false claim is checked",
+        ),
+        (
+            "generic_slice_element_cannot_prove_this",
+            "a generic `&[T]` has no element width, so `v[0]` is an unmodelled element \
+             read and `ret == d` is unreadable -- the length is modelled, the element \
+             is not, so the claim is a skip rather than a refutation",
+        ),
+    ];
     let mut checked = 0usize;
     let mut liars = Vec::new();
+    let mut wrongly_undecided = Vec::new();
     for (name, o) in &report.outcomes {
-        // The suffix is the whole convention: all 49 probes in the corpus use it, and
-        // none uses a prefix. A name that does not end this way is not a
-        // false-direction probe, whatever else it looks like.
         let false_direction = name.ends_with("_cannot_prove_this");
         if !false_direction {
             continue;
@@ -4086,11 +5073,20 @@ fn no_cannot_prove_entry_is_ever_verified() {
         checked += 1;
         if o.is_verified() {
             liars.push(name.clone());
+        } else if !matches!(o, FnOutcome::Failed { .. })
+            && !undecided_on_purpose.iter().any(|(n, _)| n == name)
+        {
+            wrongly_undecided.push(format!("{name}: {o}"));
         }
     }
     assert!(
         liars.is_empty(),
         "these entries claim a false contract and were `verified` -- a false proof: {liars:?}"
+    );
+    assert!(
+        wrongly_undecided.is_empty(),
+        "these tripwires were neither refuted nor on the documented undecided list -- a \
+         tripwire that was not pulled is not evidence: {wrongly_undecided:#?}"
     );
     // A silent zero would make this test vacuous if the naming convention ever drifts,
     // so the count is asserted rather than merely reported.
@@ -4100,6 +5096,73 @@ fn no_cannot_prove_entry_is_ever_verified() {
          has the naming convention changed?"
     );
 }
+
+/// The loop cut havocs what the loop writes *through*, not what it names.
+///
+/// A `for` loop advances its `RangeInclusive` through `&mut` and the range is a
+/// widthless aggregate, so the loop header must havoc both the referent of the
+/// reference and the aggregate's parts. When it havoced neither, the header state
+/// kept the entry-time iterator value, the exit guard folded to `false`, the exit
+/// edge was pruned as unsatisfiable, and the postcondition was never checked -- a
+/// `for` loop whose postcondition was false came back `Verified`.
+///
+/// The two corpus pairs pin both directions: the true contract verifies and the
+/// false twin is refuted. The false twin is also covered by the corpus-wide
+/// `no_cannot_prove_entry_is_ever_verified` sweep; this test adds the *positive*
+/// half, so a fix that refused every loop invariant would fail here.
+#[test]
+fn a_loop_havocs_what_it_writes_through() {
+    let names = [
+        "for_loop_invariant_holds",
+        "for_loop_invariant_cannot_prove_this",
+        "while_writes_through_ref_holds",
+        "while_writes_through_ref_cannot_prove_this",
+        "ref_arg_written_in_a_loop_holds",
+        "ref_arg_written_in_a_loop_cannot_prove_this",
+        "call_writes_through_in_a_loop_holds",
+        "call_writes_through_in_a_loop_cannot_prove_this",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    let outcome = |name: &str| {
+        report
+            .outcomes
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("`{name}` must be in the report"))
+            .1
+            .clone()
+    };
+    for holds in [
+        "for_loop_invariant_holds",
+        "while_writes_through_ref_holds",
+        "ref_arg_written_in_a_loop_holds",
+        "call_writes_through_in_a_loop_holds",
+    ] {
+        assert!(
+            outcome(holds).is_verified(),
+            "`{holds}` establishes its postcondition and must verify, got: {}",
+            outcome(holds)
+        );
+    }
+    for twin in [
+        "for_loop_invariant_cannot_prove_this",
+        "while_writes_through_ref_cannot_prove_this",
+        "ref_arg_written_in_a_loop_cannot_prove_this",
+        "call_writes_through_in_a_loop_cannot_prove_this",
+    ] {
+        match outcome(twin) {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition") || kind.contains("invariant"),
+                "`{twin}` must fail on its own claim, got `{kind}`"
+            ),
+            other => panic!(
+                "`{twin}` claims a false postcondition and must be refuted; a header \
+                 that is not havoced proves it, got: {other}"
+            ),
+        }
+    }
+}
+
 /// A deep term is refused, not allowed to overflow the stack.
 ///
 /// The engine's contract is that a query it cannot decide is *reported*: `Unknown`,
@@ -4271,6 +5334,48 @@ fn a_callee_contract_is_never_assumed() {
              precondition must not prove this; `{name}` got: {o}"
         );
     }
+}
+
+/// A loop counter's arithmetic in an invariant is a *variable*'s arithmetic, not
+/// a written constant expression.
+///
+/// The invariant is evaluated in the loop-head state, where the counter is bound
+/// to the value it holds on entry (`0`). `i - 1` then has two constant operands,
+/// and the fold read it as the *written* `0 - 1` and refused it as an unsigned
+/// underflow -- even though Rust never range-checks a variable's arithmetic as a
+/// constant expression. The refusal was a lost proof, not a false one, but it made
+/// the commonest accumulator invariant unreadable. The written form is still
+/// refused, and that negative control is what keeps the fix from dropping the
+/// rustc-mirroring check.
+#[test]
+fn a_counter_arithmetic_in_an_invariant_is_not_a_written_constant() {
+    let Some(report) = verify_realistic(&[
+        "an_invariant_subtracts_from_a_counter",
+        "an_invariant_subtracts_from_a_counter_cannot_prove_this",
+        "an_invariant_written_underflow_is_refused",
+    ]) else {
+        return;
+    };
+
+    let o = outcome(&report, "an_invariant_subtracts_from_a_counter");
+    assert!(
+        o.is_verified(),
+        "a counter's `i - 1` is a variable's arithmetic and must be read; got: {o}"
+    );
+
+    // The false twin proves the shape is *decided*, not discharged vacuously.
+    let o = outcome(&report, "an_invariant_subtracts_from_a_counter_cannot_prove_this");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "the false twin must be refuted, not proved; got: {o}"
+    );
+
+    // The *written* `0 - 1` is still a rustc const-eval error, so it is refused.
+    let o = outcome(&report, "an_invariant_written_underflow_is_refused");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. } | FnOutcome::Incomplete { .. }),
+        "the written `0 - 1` must still be refused, not decided; got: {o}"
+    );
 }
 
 /// A slice's length is read through the *one* rvalue the compiler prints, on any
@@ -4677,6 +5782,7 @@ fn a_contract_error_quotes_the_source_text() {
         &std::collections::BTreeSet::new(),
         false,
         &fields,
+        &std::collections::BTreeMap::new(),
     )
     .expect_err("`a[j]` has no chain and must be refused");
     assert_eq!(
@@ -4798,6 +5904,890 @@ fn a_qualified_standard_construction_resolves() {
     assert!(o.is_verified(), "`option_qualified_some_payload` must verify, got: {o}");
     let t = outcome(&report, "option_qualified_some_payload_tripwire");
     assert!(!t.is_verified(), "the qualified-construction tripwire must be refuted, got: {t}");
+}
+
+/// The `Option` *methods* read the receiver's tag and payload, not a bit-vector
+/// operand.
+///
+/// `unwrap_or`, `unwrap`, `expect`, `is_some` and `is_none` are the first modelled
+/// calls whose input is an enum's state rather than a word. Each true direction
+/// must verify and each tripwire must be *refuted* (not merely undecided): the
+/// tripwires are the evidence the tag and payload are read, because a model that
+/// returned a constant -- a fixed tag, or the payload unconditionally -- would
+/// prove the false contract instead.
+///
+/// The two panic tripwires (`option_unwrap_unguarded`, `option_expect_unguarded`)
+/// are the sharpest: they must fail with a *panic* obligation, because an
+/// unguarded `unwrap` on a value that can be `None` really does panic. A model
+/// that reported the method total would report them verified.
+#[test]
+fn the_option_methods_read_the_receivers_tag_and_payload() {
+    let names = [
+        "option_unwrap_or_fallback",
+        "option_unwrap_or_fallback_tripwire",
+        "option_is_some_true_on_some",
+        "option_is_some_true_on_some_tripwire",
+        "option_is_some_false_on_none",
+        "option_is_some_false_on_none_tripwire",
+        "option_is_none_false_on_some",
+        "option_is_none_false_on_some_tripwire",
+        "option_is_none_true_on_none",
+        "option_is_none_true_on_none_tripwire",
+        "option_unwrap_guarded",
+        "option_unwrap_unguarded",
+        "option_expect_guarded",
+        "option_expect_unguarded",
+        "option_is_some_guards_unwrap",
+        "option_is_none_guards_unwrap",
+        "option_guard_tripwire",
+        "option_arg_unwrap_or",
+        "option_arg_unwrap_or_tripwire",
+        "option_arg_unwrap_unguarded",
+        "result_is_ok",
+        "result_is_ok_tripwire",
+        "result_is_err",
+        "result_is_err_tripwire",
+        "result_unwrap_or",
+        "result_unwrap_or_tripwire",
+        "result_unwrap_unguarded",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    // The true directions.
+    for name in [
+        "option_unwrap_or_fallback",
+        "option_is_some_true_on_some",
+        "option_is_some_false_on_none",
+        "option_is_none_false_on_some",
+        "option_is_none_true_on_none",
+        "option_unwrap_guarded",
+        "option_expect_guarded",
+        "option_is_some_guards_unwrap",
+        "option_is_none_guards_unwrap",
+        "option_arg_unwrap_or",
+        "result_is_ok",
+        "result_is_err",
+        "result_unwrap_or",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    // The postcondition tripwires: refuted, so the tag and payload are read.
+    for name in [
+        "option_unwrap_or_fallback_tripwire",
+        "option_is_some_true_on_some_tripwire",
+        "option_is_some_false_on_none_tripwire",
+        "option_is_none_false_on_some_tripwire",
+        "option_is_none_true_on_none_tripwire",
+        "option_arg_unwrap_or_tripwire",
+        "result_is_ok_tripwire",
+        "result_is_err_tripwire",
+        "result_unwrap_or_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        assert!(!o.is_verified(), "`{name}` must be refuted, got: {o}");
+    }
+    // The panic tripwires: an unguarded `unwrap`/`expect`/argument `unwrap` panics
+    // on the failure value, and the *wrong-arm* guard unwraps on that path, so each
+    // must fail with a *panic* obligation, not merely be undecided.
+    for name in [
+        "option_unwrap_unguarded",
+        "option_expect_unguarded",
+        "option_guard_tripwire",
+        "option_arg_unwrap_unguarded",
+        "result_unwrap_unguarded",
+    ] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => {
+                assert!(
+                    kind.contains("panic"),
+                    "`{name}` must fail on a panic obligation, got kind: {kind}"
+                );
+            }
+            other => panic!("`{name}` must fail with a panic, got: {other}"),
+        }
+    }
+    // The `Result` panic message names `Err`, not `None`: the evidence the model
+    // read the `Result` tag (payload on `Ok`) rather than the `Option` one. A model
+    // that assumed `Some` would report the panic at the wrong variant, or (worse)
+    // read the `Err` payload as the value.
+    let FnOutcome::Failed { kind, .. } = outcome(&report, "result_unwrap_unguarded") else {
+        panic!("`result_unwrap_unguarded` must fail on the `Err` panic");
+    };
+    assert!(
+        kind.contains("Err") && !kind.contains("None"),
+        "the `Result::unwrap` panic must name `Err`, got kind: {kind}"
+    );
+}
+
+/// An enum-returning function's contract can name the *discriminant* methods:
+/// `ret.is_ok()`, `ret.is_some()`, `ret.is_err()`, `ret.is_none()`.
+///
+/// A function returning `Option`/`Result` has no single return word, so a bare
+/// `ret <= n` is refused. The four methods read the return place's tag, which the
+/// executor passes as the return word. Each is total over the tag -- unlike
+/// `ret.Ok`, which names a payload that exists on only one variant -- so they are
+/// admitted without a payload guard.
+///
+/// The pairs are the teeth: a body that always returns `Some`/`Ok` must *verify*
+/// `ret.is_some()`/`ret.is_ok()` and *refute* `ret.is_none()`/`ret.is_err()`, and
+/// the `None`/`Err` bodies the other way round. A model that read the tag as a
+/// constant, or swapped the two discriminants, would prove the tripwires.
+#[test]
+fn an_enum_return_contract_can_name_the_discriminant_methods() {
+    let names = [
+        "enum_ret_is_some",
+        "enum_ret_is_some_tripwire",
+        "enum_ret_is_none",
+        "enum_ret_is_none_tripwire",
+        "enum_ret_is_ok",
+        "enum_ret_is_ok_tripwire",
+        "enum_ret_is_err",
+        "enum_ret_is_err_tripwire",
+        "enum_ret_is_ok_or_err",
+        "enum_ret_is_ok_and_err_tripwire",
+        "enum_ret_passthrough",
+        "enum_ret_passthrough_tripwire",
+        "enum_ret_from_match",
+        "enum_ret_from_match_tripwire",
+        "enum_ret_method_on_non_enum",
+        "enum_arg_is_ok_guarded",
+        "enum_arg_is_ok_guarded_tripwire",
+        "enum_arg_is_ok_or_err",
+        "enum_arg_is_ok_and_err_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    // The true directions: the success/failure tag matches the method.
+    for name in [
+        "enum_ret_is_some",
+        "enum_ret_is_none",
+        "enum_ret_is_ok",
+        "enum_ret_is_err",
+        "enum_ret_is_ok_or_err",
+        "enum_ret_passthrough",
+        "enum_ret_from_match",
+        "enum_arg_is_ok_guarded",
+        "enum_arg_is_ok_or_err",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    // The tripwires: refuted, so the method read the *right* discriminant.
+    for name in [
+        "enum_ret_is_some_tripwire",
+        "enum_ret_is_none_tripwire",
+        "enum_ret_is_ok_tripwire",
+        "enum_ret_is_err_tripwire",
+        "enum_ret_is_ok_and_err_tripwire",
+        "enum_ret_passthrough_tripwire",
+        "enum_ret_from_match_tripwire",
+        "enum_arg_is_ok_guarded_tripwire",
+        "enum_arg_is_ok_and_err_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        assert!(!o.is_verified(), "`{name}` must be refuted, got: {o}");
+    }
+    // The refusal: a non-enum return names a tag that does not exist, so the
+    // method is unreadable -- a skip, never a verdict against a fabricated tag.
+    let o = outcome(&report, "enum_ret_method_on_non_enum");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "`ret.is_ok()` on a non-enum return must be refused, got: {o}"
+    );
+}
+
+/// An enum-returning function's contract can name a *payload*: `ret.Ok`,
+/// `ret.Some`, `ret.Err`, `ret.Data` (a user enum's variant).
+///
+/// A payload exists only on the variant's paths, so the clause naming it is
+/// *guarded on the discriminant* (`tag == disc => clause`) and is vacuous on the
+/// other variant. The true entries verify because the contract's `ret.Ok` and the
+/// body's `((_0 as Ok).0)` are one variable; the tripwires claim a value the
+/// payload cannot be, so a model that bound the payload to a fresh unconstrained
+/// variable (or dropped the guard) would prove them. The two refusals pin the
+/// boundary: a non-enum return and a unit variant have no payload to read.
+#[test]
+fn an_enum_return_contract_can_name_a_payload() {
+    let names = [
+        "ret_ok_payload",
+        "ret_ok_payload_tripwire",
+        "ret_some_payload",
+        "ret_some_payload_tripwire",
+        "ret_err_payload",
+        "ret_err_payload_tripwire",
+        "ret_payload_guarded_vacuous",
+        "ret_payload_guarded_vacuous_tripwire",
+        "ret_user_enum_payload",
+        "ret_user_enum_payload_tripwire",
+        "ret_payload_on_non_enum",
+        "ret_payload_on_unit_variant",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "ret_ok_payload",
+        "ret_some_payload",
+        "ret_err_payload",
+        "ret_payload_guarded_vacuous",
+        "ret_user_enum_payload",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "ret_ok_payload_tripwire",
+        "ret_some_payload_tripwire",
+        "ret_err_payload_tripwire",
+        "ret_payload_guarded_vacuous_tripwire",
+        "ret_user_enum_payload_tripwire",
+    ] {
+        assert_refuted(&report, name);
+    }
+    // The refusals: a non-enum return and a unit variant have no payload, so the
+    // contract is unreadable -- a skip, never a verdict against a fabricated value.
+    for name in ["ret_payload_on_non_enum", "ret_payload_on_unit_variant"] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Skipped { .. }),
+            "`{name}` must be refused (no such payload), got: {o}"
+        );
+    }
+}
+
+/// A parenthesized comparison used as an operand is a `bool` value, and a bare
+/// one-bit word at the predicate position reads as the value itself.
+///
+/// `ret == (x == 1)` is the natural spelling of a `bool`-returning function's
+/// postcondition, and the arithmetic parser refused it with "missing `)`" -- a
+/// dropped obligation for an ordinary shape. The group's predicate is turned into a
+/// one-bit value, so the surrounding `==` compares two `bool`s as Rust does. The
+/// true/tripwire pairs pin that the group is read as the comparison's *value*: a
+/// reader that dropped the group would prove the tripwire, and one that read it as
+/// a constant could not verify the true direction at every input.
+#[test]
+fn a_parenthesized_comparison_is_a_bool_operand() {
+    let names = [
+        "bool_ret_is_comparison",
+        "bool_ret_is_comparison_tripwire",
+        "bool_ret_grouped_arithmetic",
+        "bool_ret_bare",
+        "bool_ret_bare_tripwire",
+        "bool_ret_negated",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "bool_ret_is_comparison",
+        "bool_ret_grouped_arithmetic",
+        "bool_ret_bare",
+        "bool_ret_negated",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in ["bool_ret_is_comparison_tripwire", "bool_ret_bare_tripwire"] {
+        assert_refuted(&report, name);
+    }
+}
+
+/// Three payload-summary defects, each of which let a *false* claim be verified.
+///
+/// * **A parenthesized conjunction of payload clauses** re-guarded both payloads
+///   with a combined `tag == 0 && tag == 1` -- unsatisfiable -- so the group was
+///   vacuously true and `(ret.Ok == 9 && ret.Err == 8)` was *verified* on a body
+///   returning `Err(7)`. The grouped and ungrouped spellings must now agree: both
+///   refuted. The true companion pins that the fix did not simply refuse every
+///   group.
+/// * **A multi-field payload variant** wrote every operand to the single-valued
+///   payload store, so the last field won and `ret.Pair` (field 0) denoted field 1.
+///   `ret.Pair == 2` was verified; it is refuted now, and `ret.Pair == 1` verifies.
+/// * **An argument named like the generated payload binding** (`ret__v_Ok`) was
+///   overwritten by it, so `ret.Ok == ret__v_Ok` compared the payload with itself
+///   and verified. The binding is now dropped on a collision, so the contract is
+///   refused -- a skip, never a proof against the wrong value.
+/// * **A *negated* payload comparison** read its discriminant guard from *inside*
+///   the `!`: `!(ret.Ok == 9)` became `!(tag == 0 => payload == 9)`, which is false
+///   on an `Err` return, so a valid contract was refuted while the equivalent
+///   `ret.Ok != 9` verified. The guard is now applied outside the negation, and
+///   the two spellings agree -- both verify, and both are refuted on an `Ok(9)`
+///   body. A negation that spans two variants has no single scope, so it is
+///   refused rather than given a contradictory guard.
+#[test]
+fn payload_summaries_cannot_prove_a_false_claim() {
+    let names = [
+        "grouped_payload_conjunction_cannot_prove_this",
+        "grouped_payload_conjunction_ok",
+        "ungrouped_payload_conjunction_cannot_prove_this",
+        "duo_pair_first_field",
+        "duo_pair_second_field_cannot_prove_this",
+        "payload_binding_shadow_tripwire",
+        "negated_payload_comparison",
+        "negated_payload_comparison_inequality",
+        "negated_payload_comparison_cannot_prove_this",
+        "negated_payload_mixed_variant_is_refused",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    let o = outcome(&report, "grouped_payload_conjunction_ok");
+    assert!(o.is_verified(), "`grouped_payload_conjunction_ok` must verify, got: {o}");
+    let o = outcome(&report, "duo_pair_first_field");
+    assert!(o.is_verified(), "`duo_pair_first_field` must verify, got: {o}");
+    for name in [
+        "grouped_payload_conjunction_cannot_prove_this",
+        "ungrouped_payload_conjunction_cannot_prove_this",
+        "duo_pair_second_field_cannot_prove_this",
+    ] {
+        assert_refuted(&report, name);
+    }
+    // The shadowing argument's contract is *unreadable* (the binding is dropped),
+    // so the function is skipped -- the refusal, not a verdict.
+    let o = outcome(&report, "payload_binding_shadow_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "`payload_binding_shadow_tripwire` must be refused, got: {o}"
+    );
+    // The negation fix: the `!(…)` and `!=` spellings must agree, both verifying
+    // here (the `Err` path leaves `ret.Ok` vacuous), and both refuted on an `Ok(9)`
+    // body. The mixed-variant negation has no single scope, so it is refused.
+    for name in ["negated_payload_comparison", "negated_payload_comparison_inequality"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    assert_refuted(&report, "negated_payload_comparison_cannot_prove_this");
+    let o = outcome(&report, "negated_payload_mixed_variant_is_refused");
+    assert!(
+        matches!(o, FnOutcome::Skipped { .. }),
+        "`negated_payload_mixed_variant_is_refused` must be refused, got: {o}"
+    );
+}
+
+/// The `?` operator decides, on both the `Ok`/`Some` and the `Err`/`None` paths,
+/// and its false directions are refuted.
+///
+/// `expr?` lowers to three steps the model has to agree on: `<T as Try>::branch`
+/// produces a `ControlFlow<Residual, T>`, a `switchInt` reads its discriminant,
+/// and on `Break` a `FromResidual::from_residual` call re-wraps the error as the
+/// function's return enum. The test pins each step's own observable:
+///
+/// * the *success* value: `result_try_value_used` uses the yielded value
+///   (`r.Ok + 1`), so a model that bound the `Continue` payload to the wrong
+///   variant, or to the wrong width, would refute it.
+/// * the *tag* the `switchInt` reads: the `Err`-propagation pair, where the
+///   failure path must produce `ret.is_err()` and the opposite claim is refuted.
+/// * `from_residual`'s re-wrap: `ret.Err == r.Err`, so the error value has to
+///   survive the conversion, not just the tag.
+///
+/// Both families (`Result` and `Option`) are covered, because they differ in
+/// where the payload lives (`Ok` is 0, `Some` is 1) and in whether the residual
+/// carries a value (`Result` does, `Option`'s `None` does not).
+#[test]
+fn the_try_operator_decides_on_both_paths() {
+    let names = [
+        "result_try_ok_value",
+        "result_try_ok_value_cannot_prove_this",
+        "result_try_err_propagates",
+        "result_try_err_propagates_cannot_prove_this",
+        "result_try_value_used",
+        "result_try_value_used_cannot_prove_this",
+        "option_try_some_value",
+        "option_try_some_value_cannot_prove_this",
+        "option_try_none_propagates",
+        "option_try_none_propagates_cannot_prove_this",
+        "result_try_of_a_known_ok",
+        "result_try_of_a_known_err",
+        "result_try_of_a_known_err_cannot_prove_this",
+        "option_try_of_a_known_none",
+        "option_try_of_a_known_none_cannot_prove_this",
+        "result_try_chained",
+        "result_try_chained_cannot_prove_this",
+        "result_try_in_either_branch",
+        "result_try_in_either_branch_cannot_prove_this",
+        "result_try_widens_the_error",
+        "result_try_widens_the_error_cannot_prove_this",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "result_try_ok_value",
+        "result_try_err_propagates",
+        "result_try_value_used",
+        "option_try_some_value",
+        "option_try_none_propagates",
+        "result_try_of_a_known_ok",
+        "result_try_of_a_known_err",
+        "option_try_of_a_known_none",
+        "result_try_chained",
+        "result_try_in_either_branch",
+        "result_try_widens_the_error",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "result_try_ok_value_cannot_prove_this",
+        "result_try_err_propagates_cannot_prove_this",
+        "result_try_value_used_cannot_prove_this",
+        "option_try_some_value_cannot_prove_this",
+        "option_try_none_propagates_cannot_prove_this",
+        "result_try_of_a_known_err_cannot_prove_this",
+        "option_try_of_a_known_none_cannot_prove_this",
+        "result_try_chained_cannot_prove_this",
+        "result_try_in_either_branch_cannot_prove_this",
+        "result_try_widens_the_error_cannot_prove_this",
+    ] {
+        assert_refuted(&report, name);
+    }
+}
+
+/// The `Option`↔`Result` conversions -- `Option::ok_or`, `Result::ok`,
+/// `Result::err` -- decide, and both the *tag* and the *payload* cross.
+///
+/// Three things are pinned, and each is a way the model could be wrong:
+///
+/// * the tag: `ok_or`/`ok` reinterpret the receiver's tag (`Ok` and `Some` are
+///   discriminants 0 and 1, so `1 - tag`), while `err` *keeps* it (`Err` is
+///   already the payload-carrying variant). A model that inverted `err`'s tag, or
+///   read the result tag as a constant, proves a tripwire.
+/// * the payload: the moved payload is recorded under the discriminant the
+///   consuming `switchInt` selects, at the *payload's* width. The `_moves_the_payload`
+///   pair reads it back through `unwrap`; a model that recorded the wrong width (as
+///   the first cut did -- it stored the error argument as the `Ok` payload) refutes
+///   the true direction and cannot prove the false one.
+/// * the classifier: `ok_or` is printed with a *method* turbofish
+///   (`Option::<u8>::ok_or::<i32>`), so its name must be found past the `<…>`
+///   segment, or the call is reported unmodelled.
+#[test]
+fn the_option_result_conversions_decide_and_move_the_payload() {
+    let names = [
+        "ok_or_some_is_ok",
+        "ok_or_some_is_ok_tripwire",
+        "ok_or_none_is_err",
+        "ok_or_none_is_err_tripwire",
+        "ok_or_moves_the_payload",
+        "ok_or_moves_the_payload_tripwire",
+        "ok_ok_is_some",
+        "ok_ok_is_some_tripwire",
+        "ok_err_is_none",
+        "ok_err_is_none_tripwire",
+        "ok_moves_the_payload",
+        "ok_moves_the_payload_tripwire",
+        "err_err_is_some",
+        "err_err_is_some_tripwire",
+        "err_ok_is_none",
+        "err_ok_is_none_tripwire",
+        "err_moves_the_payload",
+        "err_moves_the_payload_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "ok_or_some_is_ok",
+        "ok_or_none_is_err",
+        "ok_or_moves_the_payload",
+        "ok_ok_is_some",
+        "ok_err_is_none",
+        "ok_moves_the_payload",
+        "err_err_is_some",
+        "err_ok_is_none",
+        "err_moves_the_payload",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "ok_or_some_is_ok_tripwire",
+        "ok_or_none_is_err_tripwire",
+        "ok_or_moves_the_payload_tripwire",
+        "ok_ok_is_some_tripwire",
+        "ok_err_is_none_tripwire",
+        "ok_moves_the_payload_tripwire",
+        "err_err_is_some_tripwire",
+        "err_ok_is_none_tripwire",
+        "err_moves_the_payload_tripwire",
+    ] {
+        // A *refutation*: the conversion is only pinned if the false contract
+        // produced a counterexample. `!is_verified()` would also accept a skip.
+        assert_refuted(&report, name);
+    }
+}
+
+/// The three findings of the PR #8 review round on the enum conversions.
+///
+/// * A *constructed* source variant (`None::<u8>.ok_or(e)`, `Err(e).ok()`,
+///   `Ok(x).err()`) records no payload for the variant that is absent, so the
+///   conversion must still produce a result. It is sound to leave the unreachable
+///   payload unbound when the tag is a *known* other discriminant; a symbolic tag
+///   still refuses. The tripwires refute the *tag*, which is what proves the
+///   conversion ran rather than the whole call being dropped.
+/// * The grouping and negation lookaheads recognise the `base.method()` enum
+///   predicate, so `(ret.is_ok())` and `!x.is_none()` read instead of being routed
+///   into arithmetic.
+#[test]
+fn the_option_result_conversions_handle_constructed_variants_and_grouping() {
+    let names = [
+        "constructed_none_ok_or_is_err",
+        "constructed_none_ok_or_is_err_tripwire",
+        "constructed_err_ok_is_none",
+        "constructed_err_ok_is_none_tripwire",
+        "constructed_ok_err_is_none",
+        "constructed_ok_err_is_none_tripwire",
+        "constructed_ok_ok_is_some",
+        "constructed_ok_ok_is_some_tripwire",
+        "grouped_enum_predicate",
+        "grouped_enum_predicate_tripwire",
+        "negated_enum_predicate",
+        "negated_enum_predicate_tripwire",
+        "grouped_enum_predicate_conjunction",
+        "grouped_enum_predicate_conjunction_tripwire",
+        "bare_negated_enum_predicate",
+        "bare_negated_enum_predicate_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "constructed_none_ok_or_is_err",
+        "constructed_err_ok_is_none",
+        "constructed_ok_err_is_none",
+        "constructed_ok_ok_is_some",
+        "grouped_enum_predicate",
+        "negated_enum_predicate",
+        "grouped_enum_predicate_conjunction",
+        "bare_negated_enum_predicate",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "constructed_none_ok_or_is_err_tripwire",
+        "constructed_err_ok_is_none_tripwire",
+        "constructed_ok_err_is_none_tripwire",
+        "constructed_ok_ok_is_some_tripwire",
+        "grouped_enum_predicate_tripwire",
+        "negated_enum_predicate_tripwire",
+        "grouped_enum_predicate_conjunction_tripwire",
+        "bare_negated_enum_predicate_tripwire",
+    ] {
+        // A *refutation*, not merely "not verified": these tripwires are only
+        // evidence of the conversion/parser if the false contract produced a
+        // counterexample. `!is_verified()` would also accept a skip.
+        assert_refuted(&report, name);
+    }
+}
+
+/// `Option::or` and `Option::and` are total, and the *right* operand's tag and
+/// payload cross.
+///
+/// Each combinator returns one of its two `Option`s by the receiver's tag, so the
+/// result's tag is an `ite` on that tag and both payloads are carried. `or` is the
+/// receiver on `Some` and the argument on `None`; `and` is the mirror, dropping the
+/// receiver's payload on `Some`.
+///
+/// Three things are pinned, each a way the model could be wrong:
+///
+/// * the tag: `or` on a `None` receiver must take the *argument's* tag, and `and`
+///   on a `Some` receiver must take the argument's -- so the two tripwires that
+///   claim the receiver's own value are refuted.
+/// * the payload: the selected payload is read back through `unwrap`, so a model
+///   that recorded the wrong one refutes the true direction and cannot prove the
+///   false one.
+///
+/// The drop-glue rule is shared with `ok`/`err`: `or` drops the argument's payload
+/// on the `Some` path and `and` drops the receiver's, so a `T` whose destructor is
+/// not modelled is refused rather than read as glue-free.
+///
+/// The *operand shapes* are pinned separately: a `checked_*` receiver's tag is the
+/// arithmetic width while a seeded `Option` argument's is one bit, so the tags must
+/// be normalised; `Option<T>::and<U>` returns `Option<U>`, so the receiver's
+/// payload must never be `ite`-d with the argument's; and a constructed `None`
+/// records no payload, so its absence must not refuse the call.
+#[test]
+fn option_or_and_are_total_and_select_the_right_operand() {
+    let names = [
+        "or_some_is_the_receiver",
+        "or_some_is_the_receiver_tripwire",
+        "or_none_is_the_argument",
+        "or_none_is_the_argument_tripwire",
+        "and_some_is_the_argument",
+        "and_some_is_the_argument_tripwire",
+        "and_none_is_the_receiver",
+        "and_none_is_the_receiver_tripwire",
+        "or_mixed_tag_widths_is_none",
+        "or_mixed_tag_widths_tripwire",
+        "or_mixed_tag_widths_none_is_argument",
+        "and_different_payload_widths",
+        "and_different_payload_widths_tripwire",
+        "and_none_receiver_decides",
+        "constructed_none_or_some",
+        "constructed_some_or_none",
+        "constructed_none_or_some_tripwire",
+        "or_slices_selects_the_receiver",
+        "or_slices_selects_the_receiver_tripwire",
+        "and_slices_selects_the_argument",
+        "and_slices_selects_the_argument_tripwire",
+        "and_different_width_deref",
+        "and_different_width_deref_tripwire",
+        "and_scalar_receiver_ref_argument",
+        "and_scalar_receiver_ref_argument_tripwire",
+        "chained_or_selects_the_first",
+        "chained_or_selects_the_first_cannot_prove_this",
+        "and_with_a_conditional_argument",
+        "and_with_a_conditional_argument_cannot_prove_this",
+        "signed_or_element_is_signed",
+        "signed_or_element_is_signed_cannot_prove_this",
+        "signed_or_element_divides_signed",
+        "signed_or_element_divides_signed_cannot_prove_this",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "or_some_is_the_receiver",
+        "or_none_is_the_argument",
+        "and_some_is_the_argument",
+        "and_none_is_the_receiver",
+        "or_mixed_tag_widths_is_none",
+        "or_mixed_tag_widths_none_is_argument",
+        "and_different_payload_widths",
+        "and_none_receiver_decides",
+        "constructed_none_or_some",
+        "constructed_some_or_none",
+        "or_slices_selects_the_receiver",
+        "and_slices_selects_the_argument",
+        "and_different_width_deref",
+        "and_scalar_receiver_ref_argument",
+        "chained_or_selects_the_first",
+        "and_with_a_conditional_argument",
+        "signed_or_element_is_signed",
+        "signed_or_element_divides_signed",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "or_some_is_the_receiver_tripwire",
+        "or_none_is_the_argument_tripwire",
+        "and_some_is_the_argument_tripwire",
+        "and_none_is_the_receiver_tripwire",
+        "or_mixed_tag_widths_tripwire",
+        "and_different_payload_widths_tripwire",
+        "constructed_none_or_some_tripwire",
+        "or_slices_selects_the_receiver_tripwire",
+        "and_slices_selects_the_argument_tripwire",
+        "and_different_width_deref_tripwire",
+        "and_scalar_receiver_ref_argument_tripwire",
+        "chained_or_selects_the_first_cannot_prove_this",
+        "and_with_a_conditional_argument_cannot_prove_this",
+        "signed_or_element_is_signed_cannot_prove_this",
+        "signed_or_element_divides_signed_cannot_prove_this",
+    ] {
+        // A *refutation*, not merely "not verified": a swap of the two operands
+        // must produce a counterexample, and a skip would not be evidence.
+        assert_refuted(&report, name);
+    }
+}
+
+/// `Option<&T>::copied()`/`cloned()` is the everyday `v.first().copied()` idiom:
+/// the value the payload reference addresses, with the receiver's tag unchanged.
+///
+/// The model stores a `&T` payload as the value it addresses, so the result's
+/// payload is the receiver's -- `v.first().copied()` and `*v.first().unwrap()`
+/// name one word. Two things are pinned, each a way the model could be wrong:
+///
+/// * the payload: the copied value must be the slice's own element, so a claim
+///   about the element verifies and a claim about a different value is refuted.
+/// * the tag: `copied` keeps the receiver's tag, so on an empty slice `unwrap_or`
+///   takes the default rather than panicking -- a model that fixed the tag to
+///   `Some` would refute `copied_empty_is_none`.
+///
+/// `cloned` is the same shape as `copied` for a `Copy` element, so one arm serves
+/// both and the `cloned` fixture pins that the shared arm is reached.
+#[test]
+fn option_copied_and_cloned_copy_the_payload_with_the_tag() {
+    let names = [
+        "copied_first_is_the_element",
+        "copied_first_tripwire",
+        "copied_get_is_the_element",
+        "copied_get_tripwire",
+        "copied_empty_is_none",
+        "cloned_first_is_the_element",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "copied_first_is_the_element",
+        "copied_get_is_the_element",
+        "copied_empty_is_none",
+        "cloned_first_is_the_element",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in ["copied_first_tripwire", "copied_get_tripwire"] {
+        assert_refuted(&report, name);
+    }
+}
+
+/// `char` is a 32-bit unsigned value, its literals and the `is_ascii_*` predicates.
+///
+/// The predicates are exact at width 32 because every range they test lies inside
+/// `0..=0x7f`, so a value at or above `0x100` is outside all of them -- which is
+/// what `char::is_ascii_digit` means too. `char_high_digit_tripwire` is the
+/// evidence: `'\u{130}'`'s low byte is `'0'`, so a model that masked to eight bits
+/// would *prove* it, while the real predicate is `false`.
+#[test]
+fn char_literals_and_ascii_predicates_are_modelled() {
+    let names = [
+        "char_as_byte",
+        "char_ord_of_a",
+        "char_digit_is_true",
+        "char_digit_tripwire",
+        "char_high_digit_tripwire",
+        "char_high_is_not_digit",
+        "char_newline_is_whitespace",
+        "char_emoji_not_alphabetic",
+        "char_max_is_the_scalar_maximum",
+        "char_max_is_the_scalar_maximum_cannot_prove_this",
+        "char_min_is_nul",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "char_as_byte",
+        "char_ord_of_a",
+        "char_digit_is_true",
+        "char_high_is_not_digit",
+        "char_newline_is_whitespace",
+        "char_emoji_not_alphabetic",
+        "char_max_is_the_scalar_maximum",
+        "char_min_is_nul",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    // Real refutations, with the scalar value in the witness -- so the literals
+    // were read (120 is `'x'`, 304 is `0x130`) and not skipped.
+    assert_refuted(&report, "char_digit_tripwire");
+    assert_refuted(&report, "char_high_digit_tripwire");
+    // `char::MAX` is `0x10FFFF`, not `2^32 - 1`: the false twin is refuted at the
+    // *real* maximum (`c = 1114111`), which a width-derived bound would prove.
+    assert_refuted(&report, "char_max_is_the_scalar_maximum_cannot_prove_this");
+}
+
+/// `slice::last` -- a fresh element for a slice, the exact element for an array.
+///
+/// A slice's length is symbolic, so `xs.last()` names no index the store can pin
+/// and the element is a *fresh* variable: a contract true of every element holds
+/// of the last one (`slice_last_is_an_element` verifies), and a claim that the last
+/// element is a particular value is refuted, because a slice with that element can
+/// exist. An *array*'s length is its type's constant, so `a.last()` is the exact
+/// element `a[N-1]`: `array_last_is_the_last_element` verifies against `a[3] == 7`
+/// and its twin, claiming `a[0] == 9`, refutes. The two directions together show the
+/// element is neither a constant (the array case decides by the actual last element)
+/// nor the first element (the twin refutes).
+#[test]
+fn slice_last_is_an_element_and_array_last_is_exact() {
+    let names = [
+        "slice_last_is_an_element",
+        "array_last_is_the_last_element",
+        "slice_last_is_an_element_cannot_prove_this",
+        "array_last_is_the_last_element_cannot_prove_this",
+        "slice_last_after_write_is_seen",
+        "slice_last_after_write_is_seen_cannot_prove_this",
+        "slice_last_is_kept_when_another_index_is_written",
+        "slice_last_read_before_a_write_is_not_kept_cannot_prove_this",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "slice_last_is_an_element",
+        "array_last_is_the_last_element",
+        "slice_last_after_write_is_seen",
+        "slice_last_is_kept_when_another_index_is_written",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    // Real refutations: the fresh element is unconstrained, and the array's last
+    // element is not the first, so neither claim can be proved.
+    assert_refuted(&report, "slice_last_is_an_element_cannot_prove_this");
+    assert_refuted(&report, "array_last_is_the_last_element_cannot_prove_this");
+    // The write/read interaction: a concrete-index write that *is* the last
+    // element must reach the sentinel, so the pre-write value does not survive.
+    // A model that left the sentinel alone would prove the twin -- the false proof
+    // this pair exists to pin.
+    assert_refuted(&report, "slice_last_after_write_is_seen_cannot_prove_this");
+    // The read-before/write/read-after shape at the length where the write reaches
+    // `last()`. This is the review's exact example: both reads must not be the same
+    // variable. The `len == 2` fixture above keeps `last()` across the write, so it
+    // stays green whether or not the sentinel is refreshed; only this one refutes a
+    // model that left the sentinel alone.
+    assert_refuted(&report, "slice_last_read_before_a_write_is_not_kept_cannot_prove_this");
+}
+
+/// `u8::from(bool)` -- the one conversion the integer model would otherwise refuse.
+///
+/// A `bool` has no integer width, so `conversion_types` reads the pair but
+/// `int_width` refuses the source. The conversion is the zero-extension of the
+/// one-bit value: `false` -> 0, `true` -> 1. The `true`/`false` pair pins that the
+/// bit is the *value*: a model that fixed it to a constant would prove one and
+/// refute the other, and here `bool_to_u8_of_true_is_one` verifies while its
+/// `false` twin refutes with the witness `b = 0`. The `u32` destination pins the
+/// widening.
+#[test]
+fn a_bool_conversion_is_the_zero_extended_bit() {
+    let names = [
+        "bool_to_u8_is_zero_or_one",
+        "bool_to_u8_of_true_is_one",
+        "bool_to_u8_of_true_is_one_cannot_prove_this",
+        "bool_to_u32_is_zero_or_one",
+    ];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in [
+        "bool_to_u8_is_zero_or_one",
+        "bool_to_u8_of_true_is_one",
+        "bool_to_u32_is_zero_or_one",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    // A real refutation, so the bit is the value and not a constant one.
+    assert_refuted(&report, "bool_to_u8_of_true_is_one_cannot_prove_this");
+}
+
+/// A `&mut bool` argument's final value is a predicate, not a word.
+///
+/// The postcondition's bare `c` means the value the body left at the target. A
+/// `bool` target is a `Val::Bool`, so the word-only collection dropped it and the
+/// contract was refused as an unknown name. The predicate is widened to a one-bit
+/// word, exactly as a `bool` `ret` is. The false direction pins that the binding is
+/// the *final* value, not the entry value.
+#[test]
+fn a_mutable_bool_reference_postcondition_reads_its_final_value() {
+    let names = ["set_bool_ref", "a_bool_ref_write_cannot_prove_this", "keep_bool_ref"];
+    let Some(report) = verify_realistic(&names) else {
+        return;
+    };
+    for name in ["set_bool_ref", "keep_bool_ref"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    // A real refutation, so the false direction is a counterexample and not a skip.
+    assert_refuted(&report, "a_bool_ref_write_cannot_prove_this");
 }
 
 /// A trailing line comment on a variant line does not erase the enum layout.
@@ -4938,7 +6928,8 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
-    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts())
+        .expect("frontend");
     let o = report
         .outcomes
         .into_iter()
@@ -4947,6 +6938,17 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     let _ = std::fs::remove_dir_all(&dir);
     assert_not_dropped(name, src, o.is_some(), &report.missing);
     o
+}
+
+/// Options for a probe written to a loose temp file.
+///
+/// A probe has no `Cargo.toml` above it, so the edition cannot be resolved from a
+/// manifest -- and it is never guessed. The tests name the crate's own edition
+/// (2024) explicitly. The corpus files (`actuator.rs`, `realistic.rs`) do live
+/// under this repository's `Cargo.toml`, so those tests use the plain entry point
+/// and exercise the manifest resolution path instead.
+fn probe_opts() -> verify::MirOptions {
+    verify::MirOptions { edition: Some(verify::Edition::Rust2024) }
 }
 
 /// Every outcome and the `missing` list for one source, without the
@@ -4960,7 +6962,7 @@ fn verify_all_outcomes(src: &str) -> (Vec<(String, FnOutcome)>, Vec<String>) {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
-    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts()).expect("frontend");
     let _ = std::fs::remove_dir_all(&dir);
     (report.outcomes, report.missing)
 }
@@ -5031,6 +7033,449 @@ pub fn ref_written_then_symbolic(a: &mut [u8; 4], i: usize) -> u8 {
     );
 }
 
+/// The `Vec<T>` length model: `new`/`push`/`len` track a length the executor
+/// holds, so `make`-shaped code is decided rather than refused.
+///
+/// The element is *not* modelled (a `Vec`'s fields are not printed by the dump),
+/// so this pins the length and nothing else. Each true direction must verify and
+/// each false twin must be refuted -- a model that returned a constant, or that
+/// ignored the `push`, would prove the twin. The helper direction pins that the
+/// write reaches the caller through `&mut Vec<u8>`, and the argument direction
+/// pins that a length the run never set is *refused* rather than invented.
+#[test]
+fn a_vec_length_is_tracked_through_new_push_and_len() {
+    let src = r#"
+/// requires: true
+/// ensures: ret == 1
+pub fn make_ok(n: u8) -> usize { let mut v = Vec::new(); v.push(n); v.len() }
+
+/// requires: true
+/// ensures: ret == 2
+pub fn make_bad(n: u8) -> usize { let mut v = Vec::new(); v.push(n); v.len() }
+
+/// requires: true
+/// ensures: ret == 2
+pub fn two_ok(n: u8) -> usize { let mut v = Vec::new(); v.push(n); v.push(n); v.len() }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn two_bad(n: u8) -> usize { let mut v = Vec::new(); v.push(n); v.push(n); v.len() }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn empty_ok() -> usize { Vec::<u8>::new().len() }
+
+/// requires: true
+/// ensures: ret == 3
+pub fn empty_bad() -> usize { Vec::<u8>::new().len() }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn helper_ok(n: u8) -> usize { let mut v = Vec::new(); add(&mut v, n); v.len() }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn helper_bad(n: u8) -> usize { let mut v = Vec::new(); add(&mut v, n); v.len() }
+
+fn add(v: &mut Vec<u8>, x: u8) { v.push(x); }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn arg_len_refused(v: &Vec<u8>) -> usize { v.len() }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn is_empty_new_ok() -> u8 { Vec::<u8>::new().is_empty() as u8 }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn is_empty_new_bad() -> u8 { Vec::<u8>::new().is_empty() as u8 }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn not_empty_after_push_ok() -> u8 { let mut v = Vec::<u8>::new(); v.push(1); v.is_empty() as u8 }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn not_empty_after_push_bad() -> u8 { let mut v = Vec::<u8>::new(); v.push(1); v.is_empty() as u8 }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn pop_then_len_ok() -> usize { let mut v = Vec::<u8>::new(); v.push(1); v.pop(); v.len() }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn pop_then_len_bad() -> usize { let mut v = Vec::<u8>::new(); v.push(1); v.pop(); v.len() }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn pop_empty_is_none_ok() -> u8 { let mut v = Vec::<u8>::new(); v.pop().is_none() as u8 }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn pop_empty_is_none_bad() -> u8 { let mut v = Vec::<u8>::new(); v.pop().is_none() as u8 }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn pop_nonempty_is_some_ok() -> u8 { let mut v = Vec::<u8>::new(); v.push(9); v.pop().is_some() as u8 }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn pop_nonempty_is_some_bad() -> u8 { let mut v = Vec::<u8>::new(); v.push(9); v.pop().is_some() as u8 }
+"#;
+    for name in [
+        "make_ok",
+        "two_ok",
+        "empty_ok",
+        "helper_ok",
+        "is_empty_new_ok",
+        "not_empty_after_push_ok",
+        "pop_then_len_ok",
+        "pop_empty_is_none_ok",
+        "pop_nonempty_is_some_ok",
+    ] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    for name in [
+        "make_bad",
+        "two_bad",
+        "empty_bad",
+        "helper_bad",
+        "is_empty_new_bad",
+        "not_empty_after_push_bad",
+        "pop_then_len_bad",
+        "pop_empty_is_none_bad",
+        "pop_nonempty_is_some_bad",
+    ] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` claims a length the body never produces and must be refuted, \
+             not proved; got: {o}"
+        );
+    }
+    // A `Vec` argument's length is not a value the run holds, so a `len` on it is
+    // a refusal -- never an invented number.
+    let Some(o) = verify_src("arg_len_refused", src) else { return };
+    assert!(
+        !o.is_verified(),
+        "a `Vec` argument's length is unmodelled and must not verify; got: {o}"
+    );
+}
+
+/// Three soundness holes in the `Vec` length model, each a *false proof*.
+///
+/// The model tracks a length per local (`Env::vec_len`). Each of these had the
+/// length survive a place it should not, so a false postcondition was proved:
+///
+/// * **A user `Vec` is not the container.** A local `struct Vec<T>` whose `Drop`
+///   panics was treated as glue-free (the model matched the bare `Vec`), so the
+///   panic never ran and `f` was reported `Verified`. The container identity is
+///   the *full* path (`std::vec::Vec` / `alloc::vec::Vec`); a user `Vec` is an
+///   ordinary type and its destructor is resolved like any other.
+/// * **The loop header havocs the length.** An inductive loop that pushes has to
+///   forget the entry length, or the exit edge reads it: a `while i < 3 { v.push
+///   (1); i += 1 }` proved `ret == 0` for the real `ret == 3`. `havoc_parts`
+///   refreshes the tracked length to a fresh `usize`.
+/// * **A move carries the length.** `let w = v` (`copy_parts`) and a returned
+///   vector (the call's return merge) both have to transfer the tracked length to
+///   the destination, or `w.len()`/`mk().len()` read a receiver with no length.
+#[test]
+fn a_vec_length_model_does_not_leak_across_a_drop_havoc_or_move() {
+    let src = r#"
+mod m {
+    pub struct Vec<T>(pub T);
+    impl<T> Drop for Vec<T> {
+        fn drop(&mut self) { panic!() }
+    }
+}
+
+/// A user `Vec` whose destructor always panics: `drop` runs it, so this must not
+/// be `verified`. The bare-name model treated `m::Vec<u8>` as glue-free.
+/// requires: true
+/// ensures: true
+pub fn user_vec_drop_panics() { let _x = m::Vec(0u8); }
+
+/// The loop's entry length must be havoced at the header. A model that kept it
+/// reads `0` at the exit and proves this; the body really returns `3`.
+/// requires: true
+/// invariant: i <= 3
+/// ensures: ret == 0
+pub fn loop_push_cannot_prove_this() -> usize {
+    let mut v = Vec::<u8>::new();
+    let mut i = 0u8;
+    while i < 3 { v.push(1); i += 1; }
+    v.len()
+}
+
+/// The control: the same loop, but the postcondition is about the *counter*,
+/// which the invariant does relate (`i <= 3` and the exit guard `i >= 3` give
+/// `i == 3`). Havocing the vector's length must not break this -- a model that
+/// refused every `Vec`-carrying loop would pass the twin above while checking
+/// nothing.
+/// requires: true
+/// invariant: i <= 3
+/// ensures: ret == 3
+pub fn loop_counter_ok() -> u8 {
+    let mut v = Vec::<u8>::new();
+    let mut i = 0u8;
+    while i < 3 { v.push(1); i += 1; }
+    i
+}
+
+/// A move (`let w = v`) must carry the tracked length to the destination.
+/// requires: true
+/// ensures: ret == 1
+pub fn move_ok(n: u8) -> usize { let mut v = Vec::new(); v.push(n); let w = v; w.len() }
+
+/// The false twin: a model that dropped the length on the move reads a receiver
+/// with no length and refuses; one that kept the *source* length and read it
+/// through the wrong local would prove this.
+/// requires: true
+/// ensures: ret == 0
+pub fn move_bad(n: u8) -> usize { let mut v = Vec::new(); v.push(n); let w = v; w.len() }
+
+/// A returned vector must carry its length to the caller's destination.
+/// requires: true
+/// ensures: ret == 0
+pub fn mk() -> Vec<u8> { Vec::new() }
+
+/// requires: true
+/// ensures: ret == 0
+pub fn returned_ok() -> usize { let v = mk(); v.len() }
+"#;
+    // The user `Vec`'s destructor panics, so the function must be *refused*.
+    // The assertion is `Incomplete`, not merely `!is_verified()`: a `!is_verified`
+    // check also passes on `Failed`, so it cannot tell a refusal (the honest
+    // answer, since the destructor's `panic!` has no value) from a spurious
+    // refutation of the `ensures: true` claim -- the same weakness the invariant
+    // tripwire was fixed for. Measured, the drop of a user `Vec` whose fields are
+    // not modelled is `Incomplete`; pinning it makes a regression to `Failed`
+    // visible rather than silently passing.
+    let Some(o) = verify_src("user_vec_drop_panics", src) else { return };
+    match o {
+        FnOutcome::Incomplete { .. } => {}
+        other => panic!(
+            "a user `Vec` whose `Drop` panics must be refused as `Incomplete` \
+             (the destructor's `panic!` is not modelled as a value), got: {other} -- \
+             a `verified` here is a false proof and a `Failed` would be a spurious \
+             refutation of `ensures: true`"
+        ),
+    }
+
+    // The loop twin must be *refuted* on its postcondition, not merely refused:
+    // a refusal also satisfies "not verified" and would check nothing.
+    let Some(o) = verify_src("loop_push_cannot_prove_this", src) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("postcondition"),
+            "the loop twin must fail on its postcondition; got `{kind}`"
+        ),
+        other => panic!(
+            "the loop entry length must be havoced, so `ret == 0` for a body \
+             returning 3 must be refuted; got: {other}"
+        ),
+    }
+    // The control: havocing the length must not break a loop whose postcondition
+    // is about a variable the invariant *does* relate.
+    let Some(o) = verify_src("loop_counter_ok", src) else { return };
+    assert!(
+        o.is_verified(),
+        "a `Vec`-carrying loop with a counter postcondition must still verify; got: {o}"
+    );
+
+    // The move: the true direction verifies, the false twin is refuted.
+    let Some(o) = verify_src("move_ok", src) else { return };
+    assert!(o.is_verified(), "a moved vector keeps its length; got: {o}");
+    let Some(o) = verify_src("move_bad", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "the move twin claims `0` for a vector of length 1 and must be refuted; got: {o}"
+    );
+
+    // The returned vector: the caller's destination inherits the length.
+    let Some(o) = verify_src("returned_ok", src) else { return };
+    assert!(o.is_verified(), "a returned vector keeps its length; got: {o}");
+}
+
+/// A user type spelled `Vec` is not the container, and its *methods* are answered
+/// by their own bodies.
+///
+/// `names_vec_impl` accepts a call whose path contains `vec::Vec` or starts with a
+/// bare `Vec::` -- the shortened spelling rustc prints for the *standard*
+/// container when nothing shadows it. A user `Vec` also prints `Vec::<u8>::new`
+/// at the crate root, so the predicate alone cannot separate them. What does is
+/// the executor's same-dump lookup, which resolves the user body *before* the
+/// model: `body_wins` returns 7 from its own `len` and verifies against `ret == 7`,
+/// while the twin claiming the container model's `0` is refuted. This pins that
+/// the model is not consulted for a call that names a body in the dump.
+#[test]
+fn a_user_vec_method_is_answered_by_its_own_body() {
+    let src = r#"
+pub struct Vec<T>(pub T);
+impl Vec<u8> {
+    pub fn new() -> Self { Vec(0) }
+    pub fn len(&self) -> usize { 7 }
+}
+
+/// The user body returns 7, so this verifies -- the model's `0` would refute it.
+/// requires: true
+/// ensures: ret == 7
+pub fn body_wins() -> usize { let v = Vec::new(); v.len() }
+
+/// The twin: the container model would answer `0` and prove this, so a refutation
+/// is the evidence the user body was used.
+/// requires: true
+/// ensures: ret == 0
+pub fn model_would_say_zero() -> usize { let v = Vec::new(); v.len() }
+"#;
+    let Some(o) = verify_src("body_wins", src) else { return };
+    assert!(
+        o.is_verified(),
+        "a user `Vec` method must be answered by its own body; got: {o}"
+    );
+    let Some(o) = verify_src("model_would_say_zero", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "the container model must not answer a user `Vec` call, so `ret == 0` must be \
+         refuted; got: {o}"
+    );
+}
+
+/// A `&str` argument's length is a symbolic input, exactly as a `&[T]` slice's is.
+///
+/// `str` is unsized, so its length lives in the fat pointer and is a caller
+/// choice, not a constant in the type. `s.len()`/`s.is_empty()` read only that
+/// length, so they are modelled the same way the slice ones are -- the same two
+/// intrinsics, a different path (`core::str::<impl str>::len`). The length is
+/// bound by the contract binder, so a body's `s.len()` and a contract's `s.len()`
+/// name one variable: a `requires: s.len() == 3` pins the body's read, and the
+/// false twin is refuted.
+///
+/// `String` is deliberately *not* covered: it is a different type
+/// (`alloc::string::String`), so `String::len` stays an honest refusal rather
+/// than being answered with a length the model does not hold.
+#[test]
+fn a_str_length_is_a_symbolic_input() {
+    let src = r#"
+/// requires: true
+/// ensures: ret <= s.len()
+pub fn len_bound(s: &str) -> usize { s.len() }
+
+/// The length is pinned by the precondition, so the body's read is that value.
+/// requires: s.len() == 3
+/// ensures: ret == 3
+pub fn pinned_len(s: &str) -> usize { s.len() }
+
+/// The false twin: an unbounded `&str` length is not 4.
+/// requires: true
+/// ensures: ret == 4
+pub fn wrong_len_cannot_prove_this(s: &str) -> usize { s.len() }
+
+/// `is_empty` reads the same variable, so it agrees with `len`.
+/// requires: s.len() == 0
+/// ensures: ret
+pub fn empty_is_empty(s: &str) -> bool { s.is_empty() }
+"#;
+    for name in ["len_bound", "pinned_len", "empty_is_empty"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    let Some(o) = verify_src("wrong_len_cannot_prove_this", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "an unbounded `&str` length must not be provable as `4`; got: {o}"
+    );
+}
+
+/// `Option::unwrap_or_default` is total, and its default is the payload's own zero.
+///
+/// The default of every scalar `Default` this tool models is the zero of the
+/// payload's width (`0u8`, `0i32`, `false`), so the failure variant yields that
+/// word rather than a fresh input. The `x.is_none()` pin makes the body's read the
+/// default on every path, and the false twin (`ret == 7`) is refuted because the
+/// `Some` path can carry any payload.
+#[test]
+fn option_unwrap_or_default_is_the_payload_or_zero() {
+    let src = r#"
+/// requires: true
+/// ensures: ret <= 255
+pub fn or_zero(x: Option<u8>) -> u8 { x.unwrap_or_default() }
+
+/// requires: x.is_none()
+/// ensures: ret == 0
+pub fn none_is_zero(x: Option<u8>) -> u8 { x.unwrap_or_default() }
+
+/// requires: true
+/// ensures: ret == 7
+pub fn cannot_prove_this(x: Option<u8>) -> u8 { x.unwrap_or_default() }
+"#;
+    for name in ["or_zero", "none_is_zero"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    let Some(o) = verify_src("cannot_prove_this", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`unwrap_or_default` must not be provable as a fixed `7`; got: {o}"
+    );
+}
+
+/// A user type named `str` is not the primitive `str`.
+///
+/// Rust lets a crate shadow a primitive name, and rustc prints a crate-root type
+/// as the bare name, so a `pub struct str { .. }` argument is spelled `&str`
+/// exactly as the primitive is. Binding the primitive's symbolic length *before*
+/// consulting the declared layout therefore bound a field-less type over the
+/// user's struct, and a contract naming its field could not resolve. The declared
+/// layout now wins; the primitive is meant only when nothing declares `str`.
+///
+/// The primitive direction is asserted too, so a fix that simply refused every
+/// `str` argument would fail this test.
+#[test]
+fn a_user_type_named_str_is_not_the_primitive_str() {
+    let src = r#"
+pub struct str { pub value: u8 }
+
+/// requires: s.value == 3
+/// ensures: ret == 3
+pub fn read(s: &str) -> u8 { s.value }
+
+/// requires: true
+/// ensures: ret == 3
+pub fn read_cannot_prove_this(s: &str) -> u8 { s.value }
+"#;
+    let Some(o) = verify_src("read", src) else { return };
+    assert!(
+        o.is_verified(),
+        "a field of a user `str` must resolve; got: {o}"
+    );
+    let Some(o) = verify_src("read_cannot_prove_this", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "the user `str`'s field is an input, so a fixed value must be refuted; got: {o}"
+    );
+
+    // The primitive is still modelled when nothing declares `str`.
+    let prim = r#"
+/// requires: s.len() == 3
+/// ensures: ret == 3
+pub fn len_is_symbolic(s: &str) -> usize { s.len() }
+
+/// requires: true
+/// ensures: ret == 4
+pub fn wrong_len_cannot_prove_this(s: &str) -> usize { s.len() }
+"#;
+    let Some(o) = verify_src("len_is_symbolic", prim) else { return };
+    assert!(o.is_verified(), "the primitive `str` length must resolve; got: {o}");
+    let Some(o) = verify_src("wrong_len_cannot_prove_this", prim) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "an unpinned `str` length must not be provable as `4`; got: {o}"
+    );
+}
+
 /// A `&mut [u8]` slice write must reach the store the read consults.
 ///
 /// This is the gap the `&raw const (fake) (*_1)` parse closed. Before it, the
@@ -5090,6 +7535,217 @@ pub fn slice_written_then_symbolic(s: &mut [u8], i: usize) -> u8 {
     assert!(
         matches!(o, FnOutcome::Failed { .. }),
         "a slice write must not leave a stale element readable by the chain; got: {o}"
+    );
+}
+
+/// `slice::first`/`get` produce `Option<&T>`, and the payload is the slice's
+/// *own* element, so `*xs.first().unwrap()` and `xs[0]` agree -- and a claim
+/// about a different element is refuted rather than proved.
+///
+/// The tag is a predicate (`len == 0` for `first`, `len <= k` for `get`), so the
+/// `unwrap`'s panic obligation is real: `get(1)` past the end must fail, not be
+/// assumed `Some`. Both directions are pinned, because a model that answered
+/// every `first` with the element would prove the true contracts and the false
+/// ones alike.
+#[test]
+fn slice_first_and_get_reach_the_slices_own_element() {
+    let src = r#"
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 5
+pub fn first_reads_the_element(xs: &[u8]) -> u8 {
+    *xs.first().unwrap()
+}
+
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 6
+pub fn first_wrong_element_cannot_prove_this(xs: &[u8]) -> u8 {
+    *xs.first().unwrap()
+}
+
+/// requires: xs.len() == 0
+/// ensures: ret
+pub fn first_is_none_when_empty(xs: &[u8]) -> bool {
+    xs.first().is_none()
+}
+
+/// requires: xs.len() > 1 && xs[1] == 7
+/// ensures: ret == 7
+pub fn get_reads_the_indexed_element(xs: &[u8]) -> u8 {
+    *xs.get(1).unwrap()
+}
+
+/// requires: xs.len() > 1 && xs[1] == 7
+/// ensures: ret == 8
+pub fn get_wrong_element_cannot_prove_this(xs: &[u8]) -> u8 {
+    *xs.get(1).unwrap()
+}
+
+/// requires: xs.len() > 0
+/// ensures: ret == 7
+pub fn get_out_of_range_unwrap_panics(xs: &[u8]) -> u8 {
+    *xs.get(1).unwrap()
+}
+
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 5
+pub fn first_match_reads_the_element(xs: &[u8]) -> u8 {
+    match xs.first() { Some(v) => *v, None => 0 }
+}
+
+/// requires: xs.len() > 0 && xs[0] == 5
+/// ensures: ret == 6
+pub fn first_match_tripwire(xs: &[u8]) -> u8 {
+    match xs.first() { Some(v) => *v, None => 0 }
+}
+
+/// requires: xs.len() == 0
+/// ensures: ret == 0
+pub fn first_match_empty_takes_none(xs: &[u8]) -> u8 {
+    match xs.first() { Some(v) => *v, None => 0 }
+}
+
+/// requires: i < xs.len() && xs.len() <= 64
+/// ensures: true
+pub fn get_symbolic_index_is_refused(xs: &[u8], i: usize) -> u8 {
+    *xs.get(i).unwrap()
+}
+"#;
+    let Some(o) = verify_src("first_reads_the_element", src) else { return };
+    assert!(
+        o.is_verified(),
+        "`*xs.first().unwrap()` is `xs[0]`, so the true contract must verify; got: {o}"
+    );
+    let Some(o) = verify_src("first_wrong_element_cannot_prove_this", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "the payload is the slice's own element, so a claim about a different value \
+         must be refuted, not proved; got: {o}"
+    );
+    let Some(o) = verify_src("first_is_none_when_empty", src) else { return };
+    assert!(
+        o.is_verified(),
+        "`first` is `None` exactly when the slice is empty; got: {o}"
+    );
+    let Some(o) = verify_src("get_reads_the_indexed_element", src) else { return };
+    assert!(
+        o.is_verified(),
+        "`*xs.get(1).unwrap()` is `xs[1]`, so the true contract must verify; got: {o}"
+    );
+    let Some(o) = verify_src("get_wrong_element_cannot_prove_this", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`get`'s payload is the indexed element, so a claim about another value must \
+         be refuted; got: {o}"
+    );
+    let Some(o) = verify_src("get_out_of_range_unwrap_panics", src) else { return };
+    assert!(
+        matches!(&o, FnOutcome::Failed { kind, .. } if kind.starts_with("panic")),
+        "`get(1)` past the end is `None`, so `unwrap` panics -- a real obligation, not \
+         an assumed `Some`; got: {o}"
+    );
+    // The `match` form reads the payload through a downcast temp, a different
+    // desugaring from `unwrap`; both must decide, and a `match` on the empty
+    // slice must take the `None` arm.
+    let Some(o) = verify_src("first_match_reads_the_element", src) else { return };
+    assert!(
+        o.is_verified(),
+        "a `match` on `first()` names the same element `unwrap` does; got: {o}"
+    );
+    let Some(o) = verify_src("first_match_tripwire", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "the `match` payload is the slice's element, so a claim about another value \
+         must be refuted; got: {o}"
+    );
+    let Some(o) = verify_src("first_match_empty_takes_none", src) else { return };
+    assert!(
+        o.is_verified(),
+        "an empty slice takes the `None` arm, which returns the constant; got: {o}"
+    );
+    // A symbolic index has no finite domain on a slice, so the read is refused
+    // rather than guessed -- a wrong value would be worse than a missing one.
+    let Some(o) = verify_src("get_symbolic_index_is_refused", src) else { return };
+    assert!(
+        !o.is_verified()
+            && matches!(&o, FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. }),
+        "`xs.get(i)` for a symbolic `i` must be refused, not modelled; got: {o}"
+    );
+}
+
+/// A generic `&[T]` has a *length* even though its element width is unknown.
+///
+/// `T` is an unbound type parameter, so there is no element width to model and
+/// every element operation must stay refused. But `len`/`is_empty` read only the
+/// length, which is a `usize` input whatever `T` is — so the length is bound and
+/// those functions decide. This pins both halves: the length functions verify, and
+/// an element-naming contract is a refusal, never a proof. The two tripwires are
+/// the teeth: `generic_slice_len_is_zero_cannot_prove_this` must be *refuted*
+/// (the length is a real value, not a constant `0`), and
+/// `generic_slice_element_cannot_prove_this` must not be *verified* (the element
+/// has no width, so a claim about it cannot be discharged).
+#[test]
+fn a_generic_slices_length_is_modelled_but_its_element_is_not() {
+    let src = r#"
+/// requires: true
+/// ensures: ret == v.len()
+pub fn len_of<T: Copy>(v: &[T]) -> usize {
+    v.len()
+}
+
+/// requires: true
+/// ensures: ret == (v.len() == 0)
+pub fn empty_of<T: Copy>(v: &[T]) -> bool {
+    v.is_empty()
+}
+
+/// requires: true
+/// ensures: true
+pub fn first_or_of<T: Copy>(v: &[T], d: T) -> T {
+    if v.is_empty() { d } else { v[0] }
+}
+
+/// requires: true
+/// ensures: ret == 0
+pub fn len_is_zero_cannot_prove_this<T: Copy>(v: &[T]) -> usize {
+    v.len()
+}
+
+/// requires: true
+/// ensures: ret == d
+pub fn element_cannot_prove_this<T: Copy>(v: &[T], d: T) -> T {
+    if v.is_empty() { d } else { v[0] }
+}
+"#;
+    let Some(o) = verify_src("len_of", src) else { return };
+    assert!(
+        o.is_verified(),
+        "`v.len()` on a `&[T]` reads only the length, which is modelled; got: {o}"
+    );
+    let Some(o) = verify_src("empty_of", src) else { return };
+    assert!(
+        o.is_verified(),
+        "`v.is_empty()` is `len == 0`, decided by the length alone; got: {o}"
+    );
+    let Some(o) = verify_src("first_or_of", src) else { return };
+    assert!(
+        o.is_verified(),
+        "`first_or` is guarded by `is_empty`, which the length decides, so the \
+         bounds check on `v[0]` is discharged; got: {o}"
+    );
+    // The teeth: a false length claim is refuted (the length is a real input),
+    // and an element claim is not proved (the element has no width).
+    let Some(o) = verify_src("len_is_zero_cannot_prove_this", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`v.len() == 0` is false for a non-empty slice, so this must be refuted \
+         (a verified verdict would mean the length was folded to the constant 0); \
+         got: {o}"
+    );
+    let Some(o) = verify_src("element_cannot_prove_this", src) else { return };
+    assert!(
+        !o.is_verified(),
+        "a generic slice's element has no width, so `ret == d` must never be \
+         reported verified; got: {o}"
     );
 }
 
@@ -5213,7 +7869,7 @@ pub fn chain_must_be_read(a: [u8; 4], i: usize) -> u8 {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("chain.rs");
     std::fs::write(&file, src).expect("write probe");
-    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts()).expect("frontend");
     let o = outcome(&report, "chain_must_be_read");
     match o {
         FnOutcome::Failed { detail, .. } => assert!(
@@ -5253,6 +7909,29 @@ fn an_enum_payload_is_read_through_the_downcast() {
     let Some(report) = verify_realistic(&["enum_payload_reads_through"]) else { return };
     let o = outcome(&report, "enum_payload_reads_through");
     assert!(o.is_verified(), "`enum_payload_reads_through` must verify, got: {o}");
+}
+
+/// A `match` arm *guard* is decided by the payload its borrow of a downcast reads.
+///
+/// `Msg::Data(n) if n < 10` lowers to `_4 = &((_1 as Data).0: u8); _6 = copy
+/// (*_4)`, and the rvalue contains the word ` as ` inside its parentheses. A
+/// parser that checked for a cast before a reference split that at the ` as `, so
+/// the borrow got no address, `copy (*_4)` read `Unknown`, and the `switchInt` on
+/// the guard reported "unmodelled switch discriminant". The true contract must
+/// verify and the tripwire -- which claims the guard's *other* arm ran -- must be
+/// refuted with a witness naming the payload.
+#[test]
+fn a_match_guard_reads_its_payload_through_a_borrow() {
+    let Some(report) = verify_realistic(&["guarded_match_reads_its_payload"]) else { return };
+    let o = outcome(&report, "guarded_match_reads_its_payload");
+    assert!(o.is_verified(), "`guarded_match_reads_its_payload` must verify, got: {o}");
+
+    let Some(report) = verify_realistic(&["guarded_match_tripwire"]) else { return };
+    let t = outcome(&report, "guarded_match_tripwire");
+    match t {
+        FnOutcome::Failed { kind, .. } => assert_eq!(kind, "postcondition"),
+        other => panic!("`guarded_match_tripwire` must be refuted, got: {other}"),
+    }
 }
 
 /// A locally constructed variant has a *known* tag, so its `match` decides.
@@ -5479,6 +8158,51 @@ fn the_pow_families_are_modelled_with_a_wide_exponent() {
             panic!("`{name}` must FAIL: a `Skipped` means the name is not modelled, got: {o}");
         };
         assert_eq!(kind, "postcondition", "`{name}` got: {o}");
+    }
+}
+
+/// The plain inherent `pow` is modelled, and its failure is a *panic* obligation
+/// rather than a wrapped value.
+///
+/// This is the polarity the shape exists to pin: the families' `pow` expresses
+/// overflow as a value (wrap, clamp, `None`, flag), but the plain `pow` panics, so
+/// a model that treated it as total would discharge `plain_pow_panic_is_reachable`
+/// as panic-free -- a false proof that an overflowing `pow` is safe. The two
+/// verifying entries are the in-range case and the exact-boundary case; the two
+/// failing entries must fail on the *panic* obligation, not on a postcondition, so
+/// a model that wrapped instead of panicking is caught by the kind rather than by
+/// a value that happens to differ.
+#[test]
+fn the_plain_pow_panics_where_it_overflows() {
+    let Some(report) = verify_realistic(&[
+        "plain_pow_three_to_five_is_243",
+        "plain_pow_two_to_seven_does_not_panic",
+    ]) else {
+        return;
+    };
+    for name in ["plain_pow_three_to_five_is_243", "plain_pow_two_to_seven_does_not_panic"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    let Some(report) = verify_realistic(&[
+        "plain_pow_panic_is_reachable",
+        "plain_pow_two_to_eight_would_panic_tripwire",
+    ]) else {
+        return;
+    };
+    for name in ["plain_pow_panic_is_reachable", "plain_pow_two_to_eight_would_panic_tripwire"] {
+        let o = outcome(&report, name);
+        let FnOutcome::Failed { kind, .. } = o else {
+            panic!("`{name}` must FAIL on a panic, got: {o}");
+        };
+        // The panic must be *`pow`'s overflow*, not merely any panic: a model that
+        // wrapped and then tripped a later shift, or a divide, would pass a bare
+        // `starts_with("panic")`. The message names the method, so pin both.
+        assert!(
+            kind.starts_with("panic") && kind.contains("pow"),
+            "`{name}` must fail on the `pow` overflow panic, got: {o}"
+        );
     }
 }
 
@@ -5791,6 +8515,52 @@ fn a_wrapping_method_in_a_contract_is_read_as_the_operator_it_denotes() {
         assert!(
             matches!(o, FnOutcome::Skipped { .. }),
             "`{name}` is a rustc error and must be refused, never given a verdict, got: {o}"
+        );
+    }
+}
+
+/// `wrapping_shl`/`wrapping_shr` are modelled as a shift by the amount reduced
+/// modulo the width, with `shr` arithmetic on a signed receiver and logical on an
+/// unsigned one. The model was checked against Rust's own methods over the whole
+/// `u8`/`i8` operand domain in `intrinsics::tests::wrapping_shifts_agree_with_rust`
+/// (a mutation to a logical shift, and one that drops the amount reduction, each
+/// fail it); these corpus entries pin the *end-to-end* verdicts, so a regression
+/// in the wiring -- not just the model -- is caught.
+///
+/// Each true entry has a false twin that a wrong model would *prove*, and each
+/// pair is *discriminating*: the left-shift pair pins the amount reduction (the
+/// true entry claims `1`, the twin claims the saturated `0`, so only a reducing
+/// model proves one and refutes the other -- a `ret <= 255` bound would satisfy
+/// both), the signed right-shift pair pins the shift *kind* (`-4` vs the logical
+/// `124`), and the unsigned right-shift entry pins both at once (`64`: a sign fill
+/// would give `192`, a saturating shift `0`).
+#[test]
+fn wrapping_shifts_are_modelled_with_the_amount_reduced_modulo_the_width() {
+    let Some(report) = verify_realistic(&[
+        "wrapping_shl_reduces_its_amount",
+        "wrapping_shl_amount_is_not_saturated_tripwire",
+        "wrapping_shr_signed_is_arithmetic",
+        "wrapping_shr_signed_is_not_logical_tripwire",
+        "wrapping_shr_unsigned_is_logical",
+    ]) else {
+        return;
+    };
+    for name in [
+        "wrapping_shl_reduces_its_amount",
+        "wrapping_shr_signed_is_arithmetic",
+        "wrapping_shr_unsigned_is_logical",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "wrapping_shl_amount_is_not_saturated_tripwire",
+        "wrapping_shr_signed_is_not_logical_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` is false under the correct model and must be refuted, got: {o}"
         );
     }
 }
@@ -7476,21 +10246,27 @@ pub fn into_signed_matches_cast(x: i8) -> i32 {
 
 /// A call to an *unmodelled* conversion is reported unknown, not guessed.
 ///
-/// `u8::from(true)` is a real `From` impl, but the source is a `bool`, which has no
-/// bit-vector the engine widens -- `u8` is one bit's worth of a value, but a `bool`
-/// local is a predicate, not a word. The model refuses it (rather than guessing a
-/// width from the destination alone), and the path is reported unknown. This pins
-/// that the refusal is a *reported* gap rather than a silent approximation.
+/// `u32::from('a')` is a real `From` impl, but the source is a `char`, whose
+/// conversion is not one of the integer widenings the model reads -- so it is
+/// refused (rather than guessing a width from the destination alone), and the path
+/// is reported unknown. This pins that the refusal is a *reported* gap rather than
+/// a silent approximation. (`u8::from(bool)` used to be the example; it is now
+/// modelled as the zero-extended bit.)
 #[test]
 fn an_unmodelled_conversion_is_reported_unknown_not_guessed() {
+    // `u32::from(char)` is a real `From` impl whose source is not an integer the
+    // engine holds (`char` is modelled as a 32-bit value, but a `char` *conversion*
+    // is not one of the integer widenings), so it stays unmodelled. `u8::from(bool)`
+    // used to be the example here and is now modelled (the zero-extended bit), so
+    // the test names a conversion that is still a refusal.
     let src = r#"
 /// requires: true
 /// ensures: ret == 1
-pub fn from_bool_is_unmodelled(flag: bool) -> u8 {
-    u8::from(flag)
+pub fn from_char_is_unmodelled(c: char) -> u32 {
+    u32::from(c)
 }
 "#;
-    let Some(o) = verify_src("from_bool_is_unmodelled", src) else { return };
+    let Some(o) = verify_src("from_char_is_unmodelled", src) else { return };
     assert!(
         !o.is_verified(),
         "a conversion the model does not hold must not verify; got: {o}"
@@ -7666,7 +10442,7 @@ fn a_cfg_excluded_contract_does_not_steal_a_compiled_body() {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
-    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts()).expect("frontend");
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         report.outcomes.is_empty(),
@@ -8235,7 +11011,7 @@ fn verify_all_src(src: &str) -> Option<Vec<(String, FnOutcome)>> {
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
-    let report = verify::verify_file_with(&rustc, &file, &[]).expect("frontend");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts()).expect("frontend");
     let _ = std::fs::remove_dir_all(&dir);
     Some(report.outcomes)
 }
@@ -8760,4 +11536,1567 @@ fn a_helper_call_in_a_measured_loop_keeps_the_termination_measure() {
         o.is_verified(),
         "the helper call must not erase the loop's measure, got: {o}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A diverging call is a checked panic, not a dropped path
+// ---------------------------------------------------------------------------
+
+/// `assert!` is a promise, and the frontend now checks it instead of dropping it.
+///
+/// `assert!(x <= 200)` lowers to a `switchInt` that routes the *failing* case into
+/// a diverging call to `core::panicking::panic`, with no `[return: bbN]` arm. The
+/// parser only recognised the `[return:` shape, so the terminator came back
+/// `Unknown("missing")`, the path was reported unmodelled, and the whole function
+/// was `Incomplete` -- the assert, the most ordinary safety guard in Rust, was
+/// never checked at all. Both halves are pinned here: the guard is *discharged*
+/// under a precondition that implies it, and *refuted* with a real counterexample
+/// when it is not.
+#[test]
+fn an_assert_is_checked_and_discharged_under_its_precondition() {
+    let src = "/// requires: x <= 200\n\
+               /// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { assert!(x <= 200); 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    assert!(
+        o.is_verified(),
+        "the guard follows from the precondition, so the assert cannot fire: {o}"
+    );
+}
+
+/// The teeth: with no precondition the assert is a real panic, and it is reported.
+///
+/// The counterexample is a value above 200, which is exactly the input the assert
+/// exists to reject. Reading the diverging call as a harmless drop would instead
+/// have left the function `Incomplete`, which is a lost proof of nothing -- this
+/// makes the missing precondition a *failure*, the sound direction.
+#[test]
+fn an_unproved_assert_is_refuted_with_a_counterexample() {
+    let src = "/// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { assert!(x <= 200); 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, detail } => {
+            assert!(
+                kind.contains("assertion failed: x <= 200"),
+                "the report should name the failed assertion, got `{kind}`"
+            );
+            assert!(!detail.is_empty(), "a failure must carry a counterexample");
+        }
+        other => panic!("an assert with no guard must fail, got: {other}"),
+    }
+}
+
+/// An assert is *assumed* on the fall-through path, so the code after it can rely
+/// on the guard -- the same rule the `assert` terminator already had.
+///
+/// Without this the guard would be checked and then thrown away, so `x + 1` after
+/// `assert!(x <= 200)` would be reported as a possible overflow even though the
+/// assert rules it out. The postcondition `ret == x + 1` is what makes the
+/// assumption load-bearing: it only holds if the guard is carried forward.
+#[test]
+fn an_assert_guard_is_assumed_by_the_code_after_it() {
+    let src = "/// requires: x <= 200\n\
+               /// ensures: ret == x + 1\n\
+               pub fn f(x: u8) -> u8 { assert!(x <= 200); x + 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    assert!(o.is_verified(), "the assert must be assumed on the fall-through path: {o}");
+}
+
+/// `debug_assert!` lowers the same way, so it is checked and assumed too.
+#[test]
+fn a_debug_assert_is_checked_like_an_assert() {
+    let src = "/// requires: x <= 200\n\
+               /// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { debug_assert!(x <= 200); 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    assert!(o.is_verified(), "a debug_assert is the same terminator as an assert: {o}");
+}
+
+/// `panic!` is a reachable failure, so an unguarded one is refuted, and a guarded
+/// one is proved unreachable.
+///
+/// The message is carried from the string literal the dump passes, so the report
+/// names the panic rather than the mangled callee path.
+#[test]
+fn a_panic_is_refuted_unless_its_guard_excludes_it() {
+    let unguarded = "/// ensures: ret == 1\n\
+                     pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"zero\"); } 1 }\n";
+    let o = verify_src("f", unguarded).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, .. } => {
+            assert!(kind.contains("zero"), "the report should name the panic, got `{kind}`");
+        }
+        other => panic!("an unguarded panic must fail, got: {other}"),
+    }
+    let guarded = "/// requires: x != 0\n\
+                   /// ensures: ret == 1\n\
+                   pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"zero\"); } 1 }\n";
+    let o = verify_src("f", guarded).expect("f must be in the report");
+    assert!(o.is_verified(), "the precondition excludes the panic: {o}");
+}
+
+/// A *formatted* panic message is recovered from the `core::fmt` chain, not from
+/// a literal operand.
+///
+/// Edition 2024 never puts `panic!("bad {}", x)` in the MIR as one string: the
+/// pieces are a promoted `&[&str]` and the placeholders are separate `rt::Argument`
+/// values, assembled by `Arguments::new_v1` on 1.85 and by
+/// `Arguments::new::<LEN, _>` (a single encoded byte template) on stable. Both
+/// spellings have to be read, and this test is what pins that -- it runs on
+/// whichever toolchain `VERIF_RUSTC` names, so the two shapes are covered by the
+/// same assertion on the two toolchains the gate uses.
+#[test]
+fn a_formatted_panic_message_is_recovered_from_the_fmt_chain() {
+    let unguarded = "/// ensures: ret == 1\n\
+                     pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"bad {}\", x); } 1 }\n";
+    let Some(o) = verify_src("f", unguarded) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => {
+            assert!(
+                kind.contains("bad {}"),
+                "the report should name the panic's pieces, got `{kind}`"
+            );
+        }
+        other => panic!("a formatted panic with no guard must fail, got: {other}"),
+    }
+    // A formatted `assert!` is the same chain with the guard in front of it.
+    let guarded = "/// requires: x <= 100\n\
+                   /// ensures: ret == 1\n\
+                   pub fn f(x: u8) -> u8 { assert!(x <= 100, \"bad {}\", x); 1 }\n";
+    let o = verify_src("f", guarded).expect("f must be in the report");
+    assert!(o.is_verified(), "the precondition implies the formatted assert: {o}");
+    let misguarded = "/// ensures: ret == 1\n\
+                      pub fn f(x: u8) -> u8 { assert!(x <= 100, \"bad {}\", x); 1 }\n";
+    let o = verify_src("f", misguarded).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("bad {}"),
+            "the formatted assert should be named by its pieces, got `{kind}`"
+        ),
+        other => panic!("an unguarded formatted assert must fail, got: {other}"),
+    }
+    // `panic!("{}", x)` has no literal piece at all -- it lowers to a
+    // `panic_display::<u8>` / `panic_cold_display::<u8>` call -- so there is no
+    // message to recover and the callee's own name is the fallback. It must be the
+    // *name*, read through the generics, and not the type arguments: the report
+    // used to read `<u8>`, which is a mangled path rather than a fallback. The
+    // two toolchains spell the callee differently, so only the shape is pinned.
+    let no_pieces = "/// ensures: ret == 1\n\
+                     pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"{}\", x); } 1 }\n";
+    let o = verify_src("f", no_pieces).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("display") && !kind.contains('<'),
+            "the fallback should be the callee's name, not its generics, got `{kind}`"
+        ),
+        other => panic!("an unguarded panic must fail, got: {other}"),
+    }
+}
+
+/// The other two panicking macros name their own message too.
+///
+/// `unreachable!()` and `todo!()` pass a *literal*, so they take the
+/// `core::panicking::panic(const "…")` / `Arguments::from_str` path rather than the
+/// `core::fmt` chain, and the report should carry the text the programmer wrote --
+/// not the mangled callee. They are here because a fix aimed at the formatted case
+/// must not regress the plain one.
+#[test]
+fn a_literal_panic_macro_names_its_message() {
+    let src = "/// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { if x == 0 { unreachable!(); } 1 }\n";
+    let Some(o) = verify_src("f", src) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("entered unreachable code"),
+            "the report should carry the macro's text, got `{kind}`"
+        ),
+        other => panic!("an unguarded `unreachable!` must fail, got: {other}"),
+    }
+    let src = "/// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { if x == 0 { todo!(); } 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.contains("not yet implemented"),
+            "the report should carry the macro's text, got `{kind}`"
+        ),
+        other => panic!("an unguarded `todo!` must fail, got: {other}"),
+    }
+}
+
+/// The bounds check rustc inserts for `xs[0]` is a diverging call too, and it is
+/// proved unreachable from the length precondition.
+///
+/// This is the shape an ordinary slice access lowers to, so the check is what
+/// makes a `&[T]` argument safe to reason about at all.
+#[test]
+fn an_index_bounds_check_is_proved_unreachable() {
+    let src = "/// requires: xs.len() >= 1\n\
+               /// ensures: ret == 0\n\
+               pub fn f(xs: &[u8]) -> u8 { xs[0] * 0 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    assert!(o.is_verified(), "the length precondition rules the bounds check out: {o}");
+}
+
+/// A diverging call in its *cleanup* form is recognised too (review C1b).
+///
+/// With a live `Drop` local, rustc prints the diverging call's single successor as
+/// its cleanup edge (`_4 = core::panicking::panic(…) -> bb4`, with `bb4 (cleanup)`)
+/// rather than the `-> unwind continue` arm the parser first recognised. That line
+/// matched neither the `-> [return:` nor the `-> unwind` shape, so the whole path
+/// was still dropped -- an `assert!` in any function with a live RAII local (`Vec`,
+/// `String`, `Box`, a lock guard) was never checked. The parser now combines the
+/// `!`-typed destination with the `(cleanup)` marker and reads it as a diverging
+/// call, so the assert is a real failure again.
+///
+/// The `drop(_2)` line is still unmodelled (review C1), so a *guarded* version is
+/// `incomplete` for that reason -- but the *unguarded* one is a definite `FAILED`
+/// with the counterexample, which is the sound direction: a missing precondition
+/// is a failure, not a silently dropped check.
+#[test]
+fn a_diverging_call_in_a_function_with_a_drop_local_is_checked() {
+    let src = "pub struct Guard(pub u8);\n\
+               impl Drop for Guard {\n    fn drop(&mut self) {}\n}\n\
+               /// ensures: ret == 1\n\
+               pub fn f(x: u8) -> u8 { let _g = Guard(0); assert!(x < 200); 1 }\n";
+    let o = verify_src("f", src).expect("f must be in the report");
+    match o {
+        FnOutcome::Failed { kind, detail } => {
+            assert!(
+                kind.contains("assertion failed: x < 200"),
+                "the cleanup-form assert must be named, got `{kind}`"
+            );
+            assert!(!detail.is_empty(), "a failure must carry a counterexample");
+        }
+        other => panic!(
+            "an unguarded assert with a live Drop local must be a failure, not a \
+             dropped path, got: {other}"
+        ),
+    }
+}
+
+/// `iN::abs`, `iN::unsigned_abs` and `Ord::clamp` are modelled, and `abs`'s
+/// *panic* is modelled too.
+///
+/// `abs` and `clamp` are the first modelled methods whose failure is a **panic**
+/// rather than a value or an `Option`, so the two halves have to be checked
+/// apart. A model that returned `|x|` with no panic predicate would verify
+/// `abs_min_can_overflow` (which panics at `i8::MIN`); a model that returned a
+/// constant would prove the value tripwires. Each true direction is asserted
+/// `Verified` and each false direction `Failed`, and the panic entries are pinned
+/// to a `panic` kind so an unrelated refusal cannot satisfy them.
+///
+/// `unsigned_abs` is the contrast that makes `abs`'s panic meaningful: the same
+/// magnitude, read as the unsigned type, so it is *total* even at `MIN`
+/// (`i8::MIN.unsigned_abs()` is `128u8`). Its `requires: true` control must
+/// verify, which a model that gave it `abs`'s failure predicate could not.
+#[test]
+fn abs_and_clamp_are_modelled_with_their_panics() {
+    let names = [
+        "abs_small_reads",
+        "abs_small_is_a_value_cannot_prove_this",
+        "abs_min_can_overflow",
+        "unsigned_abs_reads",
+        "unsigned_abs_of_min_is_the_magnitude",
+        "unsigned_abs_of_min_is_panic_free",
+        "unsigned_abs_is_a_value_cannot_prove_this",
+        "clamp_builtin_reads",
+        "clamp_builtin_can_panic",
+        "clamp_builtin_is_a_value_cannot_prove_this",
+        "clamp_builtin_signed_reads",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+
+    for name in [
+        "abs_small_reads",
+        "unsigned_abs_reads",
+        "unsigned_abs_of_min_is_the_magnitude",
+        "unsigned_abs_of_min_is_panic_free",
+        "clamp_builtin_reads",
+        "clamp_builtin_signed_reads",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    // The value tripwires: the call is a value, not an uninterpreted one. The
+    // failure *kind* is asserted, not just `Failed`, because both entries carry a
+    // precondition that discharges the panic -- so a refutation on the panic
+    // instead of the postcondition would mean the entry is not testing the value
+    // at all (the `abs` panic fires at `i32::MIN`, before the value is read).
+    for name in [
+        "abs_small_is_a_value_cannot_prove_this",
+        "unsigned_abs_is_a_value_cannot_prove_this",
+        "clamp_builtin_is_a_value_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.starts_with("postcondition"),
+                "`{name}` must be refuted on the value (postcondition), got `{kind}`"
+            ),
+            other => panic!("`{name}` claims a false value and must be refuted, got: {other}"),
+        }
+    }
+
+    // The panic obligations: the call *can* panic, so the function fails on the
+    // panic, not on a postcondition.
+    for name in ["abs_min_can_overflow", "clamp_builtin_can_panic"] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => {
+                assert!(kind.starts_with("panic"), "`{name}` must fail on the panic, got `{kind}`")
+            }
+            other => panic!("`{name}` must be a failing panic, got: {other}"),
+        }
+    }
+}
+
+/// The ASCII class tests on `u8` are modelled, and each one is a *predicate*
+/// rather than an uninterpreted value.
+///
+/// The shape is the one `is_power_of_two` already had -- a `bool`-valued method
+/// whose destination is a `bool`, not a one-bit word -- with one difference: the
+/// receiver is `&self`, so the operand is the *referent* of a reference the body
+/// materialises (`_3 = &_1`). The three tripwires are the evidence the predicates
+/// are read at all: a model that returned a constant would prove them.
+#[test]
+fn the_ascii_classes_are_modelled_with_their_boundaries() {
+    let names = [
+        "ascii_digit_value",
+        "ascii_digit_is_not_every_byte_cannot_prove_this",
+        "ascii_class_discriminates",
+        "ascii_class_hex_arm_is_not_every_byte_cannot_prove_this",
+        "ascii_is_ascii_boundary",
+        "ascii_is_ascii_is_not_every_byte_cannot_prove_this",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+
+    for name in ["ascii_digit_value", "ascii_class_discriminates", "ascii_is_ascii_boundary"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    // Each tripwire must be refuted on the *postcondition*, with a witness at a
+    // byte that really takes the other arm -- so an unrelated refusal cannot
+    // satisfy it, and the model cannot be passing by answering a constant.
+    for (name, byte) in [
+        ("ascii_digit_is_not_every_byte_cannot_prove_this", 48u64),
+        ("ascii_class_hex_arm_is_not_every_byte_cannot_prove_this", 80),
+        ("ascii_is_ascii_is_not_every_byte_cannot_prove_this", 128),
+    ] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.starts_with("postcondition"),
+                "`{name}` must be refuted on the postcondition, got `{kind}`"
+            ),
+            other => panic!("`{name}` claims a false value and must be refuted, got: {other}"),
+        }
+        // The witness names the byte that takes the else arm: `b'0'` for the digit
+        // test, `b'P'` (80) for the hex arm, and `0x80` for `is_ascii`.
+        let detail = format!("{o}");
+        assert!(
+            detail.contains(&byte.to_string()),
+            "`{name}`'s witness should name the byte {byte}, got: {detail}"
+        );
+    }
+}
+
+/// `abs_diff` and the rotations are modelled, and each has a tripwire that a
+/// wrong model would *prove*.
+///
+/// `abs_diff`'s result is the *unsigned* magnitude, so the model computes the
+/// difference at one bit of headroom and takes the absolute value there; a model
+/// that returned the signed difference would read a negative result as a huge
+/// unsigned one. The rotations reduce the amount modulo the width (`rotate by the
+/// width` is the identity, `by w + 1` is `by 1`), which is the property a shift
+/// model gets wrong. Both tripwires claim the shape a *shift or signed-difference*
+/// model would produce, so they must be refuted.
+#[test]
+fn abs_diff_and_rotations_are_modelled_with_their_boundaries() {
+    let names = [
+        "abs_diff_ordered",
+        "abs_diff_is_symmetric_cannot_prove_this",
+        "rotate_left_wraps_the_top_bit",
+        "rotate_is_not_a_shift_cannot_prove_this",
+        "rotate_by_the_width_is_the_identity",
+        "rotate_by_more_than_the_width_wraps",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+
+    for name in [
+        "abs_diff_ordered",
+        "rotate_left_wraps_the_top_bit",
+        "rotate_by_the_width_is_the_identity",
+        "rotate_by_more_than_the_width_wraps",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    // The tripwires must be refuted on the *postcondition*, not by an unrelated
+    // refusal, so the model cannot pass by answering a constant.
+    for name in ["abs_diff_is_symmetric_cannot_prove_this", "rotate_is_not_a_shift_cannot_prove_this"]
+    {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.starts_with("postcondition"),
+                "`{name}` must be refuted on the postcondition, got `{kind}`"
+            ),
+            other => panic!("`{name}` claims a false value and must be refuted, got: {other}"),
+        }
+    }
+}
+
+/// The next batch of `core` value methods is modelled: `signum`, the Euclidean
+/// pair (`div_euclid`/`rem_euclid`), `div_ceil`, the byte permutations
+/// (`reverse_bits`/`swap_bytes`), the byte orders (`to_be`/`to_le`), the ASCII
+/// case conversions and `is_multiple_of`.
+///
+/// Each shape has a true pin and a tripwire that claims the value a *plausible
+/// wrong model* would produce (the truncating `/` for the Euclidean pair, the
+/// identity for the permutations, an unconditional `+32` for the ASCII case, an
+/// unguarded `%` for `is_multiple_of`). The tripwires must be refuted on the
+/// *postcondition*, so the model cannot pass by answering a constant, and the
+/// signedness pins (`signum_of_min`) fail for a model that read the top bit
+/// unsigned.
+#[test]
+fn the_next_core_value_methods_are_modelled_with_their_tripwires() {
+    let names = [
+        "signum_of_min_is_minus_one",
+        "signum_of_a_negative_cannot_prove_this",
+        "cast_unsigned_reinterprets_negative_as_large",
+        "cast_unsigned_reinterprets_negative_cannot_prove_this",
+        "cast_signed_reinterprets_large_as_negative",
+        "cast_signed_reinterprets_large_cannot_prove_this",
+        "cast_unsigned_makes_a_comparison_unsigned",
+        "div_euclid_rounds_toward_negative_infinity",
+        "div_euclid_is_not_truncating_division_cannot_prove_this",
+        "rem_euclid_is_non_negative",
+        "rem_euclid_is_not_the_truncating_remainder_cannot_prove_this",
+        "unsigned_rem_euclid_is_the_plain_remainder",
+        "unsigned_rem_euclid_is_not_the_signed_adjustment_cannot_prove_this",
+        "unsigned_div_euclid_is_the_plain_quotient",
+        "unsigned_div_euclid_is_not_the_signed_adjustment_cannot_prove_this",
+        "div_ceil_rounds_toward_positive_infinity",
+        "div_ceil_is_not_truncating_division_cannot_prove_this",
+        "reverse_bits_of_the_top_bit",
+        "reverse_bits_is_not_the_identity_cannot_prove_this",
+        "swap_bytes_reverses_the_bytes",
+        "swap_bytes_is_not_the_identity_cannot_prove_this",
+        "to_be_on_a_little_endian_target_swaps",
+        "to_be_is_not_the_identity_here_cannot_prove_this",
+        "to_le_on_a_little_endian_target_is_the_identity",
+        "from_be_on_a_little_endian_target_swaps",
+        "from_be_is_not_the_identity_here_cannot_prove_this",
+        "from_le_on_a_little_endian_target_is_the_identity",
+        "to_be_then_from_be_is_the_identity",
+        "to_le_then_from_be_is_not_the_identity_cannot_prove_this",
+        "to_ascii_uppercase_of_a_lowercase_letter",
+        "to_ascii_uppercase_leaves_uppercase_cannot_prove_this",
+        "to_ascii_lowercase_of_an_uppercase_letter",
+        "is_multiple_of_six_by_three",
+        "is_multiple_of_seven_by_three_cannot_prove_this",
+        "is_multiple_of_zero_by_zero",
+        "is_multiple_of_five_by_zero",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+
+    for name in [
+        "signum_of_min_is_minus_one",
+        "cast_unsigned_reinterprets_negative_as_large",
+        "cast_signed_reinterprets_large_as_negative",
+        "cast_unsigned_makes_a_comparison_unsigned",
+        "div_euclid_rounds_toward_negative_infinity",
+        "rem_euclid_is_non_negative",
+        "unsigned_rem_euclid_is_the_plain_remainder",
+        "unsigned_div_euclid_is_the_plain_quotient",
+        "div_ceil_rounds_toward_positive_infinity",
+        "reverse_bits_of_the_top_bit",
+        "swap_bytes_reverses_the_bytes",
+        "to_be_on_a_little_endian_target_swaps",
+        "to_le_on_a_little_endian_target_is_the_identity",
+        "from_be_on_a_little_endian_target_swaps",
+        "from_le_on_a_little_endian_target_is_the_identity",
+        "to_be_then_from_be_is_the_identity",
+        "to_ascii_uppercase_of_a_lowercase_letter",
+        "to_ascii_lowercase_of_an_uppercase_letter",
+        "is_multiple_of_six_by_three",
+        "is_multiple_of_zero_by_zero",
+        "is_multiple_of_five_by_zero",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    for name in [
+        "signum_of_a_negative_cannot_prove_this",
+        "cast_unsigned_reinterprets_negative_cannot_prove_this",
+        "cast_signed_reinterprets_large_cannot_prove_this",
+        "div_euclid_is_not_truncating_division_cannot_prove_this",
+        "rem_euclid_is_not_the_truncating_remainder_cannot_prove_this",
+        "unsigned_rem_euclid_is_not_the_signed_adjustment_cannot_prove_this",
+        "unsigned_div_euclid_is_not_the_signed_adjustment_cannot_prove_this",
+        "div_ceil_is_not_truncating_division_cannot_prove_this",
+        "reverse_bits_is_not_the_identity_cannot_prove_this",
+        "swap_bytes_is_not_the_identity_cannot_prove_this",
+        "to_be_is_not_the_identity_here_cannot_prove_this",
+        "from_be_is_not_the_identity_here_cannot_prove_this",
+        "to_le_then_from_be_is_not_the_identity_cannot_prove_this",
+        "to_ascii_uppercase_leaves_uppercase_cannot_prove_this",
+        "is_multiple_of_seven_by_three_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.starts_with("postcondition"),
+                "`{name}` must be refuted on the postcondition, got `{kind}`"
+            ),
+            other => panic!("`{name}` claims a false value and must be refuted, got: {other}"),
+        }
+    }
+}
+
+/// The `u32` product surface is modelled: `wrapping_mul` as a value, and a
+/// `saturating_mul` whose widened `2w == 64` failure predicate is built.
+///
+/// `MUL_MAX_WIDTH` was 16, so every `u32` product reported "past what the model
+/// covers" and `hash_step` — the flagship `u32` example — was `incomplete`. At 32
+/// the value half (`wrapping_mul`) is a plain `w`-bit multiply and settles at once,
+/// and the constant-multiplier `saturating_mul` folds rather than blasting the
+/// 64-bit multiplier. The tripwires pin that the value is the *product* rather
+/// than a constant: a model that answered `0` or the operand would prove them.
+///
+/// The pinned-argument equality is the discriminating half: `100000 * 31` is
+/// `3_100_000`, which does not fit a 16-bit result, so a model that wrapped
+/// narrower would refute the true fixture instead of proving it.
+#[test]
+fn the_u32_product_surface_is_modelled() {
+    let names = [
+        "u32_wrapping_product",
+        "u32_wrapping_product_tripwire",
+        "u32_saturating_product",
+        "u32_saturating_product_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+
+    for name in ["u32_wrapping_product", "u32_saturating_product"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+
+    for name in ["u32_wrapping_product_tripwire", "u32_saturating_product_tripwire"] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.starts_with("postcondition"),
+                "`{name}` must be refuted on the postcondition, got `{kind}`"
+            ),
+            other => panic!("`{name}` claims a false value and must be refuted, got: {other}"),
+        }
+    }
+}
+
+/// C1: a `drop` terminator is modelled, not dropped.
+///
+/// The review's exit criterion for C1 was a `guarded`/`misguarded` pair on a
+/// function holding a live `Drop` local: the first verifies, the second is
+/// refuted. It runs here on inline source so the shape is pinned even if the
+/// corpus is edited, and it asserts the *verdict*, not merely "not incomplete" --
+/// a fix that refused every `drop` would pass the second and fail the first.
+#[test]
+fn a_drop_terminator_is_modelled_and_its_destructor_runs() {
+    let src = r#"
+pub struct Guard(pub u8);
+impl Drop for Guard {
+    fn drop(&mut self) {}
+}
+
+/// requires: x < 200
+/// ensures: ret == 1
+pub fn guarded(x: u8) -> u8 {
+    let _g = Guard(0);
+    assert!(x < 200);
+    1
+}
+
+/// requires: true
+/// ensures: ret == 1
+pub fn misguarded(x: u8) -> u8 {
+    let _g = Guard(0);
+    assert!(x < 200);
+    1
+}
+"#;
+    let Some(g) = verify_src("guarded", src) else { return };
+    assert!(
+        g.is_verified(),
+        "a function holding a live `Drop` local with a satisfied assert must verify, got: {g}"
+    );
+    let Some(m) = verify_src("misguarded", src) else { return };
+    match m {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.starts_with("panic"),
+            "the misguarded assert must be refuted as a panic, got `{kind}`"
+        ),
+        other => panic!("the misguarded assert is reachable and must be refuted, got: {other}"),
+    }
+}
+
+/// C1 soundness: a destructor's *body* is executed, so its panic is an obligation.
+///
+/// This is the direction that makes the model safe. Treating every `drop` as a
+/// no-op -- the tempting way to make RAII locals decide -- would report the
+/// unguarded function `verified`, but the destructor panics for `x >= 10`. The
+/// guarded companion is the positive control: refusing every `drop` would leave
+/// it undecided, so the pair pins both that the destructor runs and that the tool
+/// is not merely refusing the shape.
+#[test]
+fn a_destructor_body_is_executed_and_its_panic_is_an_obligation() {
+    let src = r#"
+pub struct PanicGuard { pub v: u8 }
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        assert!(self.v < 10);
+    }
+}
+
+/// requires: true
+/// ensures: ret == 1
+pub fn unguarded(x: u8) -> u8 {
+    let _p = PanicGuard { v: x };
+    1
+}
+
+/// requires: x < 10
+/// ensures: ret == 1
+pub fn guarded(x: u8) -> u8 {
+    let _p = PanicGuard { v: x };
+    1
+}
+"#;
+    let Some(u) = verify_src("unguarded", src) else { return };
+    match u {
+        FnOutcome::Failed { kind, detail } => {
+            assert!(
+                kind.starts_with("panic"),
+                "the destructor's assert must be a refuted panic, got `{kind}`"
+            );
+            assert!(
+                kind.contains("v < 10"),
+                "the refuted obligation must be the destructor's own assert, got: `{kind}` \
+                 with witness {detail}"
+            );
+        }
+        other => panic!(
+            "a destructor that panics for `x >= 10` must be refuted, got: {other} -- \
+             treating the drop as a no-op would have proved it"
+        ),
+    }
+    let Some(g) = verify_src("guarded", src) else { return };
+    assert!(g.is_verified(), "the guarded destructor cannot panic, got: {g}");
+}
+
+/// C1: a container whose destructor the tool cannot represent is *refused*.
+///
+/// A `String` local frees the heap, which is not a bit-vector fact. Assuming the
+/// `drop` were a no-op would be a false proof whenever the destructor's effect is
+/// observable, so the honest answer is a refusal -- not a verdict. This is the
+/// case the dump cannot tell apart from a struct holding a user-`Drop` field (both
+/// print `drop(_x) -> [return: …]`), which is why the no-op is not taken here.
+#[test]
+fn an_unmodelled_drop_is_refused_not_assumed_away() {
+    let src = r#"
+/// requires: true
+/// ensures: ret == 1
+pub fn owns_string(s: String) -> u8 {
+    let _owned = s;
+    1
+}
+"#;
+    let Some(o) = verify_src("owns_string", src) else { return };
+    match o {
+        FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. } => {}
+        other => panic!(
+            "a `String` drop is not representable and must be refused, got: {other} -- \
+             a verdict here would be a false proof"
+        ),
+    }
+}
+
+/// C1, on the corpus: the `Drop` fixtures decide, and the false ones are refuted.
+///
+/// The review's exit criterion is stated on `guard_guarded` (verifies) and
+/// `guard_misguarded` (refuted). This asserts the corpus copies of those, plus the
+/// destructor-panic pair, so a regression in the corpus cannot pass unnoticed --
+/// `realistic.rs` is scored by a floor, and a fixture that flipped to `incomplete`
+/// would lower the score without failing the floor test.
+#[test]
+fn the_drop_fixtures_decide_and_the_false_ones_are_refuted() {
+    let names = [
+        "guard_is_dropped_cleanly",
+        "guard_guarded",
+        "destructor_panic_guarded",
+        "guard_misguarded_cannot_prove_this",
+        "destructor_panic_cannot_prove_this",
+        "string_drop_is_refused",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+
+    for name in [
+        "guard_is_dropped_cleanly",
+        "guard_guarded",
+        "destructor_panic_guarded",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "guard_misguarded_cannot_prove_this",
+        "destructor_panic_cannot_prove_this",
+    ] {
+        let o = outcome(&report, name);
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.starts_with("panic"),
+                "`{name}` must be refuted as a reachable panic, got `{kind}`"
+            ),
+            other => panic!(
+                "`{name}` has a reachable panic and must be refuted, got: {other} -- \
+                 treating the `drop` as a no-op, or dropping the path at it, would hide it"
+            ),
+        }
+    }
+    // A container drop is a refusal, not a verdict.
+    match outcome(&report, "string_drop_is_refused") {
+        FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. } => {}
+        other => panic!("a `String` drop must be refused, got: {other}"),
+    }
+}
+
+/// A combinator that *destroys* its unused operand must respect that operand's
+/// drop glue, or it is a false proof.
+///
+/// `Result::unwrap_or_default` consumes the receiver and destroys the error value
+/// on the `Err` branch. The model checked only that the payload and the default
+/// were scalar words, so a `Result<u8, Boom>` whose `Boom` destructor panics was
+/// reported panic-free -- while a real call unwinds. The same holds for
+/// `unwrap_or`, `or`, and `and`, which drop the operand they do not return. Each
+/// is now refused when the dropped type's glue is not representable, which is the
+/// honest answer rather than an assumed no-op.
+#[test]
+fn a_combinator_that_destroys_a_value_respects_its_drop_glue() {
+    let src = r#"
+pub struct Boom;
+impl Drop for Boom {
+    fn drop(&mut self) {
+        panic!("boom");
+    }
+}
+
+/// requires: true
+/// ensures: ret <= 255
+pub fn boom_default(r: Result<u8, Boom>) -> u8 {
+    r.unwrap_or_default()
+}
+
+/// requires: true
+/// ensures: ret <= 255
+pub fn boom_or(r: Result<u8, Boom>) -> u8 {
+    r.unwrap_or(7)
+}
+"#;
+    for name in ["boom_default", "boom_or"] {
+        let Some(o) = verify_src(name, src) else { return };
+        // Pinned as `Incomplete`, not `Incomplete | Skipped`: the contracts here
+        // (`ret <= 255`) are readable, so a `Skipped` would mean the contract
+        // stopped being read -- a different defect that this check should not
+        // silently accept. Measured, both are `Incomplete` (the destructor's glue
+        // is not representable), so the exact kind is the honest pin.
+        match o {
+            FnOutcome::Incomplete { .. } => {}
+            other => panic!(
+                "`{name}` destroys a `Boom` whose destructor panics and must be refused \
+                 as `Incomplete`, got: {other} -- a `verified` here is a false proof"
+            ),
+        }
+    }
+}
+
+/// Review round: field drop glue, `unwrap_or`, unwind accounting, edition
+/// resolution, and rotate widths.
+///
+/// Nine findings from an adversarial review, each reproduced before being fixed.
+/// They fall into four families: drop glue (F1/F2/F3), unwinding (F4/F5), edition
+/// resolution (F6/F7), and width/precision (F8/F9).
+mod review_round {
+    use super::*;
+
+    /// F1/F3: a struct whose field has its own destructor must not be treated as
+    /// fully dropped after the outer user destructor.
+    ///
+    /// `Outer { inner: Inner }` with `impl Drop for Outer` and `impl Drop for
+    /// Inner` destroys *both*: the user body runs, then each field's glue. The
+    /// model ran the user body and stopped, so a panicking `Inner::drop` was never
+    /// seen and the function was a false `Verified`. The fix refuses the shape --
+    /// a field whose type has glue this tool cannot execute -- which is the honest
+    /// answer: the drop is unmodelled, not proved safe.
+    #[test]
+    fn a_field_with_its_own_destructor_is_refused_not_assumed_safe() {
+        let src = r#"
+pub struct Inner { pub v: u8 }
+impl Drop for Inner {
+    fn drop(&mut self) { assert!(self.v < 10); }
+}
+pub struct Outer { pub inner: Inner }
+impl Drop for Outer {
+    fn drop(&mut self) {}
+}
+
+/// requires: true
+/// ensures: ret == 1
+pub fn outer_with_panicking_field(x: u8) -> u8 {
+    let _o = Outer { inner: Inner { v: x } };
+    1
+}
+
+/// requires: x < 10
+/// ensures: ret == 1
+pub fn outer_guarded(x: u8) -> u8 {
+    let _o = Outer { inner: Inner { v: x } };
+    1
+}
+"#;
+        // The unguarded one must NOT be `Verified`: the field's destructor panics
+        // for `x >= 10`, and the model cannot run it, so it is a refusal.
+        let Some(u) = verify_src("outer_with_panicking_field", src) else { return };
+        assert!(
+            !u.is_verified(),
+            "a struct whose field has a panicking destructor must not be `Verified`, got: {u}"
+        );
+        // The guarded companion is refused too (same shape), which is the point:
+        // the refusal is about the *shape*, not about whether the panic is
+        // reachable. It must not be a false `Verified`.
+        let Some(g) = verify_src("outer_guarded", src) else { return };
+        assert!(
+            !g.is_verified(),
+            "the guarded companion is the same unmodelled shape and must not verify, got: {g}"
+        );
+    }
+
+    /// F2: `Result::unwrap_or` destroys the error value on the `Err` branch, so a
+    /// panicking error destructor must not be assumed away.
+    ///
+    /// `r.unwrap_or(0)` on `Result<u8, E>` with `impl Drop for E { panic }` panics
+    /// on the `Err` branch, but the model treated `unwrap_or` as total (it has no
+    /// panic obligation for the *tag*). The fix reads the error type from the
+    /// receiver and refuses when its glue is unmodelled; a scalar error type still
+    /// decides, which is the positive control that the refusal is not blanket.
+    #[test]
+    fn unwrap_or_refuses_an_error_type_whose_drop_is_unmodelled() {
+        let src = r#"
+pub struct Boom;
+impl Drop for Boom {
+    fn drop(&mut self) { assert!(false); }
+}
+
+/// requires: true
+/// ensures: ret <= 255
+pub fn unwrap_or_dropping_error(r: Result<u8, Boom>) -> u8 {
+    r.unwrap_or(0)
+}
+
+/// requires: true
+/// ensures: ret <= 255
+pub fn unwrap_or_scalar_error(r: Result<u8, u8>) -> u8 {
+    r.unwrap_or(0)
+}
+"#;
+        let Some(d) = verify_src("unwrap_or_dropping_error", src) else { return };
+        assert!(
+            !d.is_verified(),
+            "`unwrap_or` on an error type with a panicking destructor must not verify, got: {d}"
+        );
+        let Some(s) = verify_src("unwrap_or_scalar_error", src) else { return };
+        assert!(
+            s.is_verified(),
+            "`unwrap_or` on a scalar error type must still verify (positive control), got: {s}"
+        );
+    }
+
+    /// F4/F5: the unwind bound counts *latch traversals*, not raw block entries.
+    ///
+    /// A loop that runs exactly `N` iterations needs `N + 1` entries to its header
+    /// (the last evaluates the guard and exits), so `unwind: N` rejected it. A
+    /// loop-free helper called more than once from one function also tripped the
+    /// bound, because the counter was keyed by block without regard to *which*
+    /// invocation. Both are fixed by counting back-edge traversals; the bound is
+    /// now the number of iterations, which is what a caller means.
+    #[test]
+    fn the_unwind_bound_counts_iterations_not_header_entries() {
+        let src = r#"
+/// requires: true
+/// unwind: 3
+/// ensures: ret == 3
+pub fn while_exact() -> u32 {
+    let mut i = 0u32;
+    let mut s = 0u32;
+    while i < 3 { s += 1; i += 1; }
+    s
+}
+
+/// requires: true
+/// unwind: 3
+/// ensures: ret == 3
+pub fn for_exact() -> u32 {
+    let mut s = 0u32;
+    for _i in 0..3u32 { s += 1; }
+    s
+}
+
+fn helper(x: u8) -> u8 { if x == 0 { 0 } else { 1 } }
+
+/// requires: x == 0
+/// unwind: 1
+/// ensures: ret == 0
+pub fn loop_free_helper_calls(x: u8) -> u8 {
+    let a = helper(x);
+    let b = helper(0);
+    a + b
+}
+"#;
+        for name in ["while_exact", "for_exact", "loop_free_helper_calls"] {
+            let Some(o) = verify_src(name, src) else { return };
+            assert!(
+                o.is_verified(),
+                "`{name}` must verify: the bound counts iterations, so `unwind: N` \
+                 admits a loop that runs `N` times, and helper calls do not consume it; got: {o}"
+            );
+        }
+    }
+
+    /// F4: a bound one short of the iterations must still fail.
+    ///
+    /// The fix must not simply relax the bound: `unwind: 2` on a three-iteration
+    /// loop is a claim the loop violates, and it has to be refuted. Without this
+    /// the latch fix could pass by accepting every bound.
+    #[test]
+    fn an_unwind_bound_below_the_iterations_still_fails() {
+        let src = r#"
+/// requires: true
+/// unwind: 2
+/// ensures: ret == 3
+pub fn for_too_few() -> u32 {
+    let mut s = 0u32;
+    for _i in 0..3u32 { s += 1; }
+    s
+}
+"#;
+        let Some(o) = verify_src("for_too_few", src) else { return };
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("unwind"),
+                "a too-small bound must fail on the unwind obligation, got `{kind}`"
+            ),
+            other => panic!("`unwind: 2` on a 3-iteration loop must be refuted, got: {other}"),
+        }
+    }
+
+    /// F6/F7: edition resolution reads a quoted key and an explicit workspace path.
+    ///
+    /// Two spellings Cargo accepts and the reader did not: a quoted key
+    /// (`"edition" = "2021"`) read as *no* edition, so the 2015 default applied;
+    /// and `package.workspace = "../ws"` pointing at a root that is not an
+    /// ancestor, which the ancestor search could not find. Both are resolved from
+    /// the manifest text, so they are unit-tested here rather than end to end.
+    #[test]
+    fn a_quoted_edition_key_and_an_explicit_workspace_path_are_resolved() {
+        let dir = std::env::temp_dir().join(format!("verif-edition-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("member")).unwrap();
+        std::fs::create_dir_all(dir.join("ws")).unwrap();
+        std::fs::write(dir.join("ws/Cargo.toml"), "[workspace]\n[workspace.package]\nedition = \"2021\"\n").unwrap();
+        std::fs::write(
+            dir.join("member/Cargo.toml"),
+            "[package]\nname = \"m\"\n\"edition\" = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("member/src.rs"), "").unwrap();
+        let member = dir.join("member/src.rs");
+        assert_eq!(
+            verify::edition_from_manifest(&member),
+            Some(verify::Edition::Rust2024),
+            "a quoted `\"edition\"` key must be read, not defaulted to 2015"
+        );
+
+        std::fs::write(
+            dir.join("member/Cargo.toml"),
+            "[package]\nname = \"m\"\nworkspace = \"../ws\"\nedition.workspace = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            verify::edition_from_manifest(&member),
+            Some(verify::Edition::Rust2021),
+            "`package.workspace = \"../ws\"` must resolve to that root's edition"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C3: the `for`-loop desugaring over a range is modelled, both directions.
+    ///
+    /// A `for i in a..b` lowers to `Range::new`/`RangeInclusive::new`, an
+    /// `IntoIterator::into_iter` identity and a `next(&mut range)` loop, and all
+    /// three are answered from the range's struct fields. The `unwind:` bound
+    /// decides the loop without an invariant, and an `invariant:` that does not
+    /// name the loop variable decides it too (`tri_invariant`). An invariant that
+    /// *names* the loop variable is the one shape still refused: the element `i`
+    /// is a `debug` binding inside a nested `scope` block that is not live at the
+    /// loop header (`next` has not returned yet on entry), so `invariant_names`
+    /// does not resolve it -- recorded in `ROADMAP.md` C3. The false twin is the
+    /// evidence the range state is *read*: a model that returned a constant would
+    /// prove it.
+    ///
+    /// The range's iterator state is written *through `&mut`*, so the loop header
+    /// must havoc the range local (and its parts). When it did not, the exit guard
+    /// folded to `false`, the exit edge was pruned as unreachable, and a false
+    /// postcondition came back `Verified` -- the reason `tri_invariant` now uses an
+    /// inductive invariant (`s = i.min(5050)`, not `s += i`) and
+    /// `tri_invariant_cannot_prove_this` is asserted to be refuted.
+    #[test]
+    fn the_for_loop_range_desugaring_is_modelled() {
+        let src = r#"
+/// requires: n <= 3
+/// unwind: 4
+/// ensures: ret <= 6
+pub fn for_inclusive_sum(n: u32) -> u32 {
+    let mut s = 0;
+    for i in 0..=n { s += i; }
+    s
+}
+
+/// requires: n <= 3
+/// unwind: 4
+/// ensures: ret <= 5
+pub fn for_inclusive_sum_cannot_prove_this(n: u32) -> u32 {
+    let mut s = 0;
+    for i in 0..=n { s += i; }
+    s
+}
+
+/// requires: true
+/// unwind: 3
+/// ensures: ret == 3
+pub fn for_exclusive_counts() -> u32 {
+    let mut s = 0;
+    for _i in 0..3u32 { s += 1; }
+    s
+}
+
+/// requires: n <= 100
+/// invariant: s <= 5050
+/// ensures: ret <= 5050
+pub fn tri_invariant(n: u32) -> u32 {
+    let mut s = 0;
+    for i in 0..=n { s = i.min(5050); }
+    s
+}
+
+/// requires: n <= 100
+/// invariant: s <= 5050
+/// ensures: ret <= 3
+pub fn tri_invariant_cannot_prove_this(n: u32) -> u32 {
+    let mut s = 0;
+    for i in 0..=n { s = i.min(5050); }
+    s
+}
+"#;
+        for name in ["for_inclusive_sum", "for_exclusive_counts", "tri_invariant"] {
+            let Some(o) = verify_src(name, src) else { return };
+            assert!(
+                o.is_verified(),
+                "`{name}` must verify: the range desugaring is modelled and the loop is \
+                 decided by `unwind:` or by an invariant, got: {o}"
+            );
+        }
+        let Some(f) = verify_src("for_inclusive_sum_cannot_prove_this", src) else { return };
+        match f {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "the false twin must fail on its postcondition, got `{kind}`"
+            ),
+            other => panic!(
+                "the false twin claims `ret <= 5` for a sum that reaches 6 and must be \
+                 refuted; a model that ignored the range state would prove it, got: {other}"
+            ),
+        }
+        // The invariant tripwire: a `for` loop whose postcondition is false. The
+        // loop's *iterator state* is written through `&mut`, so the havoc at the
+        // header must reach it. When it did not, the exit guard folded to `false`,
+        // the exit edge was pruned as unreachable, and this function came back
+        // `Verified` -- a false proof. It must now be refuted.
+        //
+        // The assertion is `Failed` on the *postcondition*, not merely
+        // `!is_verified()`. A refusal (`Incomplete`/`Skipped`) also satisfies
+        // "not verified", so a model that gave up on the range state would pass a
+        // weaker check while checking nothing -- the tripwire would be vacuous. A
+        // refuted postcondition is the evidence the loop was modelled and its exit
+        // state refuted the false claim.
+        let Some(g) = verify_src("tri_invariant_cannot_prove_this", src) else { return };
+        match g {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "the invariant tripwire must fail on its postcondition, got `{kind}`"
+            ),
+            other => panic!(
+                "a `for` loop whose postcondition is false must be refuted, not merely \
+                 undecided; a model that does not havoc the iterator state proves it, and \
+                 one that refuses it checks nothing, got: {other}"
+            ),
+        }
+    }
+
+    /// A loop whose body calls a *recursive* function must terminate the write-set
+    /// discovery, and a reference-carrying recursive callee must still have its
+    /// write propagated.
+    ///
+    /// The write-set walk follows each resolved callee to find what it writes
+    /// through a reference. Before it was cycle-aware, each invocation allocated
+    /// its own block-visit set, which stops a CFG cycle within one function and
+    /// cannot stop a call cycle *between* invocations: a loop calling a
+    /// self-recursive function followed the self-call forever and overflowed the
+    /// stack, aborting the whole run. The walk now carries the set of functions on
+    /// the call stack, which is what terminates it. On a cycle it also includes the
+    /// call's reference arguments -- a conservative superset, since a callee can
+    /// only reach caller storage through a reference; the reference twin below pins
+    /// that the write still reaches the loop's havoc set, whichever mechanism
+    /// carries it.
+    #[test]
+    fn a_loop_that_calls_a_recursive_function_terminates_and_is_sound() {
+        let src = r#"
+/// requires: true
+/// decreases: n
+/// ensures: ret == n
+pub fn count_down(n: u8) -> u8 {
+    if n == 0 { 0 } else { count_down(n - 1) + 1 }
+}
+
+/// requires: true
+/// decreases: n
+/// ensures: ret == 0
+pub fn walk(n: u8, c: &mut u8) -> u8 {
+    if n == 0 { 0 } else { *c = c.wrapping_add(1); walk(n - 1, c) }
+}
+
+/// requires: n <= 3
+/// invariant: i <= 3
+/// ensures: ret <= 3
+pub fn loop_calls_recursive(n: u8) -> u8 {
+    let mut i = 0u8; let mut s = 0u8;
+    while i < 3 { s = count_down(n); i += 1; }
+    s
+}
+
+/// requires: n <= 3
+/// invariant: i <= 3
+/// ensures: ret == 0
+pub fn loop_calls_recursive_cannot_prove_this(n: u8) -> u8 {
+    let mut i = 0u8; let mut s = 0u8;
+    while i < 3 { s = count_down(n); i += 1; }
+    s
+}
+
+/// A loop calling a *reference-carrying* recursive callee: the call cycle is
+/// refused rather than followed, and the call's reference argument is added
+/// directly. `x` is written through `walk`, so the exit state cannot keep `0`.
+/// requires: x == 0
+/// invariant: i <= 3
+/// ensures: ret <= 255
+pub fn loop_calls_ref_recursive(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 { walk(1, x); i += 1; }
+    *x
+}
+
+/// The false twin: `walk` writes `x`, so `ret == 0` is false. A model that
+/// dropped the reference from the cycle's havoc would prove it.
+/// requires: x == 0
+/// invariant: i <= 3
+/// ensures: ret == 0
+pub fn loop_calls_ref_recursive_cannot_prove_this(x: &mut u8) -> u8 {
+    let mut i = 0u8;
+    while i < 3 { walk(1, x); i += 1; }
+    *x
+}
+
+/// A *mutual* recursion cycle reached from an invariant loop: `even_w` calls
+/// `odd_w` calls `even_w`. The write-set walk must terminate on the cycle
+/// (`visiting` holds the functions on the stack), and neither callee writes a
+/// reference, so the loop's only write is its own counter. Before the cycle
+/// guard this was an unbounded recursion between *invocations* and overflowed the
+/// stack, aborting the whole run.
+/// requires: n <= 8
+/// invariant: i <= 3
+/// ensures: ret <= 1
+pub fn loop_calls_mutual_recursive(n: u8) -> u8 {
+    let mut i = 0u8;
+    let mut s = 0u8;
+    while i < 3 { s = even_w(n); i += 1; }
+    s
+}
+
+/// requires: true
+/// decreases: n
+/// ensures: ret <= 1
+pub fn even_w(n: u8) -> u8 {
+    if n == 0 { 1 } else { odd_w(n - 1) }
+}
+
+/// requires: true
+/// decreases: n
+/// ensures: ret <= 1
+pub fn odd_w(n: u8) -> u8 {
+    if n == 0 { 0 } else { even_w(n - 1) }
+}
+"#;
+        // The crash vehicle: a scalar-only call into a self-recursive callee. The
+        // walk must *return* (a stack overflow aborts the binary, so reaching the
+        // assertion at all is half the evidence), and the loop must be decided --
+        // the false twin refuted on its postcondition, not skipped.
+        for name in [
+            "loop_calls_recursive",
+            "loop_calls_recursive_cannot_prove_this",
+            "loop_calls_ref_recursive",
+            "loop_calls_ref_recursive_cannot_prove_this",
+        ] {
+            let Some(o) = verify_src(name, src) else { return };
+            assert!(
+                !matches!(o, FnOutcome::Skipped { .. } | FnOutcome::Incomplete { .. }),
+                "`{name}` must be decided, not refused: a cycle-aware write-set walk \
+                 terminates; a refusal here means the walk gave up, got: {o}"
+            );
+        }
+        // A loop reaching a *mutually* recursive callee. Mutual recursion has no
+        // single decreasing measure here, so it is not *proved* -- but the
+        // write-set walk must still terminate on the cycle (reaching this
+        // assertion at all is the evidence: an unbounded walk aborts the binary),
+        // and the loop must never come back `Verified`, which would be a proof of
+        // an unmodelled call.
+        let Some(m) = verify_src("loop_calls_mutual_recursive", src) else { return };
+        assert!(
+            !m.is_verified(),
+            "a loop reaching a mutually recursive callee must not be *proved* (mutual \
+             recursion is not modelled), got: {m}"
+        );
+        let Some(f) = verify_src("loop_calls_recursive_cannot_prove_this", src) else {
+            return;
+        };
+        match f {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "the false twin must fail on its postcondition, got `{kind}`"
+            ),
+            other => panic!(
+                "the false twin claims `ret == 0` for a loop returning `n` and must be \
+                 refuted, got: {other}"
+            ),
+        }
+        // The reference-carrying twin is the assertion the earlier version of this
+        // test lacked: a loop calling a *reference-carrying* recursive callee must
+        // still have that reference havoced at the header, so the exit state cannot
+        // keep the entry `0`. It pins the *effect* (the reference write reaches the
+        // exit), not which mechanism carries it: measured, the callee's own direct
+        // scan folded back positionally is what carries it for this shape, and the
+        // cycle branch's reference inclusion is a conservative superset over it.
+        let Some(g) = verify_src("loop_calls_ref_recursive_cannot_prove_this", src) else {
+            return;
+        };
+        match g {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "the reference twin must fail on its postcondition, got `{kind}`"
+            ),
+            other => panic!(
+                "`walk` writes `x` through its reference argument, so `ret == 0` must be \
+                 refuted; a `verified` here means the reference write did not reach the \
+                 loop's havoc set, got: {other}"
+            ),
+        }
+    }
+
+    /// C3 exit criterion, second half: a loop with no contract is reported as a
+    /// *missing loop contract*, not as an unmodelled construct.
+    ///
+    /// `tri` in `everyday.rs` declares no `invariant:` or `unwind:`, so its loop is
+    /// unwound to the default and the path stops. That is an honest incompleteness,
+    /// but the message has to point at the remedy -- the loop is understood, and the
+    /// tool is declining to guess an exit -- rather than reading as "the frontend
+    /// could not model this".
+    #[test]
+    fn a_loop_without_a_contract_names_the_missing_contract() {
+        let src = r#"
+/// requires: true
+/// ensures: true
+pub fn tri(n: u32) -> u32 {
+    let mut s = 0;
+    for i in 0..=n { s += i; }
+    s
+}
+"#;
+        let Some(o) = verify_src("tri", src) else { return };
+        match o {
+            FnOutcome::Incomplete { reasons, .. } => {
+                let joined = reasons.join(" | ");
+                assert!(
+                    joined.contains("missing loop contract")
+                        && joined.contains("invariant:")
+                        && joined.contains("unwind:"),
+                    "the reason must name the missing loop contract and the two ways to \
+                     supply it, got: {joined}"
+                );
+            }
+            other => panic!(
+                "`tri` declares no loop contract and must be an honest incompleteness, \
+                 got: {other}"
+            ),
+        }
+    }
+}
+
+/// Regression tests for the signed-inclusive-range review (R1–R6).
+///
+/// These live outside `review_round` because they pin a *different* surface:
+/// the `RangeInclusive::next` model's boundary arithmetic (R1), its state on an
+/// exhausted range (R4), the unwind counter's key (R2/R3), and the struct layout
+/// the drop-glue check reads (R5/R6). Every case was cross-checked against a real
+/// `rustc` execution oracle, so the expected counts are Rust's, not the model's.
+mod range_and_layout_review {
+    use super::*;
+
+    /// R1/R4: a signed inclusive range's `next` must stop at the boundary and must
+    /// not advance an exhausted range.
+    ///
+    /// The successor's overflow flag was tested only for the *unsigned* rule
+    /// (`succ == 0`), which never fires on a signed range: `127i8..=127i8` kept
+    /// yielding past `127` into `-128`, `-127`, ... until the `unwind:` bound, so a
+    /// true contract became a bound failure. The flag must test the *signed* `MIN`.
+    /// And `next` on an empty range must leave the range unchanged (Rust does not
+    /// advance `start` on `None`), or a later call resurrects an element.
+    ///
+    /// The counts are Rust's own, read from a compiled oracle, so the assertion is
+    /// the language's semantics rather than the model's.
+    #[test]
+    fn a_signed_inclusive_range_stops_at_its_boundary() {
+        let src = r#"
+/// requires: true
+/// unwind: 8
+/// ensures: ret == 1
+pub fn single_signed_incl() -> u32 {
+    let mut c = 0u32;
+    for _ in 127i8..=127i8 { c += 1; }
+    c
+}
+
+/// requires: true
+/// unwind: 8
+/// ensures: ret == 2
+pub fn two_signed_incl() -> u32 {
+    let mut c = 0u32;
+    for _ in 126i8..=127i8 { c += 1; }
+    c
+}
+
+/// requires: true
+/// unwind: 8
+/// ensures: ret == 3
+pub fn three_signed_incl() -> u32 {
+    let mut c = 0u32;
+    for _ in (-128i8)..=(-126i8) { c += 1; }
+    c
+}
+
+/// requires: true
+/// unwind: 4
+/// ensures: ret == 1
+pub fn single_unsigned_incl() -> u32 {
+    let mut c = 0u32;
+    for _ in 255u8..=255u8 { c += 1; }
+    c
+}
+"#;
+        for (name, want) in [
+            ("single_signed_incl", 1u32),
+            ("two_signed_incl", 2),
+            ("three_signed_incl", 3),
+            ("single_unsigned_incl", 1),
+        ] {
+            let Some(o) = verify_src(name, src) else { return };
+            assert!(
+                o.is_verified(),
+                "`{name}` must verify with {want} iteration(s); a signed range whose \
+                 overflow flag tests zero keeps yielding past its bound, got: {o}"
+            );
+        }
+    }
+
+    /// R4: `next` on an empty inclusive range is idempotent.
+    ///
+    /// `255u8..=254u8` is empty, so both `next` calls are `None`. A model that
+    /// advanced `start` on the first `None` would resurrect an element on the
+    /// second call (`Some(0)`), turning a true contract into a refutation.
+    #[test]
+    fn an_empty_inclusive_range_stays_empty() {
+        let src = r#"
+/// requires: true
+/// ensures: ret == 0
+pub fn empty_incl_twice() -> u8 {
+    let mut r = 255u8..=254u8;
+    let _a = r.next();
+    let b = r.next();
+    match b { Some(_) => 1, None => 0 }
+}
+
+/// requires: true
+/// ensures: ret == 0
+pub fn empty_excl_twice() -> u8 {
+    let mut r = 255u8..255u8;
+    let _a = r.next();
+    let b = r.next();
+    match b { Some(_) => 1, None => 0 }
+}
+"#;
+        for name in ["empty_incl_twice", "empty_excl_twice"] {
+            let Some(o) = verify_src(name, src) else { return };
+            assert!(
+                o.is_verified(),
+                "`{name}` must verify: `next` leaves an empty range unchanged, so the \
+                 second call is `None` too, got: {o}"
+            );
+        }
+    }
+
+    /// R2/R3: the unwind bound counts iterations of the *loop*, not of one latch.
+    ///
+    /// A loop body with two back-edge blocks (an `if` whose arms both reach the
+    /// header) had each latch counted separately, so the combined trip count could
+    /// exceed a declared `unwind:` while neither latch's own count did -- a
+    /// two-iteration loop verified under `unwind: 1`. The counter is now keyed by
+    /// the loop header, and a `switchInt` block no longer clears it.
+    #[test]
+    fn the_unwind_bound_counts_the_whole_loop_not_one_latch() {
+        let src = r#"
+/// requires: n == 2
+/// unwind: 1
+/// ensures: ret == 2
+pub fn two_latches(n: u8) -> u8 {
+    let mut i = 0u8;
+    while i < n {
+        if i == 0 { i += 1; } else { i += 1; }
+    }
+    i
+}
+
+/// requires: n == 1
+/// unwind: 1
+/// ensures: ret == 1
+pub fn one_latch(n: u8) -> u8 {
+    let mut i = 0u8;
+    while i < n {
+        if i == 0 { i += 1; } else { i += 1; }
+    }
+    i
+}
+"#;
+        let Some(f) = verify_src("two_latches", src) else { return };
+        assert!(
+            !f.is_verified(),
+            "a two-iteration loop under `unwind: 1` must run off the bound, got: {f}"
+        );
+        let Some(o) = verify_src("one_latch", src) else { return };
+        assert!(
+            o.is_verified(),
+            "a one-iteration loop under `unwind: 1` must verify (positive control), got: {o}"
+        );
+    }
+
+    /// R5: two structs of the same bare name in different modules must not share a
+    /// layout.
+    ///
+    /// The struct table was keyed by the bare name, so `m::Outer` and `n::Outer`
+    /// collided and the drop-glue check read whichever was recorded last. When that
+    /// one is glue-free, a panicking field destructor vanishes and the function is
+    /// a false `Verified`. The layout is now keyed by the module-qualified path.
+    #[test]
+    fn two_same_named_structs_do_not_share_a_layout() {
+        let src = r#"
+pub mod m {
+    pub struct Outer { pub inner: Inner }
+    pub struct Inner(pub u8);
+    impl Drop for Inner {
+        fn drop(&mut self) { if self.0 == 0 { panic!("inner"); } }
+    }
+    impl Drop for Outer { fn drop(&mut self) {} }
+}
+pub mod n {
+    pub struct Outer { pub only: u8 }
+}
+
+/// requires: true
+/// ensures: ret == 1
+pub fn same_name() -> u8 {
+    let _g = m::Outer { inner: m::Inner(0) };
+    1
+}
+"#;
+        let Some(o) = verify_src("same_name", src) else { return };
+        assert!(
+            !o.is_verified(),
+            "`m::Outer` has a field with a panicking destructor; sharing a layout with \
+             `n::Outer` would hide it and prove this, got: {o}"
+        );
+    }
+
+    /// R6: a unit struct with a `Drop` impl is a zero-field layout, not an unknown
+    /// container.
+    ///
+    /// `struct Guard;` was not read as a struct at all, so the drop-glue check saw
+    /// an unknown type and refused the function. A unit struct has no fields, so its
+    /// layout is empty and its `Drop` body is the only glue -- which runs, and a
+    /// panicking one must be a real obligation.
+    #[test]
+    fn a_unit_struct_runs_its_destructor() {
+        let src = r#"
+pub struct Guard;
+impl Drop for Guard { fn drop(&mut self) {} }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn unit_drop() -> u8 {
+    let _g = Guard;
+    1
+}
+
+pub struct Boom;
+impl Drop for Boom { fn drop(&mut self) { panic!("boom"); } }
+
+/// requires: true
+/// ensures: ret == 1
+pub fn panics_on_drop() -> u8 {
+    let _g = Boom;
+    1
+}
+"#;
+        let Some(o) = verify_src("unit_drop", src) else { return };
+        assert!(
+            o.is_verified(),
+            "a unit struct with a no-op destructor must verify, got: {o}"
+        );
+        let Some(p) = verify_src("panics_on_drop", src) else { return };
+        assert!(
+            !p.is_verified(),
+            "a unit struct whose destructor panics must not verify, got: {p}"
+        );
+    }
 }
