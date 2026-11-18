@@ -910,15 +910,15 @@ keeps growing.
     false proof in the last two weeks.
   - Exit for "beta": four weeks in a row with no new false proof, while the
     independent corpus keeps growing.
-  - Move: **build**. `SOUNDNESS.md` carries the ledger: 31 MIR-frontend rows and
-    16 engine/imperative rows — 47 in all, so the review's "at least eleven
+  - Move: **build**. `SOUNDNESS.md` carries the ledger: 41 MIR-frontend rows and
+    16 engine/imperative rows — 57 in all, so the review's "at least eleven
     earlier false proofs" is now that many *dated rows* rather than a count (the
     seven commits the review named each contribute their own row). Every row has a
     **commit**, a **date** and a fixture. `tests/soundness.rs` checks it
     mechanically — every fixture must be a `#[test]` (not a same-named helper), in
     the file the cell names, every row must carry a commit and a `YYYY-MM-DD`
     date, and no date may be in the future. The clock restarts on each row; the
-    most recent is 2026-11-16.
+    most recent is 2026-11-18.
 
 ---
 
