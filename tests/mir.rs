@@ -6656,6 +6656,9 @@ fn char_literals_and_ascii_predicates_are_modelled() {
         "char_high_is_not_digit",
         "char_newline_is_whitespace",
         "char_emoji_not_alphabetic",
+        "char_max_is_the_scalar_maximum",
+        "char_max_is_the_scalar_maximum_cannot_prove_this",
+        "char_min_is_nul",
     ];
     let Some(report) = verify_realistic(&names) else {
         return;
@@ -6667,6 +6670,8 @@ fn char_literals_and_ascii_predicates_are_modelled() {
         "char_high_is_not_digit",
         "char_newline_is_whitespace",
         "char_emoji_not_alphabetic",
+        "char_max_is_the_scalar_maximum",
+        "char_min_is_nul",
     ] {
         let o = outcome(&report, name);
         assert!(o.is_verified(), "`{name}` must verify, got: {o}");
@@ -6675,6 +6680,9 @@ fn char_literals_and_ascii_predicates_are_modelled() {
     // were read (120 is `'x'`, 304 is `0x130`) and not skipped.
     assert_refuted(&report, "char_digit_tripwire");
     assert_refuted(&report, "char_high_digit_tripwire");
+    // `char::MAX` is `0x10FFFF`, not `2^32 - 1`: the false twin is refuted at the
+    // *real* maximum (`c = 1114111`), which a width-derived bound would prove.
+    assert_refuted(&report, "char_max_is_the_scalar_maximum_cannot_prove_this");
 }
 
 /// `slice::last` -- a fresh element for a slice, the exact element for an array.
@@ -6695,11 +6703,19 @@ fn slice_last_is_an_element_and_array_last_is_exact() {
         "array_last_is_the_last_element",
         "slice_last_is_an_element_cannot_prove_this",
         "array_last_is_the_last_element_cannot_prove_this",
+        "slice_last_after_write_is_seen",
+        "slice_last_after_write_is_seen_cannot_prove_this",
+        "slice_last_is_kept_when_another_index_is_written",
     ];
     let Some(report) = verify_realistic(&names) else {
         return;
     };
-    for name in ["slice_last_is_an_element", "array_last_is_the_last_element"] {
+    for name in [
+        "slice_last_is_an_element",
+        "array_last_is_the_last_element",
+        "slice_last_after_write_is_seen",
+        "slice_last_is_kept_when_another_index_is_written",
+    ] {
         let o = outcome(&report, name);
         assert!(o.is_verified(), "`{name}` must verify, got: {o}");
     }
@@ -6707,6 +6723,11 @@ fn slice_last_is_an_element_and_array_last_is_exact() {
     // element is not the first, so neither claim can be proved.
     assert_refuted(&report, "slice_last_is_an_element_cannot_prove_this");
     assert_refuted(&report, "array_last_is_the_last_element_cannot_prove_this");
+    // The write/read interaction: a concrete-index write that *is* the last
+    // element must reach the sentinel, so the pre-write value does not survive.
+    // A model that left the sentinel alone would prove the twin -- the false proof
+    // this pair exists to pin.
+    assert_refuted(&report, "slice_last_after_write_is_seen_cannot_prove_this");
 }
 
 /// `u8::from(bool)` -- the one conversion the integer model would otherwise refuse.

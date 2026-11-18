@@ -335,6 +335,37 @@ pub fn char_emoji_not_alphabetic(c: char) -> u8 {
     c.is_ascii_alphabetic() as u8
 }
 
+/// `char::MAX` is the Unicode scalar maximum `0x10FFFF`, not `2^32 - 1`.
+///
+/// A `char` is modelled at 32 bits so a `char` comparison is exact, but the value
+/// a *bound* names is a property of the type. Deriving it from the width made
+/// `c == char::MAX` a comparison against `0xffffffff`, so this body -- which is
+/// `true` for the only input the precondition admits -- was *refuted*, and the
+/// false twin below was *proved*: a comparison different from the one the program
+/// executes. The `char` bounds are now read from the type.
+/// requires: c == '\u{10ffff}'
+/// ensures: ret == true
+pub fn char_max_is_the_scalar_maximum(c: char) -> bool {
+    c == char::MAX
+}
+
+/// The false twin: `char::MAX` is `0x10FFFF`, so a claim that it is not the
+/// maximum is false at the only admitted input. A model that compared against
+/// `2^32 - 1` would prove this.
+/// requires: c == '\u{10ffff}'
+/// ensures: ret == false
+pub fn char_max_is_the_scalar_maximum_cannot_prove_this(c: char) -> bool {
+    c == char::MAX
+}
+
+/// `char::MIN` is `'\0'`, and a `char` has no signed bound, so the read must not
+/// fall back to the signed `1 << 31` either.
+/// requires: c == '\0'
+/// ensures: ret == true
+pub fn char_min_is_nul(c: char) -> bool {
+    c == char::MIN
+}
+
 /// A fixed-size array argument. Unlike a slice the length is a *type*
 /// constant, so `a.len()` is not an input and the bounds check is against a
 /// literal: `_3 = Lt(_2, const 4_usize)`. That literal is what makes this shape
@@ -12874,6 +12905,45 @@ pub fn slice_last_is_an_element_cannot_prove_this(xs: &[u8]) -> u8 {
 /// ensures: ret == 9
 pub fn array_last_is_the_last_element_cannot_prove_this(a: [u8; 4]) -> u8 {
     a.last().copied().unwrap_or(0)
+}
+
+/// A concrete-index write can reach the last element, so a `last()` read after it
+/// must see the write when the length makes the index the last one.
+///
+/// A slice's `last()` is one fresh variable keyed by a sentinel, and a write to a
+/// concrete index used to replace only that index's entry -- leaving the sentinel
+/// at its pre-write value. `let before = *xs.last().unwrap(); xs[0] = 1; before ==
+/// *xs.last().unwrap()` was therefore *proved* for a one-element slice, though the
+/// write replaced the only element. The sentinel now carries the relationship
+/// `last == x` when `len == index + 1`, so this verifies (the write is seen) while
+/// its false twin refutes (the pre-write value is not kept).
+/// requires: xs.len() == 1
+/// ensures: ret == 1
+pub fn slice_last_after_write_is_seen(xs: &mut [u8]) -> u8 {
+    xs[0] = 1;
+    *xs.last().unwrap()
+}
+
+/// The false twin: `xs[0] = 1` on a one-element slice *is* the write to `last()`,
+/// so the pre-write value does not survive. A model that left the sentinel at its
+/// pre-write value would prove this.
+/// requires: xs.len() == 1
+/// ensures: ret == 0
+pub fn slice_last_after_write_is_seen_cannot_prove_this(xs: &mut [u8]) -> u8 {
+    xs[0] = 1;
+    *xs.last().unwrap()
+}
+
+/// The mirror: a write to an index that is *not* the last element leaves `last()`
+/// alone, so a read taken before the write equals the one after it. The
+/// relationship is `len == index + 1`, so at length 2 the index `0` write does not
+/// touch `last()`.
+/// requires: xs.len() == 2
+/// ensures: ret == true
+pub fn slice_last_is_kept_when_another_index_is_written(xs: &mut [u8]) -> bool {
+    let before = *xs.last().unwrap();
+    xs[0] = 9;
+    before == *xs.last().unwrap()
 }
 
 /// `u8::from(bool)` is the zero-extension of the one-bit value: `false` -> 0,

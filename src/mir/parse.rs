@@ -2247,7 +2247,20 @@ fn parse_const(s: &str) -> Const {
                     // make `a != i8::MIN` mean `a != 0`, so the assert guarding a
                     // signed negation looked dischargeable and the negation was
                     // reported panic-free.
+                    //
+                    // A `char` is the exception, and the exception is why this
+                    // reads the *type* rather than its width: `char::MAX` is the
+                    // Unicode scalar maximum `0x10FFFF`, not `2^32 - 1`. `char` is
+                    // modelled at 32 bits so a `char` comparison is exact, but the
+                    // value a bound *names* is a property of the type, and taking
+                    // it from the width made `c == char::MAX` a comparison against
+                    // `0xffffffff` -- a false proof for a body that reads the real
+                    // maximum. The `char` bounds are named here because a `char`
+                    // has no signed/unsigned split: `MAX` is the top scalar value
+                    // and `MIN` is `'\0'`.
                     let v = match (name, ty.is_signed()) {
+                        ("MAX", _) if ty == Ty::Char => 0x10FFFF,
+                        ("MIN", _) if ty == Ty::Char => 0,
                         ("MAX", true) => (1u128 << (w - 1)) - 1,
                         ("MAX", false) => {
                             if w == 64 {
@@ -3414,6 +3427,33 @@ fn add(_1: u32, _2: u32) -> u32 {
                 assert_eq!(*v, 65535);
             }
             other => panic!("expected u16::MAX as a typed constant, got {other:?}"),
+        }
+    }
+
+    /// `char::MAX` is the Unicode scalar maximum, not the width's all-ones.
+    ///
+    /// `char` is modelled at 32 bits so a `char` comparison is exact, but the
+    /// *value* a bound names is a property of the type. Reading it from the width
+    /// made `char::MAX` `0xffff_ffff`, so `c == char::MAX` compared against the
+    /// wrong number: a false proof for a body that reads the real maximum. The
+    /// bound must be `0x10FFFF` (`char::MIN` is `'\0'`).
+    #[test]
+    fn a_char_bound_is_its_scalar_value_not_the_width_maximum() {
+        let max = "fn f(_1: char) -> bool {\n    debug c => _1;\n    let mut _0: bool;\n\n    bb0: {\n        _0 = Eq(copy _1, const std::char::methods::<impl char>::MAX);\n        return;\n    }\n}\n";
+        let prog = parse_program(max);
+        match prog.fns[0].blocks[0].stmts.first() {
+            Some(Stmt::Assign(_, Rvalue::Binary(_, _, Operand::Const(Const::UInt(v, Some(Ty::Char)))))) => {
+                assert_eq!(*v, 0x10FFFF, "`char::MAX` is `0x10FFFF`, not `2^32 - 1`");
+            }
+            other => panic!("expected `char::MAX` as a typed constant, got {other:?}"),
+        }
+        let min = "fn f(_1: char) -> bool {\n    debug c => _1;\n    let mut _0: bool;\n\n    bb0: {\n        _0 = Eq(copy _1, const std::char::methods::<impl char>::MIN);\n        return;\n    }\n}\n";
+        let prog = parse_program(min);
+        match prog.fns[0].blocks[0].stmts.first() {
+            Some(Stmt::Assign(_, Rvalue::Binary(_, _, Operand::Const(Const::UInt(v, Some(Ty::Char)))))) => {
+                assert_eq!(*v, 0, "`char::MIN` is `'\\0'`");
+            }
+            other => panic!("expected `char::MIN` as a typed constant, got {other:?}"),
         }
     }
 

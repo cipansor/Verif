@@ -2064,6 +2064,29 @@ impl Env {
         match self.indexed.get_mut(&local) {
             Some(s) => match v {
                 Val::Sym(x, _) => {
+                    // A slice's `last()` element is one fresh variable keyed by the
+                    // `LAST_INDEX` sentinel rather than by a real index, so a write
+                    // to a concrete index does not reach it through
+                    // `elems.insert(index, x)`: the sentinel keeps its pre-write
+                    // value and a later `last()` reads it. That is a false proof --
+                    // `let before = *xs.last().unwrap(); xs[0] = 1; before ==
+                    // *xs.last().unwrap()` was *proved* for a one-element slice,
+                    // though the write replaced the only element. The write *can*
+                    // reach the last element, so the sentinel is refreshed with the
+                    // exact relationship: the last element is `x` exactly when this
+                    // write's index *is* the last one (`len == index + 1`), and the
+                    // old element otherwise. The sentinel is created here if the
+                    // write precedes any `last()` read, so the relationship holds
+                    // whichever order the body uses. An array's `last()` is the
+                    // concrete `N-1` (no sentinel), so this is skipped for it.
+                    if s.fixed_len.is_none() && s.elem_w != 0 {
+                        let old = *s.elems.entry(LAST_INDEX).or_insert_with(|| smt::var(s.elem_w));
+                        if smt::bits(old) == smt::bits(x) {
+                            let is_last = smt::eq_const(s.len, index.wrapping_add(1));
+                            let merged = smt::ite(is_last, x, old);
+                            s.elems.insert(LAST_INDEX, merged);
+                        }
+                    }
                     s.elems.insert(index, x);
                 }
                 // An aggregate element, or an unmodelled one. The element is no
@@ -10923,5 +10946,65 @@ fn count_via_helper(_1: u8) -> u8 {
             Some(vec!["one".to_string()]),
             "a single matching candidate must resolve"
         );
+    }
+
+    /// A concrete-index write reaches the `last()` sentinel, so the pre-write
+    /// value cannot be read back after a write that *is* the last element.
+    ///
+    /// The sentinel (`LAST_INDEX`) is one variable per slice, so a write to a
+    /// concrete index used to leave it at its pre-write value. That was a false
+    /// proof: `let before = *xs.last().unwrap(); xs[0] = 1; before ==
+    /// *xs.last().unwrap()` was *proved* for a one-element slice, though the write
+    /// replaced the only element. The write now refreshes the sentinel with the
+    /// exact relationship `last == x` when `len == index + 1`, so the two facts
+    /// must hold together: after a write of `1` to index `0`, the sentinel is `1`
+    /// at `len == 1` and the *old* element otherwise. Reading the store directly is
+    /// what makes the check independent of the executor's path machinery.
+    #[test]
+    fn a_concrete_index_write_reaches_the_last_sentinel() {
+        smt::with_fresh(|| {
+            let mut env = Env::new();
+            let len = smt::var_named(0, 8);
+            let old = smt::var_named(1, 8);
+            let mut elems = BTreeMap::new();
+            elems.insert(LAST_INDEX, old);
+            env.indexed.insert(
+                2,
+                Indexed {
+                    len,
+                    elem_w: 8,
+                    elem_signed: false,
+                    elems,
+                    fixed_len: None,
+                    slice_steps: None,
+                    poisoned: false,
+                },
+            );
+            let one = smt::word(1, 8);
+            env.write_elem(2, 0, Val::Sym(one, Sign::Unsigned));
+            let merged = env.indexed.get(&2).and_then(|s| s.elems.get(&LAST_INDEX).copied());
+            let merged = merged.expect("the sentinel must still be present after a write");
+            assert_ne!(
+                merged, old,
+                "a write to index 0 must refresh the sentinel rather than leave it stale"
+            );
+            // The refreshed value is `1` exactly when the write index is the last
+            // one (`len == 1`), and the old element otherwise. Both readings are
+            // checked, so a merge that dropped either branch fails here.
+            let at_len_1 = smt::substitute_word(merged, &[(len, smt::word(1, 8))]);
+            assert_eq!(
+                smt::evaluate(at_len_1, |_| None),
+                Some(1),
+                "at `len == 1` the sentinel is the written value"
+            );
+            let at_len_2 = smt::substitute_word(merged, &[(len, smt::word(2, 8))]);
+            let old_val = smt::evaluate(old, |_| None);
+            assert_eq!(
+                smt::evaluate(at_len_2, |_| None),
+                old_val,
+                "at `len == 2` the write of index 0 is not the last element, so the \
+                 sentinel keeps the old element"
+            );
+        });
     }
 }
