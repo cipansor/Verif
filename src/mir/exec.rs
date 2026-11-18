@@ -11007,4 +11007,80 @@ fn count_via_helper(_1: u8) -> u8 {
             );
         });
     }
+
+    /// A call cycle in the write-set walk adds the call's reference arguments,
+    /// which is what terminates a recursive callee and keeps its write visible.
+    ///
+    /// This pins the *cycle branch* of [`collect_writes`] directly, because no
+    /// verdict-level fixture reaches it observably: for every corpus shape the
+    /// callee's own direct scan already names the written referent, so the
+    /// branch's inclusion is a conservative *superset* -- measured, deleting it
+    /// changes no verdict. A branch that is reached (35 times in the recursion
+    /// test) but never load-bearing is exactly the kind of guard the suite has
+    /// no teeth for, so it is pinned here on the traversal's own output.
+    ///
+    /// The shape is a *mutual* cycle that writes through a reference the fold
+    /// cannot map back: `a` calls `b` (a cycle, since `b` calls `a`), and `b`
+    /// takes `&mut u8`. `a`'s header walk enters `b`, finds `b`'s self-cycle
+    /// through `a`, and must add `b`'s reference argument to the write set.
+    #[test]
+    fn a_call_cycle_adds_its_reference_arguments_to_the_write_set() {
+        fn block(id: usize, stmts: Vec<Stmt>, term: Term) -> Block {
+            Block { id, stmts, term, cleanup: false }
+        }
+        // `b(c: &mut u8)`: calls `a` again, passing `c` -- and does *not* write
+        // `c` directly, so the only way `_1` enters the write set is the cycle
+        // branch. (With a direct write here the branch would be redundant and the
+        // test would pass even with it deleted.)
+        let b = MirFn {
+            name: "b".into(),
+            arg_locals: vec![1],
+            ret_ty: Ty::U8,
+            locals: [(0u32, Ty::U8), (1, Ty::Ref(Box::new(Ty::U8)))].into_iter().collect(),
+            local_names: Default::default(),
+            debug_bindings: Vec::new(),
+            blocks: vec![block(
+                0,
+                Vec::new(),
+                Term::Call {
+                    callee: Callee::Name("a".into()),
+                    args: vec![Operand::Copy(Place::new(1))],
+                    dest: Place::new(0),
+                    diverges: false,
+                    target: 1,
+                },
+            )],
+            written: [0u32].into_iter().collect(),
+            impl_loc: None,
+        };
+        // `a(x: &mut u8)`: calls `b` (so `b`'s walk sees `a` on the stack -> cycle).
+        let a = MirFn {
+            name: "a".into(),
+            arg_locals: vec![1],
+            ret_ty: Ty::U8,
+            locals: [(0u32, Ty::U8), (1, Ty::Ref(Box::new(Ty::U8)))].into_iter().collect(),
+            local_names: Default::default(),
+            debug_bindings: Vec::new(),
+            blocks: vec![block(
+                0,
+                Vec::new(),
+                Term::Call {
+                    callee: Callee::Name("b".into()),
+                    args: vec![Operand::Copy(Place::new(1))],
+                    dest: Place::new(0),
+                    diverges: false,
+                    target: 1,
+                },
+            )],
+            written: [0u32].into_iter().collect(),
+            impl_loc: None,
+        };
+        let prog = MirProgram { fns: vec![a, b], ..Default::default() };
+        // The walk starts at `a`'s header (block 0) with `a` already `visiting`.
+        let writes = loop_writes(&prog, &prog.fns[0], 0);
+        assert!(
+            writes.contains(&1),
+            "the cycle's reference argument (`_1`) must be in the write set, got: {writes:?}"
+        );
+    }
 }
