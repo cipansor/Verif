@@ -3132,7 +3132,12 @@ it creates and removes. It is a gate rather than a paragraph because "zero cost"
 asserted: the script requires a good contract to build *and* the verifier to report
 `verified` (a build script that silently did nothing would otherwise pass), a broken
 contract to fail the build on its named obligation, and the resulting rlib to carry no
-prover symbols.
+prover symbols. It runs those checks for **both spellings** -- a `///` contract and an
+in-code `spec! { … }` block -- because the in-code path is a different compilation (the
+source names `verif` in a `use`), and a macro that expands to nothing is a claim about that
+artifact, not the doc-comment one. The in-code half also requires a *false* contract to fail
+the build: a scanner that read `requires:` and silently dropped `ensures:` would otherwise
+pass the true-contract check while proving nothing.
 
 ### Shape B — verify on the target (the prover in the artifact)
 

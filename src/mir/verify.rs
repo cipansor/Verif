@@ -226,17 +226,54 @@ fn extern_compiles(rustc: &str, opts: &MirOptions) -> bool {
 /// artifacts then sit in `<profile>/deps` and in every `<profile>/build/<dep>/*/out`
 /// beside it. A depth-based walk broke the first time Cargo nested a package
 /// directory under `build/`, which is why this one is structural.
+///
+/// **Under cross-compilation the profile directory in `OUT_DIR` is the wrong one.**
+/// `OUT_DIR` belongs to the package being built, so for `--target <triple>` it sits
+/// under `target/<triple>/<profile>/`, while a *build dependency* is compiled for the
+/// **host** and lands in `target/<profile>/`. The frontend's `rustc` runs on the
+/// host too, so only the host artifact can pass its probe -- searching the target
+/// directory finds rlibs for the wrong machine, every candidate fails, and
+/// `extern_options` returns `None` even though the usable rlib exists. So when
+/// `HOST != TARGET` the host profile directory is added, derived from the target
+/// profile directory by replacing the triple component. The target directory is kept
+/// as well: it costs one failed probe and it is what a non-cross build uses.
 #[cfg(feature = "std")]
 fn build_script_roots() -> Option<Vec<PathBuf>> {
     let out = PathBuf::from(std::env::var("OUT_DIR").ok()?);
+    let host = std::env::var("HOST").ok();
+    let target = std::env::var("TARGET").ok();
+    build_script_roots_from(&out, host.as_deref(), target.as_deref())
+}
+
+/// The pure core of [`build_script_roots`]: no environment, no globals.
+///
+/// Split out so the cross-compilation layout can be tested by passing paths and
+/// names directly. The first version of the test set `OUT_DIR`/`HOST`/`TARGET` with
+/// `std::env::set_var`, which needs an `unsafe` block on edition 2024 -- and gate 17
+/// pins the number of `unsafe` blocks in `src/`, so a test must not need one. Making
+/// the logic a function of its inputs is the fix that keeps the surface at two.
+fn build_script_roots_from(
+    out: &std::path::Path,
+    host: Option<&str>,
+    target: Option<&str>,
+) -> Option<Vec<PathBuf>> {
     let build_dir = out.ancestors().find(|a| a.file_name().is_some_and(|n| n == "build"))?;
     let profile = build_dir.parent()?;
     let mut roots = vec![profile.join("deps")];
-    if let Ok(entries) = std::fs::read_dir(build_dir) {
-        for e in entries.flatten() {
-            if let Ok(inner) = std::fs::read_dir(e.path()) {
-                for i in inner.flatten() {
-                    roots.push(i.path().join("out"));
+    collect_outs(build_dir, &mut roots);
+    // `target/<triple>/<profile>` -> `target/<profile>`, but only when the triple
+    // component is really there (a host build has `target/<profile>` already).
+    if let (Some(h), Some(t)) = (host, target) {
+        if h != t {
+            if let (Some(triple_dir), Some(root)) =
+                (profile.parent(), profile.parent().and_then(|p| p.parent()))
+            {
+                if triple_dir.file_name().is_some_and(|n| n == t) {
+                    if let Some(name) = profile.file_name() {
+                        let host_profile = root.join(name);
+                        roots.push(host_profile.join("deps"));
+                        collect_outs(&host_profile.join("build"), &mut roots);
+                    }
                 }
             }
         }
@@ -246,6 +283,19 @@ fn build_script_roots() -> Option<Vec<PathBuf>> {
         None
     } else {
         Some(roots)
+    }
+}
+
+/// Add every `<build>/<dep>/<hash>/out` directory under `build_dir` to `roots`.
+fn collect_outs(build_dir: &std::path::Path, roots: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(build_dir) {
+        for e in entries.flatten() {
+            if let Ok(inner) = std::fs::read_dir(e.path()) {
+                for i in inner.flatten() {
+                    roots.push(i.path().join("out"));
+                }
+            }
+        }
     }
 }
 
@@ -1746,6 +1796,72 @@ mod edition_tests {
         assert!(
             extern_options("a-crate-that-no-build-ever-produced").is_none(),
             "an absent artifact must be refused, never guessed"
+        );
+    }
+
+    /// Under cross-compilation the *host* profile directory is the one that holds a
+    /// usable build dependency, and the search must reach it.
+    ///
+    /// `$OUT_DIR` belongs to the package being built, so for `--target <triple>` it
+    /// sits under `target/<triple>/<profile>/`, while a build dependency is compiled
+    /// for the host and lands in `target/<profile>/`. Before the fix the host
+    /// directory was never searched: every candidate was a target rlib, every probe
+    /// failed, and `extern_options` returned `None` though the usable rlib existed.
+    ///
+    /// The test drives the *pure* core with explicit paths and names, so it needs no
+    /// `std::env::set_var` and therefore no `unsafe` block -- gate 17 pins that
+    /// surface at two, and a test is not allowed to raise it.
+    #[test]
+    fn a_cross_build_searches_the_host_profile_directory() {
+        let root = std::env::temp_dir().join(format!("verif-cross-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let triple = "thumbv7em-none-eabihf";
+        // target/<triple>/debug/build/pkg/hash/out  (the package being built)
+        let out = root.join(triple).join("debug").join("build").join("pkg").join("hash").join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        // target/debug/deps  (where the host build dependency lives)
+        let host_deps = root.join("debug").join("deps");
+        std::fs::create_dir_all(&host_deps).unwrap();
+        // target/<triple>/debug/deps  (the target artifact, unusable by a host probe)
+        let target_deps = root.join(triple).join("debug").join("deps");
+        std::fs::create_dir_all(&target_deps).unwrap();
+
+        let roots = build_script_roots_from(&out, Some("x86_64-unknown-linux-gnu"), Some(triple))
+            .expect("a build directory exists");
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            roots.contains(&host_deps),
+            "the host profile's deps directory must be searched under cross-compilation: {roots:?}"
+        );
+        assert!(
+            roots.contains(&target_deps),
+            "the target profile directory is still searched (a non-cross build uses it): {roots:?}"
+        );
+    }
+
+    /// A *host* build (`HOST == TARGET`) does not add a phantom directory, and the
+    /// profile directory it already has is the one it searches. This is the control
+    /// for the test above: a fix that always appended a "host" root would pass the
+    /// cross case and pollute every ordinary build.
+    #[test]
+    fn a_host_build_searches_only_its_own_profile_directory() {
+        let root = std::env::temp_dir().join(format!("verif-host-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let out = root.join("debug").join("build").join("pkg").join("hash").join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let deps = root.join("debug").join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+
+        let roots = build_script_roots_from(&out, Some("x86_64-unknown-linux-gnu"), Some("x86_64-unknown-linux-gnu"))
+            .expect("a build directory exists");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let deps_roots: Vec<_> = roots.iter().filter(|r| r.ends_with("deps")).collect();
+        assert_eq!(
+            deps_roots,
+            vec![&deps],
+            "a host build searches exactly one deps directory -- its own: {roots:?}"
         );
     }
 

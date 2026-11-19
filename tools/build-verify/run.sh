@@ -91,6 +91,34 @@ fn main() {
 }
 EOF
 
+# Assert that a crate rlib carries no `verif` symbol. Factored out because *both*
+# artifacts -- the doc-comment one and the in-code one -- have to be measured, and a
+# second copy of the grep is a second chance for one to drift. The pattern is
+# `verif::`, not `verif`: the scratch crate is itself named `build_verify_scratch`, so
+# a bare `verif` also matches *its own* symbols and the check fires on a prover that
+# was never linked in.
+check_symbols() {
+    rlib="$1"
+    label="$2"
+    if [ -z "$rlib" ]; then
+        echo "build-verify: no rlib was produced, so the zero-cost check for $label has" >&2
+        echo "build-verify: nothing to read" >&2
+        exit 1
+    fi
+    bytes=$(wc -c < "$rlib" | tr -d ' ')
+    if command -v nm >/dev/null 2>&1; then
+        symbols=$(nm -C "$rlib" 2>/dev/null | grep -c 'verif::' || true)
+        if [ "$symbols" -ne 0 ]; then
+            echo "build-verify: the $label artifact carries $symbols 'verif' symbol(s) -- the" >&2
+            echo "build-verify: prover reached the shipped code, so it is not zero-cost" >&2
+            exit 1
+        fi
+        echo "build-verify: 0 'verif' symbols in the $label artifact ($bytes bytes rlib)"
+    else
+        echo "build-verify: no nm, so the $label symbol check was skipped ($bytes bytes rlib)"
+    fi
+}
+
 # 1. A good contract must build, and the verification must actually *run* (a build script
 #    that silently did nothing would also "pass").
 cat > "$WORK/src/lib.rs" <<'EOF'
@@ -161,28 +189,7 @@ EOF
 (cd "$WORK" && cargo build --release >/dev/null 2>&1)
 
 rlib="$(find "$WORK/target/release" -maxdepth 1 -name 'libbuild_verify_scratch*.rlib' | head -n 1)"
-if [ -z "$rlib" ]; then
-    echo "build-verify: no rlib was produced, so the zero-cost check has nothing to read" >&2
-    exit 1
-fi
-rlib_bytes=$(wc -c < "$rlib" | tr -d ' ')
-
-if command -v nm >/dev/null 2>&1; then
-    # `nm -C` demangles, so `verif::smt::blast` shows up as such. The pattern is
-    # `verif::`, not `verif`: the scratch crate is itself named `build_verify_scratch`,
-    # so a bare `verif` also matches *its own* symbols (`build_verify_scratch::main`)
-    # and the check fires on a prover that was never linked in. Zero matches means
-    # the prover was not linked in; any match means it was, and the artifact is not free.
-    symbols=$(nm -C "$rlib" 2>/dev/null | grep -c 'verif::' || true)
-    if [ "$symbols" -ne 0 ]; then
-        echo "build-verify: the artifact carries $symbols 'verif' symbol(s) -- the prover" >&2
-        echo "build-verify: reached the shipped code, so it is not zero-cost" >&2
-        exit 1
-    fi
-    echo "build-verify: 0 'verif' symbols in the artifact ($rlib_bytes bytes rlib)"
-else
-    echo "build-verify: no nm, so the symbol check was skipped ($rlib_bytes bytes rlib)"
-fi
+check_symbols "$rlib" "doc-comment"
 
 # 4. The same guarantees for a contract written *in the code* as a `spec! { … }`
 #    block rather than a `///` doc comment. This is the shape that lets rustc parse a
@@ -241,6 +248,54 @@ case "$out" in
         ;;
 esac
 
+# 4b. A *false* in-code contract must fail the build. Check 4's true contract proves
+#     the block is read; without a false one, a scanner that dropped every clause but
+#     `requires: true` would still pass it. Restore the true contract first so the rlib
+#     below is a real artifact rather than the failed build's leftovers.
+cat > "$WORK/src/lib.rs" <<'EOF'
+use verif::spec;
+
+spec! {
+    requires: n <= 200,
+    ensures: ret == 1,
+}
+pub fn inc(n: u8) -> u8 { n + 2 }
+EOF
+if out="$(cd "$WORK" && cargo build --release 2>&1)"; then
+    echo "$out" >&2
+    echo "build-verify: a FALSE in-code contract BUILT -- the block was not verified" >&2
+    exit 1
+fi
+case "$out" in
+    *"verif inc: FAILED"*postcondition*)
+        ;;
+    *)
+        echo "$out" >&2
+        echo "build-verify: the false in-code contract failed to build, but not on the" >&2
+        echo "build-verify: postcondition -- expected the verifier to name it" >&2
+        exit 1
+        ;;
+esac
+echo "build-verify: a false in-code contract failed the build on its postcondition"
+
+# 4c. The *in-code* artifact must also carry no prover symbol. Check 3 measures the
+#     doc-comment artifact; the in-code source names `verif` in a `use`, so it is a
+#     different compilation and has to be measured separately -- the macro expanding to
+#     nothing is a claim about this artifact, not the other one.
+cat > "$WORK/src/lib.rs" <<'EOF'
+use verif::spec;
+
+spec! {
+    requires: n <= 200,
+    ensures: ret == n + 1,
+}
+pub fn inc(n: u8) -> u8 { n + 1 }
+EOF
+(cd "$WORK" && cargo build --release >/dev/null 2>&1)
+rlib="$(find "$WORK/target/release" -maxdepth 1 -name 'libbuild_verify_scratch*.rlib' | head -n 1)"
+check_symbols "$rlib" "in-code"
+
 echo "build-verify: a good contract built, a false one failed the build, and the artifact"
 echo "build-verify: carries no prover -- verification is build-time and zero-cost"
-echo 'build-verify: an in-code spec! block verified, and a malformed clause is a compile error'
+echo 'build-verify: an in-code spec! block verified, a false one was refuted, a malformed'
+echo 'build-verify: clause is a compile error, and the in-code artifact carries no prover'

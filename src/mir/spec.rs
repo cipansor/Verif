@@ -2259,14 +2259,14 @@ pub fn extract(source: &str) -> Specs {
                 ));
             } else {
                 for (offset, text) in &clauses {
-                    take_clause(&mut pending, text, lineno + 1 + offset);
+                    take_clause(&mut pending, text, lineno + 1 + offset, true);
                 }
                 skip_through = Some(lineno + consumed - 1);
             }
             continue;
         }
         if let Some(rest) = line.strip_prefix("///") {
-            take_clause(&mut pending, rest.trim(), lineno + 1);
+            take_clause(&mut pending, rest.trim(), lineno + 1, false);
             continue;
         }
         // A function item: attach whatever is pending and start fresh. A
@@ -2410,14 +2410,26 @@ fn in_code_block_start(line: &str) -> bool {
 /// proof rather than a refusal. Reading the grammar the macro declares is what
 /// keeps the two from diverging.
 fn in_code_block(lines: &[&str], start: usize) -> (Vec<(usize, String)>, usize) {
-    // Collect the block's text, remembering which line each character came from so
-    // a diagnostic can still name a line.
+    // The block is read as **one text**, scanned lexically, rather than per line
+    // with `split_once('}')`. Three findings made the per-line version wrong, and
+    // all three were silent:
+    //
+    // * a `}` inside a character literal (`ensures: ret == '}'`) closed the block
+    //   early, truncating the clause inside the literal;
+    // * a `//` comment after a clause comma was carried into the *next* clause, so
+    //   that clause began with `//` and was dropped -- and a dropped `ensures:` is
+    //   a false proof, not a lost one;
+    // * a `}` inside a string or a block comment did the same as the char case.
+    //
+    // One scan fixes all three, because the same quote/comment/nesting state that
+    // finds the closing brace also finds the clause commas. Two scans would be two
+    // chances for them to disagree about where the block ends.
     let mut text = String::new();
     let mut origins: Vec<usize> = Vec::new();
     let mut first = true;
     let mut consumed = 0usize;
     let mut closed = false;
-    for (offset, raw) in lines[start..].iter().enumerate() {
+    'lines: for (offset, raw) in lines[start..].iter().enumerate() {
         let body = if first {
             first = false;
             match raw.split_once('{') {
@@ -2427,83 +2439,243 @@ fn in_code_block(lines: &[&str], start: usize) -> (Vec<(usize, String)>, usize) 
         } else {
             *raw
         };
-        let (body, end) = match body.split_once('}') {
-            Some((head, _)) => (head, true),
-            None => (body, false),
-        };
         for ch in body.chars() {
             text.push(ch);
             origins.push(offset);
         }
-        // The newline is a separator that never splits a clause, but keeping it
-        // means a clause's own text reads as the author wrote it.
         text.push('\n');
         origins.push(offset);
         consumed = offset + 1;
-        if end {
+        // A `}` on this line may be inside a literal or a comment, so the closing
+        // brace is decided by the scan, not by the line's text.
+        if let Some(at) = block_close_offset(&text) {
+            text.truncate(at);
+            origins.truncate(at);
             closed = true;
-            break;
+            break 'lines;
         }
     }
     if !closed {
         return (Vec::new(), 0);
     }
-    // Split on **top-level** commas, which is exactly the macro's grammar
-    // (`$($clause:ident : $body:expr,)*`). Splitting per line instead would
-    // truncate a clause whose body spans lines, and a truncated `ensures` is a
-    // *weaker* postcondition -- a false proof rather than a refusal. Reading the
-    // same grammar the macro declares is what keeps the two from diverging.
-    let mut clauses = Vec::new();
+    let (clauses, _) = split_clauses(&text, &origins);
+    (clauses, consumed)
+}
+
+/// Split a closed block's text into `(line offset, clause text)` pairs.
+///
+/// Top-level commas separate clauses -- the macro's grammar is
+/// `$($clause:ident : $body:expr,)*` -- while a comma inside parentheses, brackets,
+/// braces, a string, a char literal or a comment does not. A `//` comment is
+/// *dropped* rather than carried into the next clause: keeping it made the next
+/// clause begin with `//`, so `take_clause` saw no keyword and dropped it, which is
+/// a false proof when the dropped clause was the `ensures:`.
+fn split_clauses(text: &str, origins: &[usize]) -> (Vec<(usize, String)>, usize) {
+    let bytes = text.as_bytes();
+    let mut clauses: Vec<(usize, String)> = Vec::new();
     let mut depth = 0i32;
+    // A turbofish's angle brackets nest like parentheses for the *comma* rule:
+    // `max::<u8, u8>(1, 2)` has a comma inside `<>` that is not a clause separator.
+    // Counting only `()[]{}` split that clause at the generic comma, so the body
+    // became `ret == core::cmp::max::<u8` -- a truncated expression, which is a
+    // weaker (or malformed) postcondition and therefore a false-proof shape.
+    //
+    // Only a `::<` opens the count, never a bare `<`: a comparison `a < b` is an
+    // operator and must not start a generic list. Once inside, `<`/`>` balance so a
+    // nested `Vec<u8>` counts, and a `>` that is half of `->` does not close it (a
+    // `fn(u8) -> u8` is a legal generic argument).
+    let mut angle = 0i32;
     let mut piece = String::new();
-    let mut piece_line = 0usize;
-    let mut in_str: Option<char> = None;
-    let mut escaped = false;
-    for (i, ch) in text.char_indices() {
-        if let Some(q) = in_str {
-            piece.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == q {
-                in_str = None;
+    let mut piece_start: Option<usize> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        // Comments and literals are consumed whole, so a comma or brace inside one
+        // is never a delimiter. Each branch skips to just past its construct.
+        match ch {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
             }
-            continue;
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let mut d = 1u32;
+                i += 2;
+                while i < bytes.len() && d > 0 {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        d += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        d -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            b'"' => {
+                if piece_start.is_none() {
+                    piece_start = origins.get(i).copied();
+                }
+                let end = skip_string(bytes, i);
+                piece.push_str(&text[i..end]);
+                i = end;
+                continue;
+            }
+            b'\'' if is_char_literal_start_bytes(bytes, i) => {
+                if piece_start.is_none() {
+                    piece_start = origins.get(i).copied();
+                }
+                let end = skip_char(bytes, i);
+                piece.push_str(&text[i..end]);
+                i = end;
+                continue;
+            }
+            b'r' | b'b' | b'c' => {
+                if let Some((hashes, after)) = raw_string_start(bytes, i) {
+                    if piece_start.is_none() {
+                        piece_start = origins.get(i).copied();
+                    }
+                    let end = skip_raw_string(bytes, after, hashes);
+                    piece.push_str(&text[i..end]);
+                    i = end;
+                    continue;
+                }
+                if piece_start.is_none() && !ch.is_ascii_whitespace() {
+                    piece_start = origins.get(i).copied();
+                }
+                piece.push(ch as char);
+                i += 1;
+                continue;
+            }
+            _ => {}
         }
         match ch {
-            '"' | '\'' => {
-                in_str = Some(ch);
-                piece.push(ch);
+            b'<' if angle > 0 || is_turbofish_open(bytes, i) => {
+                angle += 1;
+                if piece_start.is_none() {
+                    piece_start = origins.get(i).copied();
+                }
+                piece.push('<');
             }
-            '(' | '[' | '{' => {
+            b'>' if angle > 0 && bytes.get(i.wrapping_sub(1)) != Some(&b'-') => {
+                angle -= 1;
+                piece.push('>');
+            }
+            b'(' | b'[' | b'{' => {
                 depth += 1;
-                piece.push(ch);
+                if piece_start.is_none() {
+                    piece_start = origins.get(i).copied();
+                }
+                piece.push(ch as char);
             }
-            ')' | ']' | '}' => {
+            b')' | b']' | b'}' => {
                 depth -= 1;
-                piece.push(ch);
+                piece.push(ch as char);
             }
-            ',' if depth == 0 => {
+            b',' if depth == 0 && angle == 0 => {
                 let t = piece.trim();
                 if !t.is_empty() {
-                    clauses.push((piece_line, t.to_string()));
+                    clauses.push((piece_start.unwrap_or(0), t.to_string()));
                 }
                 piece.clear();
+                piece_start = None;
             }
             _ => {
-                if piece.trim().is_empty() && !ch.is_whitespace() {
-                    piece_line = origins.get(i).copied().unwrap_or(0);
+                if piece_start.is_none() && !(ch as char).is_whitespace() {
+                    piece_start = origins.get(i).copied();
                 }
-                piece.push(ch);
+                piece.push(ch as char);
             }
         }
+        i += 1;
     }
     let t = piece.trim();
     if !t.is_empty() {
-        clauses.push((piece_line, t.to_string()));
+        clauses.push((piece_start.unwrap_or(0), t.to_string()));
     }
-    (clauses, consumed)
+    (clauses, 0)
+}
+
+/// Is the `<` at `i` the opening of a turbofish (`::<`)?
+///
+/// Whitespace between the `::` and the `<` is allowed, because a clause body is an
+/// expression a person wrote and rustfmt is not always run. A bare `<` is never a
+/// generic opener here: `a < b` is a comparison, and treating it as one would make
+/// every relational clause need a closing `>` it does not have.
+fn is_turbofish_open(bytes: &[u8], i: usize) -> bool {
+    let mut j = i;
+    while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+        j -= 1;
+    }
+    j >= 2 && bytes[j - 1] == b':' && bytes[j - 2] == b':'
+}
+
+/// The byte offset of the block's closing `}`, ignoring braces inside literals and
+/// comments. `None` while the block is still open.
+///
+/// The scan is the same one [`split_clauses`] runs, so the two cannot disagree about
+/// where the block ends. The offset -- not a bare `bool` -- is what keeps the closing
+/// brace *out* of the last clause: returning only "closed" left `ret == n + 1 }` as
+/// the final clause body, which is a different expression from the one written.
+fn block_close_offset(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let mut d = 1u32;
+                i += 2;
+                while i < bytes.len() && d > 0 {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        d += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        d -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            b'"' => {
+                i = skip_string(bytes, i);
+                continue;
+            }
+            b'\'' if is_char_literal_start_bytes(bytes, i) => {
+                i = skip_char(bytes, i);
+                continue;
+            }
+            b'r' | b'b' | b'c' => {
+                if let Some((hashes, after)) = raw_string_start(bytes, i) {
+                    i = skip_raw_string(bytes, after, hashes);
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Apply one clause's text to `pending`, whichever spelling produced it.
@@ -2512,7 +2684,7 @@ fn in_code_block(lines: &[&str], start: usize) -> (Vec<(usize, String)>, usize) 
 /// line a reader can find. Both the `///` path and the in-code block go through
 /// here; a second copy of this match is a second chance for the two spellings to
 /// disagree about what `variant:` or an unknown clause does.
-fn take_clause(pending: &mut FnContract, text: &str, lineno: usize) {
+fn take_clause(pending: &mut FnContract, text: &str, lineno: usize, from_block: bool) {
     let t = text.trim();
     if t.is_empty() {
         return;
@@ -2553,7 +2725,36 @@ fn take_clause(pending: &mut FnContract, text: &str, lineno: usize) {
         // with no postcondition at all; a `variant:` would be ignored although
         // the reader expects it honoured. Recorded and refused, never dropped.
         pending.unknown.push((lineno, format!("{t} — {note}")));
+    } else if from_block && looks_like_clause(t) {
+        // Inside a `spec! { … }` block every piece is *guaranteed* by the matcher
+        // (`$($clause:ident : $body:expr,)*`) to be `ident : expr`, so an unknown
+        // keyword here is not prose -- it is a clause the author wrote and this
+        // frontend does not take. `postcondition: ret == 1` is nine edits from
+        // every keyword, so the typo heuristic above does not fire, and the clause
+        // was dropped silently: a function returning 0 was reported `Verified`
+        // against a postcondition nobody read. A doc comment may be prose; a block
+        // may not, so the block is strict.
+        pending.unknown.push((
+            lineno,
+            format!("{t} — not a clause this frontend takes (`requires:`, `ensures:`, `invariant:`, `decreases:`, `variant:`, `unwind:`); a `spec!` block may not contain prose"),
+        ));
     }
+}
+
+/// True when `t` is shaped `ident: …` -- an identifier, a colon, then a body.
+///
+/// This is the shape `spec!`'s matcher requires, so it distinguishes a clause the
+/// author wrote from a fragment of a malformed block. It is deliberately narrower
+/// than [`clause_shaped_word`]: that one guesses at typos, and this one does not
+/// guess at all, because inside a block the shape is a promise rustc has kept.
+fn looks_like_clause(t: &str) -> bool {
+    let Some((word, body)) = t.split_once(':') else {
+        return false;
+    };
+    let word = word.trim();
+    !word.is_empty()
+        && word.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && !body.trim().is_empty()
 }
 
 /// A note explaining why a clause-shaped doc-comment line was not taken, when
@@ -8445,6 +8646,161 @@ pub fn inc(n: u8) -> u8 { n + 2 }
         }
     }
 
+    /// A comment after a clause comma must not be carried into the next clause.
+    ///
+    /// It was: the split kept the `// …` tail, so the following `ensures:` began
+    /// with `//`, `take_clause` saw no keyword, and the clause vanished. A dropped
+    /// `ensures:` is a *false proof*, not a lost one -- the function is verified
+    /// against a postcondition the author did not write (here, none at all).
+    #[test]
+    fn a_comment_after_a_clause_comma_is_not_carried_into_the_next_clause() {
+        use super::extract;
+        let src = "\
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    ensures: ret == 0, // a true clause, and a comment
+    ensures: ret == 1,
+}
+pub fn f() -> u8 { 0 }
+";
+        let specs = extract(src);
+        let c = specs.get("f").expect("contract");
+        assert_eq!(
+            c.ensures,
+            vec!["ret == 0".to_string(), "ret == 1".to_string()],
+            "both clauses must survive a comment: {c:?}"
+        );
+    }
+
+    /// A `}` inside a character literal does not close the block, and one inside a
+    /// string does not either. The per-line `split_once('}')` truncated the clause
+    /// inside the literal, so the expression was malformed and the function was
+    /// skipped -- a valid contract refused.
+    #[test]
+    fn a_brace_inside_a_literal_does_not_close_the_block() {
+        use super::extract;
+        for body in ["'}'", "'\\u{7d}'", "\"}\"", "r\"}\"", "b'}'"] {
+            let src = format!(
+                "\
+macro_rules! spec {{ ($($c:ident : $b:expr,)*) => {{}}; }}
+
+spec! {{
+    requires: true,
+    ensures: ret == {body},
+}}
+pub fn h() -> u8 {{ 0 }}
+"
+            );
+            let specs = extract(&src);
+            let c = specs
+                .get("h")
+                .unwrap_or_else(|| panic!("the block must close past {body}: {:?}", specs));
+            assert_eq!(
+                c.ensures,
+                vec![format!("ret == {body}")],
+                "the whole clause must survive a brace inside {body}: {c:?}"
+            );
+        }
+    }
+
+    /// Inside a `spec!` block an unknown keyword is a clause the author wrote, not
+    /// prose, so it is refused. `postcondition:` is far from every real keyword, so
+    /// the typo heuristic did not fire and the clause was dropped silently: with
+    /// `requires: true` and a body returning 0, `postcondition: ret == 1` reported
+    /// `Verified` against a postcondition nobody read.
+    #[test]
+    fn an_unknown_clause_keyword_in_a_block_is_refused() {
+        use super::extract;
+        let src = "\
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    postcondition: ret == 1,
+}
+pub fn g() -> u8 { 0 }
+";
+        let specs = extract(src);
+        let c = specs.get("g").expect("contract");
+        assert!(
+            !c.unknown.is_empty(),
+            "an unknown keyword in a block must be refused, not dropped: {c:?}"
+        );
+    }
+
+    /// The doc-comment path keeps its typo heuristic and is *not* strict about
+    /// prose: a `///` line is documentation first, and ordinary sentences must not
+    /// refuse a function. This is the control for the test above.
+    #[test]
+    fn a_prose_doc_comment_is_not_refused() {
+        use super::extract;
+        let src = "\
+/// direction: this sentence is prose, not a clause.
+/// requires: n <= 200
+/// ensures: ret == n
+pub fn inc(n: u8) -> u8 { n }
+";
+        let specs = extract(src);
+        let c = specs.get("inc").expect("contract");
+        assert!(
+            c.unknown.is_empty(),
+            "prose in a doc comment must not be refused: {c:?}"
+        );
+        assert_eq!(c.ensures, vec!["ret == n".to_string()]);
+    }
+
+    /// A comma inside a turbofish is not a clause separator either.
+    ///
+    /// `max::<u8, u8>(1, 2)` holds a comma that is not a clause boundary, and the
+    /// splitter counted only `()[]{}`. The clause was cut at the generic comma, so
+    /// the postcondition became `ret == core::cmp::max::<u8` -- a truncated (and
+    /// malformed) expression. A truncated `ensures` is a weaker claim, which is the
+    /// false-proof shape this reader exists to prevent.
+    #[test]
+    fn a_comma_inside_a_turbofish_does_not_split_a_clause() {
+        use super::extract;
+        let src = "\
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    ensures: ret == core::cmp::max::<u8, u8>(1, 2),
+}
+pub fn f() -> u8 { 2 }
+";
+        let specs = extract(src);
+        let c = specs.get("f").expect("contract");
+        assert_eq!(
+            c.ensures,
+            vec!["ret == core::cmp::max::<u8, u8>(1, 2)".to_string()],
+            "the turbofish comma must not split the clause: {c:?}"
+        );
+    }
+
+    /// The control for the test above: a *comparison* `<` is an operator, not a
+    /// generic opener, so a clause containing one must still split normally at its
+    /// top-level comma. A fix that counted every `<` would make `a < b` demand a
+    /// closing `>` and swallow the following clause.
+    #[test]
+    fn a_comparison_does_not_open_a_generic_list() {
+        use super::extract;
+        let src = "\
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: n < 200,
+    ensures: ret < 200,
+}
+pub fn f(n: u8) -> u8 { n }
+";
+        let specs = extract(src);
+        let c = specs.get("f").expect("contract");
+        assert_eq!(c.requires, vec!["n < 200".to_string()]);
+        assert_eq!(c.ensures, vec!["ret < 200".to_string()]);
+    }
+
     /// A comma inside parentheses is not a clause separator: the grammar splits on
     /// *top-level* commas only, so a call-shaped body stays one clause.
     #[test]
@@ -11152,3 +11508,7 @@ fn h<
         );
     }
 }
+
+
+
+
