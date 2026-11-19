@@ -2725,20 +2725,44 @@ fn block_close_offset(text: &str) -> Option<usize> {
 /// line a reader can find. Both the `///` path and the in-code block go through
 /// here; a second copy of this match is a second chance for the two spellings to
 /// disagree about what `variant:` or an unknown clause does.
+/// The body of clause `keyword`, when `keyword` is exactly that identifier and a
+/// colon followed it.
+///
+/// `keyword` and `rest` come from splitting the clause text at its first colon, so
+/// `rest` is `Some` exactly when a colon was present. The keyword must be a bare
+/// identifier equal to `want` -- not merely a prefix -- so `requires_extra: x` is not
+/// read as a `requires:` clause.
+fn body_after<'a>(keyword: &str, rest: Option<&'a str>, want: &str) -> Option<&'a str> {
+    if keyword == want {
+        rest
+    } else {
+        None
+    }
+}
+
 fn take_clause(pending: &mut FnContract, text: &str, lineno: usize, from_block: bool) {
     let t = text.trim();
     if t.is_empty() {
         return;
     }
-    if let Some(r) = t.strip_prefix("requires:") {
+    // Split the keyword from its body at the first colon, allowing whitespace
+    // between them: Rust's matcher is `$clause:ident : $body:expr`, which accepts a
+    // comment (now a space) or plain spacing before the colon. Matching the literal
+    // `requires:` refused `requires : true` -- valid syntax -- so a comment before
+    // the colon silently dropped the clause and skipped the function.
+    let (keyword, rest) = match t.split_once(':') {
+        Some((k, r)) => (k.trim(), Some(r)),
+        None => (t, None),
+    };
+    if let Some(r) = body_after(keyword, rest, "requires") {
         pending.requires.push(r.trim().to_string());
-    } else if let Some(r) = t.strip_prefix("ensures:") {
+    } else if let Some(r) = body_after(keyword, rest, "ensures") {
         pending.ensures.push(r.trim().to_string());
-    } else if let Some(r) = t.strip_prefix("invariant:") {
+    } else if let Some(r) = body_after(keyword, rest, "invariant") {
         pending.invariants.push(r.trim().to_string());
-    } else if let Some(r) = t.strip_prefix("decreases:") {
+    } else if let Some(r) = body_after(keyword, rest, "decreases") {
         pending.decreases.push(r.trim().to_string());
-    } else if let Some(r) = t.strip_prefix("variant:") {
+    } else if let Some(r) = body_after(keyword, rest, "variant") {
         // A loop termination measure. Two would disagree, so a second is
         // recorded as an unknown clause and the function is refused -- the same
         // discipline as several `invariant:`.
@@ -2750,7 +2774,7 @@ fn take_clause(pending: &mut FnContract, text: &str, lineno: usize, from_block: 
         } else {
             pending.variant = Some(r.trim().to_string());
         }
-    } else if let Some(r) = t.strip_prefix("unwind:") {
+    } else if let Some(r) = body_after(keyword, rest, "unwind") {
         // A loop-unwinding bound. It has to be a positive integer: a non-numeric
         // or zero value is refused rather than defaulted, so a typo cannot
         // silently fall back to `DEFAULT_UNWIND`.
@@ -11585,6 +11609,37 @@ fn h<
             let got: Vec<&str> = got.iter().map(|(_, t)| t.as_str()).collect();
             assert_eq!(got, want, "clause split of {text:?}");
         }
+    }
+
+    /// A comment *before* the colon is whitespace, and Rust's matcher allows it.
+    ///
+    /// The matcher is `$($clause:ident : $body:expr,)*`, so `requires/**/: true` is a
+    /// precondition. The separator fix turns the comment into a space, giving
+    /// `requires : true`, and `take_clause` matched the literal `requires:` -- so the
+    /// clause was refused as unknown and the function was *skipped*, a lost proof on
+    /// valid syntax. Every supported keyword is checked, because the split is shared
+    /// and a fix for one is a fix for all.
+    #[test]
+    fn a_comment_before_the_colon_does_not_drop_the_clause() {
+        use super::{extract, split_clauses};
+        for (text, want) in [
+            ("requires/**/: true", "requires : true"),
+            ("ensures/**/: ret == n", "ensures : ret == n"),
+            ("invariant/**/: i <= n", "invariant : i <= n"),
+            ("decreases/**/: n", "decreases : n"),
+        ] {
+            let (got, _) = split_clauses(text, &vec![0usize; text.len()]);
+            assert_eq!(got.first().map(|(_, t)| t.as_str()), Some(want), "split of {text:?}");
+        }
+        // End to end: a block whose clauses carry a comment before the colon is read,
+        // not refused. A `spec!` block with an unknown clause would be reported, so
+        // the absence of `unknown` is the evidence the keywords were recognised.
+        let src = "spec! {\n    requires/**/: n > 0,\n    ensures/**/: ret == n,\n}\npub fn f(n: u8) -> u8 { n }\n";
+        let specs = extract(src);
+        let c = specs.by_fn.get("f").expect("f must carry a contract");
+        assert!(c.unknown.is_empty(), "no clause should be unknown: {:?}", c.unknown);
+        assert_eq!(c.requires, vec!["n > 0".to_string()]);
+        assert_eq!(c.ensures, vec!["ret == n".to_string()]);
     }
 
     /// A non-ASCII identifier is read as the character that was written.

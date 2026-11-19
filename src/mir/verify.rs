@@ -110,6 +110,20 @@ pub struct MirOptions {
     /// outer crate and then fails on the inner one -- an error naming a crate the
     /// caller never mentioned. [`extern_options`] fills this in.
     pub search_paths: Vec<PathBuf>,
+    /// The compiler the externs were *probed* with, when they came from
+    /// [`extern_options`] or [`extern_options_with`].
+    ///
+    /// An rlib's metadata is compiler-specific, so the probe's answer is only about
+    /// *that* compiler: a candidate it accepts is not thereby readable by another.
+    /// Probing with one toolchain and emitting MIR with another therefore fails
+    /// `E0514` -- or worse, silently drops the extern and reports `E0432` for a crate
+    /// that is perfectly usable. Recording the probe compiler lets
+    /// [`verify_file_with_opts`] refuse the mismatch and name both, rather than
+    /// leaving it to a compiler error about a program that is fine.
+    ///
+    /// `None` means "the caller supplied these by hand", which is not checked: a
+    /// hand-built [`MirOptions`] may legitimately name a prebuilt rlib.
+    pub probed_with: Option<String>,
 }
 
 /// Everything a build script needs to let its own source name a crate: the
@@ -194,6 +208,7 @@ pub fn extern_options_with(rustc: &str, name: &str) -> Option<MirOptions> {
         let mut opts = MirOptions {
             externs: vec![(name.to_string(), cand.clone())],
             search_paths: search.clone(),
+            probed_with: Some(canonical_compiler(rustc)),
             ..MirOptions::default()
         };
         opts.search_paths.retain(|r| r.is_dir());
@@ -208,6 +223,37 @@ pub fn extern_options_with(rustc: &str, name: &str) -> Option<MirOptions> {
 /// toolchain-accurate, and the only way to tell a current rlib from a stale one
 /// without parsing rustc's metadata format.
 #[cfg(feature = "std")]
+/// A compiler *identity*, so two spellings of one binary compare equal.
+///
+/// `rustup which` answers an absolute path while `RUSTC` may be the bare `rustc` on
+/// `PATH`; comparing the strings would call one binary two toolchains.
+fn canonical_compiler(p: &str) -> String {
+    std::fs::canonicalize(p)
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| p.to_string())
+}
+
+/// Refuse to emit with a compiler other than the one the externs were probed with.
+///
+/// The probe's answer is about the probing compiler only, so a mismatch is not a
+/// weaker proof -- it is `E0514` on a usable crate, or a dropped extern and `E0432`.
+/// The error names both compilers and the fix, because the alternative is a reader
+/// debugging a compiler message about a program that is fine.
+fn check_probe_compiler(rustc: &str, opts: &MirOptions) -> Result<(), String> {
+    let Some(probed) = opts.probed_with.as_deref() else {
+        return Ok(());
+    };
+    let emitting = canonical_compiler(rustc);
+    if emitting == probed {
+        return Ok(());
+    }
+    Err(format!(
+        "the externs were probed with `{probed}` but MIR would be emitted with `{emitting}`: \
+         an rlib's metadata is compiler-specific, so probe and emit must name one compiler \
+         -- pass the same `rustc` to `extern_options_with` and `verify_file_with_opts`"
+    ))
+}
+
 fn extern_compiles(rustc: &str, opts: &MirOptions) -> bool {
     let Some((name, _)) = opts.externs.first() else {
         return false;
@@ -1391,6 +1437,7 @@ pub fn verify_file_with_opts(
     only: &[String],
     opts: &MirOptions,
 ) -> Result<FileReport, String> {
+    check_probe_compiler(rustc, opts)?;
     let text = std::fs::read_to_string(source)
         .map_err(|e| format!("could not read {}: {e}", source.display()))?;
     let specs = spec::extract(&text);
@@ -1934,7 +1981,20 @@ mod extern_probe_tests {
             return None;
         }
         let p = String::from_utf8(out.stdout).ok()?.trim().to_string();
-        (!p.is_empty()).then_some(p)
+        (!p.is_empty()).then(|| resolve(&p))
+    }
+
+    /// A compiler *identity*, so two spellings of one binary compare equal.
+    ///
+    /// `rustup which` answers an absolute path, while `RUSTC` may be the bare `rustc`
+    /// on `PATH`. Comparing the strings would call them different and pick the same
+    /// compiler as the "other" toolchain -- the negative assertion then fails on a
+    /// correct implementation. Canonicalising makes the comparison about the binary,
+    /// which is the thing the probe is about.
+    fn resolve(p: &str) -> String {
+        std::fs::canonicalize(p)
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| p.to_string())
     }
 
     #[test]
@@ -1944,6 +2004,7 @@ mod extern_probe_tests {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "rustc".into());
+        let producer = resolve(&producer);
         // A *different* toolchain, if one is installed. Without one there is nothing
         // to compare against, and the test says so rather than passing vacuously.
         let other = ["1.85", "nightly", "stable"]
@@ -1988,6 +2049,55 @@ mod extern_probe_tests {
             !extern_compiles(&other, &opts),
             "a different toolchain ({other}) must not accept an rlib built by {producer}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A probed-extern set may only be used by the compiler that probed it.
+    ///
+    /// This is the invariant the whole `extern_options_with` signature exists for, so
+    /// it is checked rather than documented: a mismatch is refused with both compilers
+    /// named. The `None` case (hand-built options) is *not* refused -- a caller may
+    /// legitimately point at a prebuilt rlib -- so the guard cannot pass by refusing
+    /// everything.
+    #[test]
+    fn a_probed_extern_set_is_refused_by_a_different_compiler() {
+        let dir = std::env::temp_dir().join(format!("verif-probe-guard-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("lib.rs");
+        std::fs::write(&src, "pub fn one() -> u8 { 1 }\n").unwrap();
+
+        // Hand-built options are not checked: `probed_with` is `None`.
+        let hand_built = MirOptions { edition: Some(Edition::Rust2021), ..MirOptions::default() };
+        assert!(
+            check_probe_compiler("rustc", &hand_built).is_ok(),
+            "a hand-built option set names its own rlib and must not be refused"
+        );
+
+        // A probed set records its compiler and refuses any other.
+        let probed = MirOptions {
+            edition: Some(Edition::Rust2021),
+            probed_with: Some(canonical_compiler("rustc")),
+            ..MirOptions::default()
+        };
+        assert!(
+            check_probe_compiler("rustc", &probed).is_ok(),
+            "the probing compiler must be accepted"
+        );
+        if let Some(other) = ["1.85", "nightly", "stable"]
+            .into_iter()
+            .filter_map(|t| Command::new("rustup")
+                .args(["which", "--toolchain", t, "rustc"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()))
+            .map(|p| canonical_compiler(&p))
+            .find(|p| *p != canonical_compiler("rustc"))
+        {
+            let err = check_probe_compiler(&other, &probed)
+                .expect_err("a different compiler must be refused");
+            assert!(err.contains(&other), "the error must name the emitting compiler: {err}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

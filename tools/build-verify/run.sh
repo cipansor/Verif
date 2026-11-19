@@ -71,12 +71,16 @@ cat > "$WORK/build.rs" <<'EOF'
 fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
     let src = std::path::Path::new("src/lib.rs");
-    // `extern_options` finds this build script's own `verif` rlib and the search
-    // path its dependencies live on, so a source file that says `use verif::spec;`
-    // compiles. Without it the frontend's single-file `rustc` run cannot resolve the
-    // crate and reports `E0432: unresolved import`.
-    let opts = verif::mir::verify::extern_options("verif").unwrap_or_default();
-    let report = verif::mir::verify::verify_file_with_opts("rustc", src, &[], &opts)
+    // One compiler for both steps. `extern_options_with` finds the `verif` rlib that
+    // *this* compiler accepts, and the same name is handed to the emitter -- an rlib
+    // one toolchain produced is not thereby readable by another, so probing with one
+    // and emitting with another fails `E0514`. Cargo sets `RUSTC` here to the
+    // compiler that built the build-dependency rlibs, which is the one that can read
+    // them back. Without the rlib the frontend's single-file `rustc` run cannot
+    // resolve the crate and reports `E0432: unresolved import`.
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let opts = verif::mir::verify::extern_options_with(&rustc, "verif").unwrap_or_default();
+    let report = verif::mir::verify::verify_file_with_opts(&rustc, src, &[], &opts)
         .expect("verif: the MIR frontend could not read the source");
     let mut bad = Vec::new();
     for (name, outcome) in &report.outcomes {

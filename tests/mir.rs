@@ -13304,6 +13304,32 @@ pub fn panics_on_drop() -> u8 {
     }
 }
 
+/// A comment *before* a clause's colon is whitespace, and Rust's matcher allows it.
+///
+/// The matcher is `$($clause:ident : $body:expr,)*`, so `requires/**/: n > 0` is a
+/// precondition. The separator fix turns the comment into a space -- `requires : n > 0`
+/// -- and `take_clause` matched the literal `requires:`, so the clause was refused as
+/// unknown and the whole function was *skipped*: a lost proof on valid syntax. The
+/// contract here is true, so only reading both clauses can verify it; the second
+/// function carries a false postcondition behind the same spelling, so "verified"
+/// cannot be the clauses being dropped.
+#[test]
+fn a_comment_before_a_clause_colon_is_whitespace_not_a_dropped_clause() {
+    let macros = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n\n";
+    let true_src = format!("{macros}spec! {{\n    requires/**/: n > 0,\n    ensures/**/: ret == n,\n}}\npub fn f(n: u8) -> u8 {{ n }}\n");
+    let outcome = verify_src("f", &true_src).expect("the function must be reported");
+    assert!(
+        matches!(outcome, FnOutcome::Verified { .. }),
+        "a comment before the colon must not drop the clause, got: {outcome:?}"
+    );
+    let false_src = format!("{macros}spec! {{\n    requires/**/: n > 0,\n    ensures/**/: ret == n + 1,\n}}\npub fn g(n: u8) -> u8 {{ n }}\n");
+    let bad = verify_src("g", &false_src).expect("the function must be reported");
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "a false postcondition behind a comment must still be refuted, got: {bad:?}"
+    );
+}
+
 /// A comment between two tokens separates them, and a non-ASCII identifier is read
 /// as written -- both are false-proof shapes when the block reader gets them wrong.
 ///
