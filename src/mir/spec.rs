@@ -7247,8 +7247,26 @@ pub(crate) fn struct_lookup<'a>(
     if let Some(def) = structs.get(no_generics) {
         return Some(def);
     }
-    let bare = no_generics.rsplit("::").next().unwrap_or(no_generics);
-    structs.get(bare)
+    // A **qualified** name may not fall back to a bare layout. The bare key is
+    // only ever back-inserted for a name that is unique crate-wide, so it is
+    // sound *as an answer to a bare query* -- the dump prints a name bare exactly
+    // when rustc could shorten it that far. A qualified query (`m::Outer`) means
+    // rustc could **not** shorten it, so at least two types share that tail, and
+    // the bare key is then some *other* type's layout. Falling back would read it
+    // and prove a contract about the wrong fields.
+    //
+    // Measured, and it was a false proof: `pub struct Outer { lo, hi }` at the
+    // crate root plus `pub mod m { pub struct Outer { hi, lo } }` -- a one-line
+    // module, whose inline struct the line-oriented scanner never sees. The query
+    // is `m::Outer` (qualified, because the bare name is ambiguous), the only
+    // layout is the crate-root one, and both `requires: o.hi == 5; ensures: ret ==
+    // 5` on a body returning `o.lo` and its mirror were **verified** -- the two
+    // fields were the same variable. Rustc's own execution gives `ret = 7` for
+    // `{ hi: 5, lo: 7 }`. A miss here is a refusal, which the caller reports.
+    if no_generics.contains("::") {
+        return None;
+    }
+    structs.get(no_generics)
 }
 
 fn struct_head(line: &str) -> Option<StructHead> {
