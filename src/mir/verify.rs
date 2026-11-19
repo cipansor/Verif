@@ -204,11 +204,14 @@ pub fn extern_options_with(rustc: &str, name: &str) -> Option<MirOptions> {
         )
     });
     let search: Vec<PathBuf> = roots;
+    // One identity for the whole loop: `canonical_compiler` runs `rustc -vV`, and the
+    // probing compiler does not change between candidates.
+    let probed_with = Some(canonical_compiler(rustc));
     for cand in found {
         let mut opts = MirOptions {
             externs: vec![(name.to_string(), cand.clone())],
             search_paths: search.clone(),
-            probed_with: Some(canonical_compiler(rustc)),
+            probed_with: probed_with.clone(),
             ..MirOptions::default()
         };
         opts.search_paths.retain(|r| r.is_dir());
@@ -219,18 +222,49 @@ pub fn extern_options_with(rustc: &str, name: &str) -> Option<MirOptions> {
     None
 }
 
-/// Does `rustc` accept this extern? A one-line probe compiled to metadata: cheap,
-/// toolchain-accurate, and the only way to tell a current rlib from a stale one
-/// without parsing rustc's metadata format.
-#[cfg(feature = "std")]
-/// A compiler *identity*, so two spellings of one binary compare equal.
+/// A compiler *identity*, so two spellings of one compiler compare equal.
 ///
-/// `rustup which` answers an absolute path while `RUSTC` may be the bare `rustc` on
-/// `PATH`; comparing the strings would call one binary two toolchains.
+/// A path cannot answer this. `rustc` on `PATH` is usually a rustup **shim** -- a
+/// symlink to `rustup` itself, which dispatches to a toolchain at run time -- so
+/// `~/.cargo/bin/rustc` and
+/// `~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc` are the same
+/// compiler under two paths, and `std::fs::canonicalize` reports them as different
+/// (it follows the symlink to `rustup`, not the toolchain `rustup` would dispatch
+/// to). What decides whether an rlib's metadata is readable is the compiler's own
+/// account of which build it is: `-vV`'s `commit-hash` and `host`. Two spellings of
+/// one toolchain agree on both; two toolchains cannot.
+///
+/// A binary that cannot answer `-vV` falls back to its canonical path, which is the
+/// best identity available and still separates two files.
 fn canonical_compiler(p: &str) -> String {
-    std::fs::canonicalize(p)
-        .map(|c| c.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| p.to_string())
+    commit_identity(p).unwrap_or_else(|| {
+        std::fs::canonicalize(p)
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| p.to_string())
+    })
+}
+
+/// `commit-hash/host` from `rustc -vV`, when the binary answers.
+///
+/// `commit-hash` names the build and `host` the target its metadata is written for,
+/// and both are read rather than the version banner: `1.100.0` names a release while
+/// the commit names a build, and metadata compatibility follows the build.
+fn commit_identity(p: &str) -> Option<String> {
+    let out = Command::new(p).arg("-vV").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut commit = None;
+    let mut host = None;
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("commit-hash: ") {
+            commit = Some(v.trim());
+        } else if let Some(v) = line.strip_prefix("host: ") {
+            host = Some(v.trim());
+        }
+    }
+    Some(format!("{}/{}", commit?, host?))
 }
 
 /// Refuse to emit with a compiler other than the one the externs were probed with.
@@ -254,6 +288,10 @@ fn check_probe_compiler(rustc: &str, opts: &MirOptions) -> Result<(), String> {
     ))
 }
 
+/// Does `rustc` accept this extern? A one-line probe compiled to metadata: cheap,
+/// toolchain-accurate, and the only way to tell a current rlib from a stale one
+/// without parsing rustc's metadata format.
+#[cfg(feature = "std")]
 fn extern_compiles(rustc: &str, opts: &MirOptions) -> bool {
     let Some((name, _)) = opts.externs.first() else {
         return false;
@@ -2086,5 +2124,69 @@ mod extern_probe_tests {
             assert!(err.contains(&other), "the error must name the emitting compiler: {err}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bare name and the absolute path naming the same compiler are one identity.
+    ///
+    /// This is the whole point of [`canonical_compiler`], and it is easy to get wrong.
+    /// `rustc` on `PATH` is the rustup *shim*, a different file from the toolchain
+    /// binary, so neither `fs::canonicalize` nor a `PATH` search equates them -- only
+    /// the compiler's own `-vV` does. The previous version of the guard test could not
+    /// see that: it canonicalised *both* operands with the same helper, so a helper
+    /// that returned its input unchanged still compared equal. This test compares a
+    /// bare name against an absolute path obtained independently, from `rustup which`.
+    #[test]
+    fn a_bare_compiler_name_and_its_absolute_path_are_one_identity() {
+        let Some(abs) = Command::new("rustup")
+            .args(["which", "--toolchain", "stable", "rustc"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        else {
+            return; // no rustup, nothing to compare
+        };
+        let bare = canonical_compiler("rustc");
+        let path = canonical_compiler(&abs);
+        assert_eq!(
+            bare, path,
+            "a bare `rustc` (the rustup shim) and `rustup which`'s absolute path name one \
+             compiler and must canonicalise to one identity; got {bare:?} vs {path:?}"
+        );
+        // The property the guard depends on: a probed set built from the absolute path
+        // accepts the bare name rather than refusing it as a second toolchain.
+        let probed = MirOptions {
+            probed_with: Some(canonical_compiler(&abs)),
+            ..MirOptions::default()
+        };
+        assert!(
+            check_probe_compiler("rustc", &probed).is_ok(),
+            "a bare name naming the probed compiler must not be refused"
+        );
+    }
+
+    /// Two different toolchains are two identities.
+    ///
+    /// The guard is only useful if it can tell them apart, so the identity is not
+    /// "some string that two binaries might share". `1.85` and stable are different
+    /// builds and must differ.
+    #[test]
+    fn two_toolchains_are_two_identities() {
+        let one = |t: &str| {
+            Command::new("rustup")
+                .args(["which", "--toolchain", t, "rustc"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        };
+        let (Some(a), Some(b)) = (one("stable"), one("1.85")) else {
+            return; // one of the toolchains is not installed
+        };
+        assert_ne!(
+            canonical_compiler(&a),
+            canonical_compiler(&b),
+            "stable and 1.85 are different builds and must not share an identity"
+        );
     }
 }

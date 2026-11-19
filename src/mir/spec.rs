@@ -11631,6 +11631,8 @@ fn h<
             ("ensures/**/: ret == n", "ensures : ret == n"),
             ("invariant/**/: i <= n", "invariant : i <= n"),
             ("decreases/**/: n", "decreases : n"),
+            ("variant/**/: n - i", "variant : n - i"),
+            ("unwind/**/: 4", "unwind : 4"),
         ] {
             let (got, _) = split_clauses(text, &vec![0usize; text.len()]);
             assert_eq!(got.first().map(|(_, t)| t.as_str()), Some(want), "split of {text:?}");
@@ -11644,6 +11646,17 @@ fn h<
         assert!(c.unknown.is_empty(), "no clause should be unknown: {:?}", c.unknown);
         assert_eq!(c.requires, vec!["n > 0".to_string()]);
         assert_eq!(c.ensures, vec!["ret == n".to_string()]);
+        // The loop clauses take the same path, and each has its own arm in
+        // `take_clause`; a fix that split only the first four would leave a loop
+        // contract dropped. `unwind` parses its body as an integer, so a comment
+        // before its colon also exercises the split-then-parse order.
+        let loop_src = "spec! {\n    invariant/**/: i <= n,\n    variant/**/: n - i,\n    unwind/**/: 4,\n}\npub fn g(n: u8) -> u8 { let mut i = 0u8; while i < n { i += 1; } i }\n";
+        let lspecs = extract(loop_src);
+        let lc = lspecs.by_fn.get("g").expect("g must carry a contract");
+        assert!(lc.unknown.is_empty(), "no loop clause should be unknown: {:?}", lc.unknown);
+        assert_eq!(lc.invariants, vec!["i <= n".to_string()]);
+        assert_eq!(lc.variant, Some("n - i".to_string()));
+        assert_eq!(lc.unwind, Some(4));
     }
 
     /// A non-ASCII identifier is read as the character that was written.
