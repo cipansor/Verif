@@ -7851,12 +7851,33 @@ confirmed by making the shape place-aware and watching it fail):
 | `assert(c)` -> `assert(!c)` | no -- caught |
 
 The first row is a *real* rustc 1.99 change that cost four verdicts on the 1.85 floor, and
-gate 10 was silent across it; it was found by running the suite under a second toolchain,
-and gate 14 (the MSRV run) is the durable form of that check. So the correct
+gate 10 was silent across it; it was found by running the suite under a second toolchain.
+**Gate 14 samples that coverage; it does not complete it.** It runs `tests/mir.rs` under 1.85
+against the same suite on current stable, and it *skips* (reported, not passed) on a machine
+without the 1.85 toolchain. Two compilers catch a spelling change only where they differ, so
+a printer change that lands between them, or after current stable, is uncovered by both. The
+durable check is a habit -- run the suite under a compiler you have not run before when the
+toolchain moves -- and the gate is the part of it that can be automated. Measured for this
+paragraph: `tests/mir.rs` is 354/354 on 1.85.1, 1.100.0 and 1.102.0-nightly, and the two end
+spellings really do differ. So the correct
 claim is "gate 10 checks the parser's reading of the control-flow skeleton", not "the parser
 is checked". Both README sections that used to say the latter now say the former and name
 the pinning test, because a gate's *scope* is a claim like any other and this one had been
 stated wider than the code.
+
+**The shape test's blind cases need parsing controls, and did not have them.** An
+`assert_eq!` on two `Option`s passes when both are `None`, so a `shape_of` that failed to
+parse satisfied all three "the shape is blind to X" assertions for the wrong reason -- the
+test would report that the oracle cannot see a place change when it saw nothing at all.
+Measured: with `shape_of` returning `None` unconditionally, the first three assertions
+passed and the test failed only at the fourth (structural) one. Each comparison is now
+preceded by a `parsed(src, blocks)` control that requires the dump to yield exactly one `f`
+with the expected block count, so "the shapes are equal" means "identical despite the edit"
+and `assert_ne!` cannot pass on two `None`s either. Teeth: the `None` mutant now fails at the
+control with "the dump must parse to a function `f`", not at the fourth assertion. The
+general rule is the one this file keeps meeting -- a test whose assertion is satisfied by
+the *absence* of a value is not a test, and the control is what distinguishes a comparison
+of two shapes from a comparison of two nothings.
 
 **When to revisit.** Two conditions, either of which flips the decision: (1) `rustc_public`
 stabilises, which would make it strictly better -- typed MIR with no parser to rot; (2) a

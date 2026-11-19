@@ -2744,9 +2744,19 @@ or was inserted, a guard whose polarity flipped. It does not see a change in *sp
 place, a local index, a field projection, a type. Re-spelling `Len((*_1))` as
 `PtrMetadata(copy _1)` — a real change in rustc 1.99 that cost four verdicts on the 1.85
 floor — leaves the shape byte-identical, so gate 10 was silent across it; it was found by
-running the suite under a second toolchain, and gate 14 (the MSRV run) is the durable form
-of that check. So this gate is evidence about the parser's *reading of the control-flow
-skeleton*, not about every token it reads, and gate 14 is what covers the rest.
+running the suite under a second toolchain.
+
+**Gate 14 is a sample of that coverage, not the whole of it.** It runs `tests/mir.rs` under
+one older compiler (1.85) against the same suite on the current stable, and it *skipped
+entirely* in a container without the 1.85 toolchain — reported, not passed, but a skip. Two
+compilers catch a spelling change only where they differ; a printer change that lands in a
+version *between* them, or after current stable, is not covered by either. The durable form of
+the check is therefore a habit, not a gate: run the suite under a compiler you have not run
+before when the toolchain moves. Measured for this paragraph, `tests/mir.rs` is 354/354 on
+1.85.1, 1.100.0 and 1.102.0-nightly, and the two end spellings really do differ
+(`Len((*_1))` on 1.85, `PtrMetadata(copy _1)` on stable). So gate 10 is evidence about the
+parser's *reading of the control-flow skeleton*; gate 14 extends that evidence to one more
+compiler's spellings; nothing here covers every token on every toolchain.
 
 The oracle lives in
 `tools/mir-oracle`, outside the workspace, so the nightly and the `rustc_private` feature
