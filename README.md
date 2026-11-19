@@ -3115,7 +3115,12 @@ resolves one `rustc` and passes it to both calls. The convenience form `extern_o
 (no compiler argument) reads `VERIF_RUSTC`, which is what the emitter uses, so it is
 consistent only when `VERIF_RUSTC` is also the compiler that built the rlib — true for the
 common `cargo build` with no override, and the reason the explicit form exists for every
-other case.
+other case. Because that reasoning is easy to get wrong, it is also *checked*:
+`extern_options_with` records the compiler it probed with in `MirOptions::probed_with`,
+and `verify_file_with_opts` refuses to emit with a different one, naming both and the fix
+rather than leaving a `E0514`/`E0432` about a program that is fine. Hand-built
+`MirOptions` (where the caller names a prebuilt rlib) are not checked, since only the
+caller knows which compiler built it.
 
 `extern_options` does not guess: a crate that is both a dependency and a build dependency
 has *two* rlibs of one name, and a stale one from another compiler is `E0514`. So each

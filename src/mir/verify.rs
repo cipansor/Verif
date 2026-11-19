@@ -1981,20 +1981,7 @@ mod extern_probe_tests {
             return None;
         }
         let p = String::from_utf8(out.stdout).ok()?.trim().to_string();
-        (!p.is_empty()).then(|| resolve(&p))
-    }
-
-    /// A compiler *identity*, so two spellings of one binary compare equal.
-    ///
-    /// `rustup which` answers an absolute path, while `RUSTC` may be the bare `rustc`
-    /// on `PATH`. Comparing the strings would call them different and pick the same
-    /// compiler as the "other" toolchain -- the negative assertion then fails on a
-    /// correct implementation. Canonicalising makes the comparison about the binary,
-    /// which is the thing the probe is about.
-    fn resolve(p: &str) -> String {
-        std::fs::canonicalize(p)
-            .map(|c| c.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| p.to_string())
+        (!p.is_empty()).then(|| canonical_compiler(&p))
     }
 
     #[test]
@@ -2004,7 +1991,7 @@ mod extern_probe_tests {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "rustc".into());
-        let producer = resolve(&producer);
+        let producer = canonical_compiler(&producer);
         // A *different* toolchain, if one is installed. Without one there is nothing
         // to compare against, and the test says so rather than passing vacuously.
         let other = ["1.85", "nightly", "stable"]

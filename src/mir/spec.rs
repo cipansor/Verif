@@ -2719,12 +2719,6 @@ fn block_close_offset(text: &str) -> Option<usize> {
     None
 }
 
-/// Apply one clause's text to `pending`, whichever spelling produced it.
-///
-/// `lineno` is 1-based and used only for a diagnostic, so a refusal names the
-/// line a reader can find. Both the `///` path and the in-code block go through
-/// here; a second copy of this match is a second chance for the two spellings to
-/// disagree about what `variant:` or an unknown clause does.
 /// The body of clause `keyword`, when `keyword` is exactly that identifier and a
 /// colon followed it.
 ///
@@ -2740,6 +2734,16 @@ fn body_after<'a>(keyword: &str, rest: Option<&'a str>, want: &str) -> Option<&'
     }
 }
 
+/// Apply one clause's text to `pending`, whichever spelling produced it.
+///
+/// `lineno` is 1-based and used only for a diagnostic, so a refusal names the
+/// line a reader can find. Both the `///` path and the in-code block go through
+/// here; a second copy of this match is a second chance for the two spellings to
+/// disagree about what `variant:` or an unknown clause does.
+///
+/// The keyword and its colon are split apart, so `requires : true` -- what a comment
+/// before the colon becomes -- reads as a precondition. Rust's matcher is
+/// `$clause:ident : $body:expr`, which allows that spacing.
 fn take_clause(pending: &mut FnContract, text: &str, lineno: usize, from_block: bool) {
     let t = text.trim();
     if t.is_empty() {
