@@ -88,6 +88,8 @@ are the defects where it produced a wrong verdict.
 | 42 | A **qualified** type name (`m::Outer`) fell back to a *bare* layout key, so with a crate-root `Outer { lo, hi }` and a one-line `pub mod m { pub struct Outer { hi, lo } }` both field projections read the crate-root fields and `requires: o.hi == 5; ensures: ret == 5` on a body returning `o.lo` was **verified** (rustc returns `7` for `{ hi: 5, lo: 7 }`) | false proof | `a_qualified_type_is_not_answered_by_a_bare_layout` (`tests/mir.rs`) | `a552c67` | 2026-11-18 |
 | 43 | A comment between two tokens was **deleted** instead of replaced by a space, so `ensures: ret == n/**/as/**/u8` (the cast `n as u8`) was read as the identifier `nasu8`; a body returning an argument of that name **verified** a postcondition the source never states | false proof | `a_comment_and_a_non_ascii_name_cannot_smuggle_a_false_proof` (`tests/mir.rs`) | `2ab47cb` | 2026-11-19 |
 | 44 | The clause scanner walked bytes and pushed `byte as char`, so a non-ASCII identifier `µ` (0xC2 0xB5) was read as `Âµ` -- a *different* name; a body returning an argument of the mangled spelling **verified** `ensures: ret == µ` | false proof | `a_comment_and_a_non_ascii_name_cannot_smuggle_a_false_proof` (`tests/mir.rs`) | `2ab47cb` | 2026-11-19 |
+| 45 | `take_clause` matched the literal `requires:` (and each sibling keyword), so a comment before the colon -- valid Rust, whose matcher is `$clause:ident : $body:expr` -- became `requires : true` and the clause was **refused as unknown**, so the function was skipped | lost proof | `a_comment_before_a_clause_colon_is_whitespace_not_a_dropped_clause` (`tests/mir.rs`) | `808f33c` | 2026-11-19 |
+| 46 | `extern_options` probed for an rlib with `VERIF_RUSTC` while the caller emitted MIR with `rustc`; under CI (nightly `VERIF_RUSTC`, stable build) the probe rejected the stable rlib, the extern was dropped, and `use verif::spec;` failed `E0432` -- the mismatch is now a **refused** probe/emit pair naming both compilers | wrong verdict | `a_probed_extern_set_is_refused_by_a_different_compiler` (`src/mir/verify.rs`) | `808f33c` | 2026-11-19 |
 
 The clusters are the lesson: rows 1–9 are all the *contract reader's* value and
 width model; rows 10–13 are all *name resolution* (a name bound to the wrong
@@ -99,7 +101,13 @@ returns to *name resolution* — a type name answered by another type's layout; 
 rows 43–44 are the **lexical** reader — a comment deleted instead of replaced by a
 space, and a UTF-8 identifier decoded a byte at a time. Both are the same mistake
 one layer below the parser: the clause *text* was wrong before any expression was
-parsed, so every rule downstream faithfully checked the wrong string.
+parsed, so every rule downstream faithfully checked the wrong string. Row 45 is the
+same layer's other half — a comment replaced by a space is *correct*, but the clause
+matcher then demanded the colon be glued to the keyword, so the valid spelling
+`requires : true` was refused; a separator fix and a matcher are two readers of one
+line. Row 46 is not lexical at all: the *compiler* a probe asks is not the compiler
+the emitter runs, and an rlib's metadata is toolchain-specific, so the two must be
+one name — a build-time mismatch that only a second toolchain in CI could show.
 A fix that addresses one shape and not its siblings is the recurring cause — the
 reader had three `align_widths` sites, four operator levels, five `push` sites,
 and each was found one at a time.
@@ -113,22 +121,22 @@ summary would leave their fix dates unfindable.
 
 | # | Class | Symptom | Fixture | Commit | Fixed |
 |---|---|---|---|---|---|
-| 45 | false proof | An under-declared call frame let a caller prove a clobbered variable survived the call | `under_declaring_the_frame_is_rejected` (`tests/call.rs`) | `1b64205` | 2026-10-24 |
-| 46 | false proof | A callee writing more than the cap made the caller's derived frame look complete, so a prefix of the truth passed | `a_call_to_an_over_cap_callee_makes_the_caller_frame_incomplete` (`tests/call.rs`) | `fd15f98` | 2026-10-27 |
-| 47 | false proof | `Report::terminates` *counted* variant obligations instead of discharging them, so a non-decreasing measure read `Total` | `a_total_claim_is_not_made_for_a_divergent_loop` (`tests/modular_differential.rs`) | `fa178ef` | 2026-10-25 |
-| 48 | false proof | `MAX_OBLIGATIONS` dropped obligations silently, so a failing `LoopExit` sat outside the buffer and the report said `verified` | `assertions_beyond_the_cap_are_reported_not_hidden` (`tests/wp.rs`) | `8d7120c` | 2026-10-27 |
-| 49 | false proof | `exists_guarded` truncated the index to the bound's width, so a concrete index wrapped and was treated as inside | `the_guarded_quantifiers_do_not_truncate_their_index` (`tests/quant.rs`) | `40f94c0` | 2026-10-25 |
-| 50 | vacuity | An unsatisfiable precondition made `pre => wp(body, post)` a theorem for any body | `an_unreachable_precondition_is_not_a_proof` (`tests/wp.rs`) | `8c812d8` | 2026-10-25 |
-| 51 | vacuity | An unsatisfiable `Assume` inside the body made everything downstream vacuously true | `an_unreachable_assume_is_not_a_proof` (`tests/wp.rs`) | `779f1e9` | 2026-10-26 |
-| 52 | vacuity | A bound exactly as wide as the address could not name `len`, so the standard postcondition was unsatisfiable | `a_bound_the_same_width_as_the_address_is_rejected` (`tests/mem.rs`) | `a85ebe6` | 2026-10-25 |
-| 53 | vacuity | A call to `ensures false` never returns, so the post-call state was empty and the continuation vacuously true | `a_call_to_a_never_returning_proc_is_not_total` (`tests/call.rs`) | `3754e1d` | 2026-10-26 |
-| 54 | false proof | `Certificate` stored a bare term id, so one from a reset scope named a different formula and certified a falsehood | `a_certificate_does_not_survive_an_arena_reset` (`tests/kernel.rs`) | `f9f6f4d` | 2026-10-25 |
-| 55 | false proof | `Report` held term ids with no arena generation, so a report read after a reset answered `Unknown` for every obligation | `a_report_is_only_valid_in_the_arena_that_built_it` (`tests/wp.rs`) | `732aebf` | 2026-10-28 |
-| 56 | false proof | The kernel's `Imp<P, Q>` had no `Theorem` bound, so `assert_proof!(Imp<Truth, Falsity>)` compiled | `the_imp_associated_proof_type_is_a_function_between_proofs` (`tests/kernel.rs`) | `4601e9d` | 2026-10-26 |
-| 57 | false proof | The SMT-LIB printer's polarity, sort and direction bugs made the external evidence not apply (a solver proved a different formula) | `the_export_checker_rejects_what_the_old_exporter_printed` (`tests/differential.rs`) | `d687a45` | 2026-10-26 |
-| 58 | wrong verdict | `Fixed::to_int` floored instead of truncating and `from_int` wrapped instead of saturating — both total, so the proof layer could not see them | `fixed_to_int_truncates_toward_zero`, `fixed_from_int_saturates_instead_of_wrapping` (`src/logic.rs`) | `c35b456` | 2026-10-26 |
-| 59 | vacuity | The MIR frontend's twin of row 45: a call to a bodyless `ensures false` callee made every claim after it vacuously true, so the caller read `verified` | `a_call_to_a_callee_whose_postcondition_is_unsatisfiable_fails` (`tests/mir.rs`) | `c60ff40` | 2026-11-12 |
-| 60 | false proof | `prove_implies` decided a closed true goal without reading the premise, so a `pre` saved from an earlier arena returned `Valid` for a premise that was not the one passed | `a_closed_goal_does_not_bypass_a_stale_premise` (`tests/sym.rs`) | `dd1ca69` | 2026-11-09 |
+| 47 | false proof | An under-declared call frame let a caller prove a clobbered variable survived the call | `under_declaring_the_frame_is_rejected` (`tests/call.rs`) | `1b64205` | 2026-10-24 |
+| 48 | false proof | A callee writing more than the cap made the caller's derived frame look complete, so a prefix of the truth passed | `a_call_to_an_over_cap_callee_makes_the_caller_frame_incomplete` (`tests/call.rs`) | `fd15f98` | 2026-10-27 |
+| 49 | false proof | `Report::terminates` *counted* variant obligations instead of discharging them, so a non-decreasing measure read `Total` | `a_total_claim_is_not_made_for_a_divergent_loop` (`tests/modular_differential.rs`) | `fa178ef` | 2026-10-25 |
+| 50 | false proof | `MAX_OBLIGATIONS` dropped obligations silently, so a failing `LoopExit` sat outside the buffer and the report said `verified` | `assertions_beyond_the_cap_are_reported_not_hidden` (`tests/wp.rs`) | `8d7120c` | 2026-10-27 |
+| 51 | false proof | `exists_guarded` truncated the index to the bound's width, so a concrete index wrapped and was treated as inside | `the_guarded_quantifiers_do_not_truncate_their_index` (`tests/quant.rs`) | `40f94c0` | 2026-10-25 |
+| 52 | vacuity | An unsatisfiable precondition made `pre => wp(body, post)` a theorem for any body | `an_unreachable_precondition_is_not_a_proof` (`tests/wp.rs`) | `8c812d8` | 2026-10-25 |
+| 53 | vacuity | An unsatisfiable `Assume` inside the body made everything downstream vacuously true | `an_unreachable_assume_is_not_a_proof` (`tests/wp.rs`) | `779f1e9` | 2026-10-26 |
+| 54 | vacuity | A bound exactly as wide as the address could not name `len`, so the standard postcondition was unsatisfiable | `a_bound_the_same_width_as_the_address_is_rejected` (`tests/mem.rs`) | `a85ebe6` | 2026-10-25 |
+| 55 | vacuity | A call to `ensures false` never returns, so the post-call state was empty and the continuation vacuously true | `a_call_to_a_never_returning_proc_is_not_total` (`tests/call.rs`) | `3754e1d` | 2026-10-26 |
+| 56 | false proof | `Certificate` stored a bare term id, so one from a reset scope named a different formula and certified a falsehood | `a_certificate_does_not_survive_an_arena_reset` (`tests/kernel.rs`) | `f9f6f4d` | 2026-10-25 |
+| 57 | false proof | `Report` held term ids with no arena generation, so a report read after a reset answered `Unknown` for every obligation | `a_report_is_only_valid_in_the_arena_that_built_it` (`tests/wp.rs`) | `732aebf` | 2026-10-28 |
+| 58 | false proof | The kernel's `Imp<P, Q>` had no `Theorem` bound, so `assert_proof!(Imp<Truth, Falsity>)` compiled | `the_imp_associated_proof_type_is_a_function_between_proofs` (`tests/kernel.rs`) | `4601e9d` | 2026-10-26 |
+| 59 | false proof | The SMT-LIB printer's polarity, sort and direction bugs made the external evidence not apply (a solver proved a different formula) | `the_export_checker_rejects_what_the_old_exporter_printed` (`tests/differential.rs`) | `d687a45` | 2026-10-26 |
+| 60 | wrong verdict | `Fixed::to_int` floored instead of truncating and `from_int` wrapped instead of saturating — both total, so the proof layer could not see them | `fixed_to_int_truncates_toward_zero`, `fixed_from_int_saturates_instead_of_wrapping` (`src/logic.rs`) | `c35b456` | 2026-10-26 |
+| 61 | vacuity | The MIR frontend's twin of row 47: a call to a bodyless `ensures false` callee made every claim after it vacuously true, so the caller read `verified` | `a_call_to_a_callee_whose_postcondition_is_unsatisfiable_fails` (`tests/mir.rs`) | `c60ff40` | 2026-11-12 |
+| 62 | false proof | `prove_implies` decided a closed true goal without reading the premise, so a `pre` saved from an earlier arena returned `Valid` for a premise that was not the one passed | `a_closed_goal_does_not_bypass_a_stale_premise` (`tests/sym.rs`) | `dd1ca69` | 2026-11-09 |
 
 ## Unavailable evidence
 
