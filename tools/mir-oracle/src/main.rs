@@ -27,9 +27,23 @@
 //! nests `scope` blocks. Comparing the *text* would therefore fail on cosmetics
 //! and tell us nothing. What the frontend actually depends on is the *structure*
 //! of each function — how many basic blocks it has, and which panic conditions
-//! `rustc` inserted and in what order. That is a fact about the program, not
-//! about the printer, so a match is real evidence and a mismatch points at the
-//! parser rather than at whitespace.
+//! `rustc` inserted, with what polarity, and in what order. That is a fact about
+//! the program, not about the printer, so a match is real evidence and a mismatch
+//! points at the parser rather than at whitespace.
+//!
+//! # What it cannot see — read this before trusting a green run
+//!
+//! Because the shape is only the block count and the guards, this oracle is
+//! **blind to how a place, a local, a field projection or a type is spelled.**
+//! A rustc release that re-spells a place without changing the control-flow
+//! skeleton passes here and would fail only in the frontend. That is not
+//! hypothetical: `Len((*_1))` became `PtrMetadata(copy _1)` in rustc 1.99, the
+//! shape is byte-identical across it, and it cost four verdicts on the 1.85 floor
+//! before it was found by running the suite under a second toolchain. So this gate
+//! is evidence about the parser's reading of the *structure*, and the MSRV run
+//! (`scripts/gate.sh` step 14) is what covers the rest. `verif::mir::shape`'s
+//! `the_shape_sees_structure_and_guards_but_not_places` pins both directions of
+//! that boundary so it cannot drift.
 //!
 //! # Usage
 //!

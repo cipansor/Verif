@@ -347,4 +347,165 @@ fn check(_1: u32) -> u32 {
         blocks.sort_unstable();
         assert_eq!(blocks, vec![1, 2], "each shape is kept distinctly");
     }
+
+    /// **The oracle's scope, pinned as a property rather than described in prose.**
+    ///
+    /// [`FnShape`] is two facts: the block count and the panic guards. That is
+    /// deliberate -- both are facts about the *program*, so a match is evidence
+    /// and a mismatch points at the parser -- but it also means the comparison
+    /// cannot see everything the parser reads. This test states the boundary
+    /// exactly, in both directions, so the prose in `README.md` and in
+    /// `tools/mir-oracle` cannot drift into claiming more than the code does.
+    ///
+    /// The blind cases are not hypothetical: `Len((*_1))` became
+    /// `PtrMetadata(copy _1)` in rustc 1.99, and that real change cost four
+    /// verdicts on the 1.85 floor (see `AGENTS.md`, "The MIR frontend needs a
+    /// `rustc`, not a *nightly* `rustc`"). The oracle's shape is identical
+    /// across it, so gate 10 did not and could not catch it -- the MSRV gate did.
+    ///
+    /// **Every comparison here needs a parsing control, and that is not
+    /// decoration.** An `assert_eq!` on two `Option`s passes when *both* are
+    /// `None`, so a `shape_of` that failed to parse would satisfy the three
+    /// "the shape is blind to X" assertions for the wrong reason -- the test
+    /// would report that the oracle cannot see a place change when in fact it
+    /// saw nothing at all. The three blind cases are therefore each preceded by
+    /// `parsed(...)`, which requires the dump to have produced a function with
+    /// the expected block count; only then does "the two shapes are equal" mean
+    /// "the shape is identical despite the edit". The two structural cases get
+    /// the same control, so `assert_ne!` cannot pass by comparing two `None`s
+    /// either. Teeth: a `shape_of` that returns `None` unconditionally fails the
+    /// first control rather than the fourth assertion.
+    #[test]
+    fn the_shape_sees_structure_and_guards_but_not_places() {
+        let shape_of = |src: &str| of_text_mir(src).remove("f");
+        // A parsing control: the dump must yield exactly one function named `f`
+        // with the given block count, or a later equality is vacuous.
+        let parsed = |src: &str, blocks: usize| {
+            let mut group = shape_of(src).expect("the dump must parse to a function `f`");
+            assert_eq!(group.len(), 1, "the dump must yield exactly one `f`");
+            let s = group.remove(0);
+            assert_eq!(
+                s.blocks, blocks,
+                "the parsing control expects {blocks} block(s), got {}",
+                s.blocks
+            );
+            s
+        };
+
+        // A place spelled the old way and the new way: same shape.
+        let len_old = "\
+fn f(_1: &[u8], _2: usize) -> u8 {
+    let mut _0: u8;
+    let mut _3: usize;
+    let mut _4: bool;
+
+    bb0: {
+        _3 = Len((*_1));
+        _4 = Lt(copy _2, copy _3);
+        assert(move _4, \"index out of bounds: the len is {} but the index is {}\") -> [success: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = const 1u8;
+        return;
+    }
+}
+";
+        let len_new = len_old.replace("Len((*_1))", "PtrMetadata(copy _1)");
+        // Parsing control: both spellings parse, to the same two blocks.
+        let old_shape = parsed(len_old, 2);
+        let new_shape = parsed(&len_new, 2);
+        assert_eq!(
+            old_shape, new_shape,
+            "a place's spelling is invisible to the shape -- gate 10 cannot catch a \
+             printer change that only re-spells a place"
+        );
+
+        // An operand read from the wrong local: same shape.
+        let wrong_local = len_new.replace("Lt(copy _2, copy _3)", "Lt(copy _1, copy _3)");
+        assert_eq!(
+            new_shape,
+            parsed(&wrong_local, 2),
+            "which local an operand reads is invisible to the shape"
+        );
+
+        // A field index read wrong: same shape.
+        let field_0 = "\
+fn f(_1: (u8, u8)) -> u8 {
+    let mut _0: u8;
+
+    bb0: {
+        _0 = copy (_1.0: u8);
+        return;
+    }
+}
+";
+        let field_1 = field_0.replace("(_1.0: u8)", "(_1.1: u8)");
+        assert_eq!(
+            parsed(field_0, 1),
+            parsed(&field_1, 1),
+            "which field a projection reads is invisible to the shape"
+        );
+
+        // A *structural* change -- an extra block -- is what the shape is for.
+        let one_block = "\
+fn f(_1: u32) -> u32 {
+    let mut _0: u32;
+
+    bb0: {
+        _0 = copy _1;
+        return;
+    }
+}
+";
+        let three_blocks = "\
+fn f(_1: u32) -> u32 {
+    let mut _0: u32;
+    let mut _2: bool;
+
+    bb0: {
+        _2 = Lt(copy _1, const 3u32);
+        switchInt(move _2) -> [0: bb2, otherwise: bb1];
+    }
+
+    bb1: {
+        _0 = copy _1;
+        goto -> bb2;
+    }
+
+    bb2: {
+        return;
+    }
+}
+";
+        assert_ne!(
+            parsed(one_block, 1),
+            parsed(three_blocks, 3),
+            "the block count must distinguish a branch -- this is the shape's whole job"
+        );
+
+        // And a flipped guard polarity is visible, which is the other half.
+        let guard = "\
+fn f(_1: u32, _2: u32) -> u32 {
+    let mut _0: u32;
+    let mut _3: bool;
+
+    bb0: {
+        _3 = AddWithOverflow(_1, _2);
+        assert(move (_3.1: bool), \"attempt to compute `{} + {}`, which would overflow\") -> [success: bb1, unwind continue];
+    }
+
+    bb1: {
+        _0 = copy _1;
+        return;
+    }
+}
+";
+        let flipped = guard.replace("assert(move (_3.1", "assert(!move (_3.1");
+        assert_ne!(
+            parsed(guard, 2),
+            parsed(&flipped, 2),
+            "a flipped guard polarity must be visible"
+        );
+    }
 }

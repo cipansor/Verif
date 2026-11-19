@@ -2383,9 +2383,17 @@ says "I could not decide" is worth more than one that guesses.
    linking `rustc-dev`. That keeps the dependency count at zero and makes the
    input inspectable, but it means a rustc release that changes the pretty-printer
    can break the parser. It fails closed when that happens, and the
-   `rustc_public` oracle in `tools/mir-oracle` (gate 10) checks the parser's
-   reading against rustc's own typed MIR, so the breakage is caught by CI rather
-   than by a user.
+   `rustc_public` oracle in `tools/mir-oracle` (gate 10) catches one half of that
+   risk: it compares each function's **basic-block count and the panic guards
+   `rustc` inserted** (kind and polarity) between the text and typed MIR, so a
+   printer change that alters the *structure* of a body fails CI. It does **not**
+   compare places, types, locals or projections, so a change that only re-spells
+   a place is invisible to it — `Len((*_1))` becoming `PtrMetadata(copy _1)` in
+   1.99 was exactly that, and it was found by running the frontend's suite under a
+   second toolchain, not by this gate — gate 10 was silent across it. `src/mir/shape.rs`'s
+   `the_shape_sees_structure_and_guards_but_not_places` pins both directions of
+   that boundary, so this paragraph cannot drift into claiming more than the code
+   checks.
 3. **Contracts are checked at entry and exit only.** A loop invariant written as a
    contract is not an invariant; it is an assertion at two points.
 4. **The verifier is not inside the artifact.** `gnatprove` and this crate's own
@@ -2720,14 +2728,37 @@ verify at compile time while leaving the prover out of the artifact (see
 `z3diff` checks the exporter and `kanidiff`/`verusdiff` check the engine. The MIR frontend
 has a third failure mode, and it is the one gap 2 below names: it reads rustc's *textual*
 `--emit=mir` dump, so a rustc release that changes the pretty-printer can break the parser,
-and the parser is the only thing that would notice. `tools/mir-oracle` closes that loop. It
-asks `rustc_public` — the compiler's own public API, which needs a nightly with the
+and the parser is the only thing that would notice. `tools/mir-oracle` closes part of that
+loop. It asks `rustc_public` — the compiler's own public API, which needs a nightly with the
 `rustc-dev` and `llvm-tools-preview` components — for the same programs' **typed** MIR, reduces each function to a
 small comparable shape (how many basic blocks it lowered to, and which panic guards `rustc`
-inserted, in block order), and fails if that disagrees with what the frontend's parser read
-out of the text. The comparison is structural on purpose: the two dumps are not
-byte-identical (the typed one omits `copy` qualifiers and nests `scope` blocks), and
-comparing text would fail on cosmetics and prove nothing. The oracle lives in
+inserted and with what polarity, in block order), and fails if that disagrees with what the
+frontend's parser read out of the text. The comparison is structural on purpose: the two
+dumps are not byte-identical (the typed one omits `copy` qualifiers and nests `scope`
+blocks), and comparing text would fail on cosmetics and prove nothing.
+
+**What that shape can and cannot see is the honest limit of this gate**, and it is pinned in
+both directions by `the_shape_sees_structure_and_guards_but_not_places` in
+`src/mir/shape.rs`. It sees a change in *structure*: an extra basic block, a guard that moved
+or was inserted, a guard whose polarity flipped. It does not see a change in *spelling*: a
+place, a local index, a field projection, a type. Re-spelling `Len((*_1))` as
+`PtrMetadata(copy _1)` — a real change in rustc 1.99 that cost four verdicts on the 1.85
+floor — leaves the shape byte-identical, so gate 10 was silent across it; it was found by
+running the suite under a second toolchain.
+
+**Gate 14 is a sample of that coverage, not the whole of it.** It runs `tests/mir.rs` under
+one older compiler (1.85) against the same suite on the current stable, and it *skipped
+entirely* in a container without the 1.85 toolchain — reported, not passed, but a skip. Two
+compilers catch a spelling change only where they differ; a printer change that lands in a
+version *between* them, or after current stable, is not covered by either. The durable form of
+the check is therefore a habit, not a gate: run the suite under a compiler you have not run
+before when the toolchain moves. Measured for this paragraph, `tests/mir.rs` is 354/354 on
+1.85.1, 1.100.0 and 1.102.0-nightly, and the two end spellings really do differ
+(`Len((*_1))` on 1.85, `PtrMetadata(copy _1)` on stable). So gate 10 is evidence about the
+parser's *reading of the control-flow skeleton*; gate 14 extends that evidence to one more
+compiler's spellings; nothing here covers every token on every toolchain.
+
+The oracle lives in
 `tools/mir-oracle`, outside the workspace, so the nightly and the `rustc_private` feature
 never touch a crate that must build on stable with zero dependencies; the dependency arrow
 points one way, from the oracle to `verif`. Gate 10 of `scripts/gate.sh` runs it, and the
