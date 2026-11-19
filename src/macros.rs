@@ -162,6 +162,43 @@ macro_rules! verify_exhaustive {
     }};
 }
 
+/// State a contract **inside the code**, as a block the build-time verifier reads
+/// from the source text.
+///
+/// The macro expands to nothing. That is the whole point: the clauses are data
+/// for `verif::mir::verify`, not code that runs, so a `spec!` block costs a
+/// deployed artifact exactly zero bytes and leaves no symbol behind. Verification
+/// happens in a `build.rs` (see `tools/build-verify/run.sh`), where a contract that
+/// does not hold is a **compile error**, and the shipped binary is the crate's own
+/// code with nothing of the prover in it.
+///
+/// ```
+/// # use verif::spec;
+/// spec! {
+///     requires: n <= 200,
+///     ensures: ret == n + 1,
+/// }
+/// pub fn inc(n: u8) -> u8 { n + 1 }
+/// ```
+///
+/// The matcher is deliberately **structured** (`$clause:ident : $body:expr`), not
+/// a token soup. That is what makes this more than a comment: `rustc` parses each
+/// clause body as a real Rust expression, so `requires: n <=,` is
+/// `error: expected expression, found ','` at the contract line rather than a
+/// sentence a reader has to notice is wrong. A `///` clause gets no such check.
+///
+/// Both spellings feed the same clause parser, so they cannot disagree about what
+/// a clause means; the difference is that one is verified syntax and the other is
+/// unchecked prose.
+#[macro_export]
+macro_rules! spec {
+    // `ret` is a contract-only name, so a clause body is *not* required to be a
+    // Rust expression that compiles -- it is only parsed. `$body:expr` still
+    // rejects a body that is not expression-shaped (`n <=,`), which is the check
+    // that matters; `ret` reaches the verifier as text.
+    ($($clause:ident : $body:expr,)*) => {};
+}
+
 #[cfg(test)]
 mod tests {
     use crate::smt;
