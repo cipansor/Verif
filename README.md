@@ -125,13 +125,13 @@ you.
 
 ```toml
 [dependencies]
-verif = "0.1"
+verif = "0.2"
 
 # The host-side tools (the MIR frontend, the file-backed helpers) need `std`.
 # The engine itself does not: the default build is `no_std` and links `core`
 # and nothing else, which is what a bare-metal safety build wants.
 [dev-dependencies]
-verif = { version = "0.1", features = ["std"] }
+verif = { version = "0.2", features = ["std"] }
 ```
 
 There is nothing else to add: `verif`'s only dependency is `verif-arithmetic`,
@@ -3081,10 +3081,10 @@ code the crate's own compilation needs):
 
 ```toml
 [dependencies]
-verif = { version = "0.1", features = ["std"] }
+verif = { version = "0.2", features = ["std"] }
 
 [build-dependencies]
-verif = { version = "0.1", features = ["std"] }
+verif = { version = "0.2", features = ["std"] }
 ```
 
 ```rust,ignore

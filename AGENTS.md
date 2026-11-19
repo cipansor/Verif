@@ -62,7 +62,7 @@ Done in one commit. The traps, so a future rename does not repeat them:
 
 ## Publishing to crates.io
 
-Both crates are published: `verif-arithmetic` at `0.1.0` and `verif` at `0.1.1`.
+Both crates are published: `verif-arithmetic` at `0.1.0` and `verif` at `0.2.0`.
 They version independently, so those numbers are not required to agree — see the
 `verif-arithmetic` requirement note in the root `Cargo.toml`. The repository is
 arranged so they stay publishable, and the checks that make that true are separate

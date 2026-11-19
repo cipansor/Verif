@@ -23,7 +23,7 @@ fn readme_flagship_example_proves_a_bound() {
 
 /// The Installation section must tell a reader to depend on the published crate.
 ///
-/// Both crates are on crates.io, so the README depends on `verif = "0.1"` rather
+/// Both crates are on crates.io, so the README depends on `verif = "0.2"` rather
 /// than on the git repository. This pins the *shape* of that instruction: a
 /// version requirement, no git source, and the `verif-arithmetic` sibling named
 /// as the published crate it is. If a release ever has to fall back to a git
@@ -40,8 +40,8 @@ fn readme_install_uses_the_published_crate() {
         .next()
         .expect("the Installation section must end at the next heading");
     assert!(
-        install.contains("verif = \"0.1\""),
-        "Installation must depend on the published `verif = \"0.1\"`; got:\n{install}"
+        install.contains("verif = \"0.2\""),
+        "Installation must depend on the published `verif = \"0.2\"`; got:\n{install}"
     );
     assert!(
         !install.contains("git = \"https://github.com/cipansor/verif\""),

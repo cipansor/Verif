@@ -1058,7 +1058,10 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     what makes the published crate sound rather than merely buildable. The
     dependency snippets are pinned by `readme_install_uses_the_published_crate`
     in `tests/readme.rs`, so a regression back to a git source is a failing test
-    rather than silent drift.
+    rather than silent drift. (The current release is `verif` `0.2.0`, the minor
+    bump that adds the in-code `spec!` macro, and the README snippet follows it
+    at `verif = "0.2"`; `verif-arithmetic` stays at `0.1.0` because it did not
+    change.)
   - Exit: `cargo add verif` works. ✅
   - Move: **build**.
 - **U2. `cargo verif`.** · P1 · todo · Kani (`cargo kani`)
