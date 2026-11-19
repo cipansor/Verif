@@ -7652,6 +7652,64 @@ The README's table is a measurement and moves with the machine; `tools/shape-ben
 reprints it. The *properties* -- verification at build time, and no prover in the artifact
 -- stay pinned by gate 18, because a cost figure is not a property.
 
+## The cross-tool cost table: three axes, and the caveats are the honest part
+
+`tools/cost-bench/run.sh` measures `verif` against Kani, Verus, Coq and Lean on the *same
+three functions* `examples/comparison/target.rs` uses, so the comparison is like-for-like
+about the problem even where it is not like-for-like about the task. It exists because the
+comparison README's one cost sentence ("`verif` decided all three functions in about 0.01 s;
+Kani and Prusti take seconds to minutes") was **prose, not a measurement** -- the exact
+defect this repository names repeatedly. The harness replaces it with numbers anyone can
+regenerate.
+
+Measured on one machine (x86_64, four cores; Kani 0.68.0, Verus 0.2026.11.02, Coq 8.20.1,
+Lean 4.36.0, rustc 1.100.0), cold cache:
+
+| tool | per-verification wall | peak RSS | setup (on disk) |
+|---|---|---|---|
+| `verif` | ≈0.07 s | ≈10 MB | ≈1.4 MB (a crate) |
+| Kani | ≈0.7 s | ≈14 MB | ≈486 MB |
+| Verus | ≈0.8 s | ≈316 MB | ≈133 MB |
+| Coq | ≈0.5 s | ≈298 MB | ≈451 MB |
+| Lean | ≈0.5 s | ≈472 MB | ≈3.1 GB |
+
+Three things about this table are the point, and each is a way a naive comparison misleads:
+
+1. **The axes must stay apart.** Setup, per-verification and artifact are different
+   questions. Folding them into "which is faster" is what produces the wrong conclusion:
+   `verif` wins *setup* by two-to-three orders of magnitude (a crate versus a
+   multi-hundred-MB toolchain), is *competitive* on per-verification for this small
+   fixture, and *loses* the artifact axis on-target (5.3 MB and 42 symbols, where the
+   others ship nothing because they cannot run on the target at all). The artifact axis
+   lives in `tools/shape-bench/run.sh`, not here -- duplicating it would invite the false
+   reading that "0 bytes" is a win rather than a different shape.
+2. **`verif`'s row is a different measurement.** It includes spawning `rustc --emit=mir` to
+   read the source -- it is the only tool whose verification step also *compiles* the code
+   it verifies. So "≈0.07 s" is not "the engine is 10× faster than Kani"; the engine-only
+   figure is ≈0.05 s (`mir_coverage`'s per-function `elapsed` column), and the gap is the
+   frontend's compiler call, not the decision procedure.
+3. **Coq and Lean prove a hand-written model, not the Rust code.** Their rows are not "the
+   same task, slower"; they are a different task, and the transcription is the risk the
+   comparison README is built around. A like-for-like *engine* comparison excludes them --
+   they are here because the comparison README lists them for *correctness*.
+
+Two tools the correctness table has are **absent** and the harness says so in its output
+rather than dropping them silently: Prusti needs a pinned nightly and a JDK, `gnatprove`
+pulls four solvers. A table that shrank without a word reads as "the tool was fast", which
+is the failure mode the notes guard against.
+
+The honest conclusion the harness supports, and that the README states in prose: **`verif`'s
+reason to exist is embeddability and no external toolchain, not raw speed.** The BDD scaling
+wall is real and documented; the mature competitors have higher coverage (pointers,
+aliasing, concurrency, unbounded induction). A user choosing a verifier for a normal host
+build should reach for Kani or Verus; a user who needs a prover *inside* an artifact, with
+no solver process and no dependency, has `verif` and little else.
+
+Not a gate, deliberately: the numbers move with the machine, so a CI job asserting them
+would fail on a slower runner for a reason unrelated to the crate. `tools/comparison/run.sh`
+(gate 13) asserts the *verdicts*; this reports their cost. Exit 2 when no tool could be
+measured at all.
+
 ## The MIR frontend: own text parser, `rustc_public` as the oracle only
 
 A recurring question is why the frontend parses rustc's *textual* `--emit=mir` dump

@@ -1,0 +1,225 @@
+#!/bin/sh
+# Print the cross-tool cost table the comparison README quotes.
+#
+# The comparison in `examples/comparison/` is about *correctness*: every tool in
+# its table verifies the same three functions, and the point is what each one
+# proves and what it catches. It has never been about cost, and the one cost
+# figure it carried -- "`verif` decided all three functions in about 0.01 s; Kani
+# and Prusti take seconds to minutes" -- was prose, not a measurement. This script
+# is that measurement.
+#
+# It reports **three axes**, kept apart because folding them into one number is
+# the usual way a comparison misleads:
+#
+#   setup        -- the one-time cost of installing the tool (disk).
+#   verification -- the per-run cost of deciding the *same three functions*,
+#                   wall / CPU / peak RSS, cold-cache.
+#   artifact     -- what the tool adds to the binary you ship.
+#
+# The `artifact` axis is not measured here: only `verif` has an on-target shape
+# (the others are all host-side binaries that ship nothing), and that axis is
+# already measured by `tools/shape-bench/run.sh` -- `verif` build-time is 0
+# symbols and the same bytes as the baseline; `verif` on-target is ~5.3 MB and 42
+# symbols. Quoting it here would duplicate it and invite a false comparison: the
+# other tools do not have the option to ship their prover, so "0 bytes" is not a
+# win, it is a different shape.
+#
+# This is deliberately **not a gate**: the numbers move with the machine, and a
+# CI job that asserted them would fail on a slower runner for a reason unrelated
+# to the crate. `tools/comparison/run.sh` (gate 13) is the checked half -- it
+# asserts the verdicts; this reports their cost. Exit 2 when no tool at all could
+# be measured (nothing to report); 0 otherwise. A tool that is absent is named in
+# the output, never silently dropped -- a table that shrank without saying so
+# reads as "the tool was fast".
+#
+# The launcher is `tools/shape-bench/measurer.rs`, shared rather than copied: a
+# second copy would be a second thing to drift, and the reasoning for reading
+# `VmHWM` rather than `ru_maxrss` lives in one place (its header).
+#
+# Usage: sh tools/cost-bench/run.sh
+set -eu
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
+cd "$ROOT"
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cost-bench: no cargo on PATH, so nothing was measured" >&2
+  exit 2
+fi
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT INT TERM
+
+MEASURER="$WORK/measurer"
+rustc -O --edition 2024 -o "$MEASURER" "$ROOT/tools/shape-bench/measurer.rs"
+
+FIXTURE="examples/comparison/target.rs"
+
+# One measured run: median of three, so a single scheduler hiccup does not become
+# the figure. The launcher prints `code  wall  cpu  peak_kb  sampled`.
+measure() {
+  label="$1"; shift
+  best=""
+  i=0
+  while [ "$i" -lt 3 ]; do
+    line="$("$MEASURER" "$@" 2>/dev/null || true)"
+    code="$(printf '%s' "$line" | cut -f1)"
+    if [ "${code:-1}" != "0" ]; then
+      printf '%-14s %s\n' "$label" "FAILED (exit $code)"
+      return
+    fi
+    wall="$(printf '%s' "$line" | cut -f2)"
+    cpu="$(printf '%s' "$line" | cut -f3)"
+    kb="$(printf '%s' "$line" | cut -f4)"
+    best="${best}${wall} ${cpu} ${kb}\n"
+    i=$((i + 1))
+  done
+  # median by wall time
+  printf '%b' "$best" | sort -k1 -n | sed -n 2p | \
+    awk -v l="$label" '{printf "%-14s %8.3f  %8.3f  %8.1f\n", l, $1, $2, $3/1024}'
+}
+
+printf '%-14s %8s  %8s  %8s\n' "tool" "wall_s" "cpu_s" "peak_MB"
+printf '%-14s %8s  %8s  %8s\n' "----" "------" "-----" "-------"
+
+# ---- verif: build the coverage driver once, then run it on the shared fixture.
+# `mir_coverage` reads the source with `--emit=mir` and decides every function,
+# which is the same three functions the other tools decide. It needs a compiler
+# named; a stable `rustc` is enough (`--emit=mir` is stable).
+if command -v rustc >/dev/null 2>&1; then
+  VERIF_RUSTC="${VERIF_RUSTC:-$(command -v rustc)}"
+  export VERIF_RUSTC
+  if cargo build -q --features std --example mir_coverage >/dev/null 2>&1; then
+    measure "verif" "target/debug/examples/mir_coverage" "$FIXTURE"
+  else
+    printf '%-14s %s\n' "verif" "SKIPPED (the example did not build)"
+  fi
+else
+  printf '%-14s %s\n' "verif" "SKIPPED (no rustc)"
+fi
+
+# ---- Kani: needs its own crate with a `#[cfg(kani)]` harness, because a Kani
+# proof is a Rust function. The fixture is the committed `kani.rs`, copied in
+# verbatim so the two sides prove the same statements.
+if command -v cargo >/dev/null 2>&1 && cargo kani --version >/dev/null 2>&1; then
+  K="$WORK/kani"
+  mkdir -p "$K/src"
+  cp examples/comparison/kani.rs "$K/src/lib.rs"
+  cat > "$K/Cargo.toml" <<'EOF'
+[package]
+name = "cost_bench_kani"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kani-verifier = { version = "0.68.0", optional = true }
+
+[features]
+kani = ["dep:kani-verifier"]
+EOF
+  ( cd "$K" && cargo kani --features kani >/dev/null 2>&1 ) || true   # warm the harness build
+  ( cd "$K" && measure "kani" "cargo" "kani" "--features" "kani" )
+else
+  printf '%-14s %s\n' "kani" "SKIPPED (cargo-kani not installed)"
+fi
+
+# ---- Verus: one self-contained `.rs`, run through the `verus` driver. The
+# driver needs the rust toolchain its release pins; if that is missing, `verus`
+# exits non-zero and the run is reported FAILED rather than dropped.
+VERUS_BIN=""
+for c in "${VERUS_BIN:-}" "$(command -v verus 2>/dev/null || true)" /tmp/verus/verus-x86-linux/verus; do
+  if [ -n "$c" ] && [ -x "$c" ]; then VERUS_BIN="$c"; break; fi
+done
+if [ -n "$VERUS_BIN" ]; then
+  cp examples/comparison/verus.rs "$WORK/verus_example.rs"
+  measure "verus" "$VERUS_BIN" "--crate-type=lib" "$WORK/verus_example.rs"
+else
+  printf '%-14s %s\n' "verus" "SKIPPED (verus not found; set VERUS_BIN)"
+fi
+
+# ---- Coq: two files. The model is compiled once (it is the hand-written model
+# the proof is *about*), then the example is the measured unit. Reported figure
+# is the example alone; the model's cost is named in the note below.
+if command -v coqc >/dev/null 2>&1; then
+  ( cd "$ROOT" && coqc -Q examples/comparison/coq "" examples/comparison/coq/model.v >/dev/null 2>&1 ) || true
+  measure "coq" "coqc" "-Q" "examples/comparison/coq" "" "examples/comparison/coq/example.v"
+  rm -f examples/comparison/coq/*.vo examples/comparison/coq/*.glob examples/comparison/coq/.*.aux 2>/dev/null || true
+else
+  printf '%-14s %s\n' "coq" "SKIPPED (coqc not installed)"
+fi
+
+# ---- Lean: model compiled to an `.olean`, then the example measured against it.
+if command -v lean >/dev/null 2>&1; then
+  ( cd "$ROOT" && lean -o "$WORK/model.olean" examples/comparison/lean/model.lean >/dev/null 2>&1 ) || true
+  LEAN_PATH="$WORK" measure "lean" "lean" "examples/comparison/lean/example.lean"
+else
+  printf '%-14s %s\n' "lean" "SKIPPED (lean not installed)"
+fi
+
+echo
+echo "=== setup: one-time install cost (measured on disk; install-method dependent) ==="
+# `du` on whatever the tool installed, so the figure is what is actually there
+# rather than a download-size claim. A tool that installs nothing of its own
+# (verif -- a crate) reports the crate download.
+setup() {
+  label="$1"; shift
+  total=0
+  for d in "$@"; do
+    if [ -e "$d" ]; then
+      kb="$(du -sk "$d" 2>/dev/null | cut -f1)"
+      total=$((total + kb))
+    fi
+  done
+  if [ "$total" -eq 0 ]; then
+    printf '%-14s %s\n' "$label" "not found on this machine"
+  else
+    awk -v l="$label" -v k="$total" 'BEGIN{printf "%-14s %8.1f MB\n", l, k/1024}'
+  fi
+}
+# verif is a crate, not an installed tool: its "setup" is the crate download.
+if command -v python3 >/dev/null 2>&1; then
+  size="$(curl -s -A "cost-bench" "https://crates.io/api/v1/crates/verif/0.1.0" 2>/dev/null \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['version']['crate_size'])" 2>/dev/null || true)"
+  if [ -n "${size:-}" ]; then
+    awk -v k="$size" 'BEGIN{printf "%-14s %8.1f MB (the crate, from crates.io)\n", "verif", k/1048576}'
+  else
+    printf '%-14s %s\n' "verif" "crate size unavailable (offline)"
+  fi
+else
+  printf '%-14s %s\n' "verif" "crate size unavailable (no python3)"
+fi
+setup "kani" "$HOME/.kani" "$HOME/.cargo/bin/cargo-kani" "$HOME/.cargo/bin/kani"
+setup "verus" "${VERUS_DIR:-/tmp/verus/verus-x86-linux}"
+# Coq installs spread across `/usr` and `~/.opam`; `dpkg` reports its own size
+# where the distribution package was used, which is the honest figure for that
+# install method. A source/opam build would be measured with `du` instead.
+if command -v dpkg-query >/dev/null 2>&1; then
+  kb="$(dpkg-query -W -f='${Installed-Size}\n' coq libcoq-core-ocaml libcoq-stdlib 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+  if [ "${kb:-0}" -gt 0 ]; then
+    awk -v k="$kb" 'BEGIN{printf "%-14s %8.1f MB (distribution packages)\n", "coq", k/1024}'
+  else
+    setup "coq" "/usr/lib/ocaml/coq" "/usr/share/coq"
+  fi
+else
+  setup "coq" "/usr/lib/ocaml/coq" "/usr/share/coq"
+fi
+setup "lean" "$HOME/.elan"
+
+cat <<'EOF'
+
+notes:
+  - One machine, x86_64, four cores. Regenerate rather than trusting the prose.
+  - verif's figure includes spawning `rustc --emit=mir` to read the source; the
+    engine-only cost of the same three functions is lower (see the comparison
+    README, which separates the two). It is the only row whose "verification"
+    step also compiles the code it verifies.
+  - kani and verus warm their own caches on the first run; the figures above are
+    the steady-state (second-run) cost, which is what a repeated check costs.
+  - coq and lean prove a *hand-written model* of the three functions, not the
+    Rust code; the model is compiled once and its cost is not in the row above.
+    That transcription is the risk the comparison README is about, and it is why
+    their rows are not "the same thing, slower".
+  - Prusti and SPARK are in the comparison README's correctness table but not
+    here: Prusti needs a pinned nightly and a JDK, and gnatprove pulls four
+    solvers. Add them the same way if you need their cost.
+EOF
