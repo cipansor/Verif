@@ -187,8 +187,15 @@ Better here:
   artifact. The comparison tools are all host-side binaries you install,
   configure, and trust; `gnatprove` alone pulls in CVC5, Alt-Ergo, Why3 and a
   bundled Z3.
-- **Speed.** `verif` decided all three functions in about 0.01 s. Kani and
-  Prusti take seconds to minutes, dominated by CBMC and by JVM/Viper startup.
+- **Speed, measured, for this small fixture.** `verif` decides the three functions
+  in ≈0.07 s wall (including the `rustc --emit=mir` it spawns to read the source);
+  Kani ≈0.7 s, Verus ≈0.8 s, Coq ≈0.5 s, Lean ≈0.5 s on the same machine. That is
+  a *fixture* measurement, not a general claim: the BDD scaling wall is real, and a
+  larger or more symbolic problem can flip the ordering. `tools/cost-bench/run.sh`
+  prints the table, with the three cost axes kept apart (setup, per-verification,
+  artifact) and every caveat spelled out. The earlier version of this bullet said
+  "about 0.01 s; Kani and Prusti take seconds to minutes" — that was prose, not a
+  measurement, and it is replaced by the harness above.
 
 Not better, and worth saying plainly:
 

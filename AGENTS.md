@@ -7652,6 +7652,142 @@ The README's table is a measurement and moves with the machine; `tools/shape-ben
 reprints it. The *properties* -- verification at build time, and no prover in the artifact
 -- stay pinned by gate 18, because a cost figure is not a property.
 
+## The cross-tool cost table: three axes, and the caveats are the honest part
+
+`tools/cost-bench/run.sh` measures `verif` against Kani, Verus, Coq and Lean on the *same
+three functions* `examples/comparison/target.rs` uses, so the comparison is like-for-like
+about the problem even where it is not like-for-like about the task. It exists because the
+comparison README's one cost sentence ("`verif` decided all three functions in about 0.01 s;
+Kani and Prusti take seconds to minutes") was **prose, not a measurement** -- the exact
+defect this repository names repeatedly. The harness replaces it with numbers anyone can
+regenerate.
+
+Measured on one machine (x86_64, four cores; Kani 0.68.0, Verus 0.2026.11.02, Coq 8.20.1,
+Lean 4.36.0, rustc 1.100.0), steady-state:
+
+| tool | per-verification wall | peak RSS | setup (on disk) |
+|---|---|---|---|
+| `verif` | ≈0.07 s | ≈97 MB | ≈1.4 MB (a crate) |
+| Kani | ≈0.7 s | ≈23 MB | ≈486 MB |
+| Verus | ≈0.8 s | ≈316 MB | ≈133 MB |
+| Coq | ≈0.5 s | ≈298 MB | ≈451 MB |
+| Lean | ≈0.5 s | ≈472 MB | ≈3.1 GB |
+
+Three things about this table are the point, and each is a way a naive comparison misleads:
+
+1. **The axes must stay apart.** Setup, per-verification and artifact are different
+   questions. Folding them into "which is faster" is what produces the wrong conclusion:
+   `verif` wins *setup* by two-to-three orders of magnitude (a crate versus a
+   multi-hundred-MB toolchain), is *competitive* on per-verification for this small
+   fixture, and *loses* the artifact axis on-target (5.3 MB and 42 symbols, where the
+   others ship nothing because they cannot run on the target at all). The artifact axis
+   lives in `tools/shape-bench/run.sh`, not here -- duplicating it would invite the false
+   reading that "0 bytes" is a win rather than a different shape.
+2. **`verif`'s row is a different measurement.** It includes spawning `rustc --emit=mir` to
+   read the source -- it is the only tool whose verification step also *compiles* the code
+   it verifies. So "≈0.07 s" is not "the engine is 10× faster than Kani"; the engine-only
+   figure is ≈0.05 s (`mir_coverage`'s per-function `elapsed` column), and the gap is the
+   frontend's compiler call, not the decision procedure. The same fact explains the ≈97 MB
+   peak: it is the *tree* peak, and the heaviest process is the `rustc` `verif` spawns.
+3. **Coq and Lean prove a hand-written model, not the Rust code.** Their rows are not "the
+   same task, slower"; they are a different task, and the transcription is the risk the
+   comparison README is built around. A like-for-like *engine* comparison excludes them --
+   they are here because the comparison README lists them for *correctness*.
+
+Two tools the correctness table has are **absent** and the harness says so in its output
+rather than dropping them silently: Prusti needs a pinned nightly and a JDK, `gnatprove`
+pulls four solvers. A table that shrank without a word reads as "the tool was fast", which
+is the failure mode the notes guard against.
+
+**Three review findings on the first version of the harness, each a measured defect:**
+
+- **Peak RSS excluded subprocesses.** `measure` ran the launcher without `-t`, so it
+  sampled only the direct child. `cargo kani` is a thin plugin whose work is a
+  `kani-driver` grandchild, and `verif`'s own driver spawns `rustc --emit=mir`; sampling
+  the direct child reported the *launcher's* RSS. Measured: kani 14 MB → 23 MB, and
+  verif 10 MB → 97 MB with `-t`. The flag changes only the peak, not the wall time
+  (checked by interleaving the two modes). The table above is the `-t` figures.
+- **`VERUS_BIN` was cleared before it was read.** The script assigned `VERUS_BIN=""` and
+  then read `${VERUS_BIN:-}` as the loop's first candidate, so a caller who set only that
+  variable (Verus not on PATH, not at the `/tmp` default) was silently skipped -- the
+  variable's whole purpose discarded by the line above its use.
+- **A configured build directory broke the `verif` row.** With `CARGO_TARGET_DIR` or a
+  `build.target-dir` in Cargo config, `cargo build` writes elsewhere while the launch path
+  stayed `target/debug/...`, so the harness either failed or -- worse -- silently measured
+  a *stale* binary left in `target/` by an earlier build. Reproduced: the env var built to
+  `/tmp/verif-build` (new) while the harness launched `target/debug/...` (nine hours old).
+  The build now passes an explicit `--target-dir` to a private directory, which overrides
+  both the env var and the config (verified) and keeps the benchmark from clobbering the
+  developer's own `target/`.
+
+A fourth was a **label**, and a label is a claim: the table said "cold cache" while the
+harness warms Kani (and now Verus) before measuring and reports the median of three warm
+runs. The gap is 4× (kani ≈3.2 s / ≈256 MB cold, ≈0.7 s / ≈23 MB warm), so the label was
+wrong by that much. It now says steady-state, and the cold figure is named in the caveats
+so the reader can see both.
+
+**Two more findings, and the first is a lesson about fixing one.** The `VERUS_BIN` fix
+above *introduced* a regression, which a second review caught. The original script opened
+the Verus block with `VERUS_BIN=""`, and that line did two jobs: it cleared a stale value
+*and* it made `"$VERUS_BIN"` defined for the later `[ -n "$VERUS_BIN" ]` test under
+`set -u`. Removing it to stop it wiping the caller's path left the variable *unset* when
+no Verus is installed, so the test aborted the whole script -- the `verif`, `kani`, `coq`
+and `lean` rows all printed, then `VERUS_BIN: parameter not set`, and the Coq, Lean and
+setup measurements never ran. The fix is `VERUS_BIN="${VERUS_BIN:-}"`: it *defines* the
+variable without *clearing* it, doing both jobs the `""` did except the one that was
+wrong. The general shape: when a line serves two purposes, removing it for one removes the
+other too, and the second purpose is the one nobody was looking at.
+
+The second finding is a **symlink**, the same "the name is not the thing" class as the
+stale-binary one. `setup` measured `dirname "$VERUS_BIN"`, and for the common
+`/usr/local/bin/verus -> /opt/verus/verus` layout that is the *link's* directory -- a
+shared bin dir of a few kB, with none of the 135 MB distribution (reproduced: 4 kB
+measured against 132 MB real). Discovery accepts a symlink because `-x` follows it, but
+`dirname` operates on the path, not the target. It now honours an explicit `VERUS_DIR`
+first (it names the installation, and the old code ignored it whenever discovery
+succeeded), and otherwise resolves the driver through `readlink -f` and accepts the
+directory only when it carries `rust_verify`, the marker of a real distribution. A
+directory that does not validate is reported "not found" rather than measured, which is
+also the honest row when discovery found no driver at all -- the old code printed a size
+for the `/tmp` default even when nothing was installed there.
+
+Both were checked by reproducing them first (`VERUS_BIN: parameter not set` under `set -u`;
+a symlinked driver measuring 4 kB) and then re-running the four scenarios -- absent, symlink,
+`VERUS_DIR`-only, and normal -- so a fix for one did not break the others.
+
+A third round found the **same symlink class one layer down, in `setup` itself.** The
+`VERUS_DIR` branch above passed the explicit directory to `setup`, whose `du -sk` call does
+not follow a *directory* symlink: `/opt/verus-current -> /opt/verus-2026` measures **0 kB**
+(the link, not its target), and `setup` prints `0` as "not found on this machine" -- so a
+working install whose `VERUS_DIR` is a stable version symlink reported nothing. Reproduced
+directly against the helper: `setup verus /tmp/verus-current` printed "not found", the same
+path with a trailing slash printed the real 1.9 MB. The finding's suggested fix (append a
+trailing slash at the one call site) is *narrower than the defect*: the `kani` row passes
+**file** symlinks (`~/.cargo/bin/kani` from `cargo binstall`), and `du -sk` reports 0 for
+those too. The fix belongs in `setup`, so every row gets it: resolve the path with
+`readlink -f` first, and add a trailing slash only when the resolved target is a directory
+(a file with a trailing slash is an error). Six cases re-checked -- directory symlink, file
+symlink, real dir, real file, a missing path (still "not found"), and a path that already
+ends in `/` (no doubling) -- plus the exact scenario from the finding.
+
+The general lesson, third time in this file: **a symlink is not its target, and the tool
+that resolves it must be the one that reads the size.** `-e`/`-x` follow symlinks, `dirname`
+does not, and `du` follows a symlink only when a trailing slash says to. Each of the three
+is a different rule about the same path, so a check that is right about one is not evidence
+about the others.
+
+The honest conclusion the harness supports, and that the README states in prose: **`verif`'s
+reason to exist is embeddability and no external toolchain, not raw speed.** The BDD scaling
+wall is real and documented; the mature competitors have higher coverage (pointers,
+aliasing, concurrency, unbounded induction). A user choosing a verifier for a normal host
+build should reach for Kani or Verus; a user who needs a prover *inside* an artifact, with
+no solver process and no dependency, has `verif` and little else.
+
+Not a gate, deliberately: the numbers move with the machine, so a CI job asserting them
+would fail on a slower runner for a reason unrelated to the crate. `tools/comparison/run.sh`
+(gate 13) asserts the *verdicts*; this reports their cost. Exit 2 when no tool could be
+measured at all.
+
 ## The MIR frontend: own text parser, `rustc_public` as the oracle only
 
 A recurring question is why the frontend parses rustc's *textual* `--emit=mir` dump

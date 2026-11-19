@@ -2637,6 +2637,10 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   │                   `thumbv7em-none-eabihf` (skipped, reported, if absent)
 │   ├── build-verify/   gate 18: the Kani/Verus shape -- verify from `build.rs`
 │   │                   and prove the artifact carries no prover (scratch crate)
+│   ├── cost-bench/     the cross-tool cost table in "How the cost compares to
+│   │                   other verifiers": `run.sh` measures `verif`, Kani, Verus,
+│   │                   Coq and Lean on the same three functions (setup + per-
+│   │                   verification; the artifact axis is `shape-bench/`)
 │   └── shape-bench/    the measured table in "Two ways to use the verifier":
 │                       `run.sh` builds four crates (build-time vs on-target
 │                       vs unused) on scratch copies, and `measurer.rs` is the
@@ -3197,6 +3201,113 @@ The numbers are a measurement, not a guarantee; `tools/shape-bench/run.sh` print
 your machine. The *properties* — verification at build time, and no prover in the
 artifact — are what gate 18 asserts, because a cost figure moves with the machine and a
 property does not.
+
+### When each shape is actually worth using
+
+The two shapes are not equals, and the honest reading is that **one is the default and the
+other is a narrow special case**. Saying so is more useful than presenting them as a
+symmetric choice.
+
+**Build time is the right default, for almost everyone.** Reach for it when:
+
+- the claim is a property of the *code for all inputs* (`∀ n. clamp100(n) <= 100`) — that
+  is what a contract states, and it is a statement about the program, not about one run;
+- you build on a normal host (a `rustc` that can `--emit=mir`, and `std`), and
+- the artifact should stay small: the shipped binary carries zero `verif` symbols, and the
+  build-time row above is the same bytes as the baseline.
+
+Its cost is a slower build (≈3.4 s here) and a host toolchain. Its limit is coverage: the
+frontend models a subset of Rust, so a function that reaches an unmodelled shape comes back
+`Incomplete` — which is *not* a proof, and must not be read as one.
+
+**On the target is for a narrow case, and it is easy to reach for it wrongly.** The
+on-target shape is worth its cost only when **all** of these hold:
+
+- the property is a relation between *values the program has right now*, unknown at
+  compile time (a calibration constant, a sensor reading, a runtime config), **and**
+- the property is non-trivial — several variables, or bit-vector structure that is awkward
+  to write as a direct check, **and**
+- there is no solver that can be run there (bare metal, offline), **and**
+- the check is *rare* — boot-time or config-time, not per control-loop iteration.
+
+If any of those is missing, the engine is the wrong tool. The section's own example makes
+the point: proving `ite(x>100,100,x) <= 100` costs ≈290 µs (measured, `shape-bench`),
+while the *same* check as `assert!(n <= 100)` is one comparison — nanoseconds. For a single
+concrete value, `assert!` or `checked_add` is always cheaper and clearer, and it needs no
+engine. The on-target shape earns its ≈5.3 MB and its hundreds of microseconds only when
+the property is genuinely *symbolic* at that point and cannot be checked by evaluating it.
+
+So the practical rule is: **default to build time; reach for on-target only with an
+explicit answer to "which dynamic property, why is it not a plain `assert`, and why can it
+not be checked at build time".** If those three do not have answers, use `assert!`.
+
+What the crate is *actually* unusual at is not "the prover can run on the target" — that is
+an impressive demo and a narrow use — but that the prover is **a zero-dependency, `no_std`,
+allocator-free library you can embed**. That is what makes it usable inside your own tooling
+without pulling in Z3 or a solver process, and it is the property to weigh against the
+mature, higher-coverage competitors.
+
+### How the cost compares to other verifiers
+
+The comparison in [`examples/comparison/`](examples/comparison/README.md) is about
+*correctness* — every tool there verifies the same three functions, and the finding is what
+each proves and what it catches. It is **not** a cost comparison, and the one cost sentence
+it used to carry ("`verif` decided all three functions in about 0.01 s; Kani and Prusti take
+seconds to minutes") was prose, not a measurement. `tools/cost-bench/run.sh` is the
+measurement; run it and compare rather than trusting any figure here.
+
+Cost has **three axes**, and folding them into one number is the usual way a comparison
+misleads:
+
+| axis | what it is | where the numbers are |
+| --- | --- | --- |
+| **setup** | one-time install | below, and `tools/cost-bench/run.sh` |
+| **per verification** | deciding the same three functions | below, and `tools/cost-bench/run.sh` |
+| **artifact** | what the tool adds to the binary you ship | `tools/shape-bench/run.sh` |
+
+Measured on one machine (x86_64, four cores; Kani 0.68.0, Verus 0.2026.11.02, Coq 8.20.1,
+Lean 4.36.0, rustc 1.100.0), steady-state (each tool warmed once, then the median of three
+runs — Kani is ≈3.2 s / ≈256 MB on a *cold* first run), the same three functions:
+
+| tool | per-verification wall | peak RSS | setup (on disk) |
+| --- | --- | --- | --- |
+| `verif` | ≈0.07 s | ≈97 MB | ≈1.4 MB (a crate) |
+| Kani | ≈0.7 s | ≈23 MB | ≈486 MB |
+| Verus | ≈0.8 s | ≈316 MB | ≈133 MB |
+| Coq | ≈0.5 s | ≈298 MB | ≈451 MB |
+| Lean | ≈0.5 s | ≈472 MB | ≈3.1 GB |
+
+Read the table with these caveats, each of which is the honest part:
+
+- **`verif`'s row includes spawning `rustc --emit=mir`** to read the source — it is the
+  only row whose verification step also compiles the code it verifies. That is also why its
+  peak RSS is ≈97 MB, not the ≈10 MB the driver process alone peaks at: the *largest process
+  in the tree* is the peak, and for `verif` that is the `rustc` it spawns. The engine-only
+  cost of the same three functions is ≈0.05 s (the per-function `elapsed` column
+  `mir_coverage` prints), so "≈0.07 s" is not "the engine is 10× faster than Kani" — it is a
+  measurement that includes the frontend's compiler call. Peak RSS is a **tree** figure for
+  every row, so each number is the tool's real peak and not its launcher's.
+- **Coq and Lean prove a hand-written *model*, not the Rust code.** Their rows are not "the
+  same thing, slower" — they are a different task, and the transcription is the risk the
+  comparison README is about. A like-for-like engine comparison would exclude them.
+- **Prusti and SPARK are missing** because their installs are heavy (a pinned nightly and a
+  JDK; four bundled solvers). Their absence is named, not hidden — a table that shrank
+  silently reads as "the tool was fast".
+- **The artifact axis is where `verif` on-target *loses*, and the others have no entry.**
+  Kani, Verus, Coq and Lean are host-side binaries that ship nothing; `verif` build-time
+  also ships nothing. `verif` on-target ships ≈5.3 MB and 42 symbols. That is the deliberate
+  trade for running where no solver can, and it is why the two shapes are not interchangeable.
+- **These are steady-state figures, not a cold first run.** Kani and Verus warm their own
+  caches on the first run, so the harness warms each once and reports the median of three
+  warm runs. The gap is large — Kani is ≈3.2 s / ≈256 MB cold against ≈0.7 s / ≈23 MB warm —
+  so a "cold cache" label would be wrong by 4×. The number answers "what does a repeated
+  check cost", which is the useful one; a one-shot first run is larger.
+- **These are one machine's figures.** They move with CPU, disk and cache. `verif` wins the
+  setup axis clearly and is competitive on the per-verification axis for this small fixture;
+  it does **not** claim to win on speed for large problems — the BDD scaling wall is real and
+  documented above, and the mature competitors have higher coverage (pointers, aliasing,
+  concurrency, unbounded induction). The reason to choose `verif` is *embeddability and no
+  external toolchain*, not raw speed.
 
 ## Documentation
 
