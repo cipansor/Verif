@@ -202,8 +202,18 @@ setup() {
   total=0
   for d in "$@"; do
     if [ -e "$d" ]; then
-      kb="$(du -sk "$d" 2>/dev/null | cut -f1)"
-      total=$((total + kb))
+      # `du -sk` does not follow a symlink, and reports 0 for the link itself:
+      # a symlinked install directory (`/opt/verus-current -> /opt/verus-2026`)
+      # measures 0 kB, and 0 total is printed as "not found on this machine" for
+      # a working install. A file symlink (a `cargo binstall`-style binary) is the
+      # same. Resolve the path first; the trailing slash is the fallback for a
+      # `readlink` with no `-f`, and is only added for a directory (a file with a
+      # trailing slash is an error).
+      real="$(readlink -f "$d" 2>/dev/null || printf '%s' "$d")"
+      [ -n "$real" ] || real="$d"
+      if [ -d "$real" ]; then real="$real/"; fi
+      kb="$(du -sk "$real" 2>/dev/null | cut -f1)"
+      total=$((total + ${kb:-0}))
     fi
   done
   if [ "$total" -eq 0 ]; then

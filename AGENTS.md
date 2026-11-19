@@ -7755,6 +7755,27 @@ Both were checked by reproducing them first (`VERUS_BIN: parameter not set` unde
 a symlinked driver measuring 4 kB) and then re-running the four scenarios -- absent, symlink,
 `VERUS_DIR`-only, and normal -- so a fix for one did not break the others.
 
+A third round found the **same symlink class one layer down, in `setup` itself.** The
+`VERUS_DIR` branch above passed the explicit directory to `setup`, whose `du -sk` call does
+not follow a *directory* symlink: `/opt/verus-current -> /opt/verus-2026` measures **0 kB**
+(the link, not its target), and `setup` prints `0` as "not found on this machine" -- so a
+working install whose `VERUS_DIR` is a stable version symlink reported nothing. Reproduced
+directly against the helper: `setup verus /tmp/verus-current` printed "not found", the same
+path with a trailing slash printed the real 1.9 MB. The finding's suggested fix (append a
+trailing slash at the one call site) is *narrower than the defect*: the `kani` row passes
+**file** symlinks (`~/.cargo/bin/kani` from `cargo binstall`), and `du -sk` reports 0 for
+those too. The fix belongs in `setup`, so every row gets it: resolve the path with
+`readlink -f` first, and add a trailing slash only when the resolved target is a directory
+(a file with a trailing slash is an error). Six cases re-checked -- directory symlink, file
+symlink, real dir, real file, a missing path (still "not found"), and a path that already
+ends in `/` (no doubling) -- plus the exact scenario from the finding.
+
+The general lesson, third time in this file: **a symlink is not its target, and the tool
+that resolves it must be the one that reads the size.** `-e`/`-x` follow symlinks, `dirname`
+does not, and `du` follows a symlink only when a trailing slash says to. Each of the three
+is a different rule about the same path, so a check that is right about one is not evidence
+about the others.
+
 The honest conclusion the harness supports, and that the README states in prose: **`verif`'s
 reason to exist is embeddability and no external toolchain, not raw speed.** The BDD scaling
 wall is real and documented; the mature competitors have higher coverage (pointers,
