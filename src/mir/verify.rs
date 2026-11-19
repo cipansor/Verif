@@ -87,6 +87,166 @@ pub struct MirOptions {
     /// first, then `VERIF_EDITION`. A file with neither is an *error*, never a
     /// silent default -- see [`resolve_edition`].
     pub edition: Option<Edition>,
+    /// Crates to make resolvable when `rustc` compiles the file, as
+    /// `(crate name, rlib path)` pairs.
+    ///
+    /// This is what lets a source file *name* `verif` -- `use verif::spec;` above
+    /// an in-code contract block -- compile at all. The frontend runs `rustc` on a
+    /// single file with no Cargo graph behind it, so without an `--extern` entry
+    /// every `use verif::…` is `E0432: unresolved import`.
+    ///
+    /// The paths are the caller's to find: a `build.rs` locates the rlib it is
+    /// already linked against ([`extern_options`] does that), and a test passes a
+    /// known artifact. The frontend deliberately does not guess a path, because a
+    /// guessed rlib is either the wrong compiler's or the wrong features', and
+    /// both surface as a compiler error about a program that is fine.
+    pub externs: Vec<(String, PathBuf)>,
+    /// Extra `-L dependency=` directories `rustc` searches when resolving an
+    /// extern's own dependencies.
+    ///
+    /// An `--extern` names one crate; that crate's *transitive* dependencies are
+    /// found only through a search path. `verif` depends on `verif-arithmetic`, so
+    /// naming `verif` without a search path for `verif-arithmetic` resolves the
+    /// outer crate and then fails on the inner one -- an error naming a crate the
+    /// caller never mentioned. [`extern_options`] fills this in.
+    pub search_paths: Vec<PathBuf>,
+}
+
+/// Everything a build script needs to let its own source name a crate: the
+/// `--extern` entry for `verif`, and the search paths its dependencies live on.
+///
+/// A `build.rs` is compiled against its `[build-dependencies]`, and Cargo lays those
+/// artifacts out under the `build` directory above `$OUT_DIR`. This finds
+/// `lib<name>-<hash>.rlib` there and returns it together with the directories the
+/// crate's own dependencies live in, so [`MirOptions`] can name `verif` *and*
+/// resolve `verif-arithmetic` through it.
+///
+/// **Two rlibs for one crate name is normal, not an error.** Cargo builds a crate
+/// once per unit, so a crate that is both a `[dependencies]` and a
+/// `[build-dependencies]` entry (which is what the zero-cost recipe is) has two
+/// rlibs of the same name. They are interchangeable for the one job this needs --
+/// resolving the crate name so `use verif::spec;` parses -- but they are not
+/// interchangeable across *toolchains*, so the choice is **verified rather than
+/// guessed**: each candidate in turn is handed to `rustc` on a one-line probe, and
+/// the first that compiles is the one returned. A stale rlib from another compiler
+/// fails the probe (`E0514`) and the next candidate is tried. `None` means no
+/// candidate compiled, which the caller turns into a skipped verification rather
+/// than a wrong one.
+///
+/// The typical `build.rs`:
+///
+/// ```ignore
+/// let opts = verif::mir::verify::extern_options("verif").unwrap_or_default();
+/// let report = verif::mir::verify::verify_file_with_opts("rustc", Path::new("src/lib.rs"), &[], &opts)?;
+/// ```
+#[cfg(feature = "std")]
+pub fn extern_options(name: &str) -> Option<MirOptions> {
+    let roots = build_script_roots()?;
+    let prefix = format!("lib{}-", name.replace('-', "_"));
+    let mut found: Vec<PathBuf> = Vec::new();
+    for root in &roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let Some(f) = p.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if f.starts_with(&prefix) && f.ends_with(".rlib") {
+                found.push(p);
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    // Newest first, so a stale artifact from an earlier build is tried last.
+    found.sort_by_key(|p| {
+        std::cmp::Reverse(
+            std::fs::metadata(p).and_then(|m| m.modified()).ok(),
+        )
+    });
+    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
+    let search: Vec<PathBuf> = roots;
+    for cand in found {
+        let mut opts = MirOptions {
+            externs: vec![(name.to_string(), cand.clone())],
+            search_paths: search.clone(),
+            ..MirOptions::default()
+        };
+        opts.search_paths.retain(|r| r.is_dir());
+        if extern_compiles(&rustc, &opts) {
+            return Some(opts);
+        }
+    }
+    None
+}
+
+/// Does `rustc` accept this extern? A one-line probe compiled to metadata: cheap,
+/// toolchain-accurate, and the only way to tell a current rlib from a stale one
+/// without parsing rustc's metadata format.
+#[cfg(feature = "std")]
+fn extern_compiles(rustc: &str, opts: &MirOptions) -> bool {
+    let Some((name, _)) = opts.externs.first() else {
+        return false;
+    };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-extern-probe-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let src = dir.join("probe.rs");
+    // `extern crate` rather than `use`, so this works on every edition and does not
+    // depend on the crate exporting any particular path.
+    let body = format!("#![allow(unused_extern_crates)]\nextern crate {name};\n");
+    if std::fs::write(&src, body).is_err() {
+        return false;
+    }
+    let mut cmd = Command::new(rustc);
+    cmd.arg("--edition=2021")
+        .arg("--crate-type=lib")
+        .arg("--emit=metadata")
+        .arg("-o")
+        .arg(dir.join("probe.rmeta"));
+    for (n, p) in &opts.externs {
+        cmd.arg("--extern").arg(format!("{}={}", n, p.display()));
+    }
+    for d in &opts.search_paths {
+        cmd.arg("-L").arg(format!("dependency={}", d.display()));
+    }
+    let ok = cmd.arg(&src).output().map(|o| o.status.success()).unwrap_or(false);
+    let _ = std::fs::remove_dir_all(&dir);
+    ok
+}
+
+/// The directories a build script's dependency artifacts live in.
+///
+/// `$OUT_DIR` is `<target>/<profile>/build/<pkg>/<hash>/out` -- but the number of
+/// components between `build` and `out` is Cargo's business, not ours, so this
+/// walks up to the directory *named* `build` rather than counting levels. The
+/// artifacts then sit in `<profile>/deps` and in every `<profile>/build/<dep>/*/out`
+/// beside it. A depth-based walk broke the first time Cargo nested a package
+/// directory under `build/`, which is why this one is structural.
+#[cfg(feature = "std")]
+fn build_script_roots() -> Option<Vec<PathBuf>> {
+    let out = PathBuf::from(std::env::var("OUT_DIR").ok()?);
+    let build_dir = out.ancestors().find(|a| a.file_name().is_some_and(|n| n == "build"))?;
+    let profile = build_dir.parent()?;
+    let mut roots = vec![profile.join("deps")];
+    if let Ok(entries) = std::fs::read_dir(build_dir) {
+        for e in entries.flatten() {
+            if let Ok(inner) = std::fs::read_dir(e.path()) {
+                for i in inner.flatten() {
+                    roots.push(i.path().join("out"));
+                }
+            }
+        }
+    }
+    roots.retain(|r| r.is_dir());
+    if roots.is_empty() {
+        None
+    } else {
+        Some(roots)
+    }
 }
 
 /// Resolve the edition to compile `file` under: explicit first, then
@@ -397,12 +557,24 @@ pub fn emit_mir_with_opts(
         seq,
         file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
     ));
-    let out = Command::new(rustc)
-        .arg(format!("--edition={}", edition.as_str()))
+    let mut cmd = Command::new(rustc);
+    cmd.arg(format!("--edition={}", edition.as_str()))
         .arg("--crate-type=lib")
         .arg("--emit=mir")
         .arg("-o")
-        .arg(&out_path)
+        .arg(&out_path);
+    // An `--extern name=path` makes the crate nameable; the crate's own
+    // dependencies are found through `-L dependency=` search paths, which the
+    // caller supplies because only it knows where the artifacts live. Without the
+    // search path the extern resolves and its *dependency* does not, and the error
+    // names the inner crate rather than the one the caller asked for.
+    for (name, path) in &opts.externs {
+        cmd.arg("--extern").arg(format!("{}={}", name, path.display()));
+    }
+    for dir in &opts.search_paths {
+        cmd.arg("-L").arg(format!("dependency={}", dir.display()));
+    }
+    let out = cmd
         .arg(file)
         .envs(bootstrap_env(file))
         .output()
@@ -1560,4 +1732,45 @@ mod edition_tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&root);
     }
+    /// `extern_options` names the crate *and* the search path its dependencies live
+    /// on, because an `--extern` alone resolves the outer crate and then fails on its
+    /// transitive dependency. An artifact that no build produced is a refusal rather
+    /// than a guessed path -- the guess would surface as a compiler error about
+    /// correct code, the confusing direction.
+    #[test]
+    fn extern_options_refuses_when_the_artifact_is_absent() {
+        // A crate name that no build ever produced has no rlib to find, so the
+        // answer is a refusal rather than a guessed path. (This deliberately does
+        // not mutate `OUT_DIR`: `set_var` is unsafe in edition 2024 and mutating the
+        // environment under a parallel test harness is a data race.)
+        assert!(
+            extern_options("a-crate-that-no-build-ever-produced").is_none(),
+            "an absent artifact must be refused, never guessed"
+        );
+    }
+
+    /// The extern plumbing reaches `rustc`: a file that imports a crate the frontend
+    /// was not told about fails with `E0432`, and the same file with the crate passed
+    /// as an extern compiles. This is the failure the `externs` field exists to fix,
+    /// and it is pinned here because a silent `--extern` that never reaches the
+    /// command line would otherwise look identical to one that works.
+    #[test]
+    fn an_unresolvable_import_names_the_missing_extern() {
+        let dir = std::env::temp_dir().join(format!("verif-extern-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("m.rs");
+        std::fs::write(
+            &src,
+            "use some_crate_nobody_linked::thing;\npub fn f() -> u8 { thing() }\n",
+        )
+        .unwrap();
+        let opts = MirOptions { edition: Some(Edition::Rust2021), ..MirOptions::default() };
+        let err = emit_mir_with_opts("rustc", &src, &opts).expect_err("an unknown crate cannot resolve");
+        assert!(
+            err.contains("E0432") || err.contains("unresolved import"),
+            "the refusal must name the unresolved import, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

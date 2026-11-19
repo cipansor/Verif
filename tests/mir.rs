@@ -1238,7 +1238,7 @@ fn every_edition_compiles_the_corpus_to_the_same_verdicts() {
         [Edition::Rust2015, Edition::Rust2018, Edition::Rust2021, Edition::Rust2024];
     let mut baseline: Option<Vec<(String, String)>> = None;
     for ed in editions {
-        let opts = verify::MirOptions { edition: Some(ed) };
+        let opts = verify::MirOptions { edition: Some(ed), ..Default::default() };
         let report = verify::verify_file_with_opts(&rustc, std::path::Path::new(TARGET), &[], &opts)
             .unwrap_or_else(|e| panic!("frontend failed under {}: {e}", ed.as_str()));
         // The verdict *shape*, so a `Failed { kind }` change is caught too, not
@@ -1285,7 +1285,7 @@ fn a_2021_only_file_is_verified_under_its_own_edition() {
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
 
-    let opts21 = verify::MirOptions { edition: Some(Edition::Rust2021) };
+    let opts21 = verify::MirOptions { edition: Some(Edition::Rust2021), ..Default::default() };
     let report = verify::verify_file_with_opts(&rustc, &file, &[], &opts21)
         .expect("a 2021 file with `extern \"C\"` must compile under 2021");
     let o = report.outcomes.iter().find(|(n, _)| n == "f").map(|(_, o)| o.clone());
@@ -1296,7 +1296,7 @@ fn a_2021_only_file_is_verified_under_its_own_edition() {
 
     // The same bytes under 2024 are a rustc error, so the frontend reports it
     // rather than a verdict. That is the evidence the edition is *used*.
-    let opts24 = verify::MirOptions { edition: Some(Edition::Rust2024) };
+    let opts24 = verify::MirOptions { edition: Some(Edition::Rust2024), ..Default::default() };
     assert!(
         verify::verify_file_with_opts(&rustc, &file, &[], &opts24).is_err(),
         "the 2021-only file must be refused under 2024, not silently compiled"
@@ -1338,7 +1338,7 @@ fn a_package_that_omits_an_edition_is_verified_as_2015() {
         .expect("write probe");
 
     // No explicit edition: the manifest supplies it. A refusal here is the bug.
-    let opts = verify::MirOptions { edition: None };
+    let opts = verify::MirOptions { edition: None, ..Default::default() };
     let (text, edition) = verify::emit_mir_with_opts(&rustc, &file, &opts)
         .expect("a package without an `edition` must resolve to Cargo's 2015 default");
     assert_eq!(edition, verify::Edition::Rust2015, "the default edition is 2015");
@@ -6940,6 +6940,125 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     o
 }
 
+/// A source file may *name* `verif` -- `use verif::spec;` above an in-code
+/// contract block -- but the frontend runs `rustc` on a single file with no Cargo
+/// graph behind it, so without an `--extern` entry that import is `E0432`. This
+/// pins both halves: the same source is refused with no extern and verified with
+/// one, so a `--extern` that never reaches the command line cannot pass.
+#[test]
+fn an_in_code_contract_can_name_verif_through_an_extern() {
+    let Some(rustc) = rustc() else { return };
+    // The test binary is linked against `verif`, so rlibs of it and of its
+    // dependency exist somewhere under this build profile. Cargo's layout is its own
+    // business (integration-test binaries live in `deps/` or under
+    // `build/<pkg>/<hash>/out/`, and a stale rlib from an earlier build can sit
+    // beside a fresh one), so the walk is over the whole profile directory and the
+    // choice is made by *trying* candidates newest-first until one compiles. That is
+    // the same rule `extern_options` uses, and it is a failure rather than a skip
+    // when nothing compiles: skipping would make this test vacuous exactly when the
+    // plumbing it pins is broken.
+    let exe = std::env::current_exe().expect("current exe");
+    let profile = exe
+        .ancestors()
+        .find(|a| a.file_name().is_some_and(|n| n == "debug" || n == "release"))
+        .expect("a debug or release profile directory above the test binary");
+
+    fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, depth - 1, out);
+            } else if p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("libverif") && n.ends_with(".rlib"))
+            {
+                out.push(p);
+            }
+        }
+    }
+
+    let mut rlibs = Vec::new();
+    walk(profile, 6, &mut rlibs);
+    // Every directory that holds a `verif` rlib is a search path, because
+    // `verif-arithmetic` is a separate rlib that may live in a sibling directory.
+    let mut search: Vec<std::path::PathBuf> = rlibs
+        .iter()
+        .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
+        .collect();
+    search.sort();
+    search.dedup();
+    let mut verif_rlibs: Vec<std::path::PathBuf> = rlibs
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("libverif-"))
+        })
+        .collect();
+    verif_rlibs.sort();
+    verif_rlibs.dedup();
+    verif_rlibs.sort_by_key(|p| {
+        std::cmp::Reverse(std::fs::metadata(p).and_then(|m| m.modified()).ok())
+    });
+    assert!(
+        !verif_rlibs.is_empty(),
+        "an rlib of `verif` must exist under {}",
+        profile.display()
+    );
+
+    let src = "use verif::spec;\n\nspec! {\n    requires: n <= 200,\n    ensures: ret == n + 1,\n}\npub fn inc(n: u8) -> u8 { n + 1 }\n";
+
+    // Without the extern, `use verif::spec;` cannot resolve: the frontend reports it.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-extern-e2e-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, src).expect("write probe");
+
+    let bare = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts());
+    assert!(
+        bare.is_err(),
+        "an import of `verif` must fail without an extern, got: {:?}",
+        bare.map(|r| r.outcomes.len())
+    );
+
+    // With the extern, the same source verifies. Candidates are tried newest-first,
+    // because a stale rlib from another compiler fails with `E0514` and the next one
+    // is the real answer.
+    let mut verified = false;
+    let mut last_err = String::new();
+    for rlib in &verif_rlibs {
+        let mut opts = probe_opts();
+        opts.externs = vec![("verif".to_string(), rlib.clone())];
+        opts.search_paths = search.clone();
+        match verify::verify_file_with_opts(&rustc, &file, &[], &opts) {
+            Ok(report) => {
+                verified = report
+                    .outcomes
+                    .iter()
+                    .find(|(n, _)| n == "inc")
+                    .is_some_and(|(_, o)| o.is_verified());
+                if verified {
+                    break;
+                }
+                last_err = format!("{:?}", report.outcomes);
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        verified,
+        "with a working extern the in-code contract must verify; last error: {last_err}"
+    );
+}
+
 /// Options for a probe written to a loose temp file.
 ///
 /// A probe has no `Cargo.toml` above it, so the edition cannot be resolved from a
@@ -6948,7 +7067,7 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
 /// under this repository's `Cargo.toml`, so those tests use the plain entry point
 /// and exercise the manifest resolution path instead.
 fn probe_opts() -> verify::MirOptions {
-    verify::MirOptions { edition: Some(verify::Edition::Rust2024) }
+    verify::MirOptions { edition: Some(verify::Edition::Rust2024), ..Default::default() }
 }
 
 /// Every outcome and the `missing` list for one source, without the

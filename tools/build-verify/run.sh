@@ -57,7 +57,11 @@ edition = "2021"
 [build-dependencies]
 verif = { path = "$ROOT", features = ["std"] }
 
+# Also a normal dependency, so "use verif::spec;" in the crate's own source resolves
+# to the real macro. The macro expands to nothing, so this costs the artifact no
+# symbols -- check 4 below measures that rather than assuming it.
 [dependencies]
+verif = { path = "$ROOT", features = ["std"] }
 EOF
 
 # The build script is the verifier. It fails the build on anything but `Verified`, so a
@@ -67,7 +71,12 @@ cat > "$WORK/build.rs" <<'EOF'
 fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
     let src = std::path::Path::new("src/lib.rs");
-    let report = verif::mir::verify::verify_file_with("rustc", src, &[])
+    // `extern_options` finds this build script's own `verif` rlib and the search
+    // path its dependencies live on, so a source file that says `use verif::spec;`
+    // compiles. Without it the frontend's single-file `rustc` run cannot resolve the
+    // crate and reports `E0432: unresolved import`.
+    let opts = verif::mir::verify::extern_options("verif").unwrap_or_default();
+    let report = verif::mir::verify::verify_file_with_opts("rustc", src, &[], &opts)
         .expect("verif: the MIR frontend could not read the source");
     let mut bad = Vec::new();
     for (name, outcome) in &report.outcomes {
@@ -175,5 +184,63 @@ else
     echo "build-verify: no nm, so the symbol check was skipped ($rlib_bytes bytes rlib)"
 fi
 
+# 4. The same guarantees for a contract written *in the code* as a `spec! { … }`
+#    block rather than a `///` doc comment. This is the shape that lets rustc parse a
+#    clause body as an expression, so a malformed contract is a compile error at the
+#    contract line -- an advantage a doc comment cannot have. It also exercises the
+#    `--extern` plumbing end to end: the file says `use verif::spec;`, and without
+#    `extern_options` the frontend's single-file `rustc` run cannot resolve it.
+cat > "$WORK/src/lib.rs" <<'EOF'
+use verif::spec;
+
+spec! {
+    requires: n <= 200,
+    ensures: ret == n + 1,
+}
+pub fn inc(n: u8) -> u8 { n + 1 }
+EOF
+
+if ! out="$(cd "$WORK" && cargo build --release 2>&1)"; then
+    echo "$out" >&2
+    echo 'build-verify: an in-code spec! contract FAILED to build' >&2
+    exit 1
+fi
+case "$out" in
+    *"verif inc: verified"*) ;;
+    *)
+        echo "$out" >&2
+        echo "build-verify: the in-code block built but was not verified -- the scanner" >&2
+        echo "build-verify: did not read the block, or the extern path did not resolve" >&2
+        exit 1
+        ;;
+esac
+
+# A malformed clause body must be a *compile* error naming the contract line, which is
+# the whole point of the structured macro over an unparsed token soup.
+cat > "$WORK/src/lib.rs" <<'EOF'
+use verif::spec;
+
+spec! {
+    requires: n <=,
+    ensures: ret == n + 1,
+}
+pub fn inc(n: u8) -> u8 { n + 1 }
+EOF
+if out="$(cd "$WORK" && cargo build --release 2>&1)"; then
+    echo "$out" >&2
+    echo "build-verify: a malformed in-code clause BUILT -- the macro is not validating" >&2
+    exit 1
+fi
+case "$out" in
+    *"expected expression"*) ;;
+    *)
+        echo "$out" >&2
+        echo "build-verify: the malformed clause failed to build, but not as a syntax" >&2
+        echo "build-verify: error -- expected rustc to reject the clause body" >&2
+        exit 1
+        ;;
+esac
+
 echo "build-verify: a good contract built, a false one failed the build, and the artifact"
 echo "build-verify: carries no prover -- verification is build-time and zero-cost"
+echo 'build-verify: an in-code spec! block verified, and a malformed clause is a compile error'

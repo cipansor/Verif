@@ -3072,6 +3072,46 @@ fn main() {
 }
 ```
 
+That is the whole recipe when the contracts are `///` doc comments. A source file that
+wants to *name* `verif` — an in-code contract block, `use verif::spec;` — needs one more
+step, because the frontend runs `rustc` on a single file with no Cargo graph behind it, so
+without an `--extern` entry the import is `E0432: unresolved import`. `extern_options`
+supplies it, and the crate must then also be an ordinary dependency (the macro is real
+code the crate's own compilation needs):
+
+```toml
+[dependencies]
+verif = { version = "0.1", features = ["std"] }
+
+[build-dependencies]
+verif = { version = "0.1", features = ["std"] }
+```
+
+```rust,ignore
+// build.rs — the extern-aware form
+fn main() {
+    println!("cargo:rerun-if-changed=src/lib.rs");
+    // Locates this build script's own `verif` rlib and the search path its
+    // dependencies live on, so a source file that says `use verif::spec;` compiles.
+    let opts = verif::mir::verify::extern_options("verif").unwrap_or_default();
+    let report = verif::mir::verify::verify_file_with_opts(
+        "rustc", "src/lib.rs".as_ref(), &[], &opts,
+    )
+    .expect("the MIR frontend could not read the source");
+    for (name, outcome) in &report.outcomes {
+        assert!(outcome.is_verified(), "verif: {name} is not verified: {outcome}");
+    }
+}
+```
+
+`extern_options` does not guess: a crate that is both a dependency and a build dependency
+has *two* rlibs of one name, and a stale one from another compiler is `E0514`. So each
+candidate is handed to `rustc` on a one-line probe and the first that compiles is returned;
+`None` means nothing compiled, and `unwrap_or_default()` then yields the plain recipe
+above, which is a *skipped* extern rather than a wrong one. The zero-cost property is
+unchanged — the macro expands to nothing, so the artifact carries no prover symbol either
+way (gate 18 measures this).
+
 A build script is a *separate compilation unit*: cargo compiles it for the host, runs it,
 and throws it away. So the decision procedure — the whole BDD blasting and CDCL fallback —
 is never linked into the crate's own artifact. That is not an optimisation, it is a

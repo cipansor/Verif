@@ -1111,6 +1111,33 @@ Exit: one real `no_std` crate with a dependency verified end to end with
   - Exit: `everyday.rs`, an SV-COMP-style set, and `verify-rust-std` functions
     scored for verif **and** Kani on the same inputs, updated by CI.
   - Move: **build**.
+- **U9. Contracts written in the code, not only in doc comments.** · P1 · done · —
+  - Gap: a `///` clause is unchecked prose. A typo in a *keyword* is now refused
+    (`ensuers:` is caught), but a typo in the *body* is a string the frontend
+    parses leniently, and a contract above a struct could leak (fixed, but by a
+    reset rather than by the syntax). A doc comment also cannot be reached by any
+    of `rustc`'s own checks.
+  - Fix: the `spec! { … }` macro, whose matcher is `$($clause:ident : $body:expr,)*`.
+    `rustc` parses each body as a real expression, so `requires: n <=,` is
+    `error: expected expression` at the contract line; the macro expands to
+    nothing, so the artifact carries no byte and no symbol of it (measured: 4 660 B
+    rlib, 0 `verif` symbols). Both spellings feed one clause parser, so they cannot
+    disagree about what a clause means. A source that says `use verif::spec;` needs
+    the frontend's `rustc` run to be told where the crate is, which is
+    `mir::verify::extern_options` (it probes candidates and returns the first that
+    compiles, so a stale rlib from another compiler is skipped rather than guessed).
+  - Exit: an in-code block verifies at build time, a false one fails the build, a
+    malformed clause is a compile error, and the artifact carries no prover symbol.
+    ✅ Gate 18 check 4 (`tools/build-verify/run.sh`); pinned by
+    `an_in_code_contract_can_name_verif_through_an_extern` (both directions: no
+    extern is `E0432`, with one it verifies) and
+    `an_unresolvable_import_names_the_missing_extern`.
+  - What remains: the macro is **not** a proc-macro, so it cannot resolve `ret` or
+    check that a clause names a real argument — the frontend does that, and a name
+    it cannot resolve is a `Skipped` function, not a compile error. Making it a
+    proc-macro would need a dependency, which the crate does not take. Recorded,
+    not planned.
+  - Move: **build**.
 
 ---
 

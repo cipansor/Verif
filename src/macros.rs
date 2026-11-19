@@ -190,6 +190,19 @@ macro_rules! verify_exhaustive {
 /// Both spellings feed the same clause parser, so they cannot disagree about what
 /// a clause means; the difference is that one is verified syntax and the other is
 /// unchecked prose.
+///
+/// # Using it from a `build.rs`
+///
+/// The macro is real code, so `verif` must be an ordinary dependency for the
+/// `use verif::spec;` to resolve. The frontend then compiles the file itself with
+/// `rustc`, which needs to be told where `verif` is: `verif::mir::verify::extern_options`
+/// supplies that, and the README's "Shape A" section has the full recipe. Without
+/// it the frontend's single-file run cannot resolve the crate and reports
+/// `E0432: unresolved import` rather than silently skipping the block.
+///
+/// That helper is `std`-only (it reads the build directory), so this note is plain
+/// text rather than an intra-doc link: in the default `no_std` build the item does
+/// not exist, and a link to it would be a `broken_intra_doc_links` warning there.
 #[macro_export]
 macro_rules! spec {
     // `ret` is a contract-only name, so a clause body is *not* required to be a
