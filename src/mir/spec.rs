@@ -2462,14 +2462,30 @@ fn in_code_block(lines: &[&str], start: usize) -> (Vec<(usize, String)>, usize) 
     (clauses, consumed)
 }
 
+/// Replace a comment with one space, so the tokens on either side stay separate.
+///
+/// Only added when the piece already has content and does not end in whitespace, so
+/// adjacent comments do not accumulate spaces and a leading comment does not make an
+/// otherwise empty clause look non-empty.
+fn push_separator(piece: &mut String, piece_start: Option<usize>) {
+    if piece_start.is_some() && !piece.ends_with(char::is_whitespace) {
+        piece.push(' ');
+    }
+}
+
 /// Split a closed block's text into `(line offset, clause text)` pairs.
 ///
 /// Top-level commas separate clauses -- the macro's grammar is
 /// `$($clause:ident : $body:expr,)*` -- while a comma inside parentheses, brackets,
-/// braces, a string, a char literal or a comment does not. A `//` comment is
-/// *dropped* rather than carried into the next clause: keeping it made the next
-/// clause begin with `//`, so `take_clause` saw no keyword and dropped it, which is
-/// a false proof when the dropped clause was the `ensures:`.
+/// braces, a string, a char literal or a comment does not.
+///
+/// A comment is *replaced by a space*, never deleted. It is not content -- carrying
+/// it into the clause made the next clause begin with `//`, so `take_clause` saw no
+/// keyword and dropped it, a false proof when the dropped clause was the `ensures:`
+/// -- but it *is* a token separator in Rust: `n/**/as` is the cast `n as`, and
+/// deleting it glued the neighbours into the single identifier `nasu8`, a name nobody
+/// wrote that a body returning an argument of that name could satisfy. The newline
+/// ending a `//` comment is itself a separator and is kept.
 fn split_clauses(text: &str, origins: &[usize]) -> (Vec<(usize, String)>, usize) {
     let bytes = text.as_bytes();
     let mut clauses: Vec<(usize, String)> = Vec::new();
@@ -2497,6 +2513,14 @@ fn split_clauses(text: &str, origins: &[usize]) -> (Vec<(usize, String)>, usize)
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
+                // A comment is a *token separator* in Rust: `n/**/as` is `n as`, and
+                // `ret == n/**/as/**/u8` is the cast `n as u8`. Deleting the comment
+                // instead of replacing it glued the neighbouring tokens into one
+                // identifier (`nasu8`), so the clause named a variable nobody wrote
+                // -- and a function with an argument of that name verified a
+                // postcondition the source never states. One space preserves the
+                // separation without changing what the clause means.
+                push_separator(&mut piece, piece_start);
                 continue;
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
@@ -2513,6 +2537,7 @@ fn split_clauses(text: &str, origins: &[usize]) -> (Vec<(usize, String)>, usize)
                         i += 1;
                     }
                 }
+                push_separator(&mut piece, piece_start);
                 continue;
             }
             b'"' => {
@@ -2584,10 +2609,26 @@ fn split_clauses(text: &str, origins: &[usize]) -> (Vec<(usize, String)>, usize)
                 piece_start = None;
             }
             _ => {
-                if piece_start.is_none() && !(ch as char).is_whitespace() {
-                    piece_start = origins.get(i).copied();
+                if ch.is_ascii() {
+                    if piece_start.is_none() && !(ch as char).is_whitespace() {
+                        piece_start = origins.get(i).copied();
+                    }
+                    piece.push(ch as char);
+                } else {
+                    // A non-ASCII byte is the start of a multi-byte UTF-8 character,
+                    // and every identifier Rust accepts may contain one (`µ`, `日本`).
+                    // `ch as char` reads one byte as Latin-1, so `µ` (0xC2 0xB5) became
+                    // `Âµ` -- a *different identifier* than the one written, which is a
+                    // false proof when a contract names it and an argument of the
+                    // mangled spelling exists. Decode the whole character instead.
+                    let ch = text[i..].chars().next().unwrap_or('\u{fffd}');
+                    if piece_start.is_none() && !ch.is_whitespace() {
+                        piece_start = origins.get(i).copied();
+                    }
+                    piece.push(ch);
+                    i += ch.len_utf8();
+                    continue;
                 }
-                piece.push(ch as char);
             }
         }
         i += 1;
@@ -11507,8 +11548,64 @@ fn h<
             ("use a::B;", true)
         );
     }
+
+    /// A comment between two tokens separates them; deleting it joins them.
+    ///
+    /// `ret == n/**/as/**/u8` is the cast `n as u8` in Rust, because a comment is a
+    /// token separator. The block reader skipped comments whole, so the clause came
+    /// out as `ret == nasu8` -- an identifier nobody wrote. A function that also
+    /// takes an argument named `nasu8` then *verified* that postcondition, which is
+    /// the false-proof direction: the source says the result is `n as u8`, and the
+    /// tool checked it against a different variable.
+    ///
+    /// The line-comment case is pinned too, since it shares the fix, and a comment
+    /// at the *start* of a clause must not make the clause look non-empty.
+    #[test]
+    fn a_comment_separates_tokens_rather_than_joining_them() {
+        use super::split_clauses;
+        let cases = [
+            ("ensures: ret == n/**/as/**/u8", vec!["ensures: ret == n as u8"]),
+            ("ensures: ret == n/*c*/+/*c*/1", vec!["ensures: ret == n + 1"]),
+            // A line comment ends at the newline, which stays as the separator, so
+            // the clause continues on the next line instead of joining `n` to `+`.
+            (
+                "ensures: ret == n // trailing\n  + 1",
+                vec!["ensures: ret == n \n  + 1"],
+            ),
+            // Two clauses split on the comma even when a comment sits on it.
+            (
+                "requires: n/*c*/> 0, ensures: ret == n",
+                vec!["requires: n > 0", "ensures: ret == n"],
+            ),
+            // A leading comment must not make an otherwise empty clause non-empty.
+            ("/*c*/", Vec::new()),
+        ];
+        for (text, want) in cases {
+            let (got, _) = split_clauses(text, &vec![0usize; text.len()]);
+            let got: Vec<&str> = got.iter().map(|(_, t)| t.as_str()).collect();
+            assert_eq!(got, want, "clause split of {text:?}");
+        }
+    }
+
+    /// A non-ASCII identifier is read as the character that was written.
+    ///
+    /// `split_clauses` walks bytes, and `byte as char` reads one byte as Latin-1, so
+    /// `µ` (0xC2 0xB5) became `Âµ` -- a *different* identifier. A contract naming `µ`
+    /// was therefore checked against a variable nobody declared, and a function with
+    /// an argument of the mangled spelling verified it. Rust accepts non-ASCII
+    /// identifiers, so this is a shape a real crate can write.
+    #[test]
+    fn a_non_ascii_identifier_is_not_mangled() {
+        use super::split_clauses;
+        for (text, want) in [
+            ("ensures: ret == µ", "ensures: ret == µ"),
+            ("requires: 日本 > 0", "requires: 日本 > 0"),
+            // A multi-byte character next to a comment and a comma: the separator
+            // fix and the decode must not interfere.
+            ("requires: µ/*c*/> 0, ensures: ret == µ", "requires: µ > 0"),
+        ] {
+            let (got, _) = split_clauses(text, &vec![0usize; text.len()]);
+            assert_eq!(got.first().map(|(_, t)| t.as_str()), Some(want), "clause of {text:?}");
+        }
+    }
 }
-
-
-
-

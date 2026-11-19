@@ -6947,12 +6947,16 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
 /// one, so a `--extern` that never reaches the command line cannot pass.
 #[test]
 fn an_in_code_contract_can_name_verif_through_an_extern() {
-    // The extern probe must use the compiler that *built* the rlib this test is
-    // linked against, which is cargo's compiler -- not `VERIF_RUSTC`, which may
-    // name a different toolchain and would reject every candidate with `E0514`.
-    // `RUSTC` is set inside a build script but not for a test binary, so the
-    // fallback is `rustc` on `PATH`, which is what cargo itself uses by default.
-    // `--emit=mir` is stable, so no nightly is needed here.
+    // Lookup and emission must name ONE compiler: a rlib's metadata is
+    // compiler-specific, so probing with one toolchain and emitting with another
+    // fails `E0514` even when both are installed and each has its own artifact.
+    //
+    // The compiler here is the one the *emitter* will use, and it is cargo's: the
+    // rlib this test binary links was built by it, and a test binary has no `RUSTC`
+    // in its environment. `--emit=mir` is stable, so no nightly is needed. The test
+    // deliberately does NOT read `VERIF_RUSTC`: CI points that at a nightly, and
+    // probing the stable-built rlib with a nightly is exactly the mismatch this
+    // test exists to catch.
     let rustc = std::env::var("RUSTC")
         .ok()
         .filter(|s| !s.is_empty())
@@ -6965,15 +6969,13 @@ fn an_in_code_contract_can_name_verif_through_an_extern() {
     {
         return;
     }
-    // The test binary is linked against `verif`, so rlibs of it and of its
-    // dependency exist somewhere under this build profile. Cargo's layout is its own
-    // business (integration-test binaries live in `deps/` or under
-    // `build/<pkg>/<hash>/out/`, and a stale rlib from an earlier build can sit
-    // beside a fresh one), so the walk is over the whole profile directory and the
-    // choice is made by *trying* candidates newest-first until one compiles. That is
-    // the same rule `extern_options` uses, and it is a failure rather than a skip
-    // when nothing compiles: skipping would make this test vacuous exactly when the
-    // plumbing it pins is broken.
+
+    // `build_script_roots()` needs `OUT_DIR`, which a test binary does not have, so
+    // the profile directory is found from the test binary's own path instead.
+    // Cargo's layout is its own business (`deps/` or `build/<pkg>/<hash>/out/`, and
+    // a stale rlib from an earlier build can sit beside a fresh one), so the walk
+    // covers the whole profile and the choice is made by *trying* candidates
+    // newest-first until one compiles -- the same rule `extern_options_with` uses.
     let exe = std::env::current_exe().expect("current exe");
     let profile = exe
         .ancestors()
@@ -7001,8 +7003,6 @@ fn an_in_code_contract_can_name_verif_through_an_extern() {
 
     let mut rlibs = Vec::new();
     walk(profile, 6, &mut rlibs);
-    // Every directory that holds a `verif` rlib is a search path, because
-    // `verif-arithmetic` is a separate rlib that may live in a sibling directory.
     let mut search: Vec<std::path::PathBuf> = rlibs
         .iter()
         .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
@@ -7030,7 +7030,6 @@ fn an_in_code_contract_can_name_verif_through_an_extern() {
 
     let src = "use verif::spec;\n\nspec! {\n    requires: n <= 200,\n    ensures: ret == n + 1,\n}\npub fn inc(n: u8) -> u8 { n + 1 }\n";
 
-    // Without the extern, `use verif::spec;` cannot resolve: the frontend reports it.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("verif-extern-e2e-{}-{seq}", std::process::id()));
@@ -7038,6 +7037,7 @@ fn an_in_code_contract_can_name_verif_through_an_extern() {
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
 
+    // Without the extern, `use verif::spec;` cannot resolve: the frontend reports it.
     let bare = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts());
     assert!(
         bare.is_err(),
@@ -7046,8 +7046,8 @@ fn an_in_code_contract_can_name_verif_through_an_extern() {
     );
 
     // With the extern, the same source verifies. Candidates are tried newest-first,
-    // because a stale rlib from another compiler fails with `E0514` and the next one
-    // is the real answer.
+    // because a stale rlib from another compiler fails the probe (`E0514`) and the
+    // next one is the answer -- which is the *same* compiler that emits the MIR.
     let mut verified = false;
     let mut last_err = String::new();
     for rlib in &verif_rlibs {
@@ -13300,6 +13300,32 @@ pub fn panics_on_drop() -> u8 {
         assert!(
             !p.is_verified(),
             "a unit struct whose destructor panics must not verify, got: {p}"
+        );
+    }
+}
+
+/// A comment between two tokens separates them, and a non-ASCII identifier is read
+/// as written -- both are false-proof shapes when the block reader gets them wrong.
+///
+/// `ensures: ret == n/**/as/**/u8` is the cast `n as u8`. Deleting the comment glued
+/// the tokens into `nasu8`, so a body returning an *argument* of that name satisfied
+/// the clause while the real postcondition (`ret == n as u8`) is false. The `µ` case
+/// is the same defect through `byte as char`: `µ` decoded to `Âµ`, a different
+/// identifier, and a body returning an argument named `Âµ` verified it.
+///
+/// Both bodies here return the *mangled* spelling, so the verdict discriminates:
+/// read correctly the clause is false and must be refuted; read under the bug it is
+/// true and would be proved. That is the shape the ledger calls a false proof.
+#[test]
+fn a_comment_and_a_non_ascii_name_cannot_smuggle_a_false_proof() {
+    let comment_src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n\nspec! {\n    requires: true,\n    ensures: ret == n/**/as/**/u8,\n}\npub fn f(n: u8, nasu8: u8) -> u8 { let _ = n; nasu8 }\n";
+    let uni_src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n\nspec! {\n    requires: true,\n    ensures: ret == \u{b5},\n}\npub fn g(\u{b5}: u8, \u{c2}\u{b5}: u8) -> u8 { let _ = \u{b5}; \u{c2}\u{b5} }\n";
+
+    for (name, src) in [("f", comment_src), ("g", uni_src)] {
+        let outcome = verify_src(name, src).expect("the function must be reported");
+        assert!(
+            matches!(outcome, FnOutcome::Failed { .. }),
+            "a clause naming a variable the body does not return must be refuted, got: {outcome:?}"
         );
     }
 }

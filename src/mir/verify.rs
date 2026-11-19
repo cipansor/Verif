@@ -141,6 +141,29 @@ pub struct MirOptions {
 /// ```
 #[cfg(feature = "std")]
 pub fn extern_options(name: &str) -> Option<MirOptions> {
+    // The probe must use the compiler that will *consume* the rlib, which is the
+    // MIR emitter -- so this resolves the same way [`verify_file_opts`] does. A
+    // rlib's metadata is compiler-specific: an rlib the producing compiler accepts
+    // is not thereby acceptable to a different one, so probing with any compiler
+    // but the emitter only proves the wrong thing. When the emitter names another
+    // toolchain, a candidate it cannot read fails the probe (`E0514`) and the next
+    // is tried; `None` then means "no rlib this emitter can read", which is the
+    // honest answer. A caller whose emitter is not `VERIF_RUSTC` must use
+    // [`extern_options_with`] so lookup and emission name one compiler.
+    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
+    extern_options_with(&rustc, name)
+}
+
+/// [`extern_options`] with the compiler named explicitly.
+///
+/// The rlib returned is the one **this** compiler accepts, so the caller must pass
+/// the same compiler to [`verify_file_with_opts`]/[`emit_mir_with_opts`]. Use this
+/// when the emitter is chosen by the caller rather than by `VERIF_RUSTC` -- a test
+/// that pins a specific toolchain, or a build script that resolved its own
+/// `rustc`. Mixing the two (probe with one compiler, emit with another) is the
+/// `E0514` failure this parameter exists to prevent.
+#[cfg(feature = "std")]
+pub fn extern_options_with(rustc: &str, name: &str) -> Option<MirOptions> {
     let roots = build_script_roots()?;
     let prefix = format!("lib{}-", name.replace('-', "_"));
     let mut found: Vec<PathBuf> = Vec::new();
@@ -166,19 +189,6 @@ pub fn extern_options(name: &str) -> Option<MirOptions> {
             std::fs::metadata(p).and_then(|m| m.modified()).ok(),
         )
     });
-    // The probe must use the compiler that *built* the rlib, not the one that will
-    // emit MIR. Cargo sets `RUSTC` for a build script to exactly that compiler, so
-    // it is the right answer whenever it is present. `VERIF_RUSTC` selects the MIR
-    // emitter and may name a different toolchain -- when it did, every candidate
-    // failed the probe with `E0514` and the caller saw `None`, i.e. "the extern is
-    // unavailable" for a crate that was built and perfectly usable. Falling back to
-    // `VERIF_RUSTC` and then `rustc` keeps the old behaviour where `RUSTC` is unset
-    // (a direct library caller outside a build script).
-    let rustc = std::env::var("RUSTC")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("VERIF_RUSTC").ok().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| "rustc".into());
     let search: Vec<PathBuf> = roots;
     for cand in found {
         let mut opts = MirOptions {
@@ -187,7 +197,7 @@ pub fn extern_options(name: &str) -> Option<MirOptions> {
             ..MirOptions::default()
         };
         opts.search_paths.retain(|r| r.is_dir());
-        if extern_compiles(&rustc, &opts) {
+        if extern_compiles(rustc, &opts) {
             return Some(opts);
         }
     }
@@ -1901,4 +1911,83 @@ mod edition_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+}
+
+/// The extern probe must be run by the compiler that will *consume* the rlib.
+///
+/// A rlib carries compiler-specific metadata, so an rlib one toolchain produced is
+/// not thereby readable by another. This pins the consequence the API is built on:
+/// [`extern_compiles`] answers about *that* compiler, so a caller that probes with
+/// one toolchain and emits MIR with another has proved the wrong thing. It also
+/// pins the positive half -- the same rlib is accepted by its own compiler -- so the
+/// test cannot pass by refusing everything.
+#[cfg(all(test, feature = "std"))]
+mod extern_probe_tests {
+    use super::*;
+
+    fn have(toolchain: &str) -> Option<String> {
+        let out = Command::new("rustup")
+            .args(["which", "--toolchain", toolchain, "rustc"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let p = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        (!p.is_empty()).then_some(p)
+    }
+
+    #[test]
+    fn the_probe_answers_for_the_compiler_that_will_read_the_rlib() {
+        // The compiler that built this test binary's `verif` rlib.
+        let producer = std::env::var("RUSTC")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "rustc".into());
+        // A *different* toolchain, if one is installed. Without one there is nothing
+        // to compare against, and the test says so rather than passing vacuously.
+        let other = ["1.85", "nightly", "stable"]
+            .into_iter()
+            .filter_map(have)
+            .find(|p| *p != producer);
+        let Some(other) = other else { return };
+
+        // Build a tiny rlib with `producer`, then ask both compilers to read it.
+        let dir = std::env::temp_dir().join(format!(
+            "verif-extern-cross-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("lib.rs");
+        std::fs::write(&src, "pub fn seven() -> u8 { 7 }\n").unwrap();
+        let rlib = dir.join("libprobe_crate.rlib");
+        let built = Command::new(&producer)
+            .args(["--crate-type=lib", "--crate-name", "probe_crate", "-o"])
+            .arg(&rlib)
+            .arg(&src)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !built {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let opts = MirOptions {
+            externs: vec![("probe_crate".into(), rlib.clone())],
+            ..MirOptions::default()
+        };
+        // The producing compiler reads its own rlib.
+        assert!(
+            extern_compiles(&producer, &opts),
+            "the compiler that built the rlib must accept it"
+        );
+        // A different toolchain must not -- and that is exactly why the probe and
+        // the emitter have to name one compiler.
+        assert!(
+            !extern_compiles(&other, &opts),
+            "a different toolchain ({other}) must not accept an rlib built by {producer}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

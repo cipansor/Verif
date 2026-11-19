@@ -3091,11 +3091,14 @@ verif = { version = "0.1", features = ["std"] }
 // build.rs — the extern-aware form
 fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
-    // Locates this build script's own `verif` rlib and the search path its
-    // dependencies live on, so a source file that says `use verif::spec;` compiles.
-    let opts = verif::mir::verify::extern_options("verif").unwrap_or_default();
+    // One compiler for both steps. `extern_options_with` returns the rlib *this*
+    // compiler accepts, so passing the same name to the emitter cannot disagree.
+    // Cargo sets `RUSTC` for a build script to the compiler that produced the
+    // build-dependency rlibs, which is the one that can read them back.
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let opts = verif::mir::verify::extern_options_with(&rustc, "verif").unwrap_or_default();
     let report = verif::mir::verify::verify_file_with_opts(
-        "rustc", "src/lib.rs".as_ref(), &[], &opts,
+        &rustc, "src/lib.rs".as_ref(), &[], &opts,
     )
     .expect("the MIR frontend could not read the source");
     for (name, outcome) in &report.outcomes {
@@ -3103,6 +3106,16 @@ fn main() {
     }
 }
 ```
+
+**The lookup and the MIR emission must name the same compiler.** An rlib's metadata is
+compiler-specific: a candidate the *producing* compiler accepts is not thereby readable by
+a *different* one, so probing with one toolchain and emitting with another fails `E0514`
+even when both are installed and each has its own artifact. That is why the recipe above
+resolves one `rustc` and passes it to both calls. The convenience form `extern_options`
+(no compiler argument) reads `VERIF_RUSTC`, which is what the emitter uses, so it is
+consistent only when `VERIF_RUSTC` is also the compiler that built the rlib — true for the
+common `cargo build` with no override, and the reason the explicit form exists for every
+other case.
 
 `extern_options` does not guess: a crate that is both a dependency and a build dependency
 has *two* rlibs of one name, and a stale one from another compiler is `E0514`. So each
