@@ -3266,12 +3266,13 @@ misleads:
 | **artifact** | what the tool adds to the binary you ship | `tools/shape-bench/run.sh` |
 
 Measured on one machine (x86_64, four cores; Kani 0.68.0, Verus 0.2026.11.02, Coq 8.20.1,
-Lean 4.36.0, rustc 1.100.0), cold cache, the same three functions:
+Lean 4.36.0, rustc 1.100.0), steady-state (each tool warmed once, then the median of three
+runs — Kani is ≈3.2 s / ≈256 MB on a *cold* first run), the same three functions:
 
 | tool | per-verification wall | peak RSS | setup (on disk) |
 | --- | --- | --- | --- |
-| `verif` | ≈0.07 s | ≈10 MB | ≈1.4 MB (a crate) |
-| Kani | ≈0.7 s | ≈14 MB | ≈486 MB |
+| `verif` | ≈0.07 s | ≈97 MB | ≈1.4 MB (a crate) |
+| Kani | ≈0.7 s | ≈23 MB | ≈486 MB |
 | Verus | ≈0.8 s | ≈316 MB | ≈133 MB |
 | Coq | ≈0.5 s | ≈298 MB | ≈451 MB |
 | Lean | ≈0.5 s | ≈472 MB | ≈3.1 GB |
@@ -3279,10 +3280,13 @@ Lean 4.36.0, rustc 1.100.0), cold cache, the same three functions:
 Read the table with these caveats, each of which is the honest part:
 
 - **`verif`'s row includes spawning `rustc --emit=mir`** to read the source — it is the
-  only row whose verification step also compiles the code it verifies. The engine-only cost
-  of the same three functions is ≈0.05 s (the per-function `elapsed` column `mir_coverage`
-  prints), so the gap is real but modest; "≈0.07 s" is not "the engine is 10× faster than
-  Kani", it is a measurement that includes the frontend's compiler call.
+  only row whose verification step also compiles the code it verifies. That is also why its
+  peak RSS is ≈97 MB, not the ≈10 MB the driver process alone peaks at: the *largest process
+  in the tree* is the peak, and for `verif` that is the `rustc` it spawns. The engine-only
+  cost of the same three functions is ≈0.05 s (the per-function `elapsed` column
+  `mir_coverage` prints), so "≈0.07 s" is not "the engine is 10× faster than Kani" — it is a
+  measurement that includes the frontend's compiler call. Peak RSS is a **tree** figure for
+  every row, so each number is the tool's real peak and not its launcher's.
 - **Coq and Lean prove a hand-written *model*, not the Rust code.** Their rows are not "the
   same thing, slower" — they are a different task, and the transcription is the risk the
   comparison README is about. A like-for-like engine comparison would exclude them.
@@ -3293,6 +3297,11 @@ Read the table with these caveats, each of which is the honest part:
   Kani, Verus, Coq and Lean are host-side binaries that ship nothing; `verif` build-time
   also ships nothing. `verif` on-target ships ≈5.3 MB and 42 symbols. That is the deliberate
   trade for running where no solver can, and it is why the two shapes are not interchangeable.
+- **These are steady-state figures, not a cold first run.** Kani and Verus warm their own
+  caches on the first run, so the harness warms each once and reports the median of three
+  warm runs. The gap is large — Kani is ≈3.2 s / ≈256 MB cold against ≈0.7 s / ≈23 MB warm —
+  so a "cold cache" label would be wrong by 4×. The number answers "what does a repeated
+  check cost", which is the useful one; a one-shot first run is larger.
 - **These are one machine's figures.** They move with CPU, disk and cache. `verif` wins the
   setup axis clearly and is competitive on the per-verification axis for this small fixture;
   it does **not** claim to win on speed for large problems — the BDD scaling wall is real and

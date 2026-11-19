@@ -13,7 +13,7 @@
 #
 #   setup        -- the one-time cost of installing the tool (disk).
 #   verification -- the per-run cost of deciding the *same three functions*,
-#                   wall / CPU / peak RSS, cold-cache.
+#                   wall / CPU / peak RSS, steady-state (see the note below).
 #   artifact     -- what the tool adds to the binary you ship.
 #
 # The `artifact` axis is not measured here: only `verif` has an on-target shape
@@ -57,12 +57,21 @@ FIXTURE="examples/comparison/target.rs"
 
 # One measured run: median of three, so a single scheduler hiccup does not become
 # the figure. The launcher prints `code  wall  cpu  peak_kb  sampled`.
+#
+# `-t` samples the whole descendant tree, not just the direct child. It matters
+# for any tool that spawns a verifier or compiler: `cargo kani` is a thin cargo
+# plugin whose real work is a `kani-driver` grandchild, and `verif`'s own driver
+# spawns `rustc --emit=mir` to read the source. Without `-t` the launcher reports
+# the launcher process's RSS (measured: kani 14 MB, verif 10 MB) instead of the
+# real peak (kani 23 MB, verif 97 MB). Wall time is unaffected by the flag; only
+# the peak is, which is the point. The largest single process's peak is reported,
+# which is the right reading for a tree whose work is done by one heavy child.
 measure() {
   label="$1"; shift
   best=""
   i=0
   while [ "$i" -lt 3 ]; do
-    line="$("$MEASURER" "$@" 2>/dev/null || true)"
+    line="$("$MEASURER" -t "$@" 2>/dev/null || true)"
     code="$(printf '%s' "$line" | cut -f1)"
     if [ "${code:-1}" != "0" ]; then
       printf '%-14s %s\n' "$label" "FAILED (exit $code)"
@@ -86,11 +95,21 @@ printf '%-14s %8s  %8s  %8s\n' "----" "------" "-----" "-------"
 # `mir_coverage` reads the source with `--emit=mir` and decides every function,
 # which is the same three functions the other tools decide. It needs a compiler
 # named; a stable `rustc` is enough (`--emit=mir` is stable).
+#
+# `--target-dir` is passed explicitly, to a private directory, rather than relying
+# on the default `target/`. With `CARGO_TARGET_DIR` or a `build.target-dir` in
+# Cargo config set, `cargo build` writes elsewhere while the launch path stayed
+# `target/debug/...` -- so the harness either failed or, worse, silently measured
+# a *stale* binary left in `target/` from an earlier build. An explicit
+# `--target-dir` overrides both the env var and the config (verified), so the
+# build and the launch cannot disagree, and the private dir also keeps this
+# benchmark from clobbering the developer's own `target/`.
 if command -v rustc >/dev/null 2>&1; then
   VERIF_RUSTC="${VERIF_RUSTC:-$(command -v rustc)}"
   export VERIF_RUSTC
-  if cargo build -q --features std --example mir_coverage >/dev/null 2>&1; then
-    measure "verif" "target/debug/examples/mir_coverage" "$FIXTURE"
+  TARGET_DIR="$WORK/verif-target"
+  if cargo build -q --features std --example mir_coverage --target-dir "$TARGET_DIR" >/dev/null 2>&1; then
+    measure "verif" "$TARGET_DIR/debug/examples/mir_coverage" "$FIXTURE"
   else
     printf '%-14s %s\n' "verif" "SKIPPED (the example did not build)"
   fi
@@ -126,12 +145,20 @@ fi
 # ---- Verus: one self-contained `.rs`, run through the `verus` driver. The
 # driver needs the rust toolchain its release pins; if that is missing, `verus`
 # exits non-zero and the run is reported FAILED rather than dropped.
-VERUS_BIN=""
+#
+# `${VERUS_BIN:-}` reads the caller's value *without* clearing it first: assigning
+# `VERUS_BIN=""` here would wipe the very path the loop's first candidate reads,
+# so a caller who set only `VERUS_BIN` (Verus not on PATH, not at the /tmp default)
+# would be silently skipped. The loop keeps an inherited value, then falls back to
+# PATH, then to the location this repo's setup notes install to.
 for c in "${VERUS_BIN:-}" "$(command -v verus 2>/dev/null || true)" /tmp/verus/verus-x86-linux/verus; do
   if [ -n "$c" ] && [ -x "$c" ]; then VERUS_BIN="$c"; break; fi
 done
 if [ -n "$VERUS_BIN" ]; then
   cp examples/comparison/verus.rs "$WORK/verus_example.rs"
+  # Warm the driver's own cache once, as for kani, so all three measured runs are
+  # steady-state and the reported median is not a blend of a cold and a warm run.
+  ( cd "$ROOT" && "$VERUS_BIN" --crate-type=lib "$WORK/verus_example.rs" >/dev/null 2>&1 ) || true
   measure "verus" "$VERUS_BIN" "--crate-type=lib" "$WORK/verus_example.rs"
 else
   printf '%-14s %s\n' "verus" "SKIPPED (verus not found; set VERUS_BIN)"
@@ -189,7 +216,14 @@ else
   printf '%-14s %s\n' "verif" "crate size unavailable (no python3)"
 fi
 setup "kani" "$HOME/.kani" "$HOME/.cargo/bin/cargo-kani" "$HOME/.cargo/bin/kani"
-setup "verus" "${VERUS_DIR:-/tmp/verus/verus-x86-linux}"
+# The setup row measures the *directory* Verus installed into. Derive it from the
+# driver that was actually found, so a caller who set only `VERUS_BIN` gets the
+# right directory measured rather than the `/tmp` default they did not use.
+if [ -n "${VERUS_BIN:-}" ] && [ -x "${VERUS_BIN:-}" ]; then
+  setup "verus" "$(dirname "$VERUS_BIN")"
+else
+  setup "verus" "${VERUS_DIR:-/tmp/verus/verus-x86-linux}"
+fi
 # Coq installs spread across `/usr` and `~/.opam`; `dpkg` reports its own size
 # where the distribution package was used, which is the honest figure for that
 # install method. A source/opam build would be measured with `du` instead.
@@ -209,12 +243,21 @@ cat <<'EOF'
 
 notes:
   - One machine, x86_64, four cores. Regenerate rather than trusting the prose.
+  - These are **steady-state** figures, not cold-cache: kani and verus warm their
+    own caches on the first run, so the harness runs each tool once to warm it and
+    then reports the median of three warm runs. The gap is large -- kani is ~3.2 s
+    / ~256 MB cold and ~0.7 s / ~23 MB warm on this machine -- so a "cold" label
+    here would be wrong by 4x. What the number answers is "what does a repeated
+    check cost", which is the interesting one; a one-shot first run is a different
+    (and much larger) figure.
+  - Peak RSS samples the whole process tree (`-t`), so it includes the verifier or
+    compiler a tool spawns. That is why verif's row is ~97 MB rather than ~10 MB:
+    its driver spawns `rustc --emit=mir`, and the largest process in the tree is
+    the peak. Sampling only the direct child would report the launcher's RSS.
   - verif's figure includes spawning `rustc --emit=mir` to read the source; the
     engine-only cost of the same three functions is lower (see the comparison
     README, which separates the two). It is the only row whose "verification"
     step also compiles the code it verifies.
-  - kani and verus warm their own caches on the first run; the figures above are
-    the steady-state (second-run) cost, which is what a repeated check costs.
   - coq and lean prove a *hand-written model* of the three functions, not the
     Rust code; the model is compiled once and its cost is not in the row above.
     That transcription is the risk the comparison README is about, and it is why

@@ -7663,12 +7663,12 @@ defect this repository names repeatedly. The harness replaces it with numbers an
 regenerate.
 
 Measured on one machine (x86_64, four cores; Kani 0.68.0, Verus 0.2026.11.02, Coq 8.20.1,
-Lean 4.36.0, rustc 1.100.0), cold cache:
+Lean 4.36.0, rustc 1.100.0), steady-state:
 
 | tool | per-verification wall | peak RSS | setup (on disk) |
 |---|---|---|---|
-| `verif` | ≈0.07 s | ≈10 MB | ≈1.4 MB (a crate) |
-| Kani | ≈0.7 s | ≈14 MB | ≈486 MB |
+| `verif` | ≈0.07 s | ≈97 MB | ≈1.4 MB (a crate) |
+| Kani | ≈0.7 s | ≈23 MB | ≈486 MB |
 | Verus | ≈0.8 s | ≈316 MB | ≈133 MB |
 | Coq | ≈0.5 s | ≈298 MB | ≈451 MB |
 | Lean | ≈0.5 s | ≈472 MB | ≈3.1 GB |
@@ -7687,7 +7687,8 @@ Three things about this table are the point, and each is a way a naive compariso
    read the source -- it is the only tool whose verification step also *compiles* the code
    it verifies. So "≈0.07 s" is not "the engine is 10× faster than Kani"; the engine-only
    figure is ≈0.05 s (`mir_coverage`'s per-function `elapsed` column), and the gap is the
-   frontend's compiler call, not the decision procedure.
+   frontend's compiler call, not the decision procedure. The same fact explains the ≈97 MB
+   peak: it is the *tree* peak, and the heaviest process is the `rustc` `verif` spawns.
 3. **Coq and Lean prove a hand-written model, not the Rust code.** Their rows are not "the
    same task, slower"; they are a different task, and the transcription is the risk the
    comparison README is built around. A like-for-like *engine* comparison excludes them --
@@ -7697,6 +7698,33 @@ Two tools the correctness table has are **absent** and the harness says so in it
 rather than dropping them silently: Prusti needs a pinned nightly and a JDK, `gnatprove`
 pulls four solvers. A table that shrank without a word reads as "the tool was fast", which
 is the failure mode the notes guard against.
+
+**Three review findings on the first version of the harness, each a measured defect:**
+
+- **Peak RSS excluded subprocesses.** `measure` ran the launcher without `-t`, so it
+  sampled only the direct child. `cargo kani` is a thin plugin whose work is a
+  `kani-driver` grandchild, and `verif`'s own driver spawns `rustc --emit=mir`; sampling
+  the direct child reported the *launcher's* RSS. Measured: kani 14 MB → 23 MB, and
+  verif 10 MB → 97 MB with `-t`. The flag changes only the peak, not the wall time
+  (checked by interleaving the two modes). The table above is the `-t` figures.
+- **`VERUS_BIN` was cleared before it was read.** The script assigned `VERUS_BIN=""` and
+  then read `${VERUS_BIN:-}` as the loop's first candidate, so a caller who set only that
+  variable (Verus not on PATH, not at the `/tmp` default) was silently skipped -- the
+  variable's whole purpose discarded by the line above its use.
+- **A configured build directory broke the `verif` row.** With `CARGO_TARGET_DIR` or a
+  `build.target-dir` in Cargo config, `cargo build` writes elsewhere while the launch path
+  stayed `target/debug/...`, so the harness either failed or -- worse -- silently measured
+  a *stale* binary left in `target/` by an earlier build. Reproduced: the env var built to
+  `/tmp/verif-build` (new) while the harness launched `target/debug/...` (nine hours old).
+  The build now passes an explicit `--target-dir` to a private directory, which overrides
+  both the env var and the config (verified) and keeps the benchmark from clobbering the
+  developer's own `target/`.
+
+A fourth was a **label**, and a label is a claim: the table said "cold cache" while the
+harness warms Kani (and now Verus) before measuring and reports the median of three warm
+runs. The gap is 4× (kani ≈3.2 s / ≈256 MB cold, ≈0.7 s / ≈23 MB warm), so the label was
+wrong by that much. It now says steady-state, and the cold figure is named in the caveats
+so the reader can see both.
 
 The honest conclusion the harness supports, and that the README states in prose: **`verif`'s
 reason to exist is embeddability and no external toolchain, not raw speed.** The BDD scaling
