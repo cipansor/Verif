@@ -10273,6 +10273,53 @@ first regardless. And `Vec::<u8>::len` is **not** read as a slice length -- the
 slice path is matched on `core::slice::<impl [T]>`, so the two lengths (a slice's
 symbolic input, a `Vec`'s tracked model) cannot be confused.
 
+## A qualified type name must not resolve to a bare layout
+
+`struct_lookup` answered *every* miss by falling back to the bare tail of the
+name. The fallback exists because rustc prints a type by its shortest
+crate-unique path, so a bare key is the right answer to a *bare* query. Applied
+to a **qualified** query it is the wrong answer, and the wrongness is a false
+proof rather than a lost one.
+
+The measurement. A crate-root `pub struct Outer { lo, hi }` and a one-line
+`pub mod m { pub struct Outer { hi, lo } }` -- the module's struct is *inline*,
+so the line-oriented scanner never sees it and no `m::Outer` layout is recorded.
+The dump spells the argument `&m::Outer` (qualified, because the bare name is
+ambiguous), the bare key exists from the crate-root struct, and both field
+projections resolved to *it*:
+
+```rust
+/// requires: o.hi == 5
+/// ensures: ret == 5
+pub fn wrong_field(o: &m::Outer) -> u8 { o.lo }
+```
+
+`verified`. The mirror (`o.lo == 5` / `o.hi`) verified too, which is the tell
+that the two fields had collapsed to one variable. Rustc's own execution returns
+`7` for `{ hi: 5, lo: 7 }`, so the contract is false and the tool proved it.
+
+The fix is one guard: a name containing `::` (after generics are stripped) does
+not fall back to the bare key. A qualified spelling is rustc's statement that the
+name could *not* be shortened, so at least two types share the tail and the bare
+key is necessarily another type's layout. A miss here is a refusal -- the caller
+reports an unreadable contract -- which is the honest direction.
+
+The shape is the mirror of the `Vec`/`str`/`Option` shadowing rules recorded
+above, and it generalises the same way: **a lookup that is sound for one spelling
+of a name is not automatically sound for another.** The bare fallback was
+justified by "the bare key is only inserted when the bare name is unique", which
+is true and is exactly why it is unsound for a *qualified* query -- a unique bare
+key means the query should have been bare, so a qualified query that misses is
+naming a type the scanner did not read.
+
+Corpus coverage is unchanged (`realistic.rs` 630/1148, `everyday.rs` 18/21,
+`actuator.rs` 18/33 before and after), so the refusal costs no decided verdict.
+The lost proof it does leave -- a struct declared inline in a one-line module is
+still unreadable -- is the safe direction and stays a documented boundary: closing
+it needs the module scope *within* a line, which `line_scopes` deliberately does
+not provide (it records the scope before the line's items open, so keying an
+inline struct with it would re-open the false proof this section describes).
+
 ## A primitive name a user type can shadow: bind the primitive only when nothing declares it
 
 Adding `str::len`/`is_empty` bound a `&str` argument's symbolic length in the
