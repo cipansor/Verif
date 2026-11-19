@@ -1048,7 +1048,9 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     `scripts/check_package.sh`, a tag-driven `.github/workflows/release.yml`) was
     already in place; what remained was the human step: create the
     `CARGO_REGISTRY_TOKEN` secret and push a `verif-arithmetic-v0.1.0` tag, then
-    `verif-v0.1.0`.
+    `verif-v0.1.0`. (That secret is no longer the mechanism: the repository is
+    now registered as a crates.io **trusted publisher**, so `release.yml` mints a
+    short-lived token through GitHub OIDC and no stored credential is needed.)
   - Fix: both crates are published (`verif-arithmetic` `0.1.0`, `verif` `0.1.1`),
     and the README's Installation section depends on the registry (`verif = "0.1"`)
     rather than on a git tag. The `0.1.1` patch is the qualified-layout soundness

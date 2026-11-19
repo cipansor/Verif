@@ -113,11 +113,16 @@ eighteen gates can still be unpublishable, and the failure only surfaces at
   file list and runs no compiler, so it is cheap enough for every pull request.
   It is a separate script rather than gate 19 because renumbering `gate.sh`'s
   eighteen checks is churn that risks the checks themselves.
-- **`.github/workflows/release.yml` checks the token before installing
-  anything**, so a missing secret fails in seconds instead of after the build.
-  It dry-runs first, then publishes, then waits for the version to appear in the
-  index. A version already on crates.io is skipped rather than treated as a
-  failure, so a re-run after a partial release finishes the rest.
+- **`.github/workflows/release.yml` authenticates by trusted publishing**, not by
+  a stored secret: `rust-lang/crates-io-auth-action` exchanges a GitHub OIDC
+  token for a short-lived crates.io token, which is why the workflow needs
+  `id-token: write` and why there is no `CARGO_REGISTRY_TOKEN` repository secret
+  to configure. The registration is keyed to this repository *and* to the
+  workflow's file name, so renaming `release.yml` breaks the exchange until the
+  crates.io setting is updated. It dry-runs first, then publishes, then waits for
+  the version to appear in the index. A version already on crates.io is skipped
+  rather than treated as a failure, so a re-run after a partial release finishes
+  the rest.
 
 ## Build and test commands
 
