@@ -62,11 +62,13 @@ Done in one commit. The traps, so a future rename does not repeat them:
 
 ## Publishing to crates.io
 
-Both crates are published at `0.1.0`. The repository is arranged so they stay
-publishable, and the checks that make that true are separate from the ones that
-make the *code* correct. A crate that builds and passes all eighteen gates can
-still be unpublishable, and the failure only surfaces at `cargo publish` — the
-worst moment, because an upload cannot be undone.
+Both crates are published: `verif-arithmetic` at `0.1.0` and `verif` at `0.1.1`.
+They version independently, so those numbers are not required to agree — see the
+`verif-arithmetic` requirement note in the root `Cargo.toml`. The repository is
+arranged so they stay publishable, and the checks that make that true are separate
+from the ones that make the *code* correct. A crate that builds and passes all
+eighteen gates can still be unpublishable, and the failure only surfaces at
+`cargo publish` — the worst moment, because an upload cannot be undone.
 
 - **The crates version independently.** No `[workspace.package] version`, no
   `version.workspace = true`. A shared version re-versions both crates at once,
