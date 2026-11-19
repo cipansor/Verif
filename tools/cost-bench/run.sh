@@ -37,6 +37,12 @@
 # `VmHWM` rather than `ru_maxrss` lives in one place (its header).
 #
 # Usage: sh tools/cost-bench/run.sh
+#
+# Environment: `VERIF_RUSTC` names the compiler the `verif` row uses (defaults to
+# `rustc` on PATH); `VERUS_BIN` names the Verus driver and `VERUS_DIR` its install
+# directory (both optional -- discovery falls back to PATH, then to the path this
+# repo's setup notes install to). A tool that is not found is reported, not
+# guessed at.
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -146,12 +152,15 @@ fi
 # driver needs the rust toolchain its release pins; if that is missing, `verus`
 # exits non-zero and the run is reported FAILED rather than dropped.
 #
-# `${VERUS_BIN:-}` reads the caller's value *without* clearing it first: assigning
-# `VERUS_BIN=""` here would wipe the very path the loop's first candidate reads,
-# so a caller who set only `VERUS_BIN` (Verus not on PATH, not at the /tmp default)
-# would be silently skipped. The loop keeps an inherited value, then falls back to
-# PATH, then to the location this repo's setup notes install to.
-for c in "${VERUS_BIN:-}" "$(command -v verus 2>/dev/null || true)" /tmp/verus/verus-x86-linux/verus; do
+# `VERUS_BIN` is *defined* before the loop -- as `${VERUS_BIN:-}`, which keeps an
+# inherited value -- rather than assigned `""`. An empty assignment wipes the path
+# the loop's first candidate reads, and leaving it entirely unset makes the
+# `[ -n "$VERUS_BIN" ]` below abort the whole run under `set -u` whenever no Verus
+# is installed, taking the Coq, Lean and setup measurements with it. Discovery
+# order: an inherited `VERUS_BIN`, then `$VERUS_DIR/verus`, then PATH, then the
+# location this repo's setup notes install to.
+VERUS_BIN="${VERUS_BIN:-}"
+for c in "$VERUS_BIN" "${VERUS_DIR:-}/verus" "$(command -v verus 2>/dev/null || true)" /tmp/verus/verus-x86-linux/verus; do
   if [ -n "$c" ] && [ -x "$c" ]; then VERUS_BIN="$c"; break; fi
 done
 if [ -n "$VERUS_BIN" ]; then
@@ -161,7 +170,7 @@ if [ -n "$VERUS_BIN" ]; then
   ( cd "$ROOT" && "$VERUS_BIN" --crate-type=lib "$WORK/verus_example.rs" >/dev/null 2>&1 ) || true
   measure "verus" "$VERUS_BIN" "--crate-type=lib" "$WORK/verus_example.rs"
 else
-  printf '%-14s %s\n' "verus" "SKIPPED (verus not found; set VERUS_BIN)"
+  printf '%-14s %s\n' "verus" "SKIPPED (verus not found; set VERUS_BIN or VERUS_DIR)"
 fi
 
 # ---- Coq: two files. The model is compiled once (it is the hand-written model
@@ -216,13 +225,26 @@ else
   printf '%-14s %s\n' "verif" "crate size unavailable (no python3)"
 fi
 setup "kani" "$HOME/.kani" "$HOME/.cargo/bin/cargo-kani" "$HOME/.cargo/bin/kani"
-# The setup row measures the *directory* Verus installed into. Derive it from the
-# driver that was actually found, so a caller who set only `VERUS_BIN` gets the
-# right directory measured rather than the `/tmp` default they did not use.
-if [ -n "${VERUS_BIN:-}" ] && [ -x "${VERUS_BIN:-}" ]; then
-  setup "verus" "$(dirname "$VERUS_BIN")"
+# The setup row measures the *directory* Verus installed into -- not the directory
+# that happens to hold a `verus` entry. Two ways those differ. An explicit
+# `VERUS_DIR` names the installation and must win over discovery. And a `VERUS_BIN`
+# that is a symlink -- the common `/usr/local/bin/verus -> /opt/verus/verus` layout
+# -- makes `dirname` name the *link's* directory, so the figure would be a shared
+# bin dir (a few kB) and none of the distribution (hundreds of MB). So: honour
+# `VERUS_DIR` first; otherwise resolve the driver through its symlinks
+# (`readlink -f`), take the real directory, and accept it only when it carries
+# `rust_verify`, the marker of a Verus distribution. When discovery found no driver
+# at all -- it already tried the documented install path -- the honest row is "not
+# found", not a size for a directory that holds no Verus.
+if [ -n "${VERUS_DIR:-}" ]; then
+  setup "verus" "$VERUS_DIR"
+elif [ -n "${VERUS_BIN:-}" ]; then
+  verus_real="$(readlink -f "$VERUS_BIN" 2>/dev/null || printf '%s' "$VERUS_BIN")"
+  verus_home="$(dirname "$verus_real")"
+  [ -e "$verus_home/rust_verify" ] || verus_home=""
+  setup "verus" "$verus_home"
 else
-  setup "verus" "${VERUS_DIR:-/tmp/verus/verus-x86-linux}"
+  setup "verus"
 fi
 # Coq installs spread across `/usr` and `~/.opam`; `dpkg` reports its own size
 # where the distribution package was used, which is the honest figure for that

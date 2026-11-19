@@ -7726,6 +7726,35 @@ runs. The gap is 4× (kani ≈3.2 s / ≈256 MB cold, ≈0.7 s / ≈23 MB warm),
 wrong by that much. It now says steady-state, and the cold figure is named in the caveats
 so the reader can see both.
 
+**Two more findings, and the first is a lesson about fixing one.** The `VERUS_BIN` fix
+above *introduced* a regression, which a second review caught. The original script opened
+the Verus block with `VERUS_BIN=""`, and that line did two jobs: it cleared a stale value
+*and* it made `"$VERUS_BIN"` defined for the later `[ -n "$VERUS_BIN" ]` test under
+`set -u`. Removing it to stop it wiping the caller's path left the variable *unset* when
+no Verus is installed, so the test aborted the whole script -- the `verif`, `kani`, `coq`
+and `lean` rows all printed, then `VERUS_BIN: parameter not set`, and the Coq, Lean and
+setup measurements never ran. The fix is `VERUS_BIN="${VERUS_BIN:-}"`: it *defines* the
+variable without *clearing* it, doing both jobs the `""` did except the one that was
+wrong. The general shape: when a line serves two purposes, removing it for one removes the
+other too, and the second purpose is the one nobody was looking at.
+
+The second finding is a **symlink**, the same "the name is not the thing" class as the
+stale-binary one. `setup` measured `dirname "$VERUS_BIN"`, and for the common
+`/usr/local/bin/verus -> /opt/verus/verus` layout that is the *link's* directory -- a
+shared bin dir of a few kB, with none of the 135 MB distribution (reproduced: 4 kB
+measured against 132 MB real). Discovery accepts a symlink because `-x` follows it, but
+`dirname` operates on the path, not the target. It now honours an explicit `VERUS_DIR`
+first (it names the installation, and the old code ignored it whenever discovery
+succeeded), and otherwise resolves the driver through `readlink -f` and accepts the
+directory only when it carries `rust_verify`, the marker of a real distribution. A
+directory that does not validate is reported "not found" rather than measured, which is
+also the honest row when discovery found no driver at all -- the old code printed a size
+for the `/tmp` default even when nothing was installed there.
+
+Both were checked by reproducing them first (`VERUS_BIN: parameter not set` under `set -u`;
+a symlinked driver measuring 4 kB) and then re-running the four scenarios -- absent, symlink,
+`VERUS_DIR`-only, and normal -- so a fix for one did not break the others.
+
 The honest conclusion the harness supports, and that the README states in prose: **`verif`'s
 reason to exist is embeddability and no external toolchain, not raw speed.** The BDD scaling
 wall is real and documented; the mature competitors have higher coverage (pointers,
