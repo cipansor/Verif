@@ -1048,10 +1048,15 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     `scripts/check_package.sh`, a tag-driven `.github/workflows/release.yml`) was
     already in place; what remained was the human step: create the
     `CARGO_REGISTRY_TOKEN` secret and push a `verif-arithmetic-v0.1.0` tag, then
-    `verif-v0.1.0`.
-  - Fix: both crates are published at `0.1.0`, and the README's Installation
-    section depends on the registry (`verif = "0.1"`) rather than on a git tag.
-    The dependency snippets are pinned by `readme_install_uses_the_published_crate`
+    `verif-v0.1.0`. (That secret is no longer the mechanism: the repository is
+    now registered as a crates.io **trusted publisher**, so `release.yml` mints a
+    short-lived token through GitHub OIDC and no stored credential is needed.)
+  - Fix: both crates are published (`verif-arithmetic` `0.1.0`, `verif` `0.1.1`),
+    and the README's Installation section depends on the registry (`verif = "0.1"`)
+    rather than on a git tag. The `0.1.1` patch is the qualified-layout soundness
+    fix (`fix/qualified-type-layout`); `0.1.0` shipped with it, so the patch is
+    what makes the published crate sound rather than merely buildable. The
+    dependency snippets are pinned by `readme_install_uses_the_published_crate`
     in `tests/readme.rs`, so a regression back to a git source is a failing test
     rather than silent drift.
   - Exit: `cargo add verif` works. ✅

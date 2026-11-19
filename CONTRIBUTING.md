@@ -118,6 +118,14 @@ is no bare `v<version>` tag, because one tag cannot say which crate it means.
 each crate; `verif` depends on `verif-arithmetic`, so the sibling must be on
 crates.io before the parent can be packaged.
 
+Pushing the tag is the whole release: `release.yml` verifies the tag against the
+manifest and the checked-out commit, then uploads. It authenticates by **trusted
+publishing** — GitHub mints an OIDC token that crates.io exchanges for a
+short-lived upload token — so there is no `CARGO_REGISTRY_TOKEN` secret to
+configure and no long-lived credential in the repository. The registration is
+keyed to this repository *and* to the workflow's file name, so renaming
+`release.yml` breaks the exchange until the crates.io setting is updated.
+
 Below 1.0 the level follows Cargo's compatibility rule, which is not the same as
 above it, because `^0.1.0` accepts `0.1.1` but not `0.2.0`:
 

@@ -13058,6 +13058,73 @@ pub fn same_name() -> u8 {
         );
     }
 
+    /// A **qualified** type name must not be answered by a *bare* layout.
+    ///
+    /// The dump prints a type by its shortest crate-unique path, so a qualified
+    /// spelling (`m::Outer`) means rustc could **not** shorten it -- at least two
+    /// types share that tail. The bare key, when it exists at all, is then some
+    /// other type's layout, and reading it proves a contract about the wrong
+    /// fields. This was a false proof: with a crate-root `Outer { lo, hi }` and a
+    /// one-line `pub mod m { pub struct Outer { hi, lo } }` (whose inline struct
+    /// the line-oriented scanner never sees), the only layout recorded was the
+    /// crate-root one, both field projections resolved to *it*, and
+    /// `requires: o.hi == 5; ensures: ret == 5` on a body returning `o.lo` was
+    /// **verified**. Rustc's own execution returns `7` for `{ hi: 5, lo: 7 }`.
+    ///
+    /// Both field directions are asserted, so the fix cannot pass by resolving
+    /// one projection and refusing the other. The *positive* control is the next
+    /// test: the same shapes with the module's struct on its own lines do verify,
+    /// which is what shows this is about the one-line spelling and not about
+    /// qualified names in general.
+    #[test]
+    fn a_qualified_type_is_not_answered_by_a_bare_layout() {
+        let src = r#"
+pub struct Outer { pub lo: u8, pub hi: u8 }
+pub mod m { pub struct Outer { pub hi: u8, pub lo: u8 } }
+
+/// requires: o.hi == 5
+/// ensures: ret == 5
+pub fn reads_the_other_field(o: &m::Outer) -> u8 { o.lo }
+
+/// requires: o.lo == 5
+/// ensures: ret == 5
+pub fn reads_the_other_field_mirror(o: &m::Outer) -> u8 { o.hi }
+"#;
+        for name in ["reads_the_other_field", "reads_the_other_field_mirror"] {
+            let Some(o) = verify_src(name, src) else { return };
+            assert!(
+                !o.is_verified(),
+                "`m::Outer`'s layout is not in the source the scanner read, so a contract \
+                 about its fields must be refused -- proving it means the crate-root \
+                 `Outer`'s fields were read instead. Got: {o}"
+            );
+        }
+    }
+
+    /// A multi-line module's struct *is* read, so the refusal above is about the
+    /// one-line spelling and not about modules in general. Without this control a
+    /// fix that simply refused every `m::`-qualified name would pass the test
+    /// above.
+    #[test]
+    fn a_module_struct_on_its_own_lines_still_reads_its_fields() {
+        let src = r#"
+pub struct Outer { pub lo: u8, pub hi: u8 }
+pub mod m {
+    pub struct Outer { pub hi: u8, pub lo: u8 }
+}
+
+/// requires: o.hi == 5
+/// ensures: ret == 5
+pub fn reads_its_own_field(o: &m::Outer) -> u8 { o.hi }
+"#;
+        let Some(o) = verify_src("reads_its_own_field", src) else { return };
+        assert!(
+            o.is_verified(),
+            "a module struct whose body is on its own lines has a real layout, so a true \
+             contract about it must verify. Got: {o}"
+        );
+    }
+
     /// R6: a unit struct with a `Drop` impl is a zero-field layout, not an unknown
     /// container.
     ///

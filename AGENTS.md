@@ -62,11 +62,13 @@ Done in one commit. The traps, so a future rename does not repeat them:
 
 ## Publishing to crates.io
 
-Both crates are published at `0.1.0`. The repository is arranged so they stay
-publishable, and the checks that make that true are separate from the ones that
-make the *code* correct. A crate that builds and passes all eighteen gates can
-still be unpublishable, and the failure only surfaces at `cargo publish` — the
-worst moment, because an upload cannot be undone.
+Both crates are published: `verif-arithmetic` at `0.1.0` and `verif` at `0.1.1`.
+They version independently, so those numbers are not required to agree — see the
+`verif-arithmetic` requirement note in the root `Cargo.toml`. The repository is
+arranged so they stay publishable, and the checks that make that true are separate
+from the ones that make the *code* correct. A crate that builds and passes all
+eighteen gates can still be unpublishable, and the failure only surfaces at
+`cargo publish` — the worst moment, because an upload cannot be undone.
 
 - **The crates version independently.** No `[workspace.package] version`, no
   `version.workspace = true`. A shared version re-versions both crates at once,
@@ -111,11 +113,16 @@ worst moment, because an upload cannot be undone.
   file list and runs no compiler, so it is cheap enough for every pull request.
   It is a separate script rather than gate 19 because renumbering `gate.sh`'s
   eighteen checks is churn that risks the checks themselves.
-- **`.github/workflows/release.yml` checks the token before installing
-  anything**, so a missing secret fails in seconds instead of after the build.
-  It dry-runs first, then publishes, then waits for the version to appear in the
-  index. A version already on crates.io is skipped rather than treated as a
-  failure, so a re-run after a partial release finishes the rest.
+- **`.github/workflows/release.yml` authenticates by trusted publishing**, not by
+  a stored secret: `rust-lang/crates-io-auth-action` exchanges a GitHub OIDC
+  token for a short-lived crates.io token, which is why the workflow needs
+  `id-token: write` and why there is no `CARGO_REGISTRY_TOKEN` repository secret
+  to configure. The registration is keyed to this repository *and* to the
+  workflow's file name, so renaming `release.yml` breaks the exchange until the
+  crates.io setting is updated. It dry-runs first, then publishes, then waits for
+  the version to appear in the index. A version already on crates.io is skipped
+  rather than treated as a failure, so a re-run after a partial release finishes
+  the rest.
 
 ## Build and test commands
 
@@ -10272,6 +10279,53 @@ Two collision guards matter. A user type spelled `Vec` in a local module
 first regardless. And `Vec::<u8>::len` is **not** read as a slice length -- the
 slice path is matched on `core::slice::<impl [T]>`, so the two lengths (a slice's
 symbolic input, a `Vec`'s tracked model) cannot be confused.
+
+## A qualified type name must not resolve to a bare layout
+
+`struct_lookup` answered *every* miss by falling back to the bare tail of the
+name. The fallback exists because rustc prints a type by its shortest
+crate-unique path, so a bare key is the right answer to a *bare* query. Applied
+to a **qualified** query it is the wrong answer, and the wrongness is a false
+proof rather than a lost one.
+
+The measurement. A crate-root `pub struct Outer { lo, hi }` and a one-line
+`pub mod m { pub struct Outer { hi, lo } }` -- the module's struct is *inline*,
+so the line-oriented scanner never sees it and no `m::Outer` layout is recorded.
+The dump spells the argument `&m::Outer` (qualified, because the bare name is
+ambiguous), the bare key exists from the crate-root struct, and both field
+projections resolved to *it*:
+
+```rust
+/// requires: o.hi == 5
+/// ensures: ret == 5
+pub fn wrong_field(o: &m::Outer) -> u8 { o.lo }
+```
+
+`verified`. The mirror (`o.lo == 5` / `o.hi`) verified too, which is the tell
+that the two fields had collapsed to one variable. Rustc's own execution returns
+`7` for `{ hi: 5, lo: 7 }`, so the contract is false and the tool proved it.
+
+The fix is one guard: a name containing `::` (after generics are stripped) does
+not fall back to the bare key. A qualified spelling is rustc's statement that the
+name could *not* be shortened, so at least two types share the tail and the bare
+key is necessarily another type's layout. A miss here is a refusal -- the caller
+reports an unreadable contract -- which is the honest direction.
+
+The shape is the mirror of the `Vec`/`str`/`Option` shadowing rules recorded
+above, and it generalises the same way: **a lookup that is sound for one spelling
+of a name is not automatically sound for another.** The bare fallback was
+justified by "the bare key is only inserted when the bare name is unique", which
+is true and is exactly why it is unsound for a *qualified* query -- a unique bare
+key means the query should have been bare, so a qualified query that misses is
+naming a type the scanner did not read.
+
+Corpus coverage is unchanged (`realistic.rs` 630/1148, `everyday.rs` 18/21,
+`actuator.rs` 18/33 before and after), so the refusal costs no decided verdict.
+The lost proof it does leave -- a struct declared inline in a one-line module is
+still unreadable -- is the safe direction and stays a documented boundary: closing
+it needs the module scope *within* a line, which `line_scopes` deliberately does
+not provide (it records the scope before the line's items open, so keying an
+inline struct with it would re-open the false proof this section describes).
 
 ## A primitive name a user type can shadow: bind the primitive only when nothing declares it
 

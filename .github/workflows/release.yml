@@ -38,10 +38,15 @@ env:
   CARGO_TERM_COLOR: always
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
-# The crates.io upload uses a secret token, not GITHUB_TOKEN. `contents: write`
-# is for the GitHub release at the end, which is created with the built-in token.
+# `id-token: write` is what trusted publishing needs: the action presents a
+# GitHub OIDC token to crates.io, which is how the run proves which repository
+# and workflow it is. Without it the exchange fails with a permission error, not
+# a helpful message, so it is stated here rather than discovered at the tag.
+# `contents: write` is for the GitHub release at the end, which is created with
+# the built-in token.
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   publish:
@@ -84,18 +89,24 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
 
-      # Checked before the upload, so a missing or expired secret fails early
-      # rather than after the build. The token is a repository secret with
-      # publish scope; this step never prints it.
-      - name: Check the crates.io token
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "::error::No CARGO_REGISTRY_TOKEN secret is configured."
-            exit 1
-          fi
-          echo "CARGO_REGISTRY_TOKEN is configured."
+      # Authenticate to crates.io through its **trusted publishing** exchange
+      # rather than a stored secret. crates.io mints a short-lived token for a
+      # run it trusts, which is strictly better than a long-lived API token:
+      # nothing durable sits in the repository, and a leaked secret cannot be
+      # replayed. The registration lives on the crate's crates.io settings
+      # (Trusted Publishing), keyed to this repository and to `release.yml`.
+      #
+      # The token is an *output* of this step, not an input: it is a one-hour
+      # credential that exists only for the rest of this job. It is passed to
+      # the publish step through `env`, never printed, and never written to a
+      # file. `CARGO_REGISTRY_TOKEN` is the variable `cargo publish` reads.
+      #
+      # A repository secret with the same name is deliberately *not* consulted:
+      # if trusted publishing is configured, a second source of truth for the
+      # same credential is the kind of thing that silently rots.
+      - name: Authenticate to crates.io (trusted publishing)
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
 
       # A crate that credits an upstream project in its code must name it in
       # NOTICE. No compiler catches that, and a release is the last moment to.
@@ -124,11 +135,11 @@ jobs:
         run: python3 scripts/publish.py --tag "$RELEASE_TAG" --notes > "$NOTES_FILE"
 
       # `--yes` skips the interactive confirmation, which no runner can answer.
-      # The token is a crates.io API token with publish scope, stored as a
-      # repository secret; `cargo publish` reads it from CARGO_REGISTRY_TOKEN.
+      # The token comes from the trusted-publishing step above: `cargo publish`
+      # reads it from `CARGO_REGISTRY_TOKEN`, and it is scoped to this job.
       - name: Publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
         run: python3 scripts/publish.py --publish --yes --tag "$RELEASE_TAG"
 
       # docs.rs builds asynchronously after the upload, so this waits for the
