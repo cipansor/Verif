@@ -3211,12 +3211,20 @@ restore the proof the invariant actually carries, not resurrect one that was nev
 
 The MIR frontend reads the **textual** `--emit=mir` dump. That is the crate's stated gap 2:
 a rustc release that reprints the dump can break the parser, and the parser is the only thing
-that reads the dump, so nothing else notices. `tools/mir-oracle` closes that loop by asking
+that reads the dump, so nothing else notices. `tools/mir-oracle` closes part of that loop by asking
 `rustc_public` — the compiler's own public API — for the same programs' **typed** MIR and
 comparing a per-function *shape*: block count plus the panic guards `rustc` inserted, in block
 order. Structural, not textual, because the two dumps are not byte-identical (the typed one
 omits `copy` qualifiers, prints `let  _4` with different spacing, and nests `scope` blocks),
 so a text diff fails on cosmetics and proves nothing.
+
+**The half it does not close is a place re-spelled with the same control flow**, and that is
+measured rather than assumed: see "The shape is two facts, and its blindness is a documented
+boundary" near the end of this file for the five-row table and the test that pins it. In
+short — a change to block count, a guard's presence, order or polarity is caught; a change to
+how a place, local, projection or type is *spelled* is not, and `Len((*_1))` ->
+`PtrMetadata(copy _1)` in 1.99 slipped past this gate; it was found by running the suite
+under a second toolchain, which gate 14 now does on every run.
 
 Traps that cost time, in the order they cost it:
 
@@ -7826,6 +7834,29 @@ A stable, dependency-free reader feeds the product; the rich, nightly API checks
 reader's *reading* against the compiler's own IR. If rustc changes the pretty-printer and
 the parser drifts, gate 10 fails in CI, not in a user's build. Cheap and stable for the
 product, expensive and rich for the test.
+
+**The shape is two facts, and its blindness is a documented boundary, not a footnote.**
+`FnShape` is the block count and the panic guards (kind + polarity). It therefore sees a
+change in *structure* -- an extra block, a guard inserted or moved or flipped -- and cannot
+see a change in *spelling*: a place, a local index, a field projection, a type. Measured, not
+assumed (`the_shape_sees_structure_and_guards_but_not_places` in `src/mir/shape.rs`, teeth
+confirmed by making the shape place-aware and watching it fail):
+
+| change between two dumps | shape equal? |
+|---|---|
+| `Len((*_1))` -> `PtrMetadata(copy _1)` | **yes** -- blind |
+| operand read from `_2` -> `_1` | **yes** -- blind |
+| field projection `.0` -> `.1` | **yes** -- blind |
+| one block -> three blocks | no -- caught |
+| `assert(c)` -> `assert(!c)` | no -- caught |
+
+The first row is a *real* rustc 1.99 change that cost four verdicts on the 1.85 floor, and
+gate 10 was silent across it; it was found by running the suite under a second toolchain,
+and gate 14 (the MSRV run) is the durable form of that check. So the correct
+claim is "gate 10 checks the parser's reading of the control-flow skeleton", not "the parser
+is checked". Both README sections that used to say the latter now say the former and name
+the pinning test, because a gate's *scope* is a claim like any other and this one had been
+stated wider than the code.
 
 **When to revisit.** Two conditions, either of which flips the decision: (1) `rustc_public`
 stabilises, which would make it strictly better -- typed MIR with no parser to rot; (2) a
