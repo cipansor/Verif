@@ -166,7 +166,19 @@ pub fn extern_options(name: &str) -> Option<MirOptions> {
             std::fs::metadata(p).and_then(|m| m.modified()).ok(),
         )
     });
-    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
+    // The probe must use the compiler that *built* the rlib, not the one that will
+    // emit MIR. Cargo sets `RUSTC` for a build script to exactly that compiler, so
+    // it is the right answer whenever it is present. `VERIF_RUSTC` selects the MIR
+    // emitter and may name a different toolchain -- when it did, every candidate
+    // failed the probe with `E0514` and the caller saw `None`, i.e. "the extern is
+    // unavailable" for a crate that was built and perfectly usable. Falling back to
+    // `VERIF_RUSTC` and then `rustc` keeps the old behaviour where `RUSTC` is unset
+    // (a direct library caller outside a build script).
+    let rustc = std::env::var("RUSTC")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("VERIF_RUSTC").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "rustc".into());
     let search: Vec<PathBuf> = roots;
     for cand in found {
         let mut opts = MirOptions {

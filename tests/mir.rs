@@ -6947,7 +6947,24 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
 /// one, so a `--extern` that never reaches the command line cannot pass.
 #[test]
 fn an_in_code_contract_can_name_verif_through_an_extern() {
-    let Some(rustc) = rustc() else { return };
+    // The extern probe must use the compiler that *built* the rlib this test is
+    // linked against, which is cargo's compiler -- not `VERIF_RUSTC`, which may
+    // name a different toolchain and would reject every candidate with `E0514`.
+    // `RUSTC` is set inside a build script but not for a test binary, so the
+    // fallback is `rustc` on `PATH`, which is what cargo itself uses by default.
+    // `--emit=mir` is stable, so no nightly is needed here.
+    let rustc = std::env::var("RUSTC")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "rustc".to_string());
+    if std::process::Command::new(&rustc)
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        return;
+    }
     // The test binary is linked against `verif`, so rlibs of it and of its
     // dependency exist somewhere under this build profile. Cargo's layout is its own
     // business (integration-test binaries live in `deps/` or under
