@@ -25,9 +25,10 @@ verifier:
 | `clamp` | Branch coverage: all three arms must be proved, not the one a test ran. |
 | `sum_to` | A loop. Deciding it needs an **induction hypothesis**, not unwinding to a fixed depth. |
 
-`target.rs` is the Rust source, with `verif` contracts as doc comments.
-Every other file is the same three functions written the way that tool wants
-them.
+`target.rs` is the Rust source, with `verif` contracts in a `spec! { … }` block
+above each function -- the specification sits in the same file as the code it
+describes. Every other file is the same three functions written the way that
+tool wants them.
 
 ## The result
 
@@ -40,7 +41,7 @@ there as controls, not as competitors.
 | --- | --- | --- | --- | --- | --- | --- |
 | plain `rustc` | no verification | — | no (release build returns `0`) | no | no | — |
 | Ferrocene | **qualified** compiler (TÜV SÜD) | not applicable — a compiler, not a verifier | no | no | no | — |
-| `verif` | in-crate decision procedure | 3/3 | yes, concrete witness | yes, invariant not preserved | yes, concrete witness | doc comments in the same file |
+| `verif` | in-crate decision procedure | 3/3 | yes, concrete witness | yes, invariant not preserved | yes, concrete witness | a `spec!` block in the same file |
 | Kani 0.68.0 | bounded model check (CBMC) | 3/3 | yes | yes (with `unwind(10)`) | yes | a separate `#[cfg(kani)]` harness module |
 | Verus | SMT (Z3), deductive | 4 verified | yes | yes | yes | `requires`/`ensures`/`decreases` attributes |
 | Prusti 0.2.2 | SMT (Viper), deductive | 3/3 | yes | yes | yes | `#[requires]`/`#[ensures]` + `body_invariant!` |
@@ -58,8 +59,10 @@ to build a comparison that looks impressive and means nothing. The `sat_add`
 contract was:
 
 ```rust
-/// ensures: ret >= a
-/// ensures: ret >= b
+spec! {
+    ensures: ret >= a,
+    ensures: ret >= b,
+}
 ```
 
 That is true of a saturating add, and it is also true of `fn sat_add(a, b) { u16::MAX }`
@@ -106,7 +109,7 @@ recalled.
 
 | Tool | Total lines | Spec or proof lines | Notes |
 | --- | --- | --- | --- |
-| `verif` | 55 | 12 contract lines | one doc comment per obligation, next to the code |
+| `verif` | 55 | 12 contract lines | one clause per obligation, in a `spec!` block next to the code |
 | Kani | 56 | 45 harness lines | the harness restates every signature; nothing keeps it in sync with the function |
 | Verus | 51 | 12 spec lines | plus `decreases` on every loop |
 | Prusti | 34 | 12 spec lines | plus `body_invariant!` on every loop |
@@ -117,7 +120,7 @@ recalled.
 The rule behind each "spec or proof" figure, all run from this directory:
 
 ```console
-grep -cE '^/// (requires|ensures|invariant|decreases):' target.rs   # verif: 12
+grep -cE '^\s*(requires|ensures|invariant|decreases):' target.rs   # verif: 12
 awk '/^#\[cfg\(kani\)\]/{f=1} f' kani.rs | grep -c .                # Kani: 45
 grep -cE '^\s*(requires|ensures|invariant|decreases)\b|==>' verus.rs # Verus: 12
 grep -cE '#\[(requires|ensures)|body_invariant!' prusti.rs          # Prusti: 12
@@ -177,7 +180,7 @@ thing from "verification of a model of the code". It is not about taste.
 
 Better here:
 
-- **No transcription.** Contracts are doc comments on the function; the
+- **No transcription.** Contracts are a `spec!` block on the function; the
   obligations are generated from the compiled MIR. Nothing to keep in sync.
 - **Panics are proved too, not assumed away.** `sat_add` discharges 4
   obligations *and rules out 2 panics*; `sum_to` discharges 5 and rules out 2.

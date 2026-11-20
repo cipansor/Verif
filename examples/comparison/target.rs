@@ -10,12 +10,20 @@
 //! `u16::MAX` for every input, which is not a saturating add. `clamp` says
 //! which arm is taken, so `lo` for every input does not pass either.
 
+
+// The contract blocks below are *data for the verifier*, not code this file runs.
+// A no-op definition keeps the corpus ordinary Rust: it still builds with a bare
+// `rustc`, imports nothing from `verif`, and the macro expands to nothing.
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    ensures: ret >= a,
+    ensures: ret >= b,
+    ensures: a <= 65535u16 - b || ret == 65535u16,
+    ensures: a > 65535u16 - b || ret == a + b,
+}
 /// Saturating add: the sum when it fits, `u16::MAX` when it does not.
-/// requires: true
-/// ensures: ret >= a
-/// ensures: ret >= b
-/// ensures: a <= 65535u16 - b || ret == 65535u16
-/// ensures: a > 65535u16 - b || ret == a + b
 pub fn sat_add(a: u16, b: u16) -> u16 {
     if a > u16::MAX - b {
         u16::MAX
@@ -24,11 +32,13 @@ pub fn sat_add(a: u16, b: u16) -> u16 {
     }
 }
 
+spec! {
+    requires: lo <= hi,
+    ensures: !(x < lo) || ret == lo,
+    ensures: !(lo <= x && x > hi) || ret == hi,
+    ensures: !(lo <= x && x <= hi) || ret == x,
+}
 /// A clamp: the result is `lo` below the range, `hi` above it, and `x` inside.
-/// requires: lo <= hi
-/// ensures: !(x < lo) || ret == lo
-/// ensures: !(lo <= x && x > hi) || ret == hi
-/// ensures: !(lo <= x && x <= hi) || ret == x
 pub fn clamp(x: u16, lo: u16, hi: u16) -> u16 {
     if x < lo {
         lo
@@ -39,11 +49,13 @@ pub fn clamp(x: u16, lo: u16, hi: u16) -> u16 {
     }
 }
 
+spec! {
+    requires: n <= 8,
+    invariant: i <= n && s == i,
+    ensures: ret == n,
+}
 /// A counted loop. Deciding it needs an induction hypothesis, not unwinding to
 /// a fixed depth.
-/// requires: n <= 8
-/// invariant: i <= n && s == i
-/// ensures: ret == n
 pub fn sum_to(n: u8) -> u8 {
     let mut s = 0u8;
     let mut i = 0u8;

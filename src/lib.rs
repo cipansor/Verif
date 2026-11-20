@@ -150,7 +150,7 @@
 //!
 //! | Module | What it is |
 //! |---|---|
-//! | `mir` | Verify **real Rust**: read `rustc`'s own MIR, symbolically execute it, and discharge rustc's overflow, underflow and division-by-zero asserts plus contracts written as an in-code `spec! { … }` block or as `/// requires:` / `/// ensures:` doc comments. |
+//! | `mir` | Verify **real Rust**: read `rustc`'s own MIR, symbolically execute it, and discharge rustc's overflow, underflow and division-by-zero asserts plus contracts written as an in-code `spec! { … }` block. |
 //!
 //! The `mir` frontend is the only module that needs a compiler at run time, so it
 //! is behind the `std` feature. Its page appears in this documentation only when

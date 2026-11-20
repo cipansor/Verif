@@ -1,9 +1,17 @@
 //! The second bug: the loop body is wrong, so the invariant is not preserved.
 //! This is the one an unwinding depth cannot catch for every `n`.
 
-/// requires: n <= 8
-/// invariant: i <= n && s == i
-/// ensures: ret == n
+
+// The contract blocks below are *data for the verifier*, not code this file runs.
+// A no-op definition keeps the corpus ordinary Rust: it still builds with a bare
+// `rustc`, imports nothing from `verif`, and the macro expands to nothing.
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: n <= 8,
+    invariant: i <= n && s == i,
+    ensures: ret == n,
+}
 pub fn sum_to(n: u8) -> u8 {
     let mut s = 0u8;
     let mut i = 0u8;

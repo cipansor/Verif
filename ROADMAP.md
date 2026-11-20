@@ -1135,6 +1135,20 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     `an_in_code_contract_can_name_verif_through_an_extern` (both directions: no
     extern is `E0432`, with one it verifies) and
     `an_unresolvable_import_names_the_missing_extern`.
+  - Corpus migrated (0.2.0). Every example and corpus file now uses `spec!`:
+    `actuator.rs`, `everyday.rs`, `realistic.rs`, the `comparison/` fixtures and
+    the inline sources in `tests/mir.rs`. The migration was checked by comparing
+    the *verdict table* before and after (`mir_coverage` on each file, diffed row
+    by row) rather than by reading: `everyday.rs` 24 rows and `realistic.rs` 1151
+    rows came out byte-identical, and the comparison fixtures kept their six
+    claims. The doc-comment form survives only where importing `verif` is the thing
+    being avoided and in the tests whose *subject* is that reader
+    (`scanner_reads_contracts_and_ignores_inner_docs` and its siblings), plus
+    `format!`-template fixtures whose braces are placeholders.
+  - Migration found one real defect: `assert_not_dropped` tested `src.contains("///")`
+    to decide whether a source had a contract, so a `spec!`-only source looked
+    contract-free and a dropped function passed the guard. It now matches the
+    clause keywords both spellings carry.
   - What remains: the macro is **not** a proc-macro, so it cannot resolve `ret` or
     check that a clause names a real argument — the frontend does that, and a name
     it cannot resolve is a `Skipped` function, not a compile error. Making it a

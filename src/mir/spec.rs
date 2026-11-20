@@ -1,6 +1,6 @@
 //! Read contracts out of the *source*, because MIR does not carry attributes.
 //!
-//! # Why doc comments, not attributes
+//! # Why a macro block, and not an attribute
 //!
 //! The obvious syntax would be `#[requires(x < 10)]`, and it is what SPARK's
 //! `Pre` looks like. It cannot be used here, for a reason worth stating: an
@@ -10,20 +10,25 @@
 //! get nicer syntax would trade the property that makes the tool usable in a
 //! bare-metal build for a cosmetic one.
 //!
-//! So contracts are written as doc comments, which are real Rust syntax, always
-//! compile, and need nothing at all:
+//! So the contract is a declarative macro block, which is real Rust syntax,
+//! always compiles, expands to nothing, and needs no dependency:
 //!
 //! ```
-//! /// # Contract
-//! /// requires: b != 0
-//! /// ensures: ret * b <= a
+//! # use verif::spec;
+//! spec! {
+//!     requires: b != 0,
+//!     ensures: ret * b <= a,
+//! }
 //! fn div(a: u32, b: u32) -> u32 { a / b }
 //! ```
 //!
-//! The scanner looks for lines beginning `requires:` or `ensures:` inside a doc
-//! comment and attaches them to the next `fn`. `//!` inner docs are skipped, so
-//! the contract parser does not mistake its own documentation for a contract —
-//! a bug this file had until the scanner was made to ignore `//!`.
+//! The scanner finds the block by its `spec!` head and reads each
+//! `clause: body,` out of the source text. The `/// requires:` / `/// ensures:`
+//! doc-comment spelling is still accepted — it feeds the same clause parser, so
+//! the two cannot disagree about what a clause means — and it is what a source
+//! that must not import `verif` uses. `//!` inner docs are skipped, so the
+//! contract parser does not mistake its own documentation for a contract — a bug
+//! this file had until the scanner was made to ignore `//!`.
 //!
 //! This is the one place the frontend looks at source text rather than at the
 //! compiler's own IR, and the split is deliberate. Attributes are erased long
@@ -40,19 +45,20 @@
 //! return value (`ret`), and integer literals:
 //!
 //! ```text
-//!   #[requires(a < 1000)]
-//!   #[requires(b != 0)]
-//!   #[ensures(ret <= a + b)]
-//!   #[requires(a <= 100 && b <= 100)]
-//!   #[ensures((ret - a) <= 50)]
+//!   requires: a < 1000,
+//!   requires: b != 0,
+//!   ensures: ret <= a + b,
+//!   requires: a <= 100 && b <= 100,
+//!   ensures: (ret - a) <= 50,
 //! ```
 //!
-//! Operators: `+ - * & | ^`, comparisons `== != < <= > >=`, and `&& || !`.
-//! Anything outside that — a function call, a cast, an array index, a method —
-//! is *refused*, and a refused contract means the function is not verified at
-//! all. Refusing is the only safe response: a contract the frontend cannot read
-//! exactly is a contract it cannot check, and silently dropping it would report
-//! success for an unchecked property.
+//! Operators: `+ - * / % & | ^ << >>`, comparisons `== != < <= > >=`, and
+//! `&& || !`, with Rust's own precedence, plus `as` casts and the
+//! `wrapping_*` methods. Anything outside that — a general function call, an
+//! array index, an arbitrary method — is *refused*, and a refused contract means
+//! the function is not verified at all. Refusing is the only safe response: a
+//! contract the frontend cannot read exactly is a contract it cannot check, and
+//! silently dropping it would report success for an unchecked property.
 
 use std::collections::{BTreeMap, BTreeSet};
 

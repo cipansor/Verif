@@ -1399,7 +1399,7 @@ variable with no source name (a temporary, a promoted constant) keeps its
 `v{index}:u{width}` spelling, so naming is a readability improvement and never a
 loss.
 
-### Contracts: an in-code `spec!` block, or a doc comment
+### Contracts: one spelling, in the code it describes
 
 The obvious syntax is an attribute:
 
@@ -1410,13 +1410,9 @@ pub fn clamp(x: u32, lo: u32, hi: u32) -> u32 { … }
 
 That one still cannot be done. An unknown attribute on a function is not Rust; it
 needs a proc-macro to consume it, and a proc-macro is a dependency, which would
-break the zero-dependency gate that `scripts/gate.sh` enforces. So there are two
-supported spellings, and both are read out of the *source text* by the frontend
-rather than compiled into anything.
-
-**In-code, the preferred spelling since 0.2.0.** A `spec!` block is a declarative
-macro that expands to nothing, so it costs a deployed artifact zero bytes and
-leaves no symbol behind:
+break the zero-dependency gate that `scripts/gate.sh` enforces. So the contract is
+a `spec!` block: a declarative macro that expands to nothing, placed directly
+above the item it describes.
 
 ```rust,ignore
 use verif::spec;
@@ -1431,41 +1427,78 @@ pub fn clamp(x: u32, lo: u32, hi: u32) -> u32 {
 }
 ```
 
-The matcher is structured (`$clause:ident : $body:expr`), not a token soup, so
-`rustc` parses each clause body as a real Rust expression and `requires: n <=,` is
-a compile error *at the contract line*. It needs `use verif::spec;` to resolve, so
-`verif` must be an ordinary dependency and the build script must tell the
-frontend where to find it; the "Shape A" section below has the full recipe. A
-macro that expands to nothing is a claim about the artifact, not about the
-verification, so `tools/build-verify/run.sh` (gate 18) checks both the true and
-the false direction for this spelling.
+The specification and the code are one artifact: the same file is compiled,
+executed and verified. There is no separate model to transcribe and no second file
+to keep in step, which is the whole reason a proof here is about the program you
+actually run. The macro expands to nothing, so it costs a deployed artifact zero
+bytes and leaves no symbol behind.
 
-**Doc comments, the spelling every earlier release used.** `rustc` accepts them
-and the frontend reads them out of the source with no import and no build-script
-setup, which is why most of `tests/mir.rs`'s inline sources still use them:
+The matcher is structured (`$clause:ident : $body:expr`), not a token soup, so
+`rustc` parses each clause body as a real Rust expression: `requires: n <=,` is a
+compile error *at the contract line*, and a misspelled `ensures` cannot silently
+drop an obligation — the identifier is a token the macro matches, not prose it
+ignores. It needs `use verif::spec;` to resolve, so `verif` must be an ordinary
+dependency and the build script must tell the frontend where to find it; the
+"Shape A" section below has the full recipe. A macro that expands to nothing is a
+claim about the artifact, not about the verification, so `tools/build-verify/run.sh`
+(gate 18) checks both the true and the false direction for this spelling.
+
+**The doc-comment spelling still parses, and the corpus still exercises it.**
+`/// requires:` / `/// ensures:` feed the *same* clause parser, so the two spellings
+cannot disagree about what a clause means. It survives for two reasons: a source
+that must not import `verif` at all (a corpus file a reviewer wants to paste into a
+plain crate), and a `format!`-style fixture whose braces are placeholders. Every
+example and every corpus file in this repository uses `spec!`; the doc-comment form
+appears only where importing `verif` is the thing being avoided, and in the tests
+whose subject *is* that reader.
+
+#### What "fused with the code" looks like
+
+The point of one spelling is that there is no second artifact. This is a whole
+module — the code, its specification and its loop induction argument in the same
+file, compiled by the same `rustc` and verified by the same build:
 
 ```rust,ignore
-/// requires: lo <= hi
-/// ensures: lo <= ret
-/// ensures: ret <= hi
-pub fn clamp(x: u32, lo: u32, hi: u32) -> u32 {
-    if x < lo { lo } else if x > hi { hi } else { x }
+use verif::spec;
+
+spec! {
+    requires: total <= 10_000,
+    requires: step >= 1 && step <= 1000,
+    invariant: total <= 10_000,
+    variant: 10_000 - total,
+    ensures: ret <= 10_000,
+}
+pub fn accumulate(total: u32, step: u32) -> u32 {
+    let mut total = total;
+    while total < 10_000 {
+        let next = total + step;
+        total = if next > 10_000 { 10_000 } else { next };
+    }
+    total
 }
 ```
 
-Both spellings feed the same clause parser, so they cannot disagree about what a
-clause means. The difference is that a `spec!` body is verified Rust syntax and a
-`///` clause is unchecked prose — a typo in `ensures` is a refusal in the doc
-form (the frontend skips the function and names the line) but cannot happen in the
-block form, because the identifier is a real token. Writing both on one item is
-allowed; the clauses are merged.
+There is no `accumulate.spec` beside it, no model to re-state, no generated proof
+script to regenerate. The `invariant:` and `variant:` lines are the induction
+argument, sitting next to the `while` they justify; delete the loop and the
+clauses stop describing anything, which the verifier reports rather than ignores.
+When a clause is wrong the build fails naming the obligation and a witness, the
+same way a type error does — the specification is a checked part of the program,
+not a comment about it.
 
-The verification corpus exercises both paths on purpose: `examples/mir_targets/actuator.rs`
-(the regression corpus the gates assert on) uses `spec!`, while `everyday.rs` and
-`realistic.rs` keep the doc-comment form, so a regression in either reader shows up
-rather than being masked by the other. `actuator.rs` defines the macro locally as a
-no-op, so it still compiles with a bare `rustc` and imports nothing from `verif` —
-the file being verified and the tool doing the verifying stay separate artifacts.
+This example is the one in the README, and it is not decorative: it was run
+through `mir_coverage` while it was written. Two earlier drafts were *refuted* —
+the first because `total` was unconstrained at entry (the invariant does not hold
+for `u32::MAX`), the second because `saturating_add` clamps at `u32::MAX` and not
+at `10_000`, so the invariant was not preserved. The version above reports
+`verified`, 7 obligations discharged and 1 panic ruled out. A specification fused
+with the code is only worth having if the tool will tell you when it is wrong,
+which is exactly what those two refutations were.
+
+The same holds for a shape the verifier cannot decide yet: it reports the
+function as `Incomplete` with the reason, rather than quietly proving something
+weaker. A specification that is *fused* with the code is only useful if the tool
+is honest about the part it did not check.
 
 A loop is proved by an `invariant:` clause rather than by unwinding. It is the
 induction hypothesis: true on entry to the loop head, and left true by one
@@ -1500,9 +1533,11 @@ which a loop that never stops satisfies vacuously. A `variant:` line names the
 quantity the loop counts down, and turns that into *total* correctness:
 
 ```rust,ignore
-/// invariant: i <= n
-/// variant: n - i
-/// ensures: ret == n
+spec! {
+    invariant: i <= n,
+    variant: n - i,
+    ensures: ret == n,
+}
 pub fn count_to(n: u8) -> u8 {
     let mut i = 0u8;
     while i < n { i += 1; }
@@ -1539,9 +1574,11 @@ then answered by the function's own contract instead of being inlined:
   hypothesis.
 
 ```rust,ignore
-/// requires: true
-/// decreases: n
-/// ensures: ret == n
+spec! {
+    requires: true,
+    decreases: n,
+    ensures: ret == n,
+}
 pub fn count_down(n: u8) -> u8 {
     if n == 0 { 0 } else { count_down(n - 1) + 1 }
 }
@@ -1564,14 +1601,18 @@ return, by the same syntax the Rust body uses:
 ```rust,ignore
 struct Bounds { lo: u8, hi: u8 }
 
-/// requires: b.lo <= b.hi
-/// ensures: ret >= b.lo && ret <= b.hi
+spec! {
+    requires: b.lo <= b.hi,
+    ensures: ret >= b.lo && ret <= b.hi,
+}
 pub fn clamp_bounds(b: &Bounds, v: u8) -> u8 {
     if v < b.lo { b.lo } else if v > b.hi { b.hi } else { v }
 }
 
-/// requires: a <= b
-/// ensures: ret.0 <= a
+spec! {
+    requires: a <= b,
+    ensures: ret.0 <= a,
+}
 pub fn split(a: u8, b: u8) -> (u8, u8) {
     if a <= b { (a, b) } else { (b, a) }
 }
@@ -1598,8 +1639,10 @@ function would verify against a weaker contract than the source states.
 A slice argument is named by its length and by its elements:
 
 ```rust,ignore
-/// requires: xs.len() > 0
-/// ensures: ret == xs[0]
+spec! {
+    requires: xs.len() > 0,
+    ensures: ret == xs[0],
+}
 pub fn first_of(xs: &[u8]) -> u8 {
     xs[0]
 }
@@ -1617,8 +1660,10 @@ refused rather than resolved to an arbitrary element.
 A fixed-size array is named the same way, but its length is not an input:
 
 ```rust,ignore
-/// requires: a[0] <= a[1]
-/// ensures: ret == a[1]
+spec! {
+    requires: a[0] <= a[1],
+    ensures: ret == a[1],
+}
 pub fn max_of_pair(a: [u8; 4]) -> u8 {
     if a[0] > a[1] { a[0] } else { a[1] }
 }
@@ -1636,8 +1681,10 @@ A literal in a contract takes its width from the operand it meets, not from the
 widest name in scope:
 
 ```rust,ignore
-/// requires: true
-/// ensures: ret <= 255
+spec! {
+    requires: true,
+    ensures: ret <= 255,
+}
 pub fn idx(a: [u8; 4]) -> u8 { a[0] }
 ```
 
@@ -1830,8 +1877,10 @@ bounds and slice checks `rustc` inserts all lower the same way: a call into
 arm**, because the call never returns.
 
 ```rust,ignore
-/// requires: x <= 200
-/// ensures: ret == 1
+spec! {
+    requires: x <= 200,
+    ensures: ret == 1,
+}
 pub fn f(x: u8) -> u8 { assert!(x <= 200); 1 }
 ```
 
@@ -3219,20 +3268,25 @@ binary size and in the time the proofs take when they run.
 ### The same function, two ways
 
 One function, one contract; the difference is only *when* the obligation is discharged.
-The contract is written once, as a doc comment, and read by the MIR frontend:
+The contract is written once, in a `spec!` block in the same file, and read by the MIR
+frontend:
 
 ```rust
-// The function under verification. The contract is a doc comment, because a MIR
-// dump carries no attributes.
-/// requires: n <= 1_000_000
-/// ensures: ret <= 100
+// The function under verification, with its contract fused into the file. The
+// `spec!` block expands to nothing, so this compiles as ordinary Rust too.
+use verif::spec;
+
+spec! {
+    requires: n <= 1_000_000,
+    ensures: ret <= 100,
+}
 pub fn clamp100(n: u32) -> u32 {
     if n > 100 { 100 } else { n }
 }
 ```
 
 The contract is read from the *source text*, not from an attribute, for the reason the
-[contracts](#contracts-an-in-code-spec-block-or-a-doc-comment) section gives: rustc's MIR
+[contracts](#contracts-one-spelling-in-the-code-it-describes) section gives: rustc's MIR
 dump carries no attributes, so the frontend reads the contract from the source and the
 body from MIR.
 
