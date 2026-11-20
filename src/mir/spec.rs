@@ -2290,6 +2290,23 @@ pub fn extract(source: &str) -> Specs {
             }
             continue;
         }
+        // A `some_other_crate::spec! { … }` block is *not* this crate's macro, and
+        // the reader cannot resolve the path to prove otherwise. Refused by name,
+        // for the same reason as `verif!` above: reading an unrelated macro's tokens
+        // as clauses would attach a contract the source never stated.
+        if is_foreign_spec_block(line) {
+            let (_, consumed) = in_code_block(&lines, lineno);
+            pending.unknown.push((
+                lineno + 1,
+                "a `*::spec! { … }` block that is not `verif::spec!` cannot be read as \
+                 a contract; write `spec! { … }` or `verif::spec! { … }`"
+                    .to_string(),
+            ));
+            if consumed > 0 {
+                skip_through = Some(lineno + consumed - 1);
+            }
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("///") {
             take_clause(&mut pending, rest.trim(), lineno + 1, false);
             continue;
@@ -2413,15 +2430,52 @@ pub fn extract(source: &str) -> Specs {
 /// the precondition and **proved** a function the user never constrained. The
 /// documented spelling is `spec!`; a qualified `verif::spec!` is still accepted,
 /// because that path can only name this crate's macro.
-fn in_code_block_start(line: &str) -> bool {
-    // Accept `spec! {` and path-qualified forms ending in `::spec! {`, so a crate
-    // that re-exports the macro under a path can still write the block.
-    let Some(brace) = line.find('{') else {
-        return false;
-    };
+///
+/// **Only this crate's own paths are accepted, and that is a soundness rule, not a
+/// naming preference.** The frontend reads source *text*; it cannot resolve a macro,
+/// so it cannot tell a re-export of `verif::spec` from an unrelated macro that happens
+/// to be called `spec`. An earlier version accepted any head ending in `::spec`, which
+/// read `my_macros::spec! { requires: …, ensures: … }` as a contract -- the same
+/// false-proof shape the bare `verif!` refusal exists to close, one spelling over. A
+/// crate that re-exports the macro can write `verif::spec!` at the use site; losing
+/// that convenience is a *lost* proof, which is the direction this crate always takes
+/// over a wrong one.
+fn spec_block_head(line: &str) -> Option<&str> {
+    let brace = line.find('{')?;
     let head = line[..brace].trim_end();
     let head = head.strip_suffix('!').unwrap_or(head).trim_end();
-    head == "spec" || head.ends_with("::spec")
+    if head == "spec" || head.ends_with("::spec") {
+        Some(head)
+    } else {
+        None
+    }
+}
+
+/// Does this line open a `spec! { … }` block naming *this* crate's macro?
+///
+/// The accepted spellings are the bare `spec!` and the crate's own qualified path,
+/// `verif::spec!` (with the edition-2018 absolute form `::verif::spec!`). Anything
+/// else is refused by `is_foreign_spec_block` rather than read as clauses.
+fn in_code_block_start(line: &str) -> bool {
+    matches!(
+        spec_block_head(line),
+        Some("spec") | Some("verif::spec") | Some("::verif::spec")
+    )
+}
+
+/// Does this line open a `*::spec! { … }` block that is *not* this crate's macro?
+///
+/// It is refused by name for the reason `in_code_block_start` gives: the frontend
+/// cannot resolve the path, so it cannot know the macro expands to nothing, and
+/// reading its argument as clauses would attach a contract the source never stated.
+/// The caller consumes the block so its tokens do not fall through as prose, and
+/// records a reason that names the fix -- a silent drop would leave the function
+/// verified against `true`.
+fn is_foreign_spec_block(line: &str) -> bool {
+    matches!(
+        spec_block_head(line),
+        Some(h) if !matches!(h, "spec" | "verif::spec" | "::verif::spec")
+    )
 }
 
 /// Does this line open a bare `verif! { … }` block, the spelling an earlier draft
@@ -8751,11 +8805,17 @@ pub fn g(n: u8) -> u8 { n }
 
     /// A *path-qualified* `verif::spec!` names this crate's macro, so it is still
     /// read. This is the spelling a crate uses when it re-exports the macro.
+    ///
+    /// The source really does spell `verif::spec!`. An earlier version of this test
+    /// claimed the qualified spelling in its name and doc but supplied a bare
+    /// `spec!`, so it passed without ever exercising the qualified branch: a
+    /// regression that rejected `verif::spec!` would have kept it green. A test
+    /// named for a spelling has to *write* that spelling.
     #[test]
     fn a_path_qualified_spec_block_is_still_read() {
         use super::extract;
         let src = "\
-spec! {
+verif::spec! {
     requires: n <= 200,
     ensures: ret == n + 1,
 }
@@ -8765,6 +8825,79 @@ pub fn inc(n: u8) -> u8 { n + 1 }
         let c = specs.get("inc").expect("a qualified `::spec!` block must attach");
         assert_eq!(c.requires, vec!["n <= 200".to_string()]);
         assert_eq!(c.ensures, vec!["ret == n + 1".to_string()]);
+    }
+
+    /// The edition-2018 absolute form of the same path is accepted too.
+    #[test]
+    fn an_absolute_path_qualified_spec_block_is_read() {
+        use super::extract;
+        let src = "\
+::verif::spec! {
+    requires: n <= 200,
+    ensures: ret == n + 1,
+}
+pub fn inc(n: u8) -> u8 { n + 1 }
+";
+        let specs = extract(src);
+        let c = specs
+            .get("inc")
+            .expect("an absolute `::verif::spec!` block must attach");
+        assert_eq!(c.requires, vec!["n <= 200".to_string()]);
+        assert_eq!(c.ensures, vec!["ret == n + 1".to_string()]);
+    }
+
+    /// A `*::spec!` block naming a *different* path is refused, not read.
+    ///
+    /// The frontend reads source text and cannot resolve a macro, so it cannot tell
+    /// a re-export of `verif::spec` from an unrelated macro that happens to be called
+    /// `spec`. Accepting any head ending in `::spec` read
+    /// `my_macros::spec! { requires: …, ensures: … }` as a contract -- the
+    /// false-proof shape the bare `verif!` refusal exists to close, one spelling
+    /// over. This test fails on that code: it asserted a contract *was* attached.
+    #[test]
+    fn a_foreign_spec_block_is_refused_by_name_not_read_as_a_contract() {
+        use super::extract;
+        for head in ["my_macros::spec!", "a::b::spec!", "other::verif::spec!"] {
+            let src = format!(
+                "{head} {{\n    requires: n == 0,\n    ensures: ret == 0,\n}}\n\
+                 pub fn g(n: u8) -> u8 {{ n }}\n"
+            );
+            let specs = extract(&src);
+            let c = specs
+                .get("g")
+                .unwrap_or_else(|| panic!("`{head}`: the function must be recorded so it is refused"));
+            assert!(
+                c.requires.is_empty() && c.ensures.is_empty(),
+                "`{head}` must not attach a contract, got: {c:?}"
+            );
+            assert!(
+                c.unknown.iter().any(|(_, m)| m.contains("verif::spec!")),
+                "`{head}`: the refusal must name the fix, got: {c:?}"
+            );
+        }
+    }
+
+    /// The refusal is *narrow*: a local macro named `spec` written bare, and this
+    /// crate's own qualified path, both still read. A guard that refused every
+    /// `spec!` would pass the test above and fail this one.
+    #[test]
+    fn the_foreign_spec_refusal_does_not_catch_this_crates_own_spellings() {
+        use super::extract;
+        for head in ["spec!", "verif::spec!"] {
+            let src = format!(
+                "{head} {{\n    requires: n <= 200,\n    ensures: ret == n + 1,\n}}\n\
+                 pub fn inc(n: u8) -> u8 {{ n + 1 }}\n"
+            );
+            let specs = extract(&src);
+            let c = specs
+                .get("inc")
+                .unwrap_or_else(|| panic!("`{head}` must attach a contract"));
+            assert!(
+                c.unknown.is_empty(),
+                "`{head}` must be read without a refusal, got: {c:?}"
+            );
+            assert_eq!(c.requires, vec!["n <= 200".to_string()], "`{head}`");
+        }
     }
 
     /// The false-proof case. Splitting the block per line read `ensures: ret ==`
