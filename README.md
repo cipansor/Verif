@@ -3224,10 +3224,10 @@ pub fn clamp100(n: u32) -> u32 {
 }
 ```
 
-The contract is a doc comment rather than an attribute for a reason the
-[contracts-are-doc-comments](#contracts-are-doc-comments-and-that-is-forced) section
-gives: rustc's MIR dump carries no attributes, so the frontend reads the contract
-from the *source text* and the body from MIR.
+The contract is read from the *source text*, not from an attribute, for the reason the
+[contracts](#contracts-an-in-code-spec-block-or-a-doc-comment) section gives: rustc's MIR
+dump carries no attributes, so the frontend reads the contract from the source and the
+body from MIR.
 
 **Verified at build time** — nothing about the function changes; the proof lives in
 `build.rs` and runs while the crate is compiled. A false contract stops the build, and the
