@@ -2010,7 +2010,15 @@ mod edition_tests {
 mod extern_probe_tests {
     use super::*;
 
-    fn have(toolchain: &str) -> Option<String> {
+    /// The *path* and the *identity* of a toolchain's `rustc`, when it is installed.
+    ///
+    /// The two are deliberately returned together, because they are not
+    /// interchangeable: `canonical_compiler` yields an identity (`commit-hash/host`),
+    /// which is what the probe guard compares, but it is **not** an executable --
+    /// `Command::new` on it fails. A test that used the identity as the program
+    /// would skip itself at the first spawn and report `ok` having tested nothing,
+    /// which is the defect this helper exists to make impossible to write by accident.
+    fn have(toolchain: &str) -> Option<(String, String)> {
         let out = Command::new("rustup")
             .args(["which", "--toolchain", toolchain, "rustc"])
             .output()
@@ -2018,25 +2026,55 @@ mod extern_probe_tests {
         if !out.status.success() {
             return None;
         }
-        let p = String::from_utf8(out.stdout).ok()?.trim().to_string();
-        (!p.is_empty()).then(|| canonical_compiler(&p))
+        let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        if path.is_empty() {
+            return None;
+        }
+        let id = canonical_compiler(&path);
+        Some((path, id))
+    }
+
+    /// The path `rustc` on `PATH` actually runs, and that path's identity.
+    ///
+    /// `rustup which rustc` (no `--toolchain`) resolves the *active* toolchain, which
+    /// is the one a bare `rustc` dispatches to -- including a directory override. Using
+    /// `--toolchain stable` here would be wrong under an override: the bare name would
+    /// then name a different build than the one asked about.
+    fn active() -> Option<(String, String)> {
+        let out = Command::new("rustup").args(["which", "rustc"]).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        if path.is_empty() {
+            return None;
+        }
+        let id = canonical_compiler(&path);
+        Some((path, id))
     }
 
     #[test]
     fn the_probe_answers_for_the_compiler_that_will_read_the_rlib() {
-        // The compiler that built this test binary's `verif` rlib.
-        let producer = std::env::var("RUSTC")
+        // The compiler that built this test binary's `verif` rlib. The *path* is what
+        // gets spawned; the identity is only ever compared.
+        let producer_path = std::env::var("RUSTC")
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "rustc".into());
-        let producer = canonical_compiler(&producer);
+        let producer = canonical_compiler(&producer_path);
         // A *different* toolchain, if one is installed. Without one there is nothing
         // to compare against, and the test says so rather than passing vacuously.
         let other = ["1.85", "nightly", "stable"]
             .into_iter()
             .filter_map(have)
-            .find(|p| *p != producer);
-        let Some(other) = other else { return };
+            .find(|(_, id)| *id != producer);
+        let Some((other_path, other_id)) = other else {
+            eprintln!(
+                "skipped: no second toolchain installed, so there is no cross-compiler \
+                 case to test (producer identity {producer})"
+            );
+            return;
+        };
 
         // Build a tiny rlib with `producer`, then ask both compilers to read it.
         let dir = std::env::temp_dir().join(format!(
@@ -2047,7 +2085,7 @@ mod extern_probe_tests {
         let src = dir.join("lib.rs");
         std::fs::write(&src, "pub fn seven() -> u8 { 7 }\n").unwrap();
         let rlib = dir.join("libprobe_crate.rlib");
-        let built = Command::new(&producer)
+        let built = Command::new(&producer_path)
             .args(["--crate-type=lib", "--crate-name", "probe_crate", "-o"])
             .arg(&rlib)
             .arg(&src)
@@ -2056,23 +2094,32 @@ mod extern_probe_tests {
             .unwrap_or(false);
         if !built {
             let _ = std::fs::remove_dir_all(&dir);
-            return;
+            panic!(
+                "the producing compiler ({producer_path}, identity {producer}) must be able \
+                 to build a trivial rlib; without it there is nothing to probe"
+            );
         }
 
         let opts = MirOptions {
             externs: vec![("probe_crate".into(), rlib.clone())],
             ..MirOptions::default()
         };
-        // The producing compiler reads its own rlib.
+        // The producing compiler reads its own rlib. `extern_compiles` *spawns* the
+        // compiler, so it takes the path -- passing the identity here would fail to
+        // spawn and read as "rejected", which is why the two are kept apart.
         assert!(
-            extern_compiles(&producer, &opts),
-            "the compiler that built the rlib must accept it"
+            extern_compiles(&producer_path, &opts),
+            "the compiler that built the rlib must accept it ({producer_path}, {producer})"
         );
         // A different toolchain must not -- and that is exactly why the probe and
-        // the emitter have to name one compiler.
+        // the emitter have to name one compiler. The identities are asserted apart
+        // first, so a wrong `other` (the same build under another spelling) cannot
+        // make the negative assertion below pass for the wrong reason.
+        assert_ne!(producer, other_id, "the cross toolchain must be a different build");
         assert!(
-            !extern_compiles(&other, &opts),
-            "a different toolchain ({other}) must not accept an rlib built by {producer}"
+            !extern_compiles(&other_path, &opts),
+            "a different toolchain ({other_path}, {other_id}) must not accept an rlib \
+             built by {producer_path} ({producer})"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2098,7 +2145,10 @@ mod extern_probe_tests {
             "a hand-built option set names its own rlib and must not be refused"
         );
 
-        // A probed set records its compiler and refuses any other.
+        // A probed set records its compiler and refuses any other. `check_probe_compiler`
+        // canonicalises whatever it is given, so it must be handed an *executable path*
+        // here: an identity is not a program, and passing one would exercise the
+        // fallback that returns the string unchanged rather than a second compiler.
         let probed = MirOptions {
             edition: Some(Edition::Rust2021),
             probed_with: Some(canonical_compiler("rustc")),
@@ -2108,20 +2158,22 @@ mod extern_probe_tests {
             check_probe_compiler("rustc", &probed).is_ok(),
             "the probing compiler must be accepted"
         );
-        if let Some(other) = ["1.85", "nightly", "stable"]
+        let active_id = canonical_compiler("rustc");
+        if let Some((other_path, other_id)) = ["1.85", "nightly", "stable"]
             .into_iter()
-            .filter_map(|t| Command::new("rustup")
-                .args(["which", "--toolchain", t, "rustc"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()))
-            .map(|p| canonical_compiler(&p))
-            .find(|p| *p != canonical_compiler("rustc"))
+            .filter_map(have)
+            .find(|(_, id)| *id != active_id)
         {
-            let err = check_probe_compiler(&other, &probed)
+            let err = check_probe_compiler(&other_path, &probed)
                 .expect_err("a different compiler must be refused");
-            assert!(err.contains(&other), "the error must name the emitting compiler: {err}");
+            // The error names the *identity* of the emitting compiler, which is what the
+            // guard compares; asserting on the identity is what proves the second
+            // toolchain was actually identified rather than failing to spawn.
+            assert!(
+                err.contains(&other_id),
+                "the error must name the emitting compiler's identity {other_id}: {err}"
+            );
+            assert_ne!(active_id, other_id, "the two must be different builds");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2135,23 +2187,23 @@ mod extern_probe_tests {
     /// see that: it canonicalised *both* operands with the same helper, so a helper
     /// that returned its input unchanged still compared equal. This test compares a
     /// bare name against an absolute path obtained independently, from `rustup which`.
+    ///
+    /// The absolute path is the **active** toolchain's, resolved by `rustup which rustc`
+    /// with no `--toolchain`, not `stable`'s: a bare `rustc` dispatches to whatever the
+    /// override selects, so asking for `stable` explicitly would compare two different
+    /// builds whenever a directory override points elsewhere, and fail while the
+    /// identification was correct.
     #[test]
     fn a_bare_compiler_name_and_its_absolute_path_are_one_identity() {
-        let Some(abs) = Command::new("rustup")
-            .args(["which", "--toolchain", "stable", "rustc"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        else {
-            return; // no rustup, nothing to compare
+        let Some((abs, abs_id)) = active() else {
+            eprintln!("skipped: no rustup, so there is no shim/path pair to compare");
+            return;
         };
         let bare = canonical_compiler("rustc");
-        let path = canonical_compiler(&abs);
         assert_eq!(
-            bare, path,
-            "a bare `rustc` (the rustup shim) and `rustup which`'s absolute path name one \
-             compiler and must canonicalise to one identity; got {bare:?} vs {path:?}"
+            bare, abs_id,
+            "a bare `rustc` (the rustup shim) and `rustup which`'s path ({abs}) name one \
+             compiler and must canonicalise to one identity; got {bare:?} vs {abs_id:?}"
         );
         // The property the guard depends on: a probed set built from the absolute path
         // accepts the bare name rather than refusing it as a second toolchain.
@@ -2172,21 +2224,14 @@ mod extern_probe_tests {
     /// builds and must differ.
     #[test]
     fn two_toolchains_are_two_identities() {
-        let one = |t: &str| {
-            Command::new("rustup")
-                .args(["which", "--toolchain", t, "rustc"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        };
-        let (Some(a), Some(b)) = (one("stable"), one("1.85")) else {
-            return; // one of the toolchains is not installed
+        let (Some((a_path, a)), Some((b_path, b))) = (have("stable"), have("1.85")) else {
+            eprintln!("skipped: stable and 1.85 must both be installed to compare them");
+            return;
         };
         assert_ne!(
-            canonical_compiler(&a),
-            canonical_compiler(&b),
-            "stable and 1.85 are different builds and must not share an identity"
+            a, b,
+            "stable ({a_path}) and 1.85 ({b_path}) are different builds and must not \
+             share an identity"
         );
     }
 }

@@ -10401,3 +10401,48 @@ the unmodified tree (`git stash` and re-run), which is what makes it a rollover 
 not a regression. A review of *findings* is not a review of the *gate*; run the gate
 on the toolchain the reviewer names, or the build stays red behind twelve green
 "already fixed" replies.
+
+## An identity is not a path, and a test that skips itself still reports `ok`
+
+`canonical_compiler` answers "which *build* is this", as `commit-hash/host` from
+`rustc -vV`, because a path cannot: `rustc` on `PATH` is the rustup *shim*, a
+different file from the toolchain binary `rustup which` prints, so the two
+spellings of one compiler never compare equal by path. That fix is correct, and
+the three tests written beside it were wrong in two ways -- both of which are the
+recurring "a test that cannot fail" class, in a new place.
+
+**An identity was used as an executable.** `extern_compiles` *spawns* the
+compiler; `Command::new("0ef1bc386…/x86_64-unknown-linux-gnu")` fails to start,
+`extern_compiles` returns `false` on a failed spawn, and the cross-toolchain test
+read that `false` as "the other compiler rejected the rlib" -- the assertion it
+exists for -- while the *positive* half (`producer` accepts its own rlib) failed
+to build and the test returned early. Net: `ok`, having tested nothing. The fix
+is to keep the two apart at the source: `have()`/`active()` return `(path,
+identity)` together, the *path* is what gets spawned and the *identity* is only
+ever compared. The early return also became a `panic!` when the producing
+compiler cannot build a trivial rlib -- a compiler that cannot compile is a
+broken environment, not "nothing to test".
+
+**The identity test assumed which toolchain was active.** It compared a bare
+`rustc` against `rustup which --toolchain stable`, so under a nightly override
+(or any `RUSTUP_TOOLCHAIN`) the bare name correctly resolved to nightly and the
+equality assertion failed *while the identification was right*. The absolute path
+must come from `rustup which rustc` with **no** `--toolchain`, which resolves the
+active toolchain -- the same one a bare `rustc` dispatches to.
+
+Both were confirmed the only way that counts: reintroduce each defect and watch
+the test go red. Using the identity as the executable now panics with "the
+producing compiler (rustc, identity …) must be able to build a trivial rlib";
+running under `RUSTUP_TOOLCHAIN=nightly` with the `--toolchain stable` form fails
+with the two identities printed, and passes with `active()`.
+
+Two general rules, both already in this file in other words and worth repeating
+because they recur: **an identity, a handle, and a path are three different
+things**, and a function that takes "a compiler" has to say which it wants -- a
+spawn needs a path, a comparison needs an identity, and passing one where the
+other belongs fails in the *silent* direction (a failed spawn reads as `false`).
+And **a test whose body can return early must prove it ran**: a skip and a pass
+both print `ok`, so a skipped test is the same "green that checked nothing" as the
+gate that did not run. Where the environment is genuinely absent, say so with
+`eprintln!` and assert on what *was* reachable; where it is present but broken,
+panic rather than return.
