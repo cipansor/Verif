@@ -134,15 +134,10 @@ verif = "0.2"
 verif = { version = "0.2", features = ["std"] }
 ```
 
-> **Which version is on crates.io.** The published line is **0.1.x**; `0.2.0` is
-> the release this tree prepares and is not yet uploaded, so a reader copying the
-> block above today should use `verif = "0.1"` until 0.2.0 appears on the
-> [crates.io page](https://crates.io/crates/verif). The `0.2` requirement is
-> deliberate here rather than a stale one: the in-code `spec!` spelling, the
-> `verif!` refusal and the doc-comment migration are all in this tree and not in
-> 0.1.x, so pinning the README to `0.1` would document a crate that does not have
-> the feature the page is about. `tests/readme.rs` pins the `"0.2"` spelling, so
-> this note and that test move together when 0.2.0 ships.
+> **Which version to depend on.** `0.2` is the current release: the in-code `spec!`
+> spelling, the `verif!` refusal and the doc-comment migration all landed in it, and
+> a crate on an older `0.1.x` does not have them. `tests/readme.rs` pins the `"0.2"`
+> requirement, so this paragraph and that test move together on the next bump.
 
 There is nothing else to add: `verif`'s only dependency is `verif-arithmetic`,
 which is itself `no_std` and dependency-free, so the artifact's crates.io supply
