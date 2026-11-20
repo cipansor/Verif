@@ -1442,7 +1442,7 @@ the false direction for this spelling.
 
 **Doc comments, the spelling every earlier release used.** `rustc` accepts them
 and the frontend reads them out of the source with no import and no build-script
-setup, which is why the verification corpora still use them:
+setup, which is why most of `tests/mir.rs`'s inline sources still use them:
 
 ```rust,ignore
 /// requires: lo <= hi
@@ -1459,6 +1459,13 @@ clause means. The difference is that a `spec!` body is verified Rust syntax and 
 form (the frontend skips the function and names the line) but cannot happen in the
 block form, because the identifier is a real token. Writing both on one item is
 allowed; the clauses are merged.
+
+The verification corpus exercises both paths on purpose: `examples/mir_targets/actuator.rs`
+(the regression corpus the gates assert on) uses `spec!`, while `everyday.rs` and
+`realistic.rs` keep the doc-comment form, so a regression in either reader shows up
+rather than being masked by the other. `actuator.rs` defines the macro locally as a
+no-op, so it still compiles with a bare `rustc` and imports nothing from `verif` —
+the file being verified and the tool doing the verifying stay separate artifacts.
 
 A loop is proved by an `invariant:` clause rather than by unwinding. It is the
 induction hypothesis: true on entry to the loop head, and left true by one

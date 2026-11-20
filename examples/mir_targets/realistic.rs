@@ -7,6 +7,12 @@
 //! reports which. Nothing here asserts a verdict, so adding a shape that fails
 //! is the point rather than a broken test: it is how the gap is measured.
 //!
+//! The contracts are doc comments (`/// requires:` / `/// ensures:`), the same
+//! spelling `everyday.rs` uses. `actuator.rs` carries the in-code `spec! { … }`
+//! form, so the corpus as a whole exercises both reader paths. Keeping this file
+//! on the doc-comment form is also what lets it stay a sample of ordinary Rust
+//! with no macro definition at the top.
+//!
 //! Every shape below is decided: fields of by-value and by-reference structs,
 //! tuple components, slice lengths and elements, fixed-size array lengths and
 //! elements, `core::num` intrinsics and loops with invariants. The three

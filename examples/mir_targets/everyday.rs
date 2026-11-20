@@ -5,6 +5,12 @@
 //! ordinary Rust can this tool decide?". The contracts are deliberately true, so
 //! every `incomplete` is a *coverage* gap, not a wrong contract.
 //!
+//! The contracts are doc comments (`/// requires:` / `/// ensures:`) on purpose.
+//! `actuator.rs` uses the in-code `spec! { … }` spelling, and keeping this file
+//! on the doc-comment spelling is what makes the corpus exercise *both* reader
+//! paths rather than one: a regression in either form shows up here or there.
+//! It also keeps the file writable as the external reviewer wrote it.
+//!
 //! The score is tracked in `ROADMAP.md` (Phase 1's exit criterion is defined on
 //! this file). Do not edit a function to make it decide: add a new one and leave
 //! the old one as the record. Regenerate the score with:
