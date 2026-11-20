@@ -199,8 +199,8 @@ specification surface, the complete-by-enumeration half, and interop.
 | `exhaustive` | Complete proofs by enumeration over `u8`/`u16` |
 | `primitives` | The symbolic oracle for the `safe_*` ops and `Bounded` (the runtime half is `arith`) |
 | `arith` (sibling crate) | `verif-arithmetic`, re-exported: total integer ops and a refinement-typed `Bounded<MIN, MAX>`, each proved by enumeration |
-| `macros` | `verify!`, `verify_implies!`, `contract!`, `proof!`, `assert_proof!`, `check!`, `verify_exhaustive!` |
-| `mir` (`std` only) | verify **real Rust**: read `rustc`'s own MIR, symbolically execute it, discharge rustc's overflow/underflow/div-by-zero asserts and doc-comment contracts |
+| `macros` | `spec!` (in-code contracts), `verify!`, `verify_implies!`, `contract!`, `proof!`, `assert_proof!`, `check!`, `verify_exhaustive!` |
+| `mir` (`std` only) | verify **real Rust**: read `rustc`'s own MIR, symbolically execute it, discharge rustc's overflow/underflow/div-by-zero asserts and contracts (`spec!` blocks or `///` clauses) |
 
 The proved runtime primitives live in the sibling crate and are re-exported as
 `verif::arith`, so a caller never has to name the workspace layout. `arith` is
@@ -1399,7 +1399,7 @@ variable with no source name (a temporary, a promoted constant) keeps its
 `v{index}:u{width}` spelling, so naming is a readability improvement and never a
 loss.
 
-### Contracts are doc comments, and that is forced
+### Contracts: an in-code `spec!` block, or a doc comment
 
 The obvious syntax is an attribute:
 
@@ -1408,10 +1408,41 @@ The obvious syntax is an attribute:
 pub fn clamp(x: u32, lo: u32, hi: u32) -> u32 { … }
 ```
 
-That cannot be done here. An unknown attribute on a function is not Rust; it needs
-a proc-macro to consume it, and a proc-macro is a dependency, which would break the
-zero-dependency gate that `scripts/gate.sh` enforces. So contracts live in doc
-comments, which `rustc` accepts and the frontend reads out of the source:
+That one still cannot be done. An unknown attribute on a function is not Rust; it
+needs a proc-macro to consume it, and a proc-macro is a dependency, which would
+break the zero-dependency gate that `scripts/gate.sh` enforces. So there are two
+supported spellings, and both are read out of the *source text* by the frontend
+rather than compiled into anything.
+
+**In-code, the preferred spelling since 0.2.0.** A `spec!` block is a declarative
+macro that expands to nothing, so it costs a deployed artifact zero bytes and
+leaves no symbol behind:
+
+```rust,ignore
+use verif::spec;
+
+spec! {
+    requires: lo <= hi,
+    ensures: lo <= ret,
+    ensures: ret <= hi,
+}
+pub fn clamp(x: u32, lo: u32, hi: u32) -> u32 {
+    if x < lo { lo } else if x > hi { hi } else { x }
+}
+```
+
+The matcher is structured (`$clause:ident : $body:expr`), not a token soup, so
+`rustc` parses each clause body as a real Rust expression and `requires: n <=,` is
+a compile error *at the contract line*. It needs `use verif::spec;` to resolve, so
+`verif` must be an ordinary dependency and the build script must tell the
+frontend where to find it; the "Shape A" section below has the full recipe. A
+macro that expands to nothing is a claim about the artifact, not about the
+verification, so `tools/build-verify/run.sh` (gate 18) checks both the true and
+the false direction for this spelling.
+
+**Doc comments, the spelling every earlier release used.** `rustc` accepts them
+and the frontend reads them out of the source with no import and no build-script
+setup, which is why the verification corpora still use them:
 
 ```rust,ignore
 /// requires: lo <= hi
@@ -1422,15 +1453,24 @@ pub fn clamp(x: u32, lo: u32, hi: u32) -> u32 {
 }
 ```
 
-A loop is proved by an `invariant:` line rather than by unwinding. It is the
+Both spellings feed the same clause parser, so they cannot disagree about what a
+clause means. The difference is that a `spec!` body is verified Rust syntax and a
+`///` clause is unchecked prose — a typo in `ensures` is a refusal in the doc
+form (the frontend skips the function and names the line) but cannot happen in the
+block form, because the identifier is a real token. Writing both on one item is
+allowed; the clauses are merged.
+
+A loop is proved by an `invariant:` clause rather than by unwinding. It is the
 induction hypothesis: true on entry to the loop head, and left true by one
 iteration. Naming it is what makes a loop with a symbolic trip count decidable
 instead of cut off at an unwind bound:
 
 ```rust,ignore
-/// requires: n <= 8
-/// invariant: i <= n && s == i
-/// ensures: ret <= 8
+spec! {
+    requires: n <= 8,
+    invariant: i <= n && s == i,
+    ensures: ret <= 8,
+}
 pub fn sum_to(n: u8) -> u8 {
     let mut s = 0u8;
     let mut i = 0u8;

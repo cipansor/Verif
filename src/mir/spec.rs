@@ -2067,12 +2067,12 @@ pub fn extract(source: &str) -> Specs {
     // share a bare name. See `Specs::structs` and `Specs::struct_of`.
     let mut struct_paths: BTreeMap<String, String> = BTreeMap::new();
     let mut struct_name_counts: BTreeMap<String, u32> = BTreeMap::new();
-    // Last line index consumed by a multi-line `verif! { … }` block, so the loop
+    // Last line index consumed by a multi-line `spec! { … }` block, so the loop
     // below does not re-read its contents as ordinary lines.
     let mut skip_through: Option<usize> = None;
 
     for (lineno, raw_line) in source.lines().enumerate() {
-        // A multi-line `verif! { … }` block is read whole by one iteration, so the
+        // A multi-line `spec! { … }` block is read whole by one iteration, so the
         // lines it spans are skipped here rather than re-examined -- otherwise a
         // clause inside it would also be seen as an ordinary line and the block's
         // own closing brace as an item boundary.
@@ -2241,10 +2241,10 @@ pub fn extract(source: &str) -> Specs {
         if line.starts_with("//!") || line.starts_with("//") && !line.starts_with("///") {
             continue;
         }
-        // A `verif! { requires: …; ensures: … }` block writes the same clauses
-        // *inside the code* instead of in a doc comment. It is read here, from the
-        // source text, exactly like a `///` line -- the frontend never compiles it,
-        // and the macro expands to nothing, so the artifact carries no trace.
+        // A `spec! { requires: …, ensures: … }` block writes the clauses *inside
+        // the code* instead of in a doc comment. It is read here, from the source
+        // text, exactly like a `///` line -- the frontend never compiles it, and
+        // the macro expands to nothing, so the artifact carries no trace.
         //
         // The block must be *closed* before it is believed. An unterminated one is
         // recorded as an unknown clause and the function is refused: reading a
@@ -2255,12 +2255,31 @@ pub fn extract(source: &str) -> Specs {
             if consumed == 0 {
                 pending.unknown.push((
                     lineno + 1,
-                    "unterminated `verif! { … }` block; the contract is not read".to_string(),
+                    "unterminated `spec! { … }` block; the contract is not read".to_string(),
                 ));
             } else {
                 for (offset, text) in &clauses {
                     take_clause(&mut pending, text, lineno + 1 + offset, true);
                 }
+                skip_through = Some(lineno + consumed - 1);
+            }
+            continue;
+        }
+        // A `verif! { … }` block is *not* a contract block. It was accepted in an
+        // earlier draft, and dropping the acceptance silently would leave the
+        // function below with no contract at all -- verified against `true`, which
+        // is the silent-loss shape the clause checks exist to close. So it is
+        // *refused by name*: the block is consumed (so its tokens are not read as
+        // prose) and the function is skipped with a reason that spells the fix.
+        if is_legacy_verif_block(line) {
+            let (_, consumed) = in_code_block(&lines, lineno);
+            pending.unknown.push((
+                lineno + 1,
+                "`verif! { … }` is not a contract block; write `spec! { … }` (or \
+                 `verif::spec! { … }`) so the block is read as clauses"
+                    .to_string(),
+            ));
+            if consumed > 0 {
                 skip_through = Some(lineno + consumed - 1);
             }
             continue;
@@ -2367,26 +2386,53 @@ pub fn extract(source: &str) -> Specs {
     specs
 }
 
-/// Does this line open an in-code contract block, `verif! { … }`?
+/// Does this line open an in-code contract block, `spec! { … }`?
 ///
-/// The block is *data for the verifier*, not Rust that runs: the `verif!` macro
+/// The block is *data for the verifier*, not Rust that runs: the `spec!` macro
 /// expands to nothing, so the clauses are inert at runtime and carry no symbols
 /// into the artifact. Writing them here rather than in a `///` comment is the
 /// difference between a contract a reader can edit only in prose and one that
-/// sits next to the code it constrains -- and, more practically, a `verif!` block
+/// sits next to the code it constrains -- and, more practically, a `spec!` block
 /// is *checked to be syntactically valid Rust*, where a doc comment is not.
+///
+/// Only `spec!` is accepted, and the reason is a soundness one rather than a
+/// naming preference. An earlier draft also accepted a bare `verif! { … }`, to
+/// keep blocks written that way readable. But `verif` is a plausible name for a
+/// *user's own* macro -- a test harness, an assertion helper -- and a macro the
+/// crate did not define cannot promise to expand to nothing. Reading its
+/// argument as a contract means an unrelated macro's token soup is parsed as
+/// `requires:` / `ensures:` and attached to the next `fn`, which is a contract
+/// the source never stated. Worse, it is the *false-proof* direction: a body of
+/// `{ requires: n == 0, ensures: ret == 0 }` passed to a no-op user macro pinned
+/// the precondition and **proved** a function the user never constrained. The
+/// documented spelling is `spec!`; a qualified `verif::spec!` is still accepted,
+/// because that path can only name this crate's macro.
 fn in_code_block_start(line: &str) -> bool {
-    // Accept `spec! {` and `verif! {`, optionally path-qualified (`verif::spec! {`),
-    // so a crate that re-exports the macro under a path can still write the block.
-    // `spec` is the documented spelling; `verif` is kept because a block written
-    // that way in an earlier draft must keep being read rather than silently
-    // becoming an inert comment.
+    // Accept `spec! {` and path-qualified forms ending in `::spec! {`, so a crate
+    // that re-exports the macro under a path can still write the block.
     let Some(brace) = line.find('{') else {
         return false;
     };
     let head = line[..brace].trim_end();
     let head = head.strip_suffix('!').unwrap_or(head).trim_end();
-    matches!(head, "spec" | "verif") || head.ends_with("::spec") || head.ends_with("::verif")
+    head == "spec" || head.ends_with("::spec")
+}
+
+/// Does this line open a bare `verif! { … }` block, the spelling an earlier draft
+/// accepted as a contract?
+///
+/// It is *not* read as a contract any more -- see `in_code_block_start` for why a
+/// macro the crate does not define cannot be trusted to be a contract. The
+/// question is kept as its own predicate because the caller must still *consume*
+/// the block and refuse the function, rather than let the tokens fall through as
+/// prose and leave the function silently unverified.
+fn is_legacy_verif_block(line: &str) -> bool {
+    let Some(brace) = line.find('{') else {
+        return false;
+    };
+    let head = line[..brace].trim_end();
+    let head = head.strip_suffix('!').unwrap_or(head).trim_end();
+    head == "verif"
 }
 
 /// Read a `spec! { … }` block starting at `start`, returning its clauses as
@@ -8660,6 +8706,57 @@ pub fn inc(n: u8) -> u8 { n + 1 }
 ";
         let specs = extract(src);
         let c = specs.get("inc").expect("a one-line block must still attach");
+        assert_eq!(c.requires, vec!["n <= 200".to_string()]);
+        assert_eq!(c.ensures, vec!["ret == n + 1".to_string()]);
+    }
+
+    /// A bare `verif! { … }` is **not** a contract block, and the function must be
+    /// *refused*, not silently left unverified.
+    ///
+    /// `verif` is a plausible name for a user's own macro, and a macro this crate
+    /// did not define cannot be trusted to expand to nothing. Reading its argument
+    /// as clauses let an unrelated macro's token soup pin a precondition and
+    /// **prove** a function the user never constrained -- the false-proof direction,
+    /// measured before this test existed. Dropping the acceptance without a refusal
+    /// would be the other silent-loss shape: a function verified against `true`.
+    #[test]
+    fn a_bare_verif_block_is_refused_by_name_not_read_as_a_contract() {
+        use super::extract;
+        let src = "\
+macro_rules! verif { ($($t:tt)*) => {}; }
+
+verif! {
+    requires: n == 0,
+    ensures: ret == 0,
+}
+pub fn g(n: u8) -> u8 { n }
+";
+        let specs = extract(src);
+        let c = specs.get("g").expect("the function must be recorded so it is refused");
+        assert!(
+            c.requires.is_empty() && c.ensures.is_empty(),
+            "a `verif!` block must not attach a contract: {c:?}"
+        );
+        assert!(
+            c.unknown.iter().any(|(_, m)| m.contains("verif!")),
+            "the refusal must name `verif!` and the fix: {c:?}"
+        );
+    }
+
+    /// A *path-qualified* `verif::spec!` names this crate's macro, so it is still
+    /// read. This is the spelling a crate uses when it re-exports the macro.
+    #[test]
+    fn a_path_qualified_spec_block_is_still_read() {
+        use super::extract;
+        let src = "\
+spec! {
+    requires: n <= 200,
+    ensures: ret == n + 1,
+}
+pub fn inc(n: u8) -> u8 { n + 1 }
+";
+        let specs = extract(src);
+        let c = specs.get("inc").expect("a qualified `::spec!` block must attach");
         assert_eq!(c.requires, vec!["n <= 200".to_string()]);
         assert_eq!(c.ensures, vec!["ret == n + 1".to_string()]);
     }
