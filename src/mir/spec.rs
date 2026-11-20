@@ -1,6 +1,6 @@
 //! Read contracts out of the *source*, because MIR does not carry attributes.
 //!
-//! # Why doc comments, not attributes
+//! # Why a macro block, and not an attribute
 //!
 //! The obvious syntax would be `#[requires(x < 10)]`, and it is what SPARK's
 //! `Pre` looks like. It cannot be used here, for a reason worth stating: an
@@ -10,20 +10,25 @@
 //! get nicer syntax would trade the property that makes the tool usable in a
 //! bare-metal build for a cosmetic one.
 //!
-//! So contracts are written as doc comments, which are real Rust syntax, always
-//! compile, and need nothing at all:
+//! So the contract is a declarative macro block, which is real Rust syntax,
+//! always compiles, expands to nothing, and needs no dependency:
 //!
 //! ```
-//! /// # Contract
-//! /// requires: b != 0
-//! /// ensures: ret * b <= a
+//! # use verif::spec;
+//! spec! {
+//!     requires: b != 0,
+//!     ensures: ret * b <= a,
+//! }
 //! fn div(a: u32, b: u32) -> u32 { a / b }
 //! ```
 //!
-//! The scanner looks for lines beginning `requires:` or `ensures:` inside a doc
-//! comment and attaches them to the next `fn`. `//!` inner docs are skipped, so
-//! the contract parser does not mistake its own documentation for a contract —
-//! a bug this file had until the scanner was made to ignore `//!`.
+//! The scanner finds the block by its `spec!` head and reads each
+//! `clause: body,` out of the source text. The `/// requires:` / `/// ensures:`
+//! doc-comment spelling is still accepted — it feeds the same clause parser, so
+//! the two cannot disagree about what a clause means — and it is what a source
+//! that must not import `verif` uses. `//!` inner docs are skipped, so the
+//! contract parser does not mistake its own documentation for a contract — a bug
+//! this file had until the scanner was made to ignore `//!`.
 //!
 //! This is the one place the frontend looks at source text rather than at the
 //! compiler's own IR, and the split is deliberate. Attributes are erased long
@@ -40,19 +45,20 @@
 //! return value (`ret`), and integer literals:
 //!
 //! ```text
-//!   #[requires(a < 1000)]
-//!   #[requires(b != 0)]
-//!   #[ensures(ret <= a + b)]
-//!   #[requires(a <= 100 && b <= 100)]
-//!   #[ensures((ret - a) <= 50)]
+//!   requires: a < 1000,
+//!   requires: b != 0,
+//!   ensures: ret <= a + b,
+//!   requires: a <= 100 && b <= 100,
+//!   ensures: (ret - a) <= 50,
 //! ```
 //!
-//! Operators: `+ - * & | ^`, comparisons `== != < <= > >=`, and `&& || !`.
-//! Anything outside that — a function call, a cast, an array index, a method —
-//! is *refused*, and a refused contract means the function is not verified at
-//! all. Refusing is the only safe response: a contract the frontend cannot read
-//! exactly is a contract it cannot check, and silently dropping it would report
-//! success for an unchecked property.
+//! Operators: `+ - * / % & | ^ << >>`, comparisons `== != < <= > >=`, and
+//! `&& || !`, with Rust's own precedence, plus `as` casts and the
+//! `wrapping_*` methods. Anything outside that — a general function call, an
+//! array index, an arbitrary method — is *refused*, and a refused contract means
+//! the function is not verified at all. Refusing is the only safe response: a
+//! contract the frontend cannot read exactly is a contract it cannot check, and
+//! silently dropping it would report success for an unchecked property.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -2067,8 +2073,18 @@ pub fn extract(source: &str) -> Specs {
     // share a bare name. See `Specs::structs` and `Specs::struct_of`.
     let mut struct_paths: BTreeMap<String, String> = BTreeMap::new();
     let mut struct_name_counts: BTreeMap<String, u32> = BTreeMap::new();
+    // Last line index consumed by a multi-line `spec! { … }` block, so the loop
+    // below does not re-read its contents as ordinary lines.
+    let mut skip_through: Option<usize> = None;
 
     for (lineno, raw_line) in source.lines().enumerate() {
+        // A multi-line `spec! { … }` block is read whole by one iteration, so the
+        // lines it spans are skipped here rather than re-examined -- otherwise a
+        // clause inside it would also be seen as an ordinary line and the block's
+        // own closing brace as an item boundary.
+        if skip_through.is_some_and(|end| lineno <= end) {
+            continue;
+        }
         let line = raw_line.trim();
         if in_block_comment {
             if line.contains("*/") {
@@ -2231,47 +2247,68 @@ pub fn extract(source: &str) -> Specs {
         if line.starts_with("//!") || line.starts_with("//") && !line.starts_with("///") {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("///") {
-            let t = rest.trim();
-            if let Some(r) = t.strip_prefix("requires:") {
-                pending.requires.push(r.trim().to_string());
-            } else if let Some(r) = t.strip_prefix("ensures:") {
-                pending.ensures.push(r.trim().to_string());
-            } else if let Some(r) = t.strip_prefix("invariant:") {
-                pending.invariants.push(r.trim().to_string());
-            } else if let Some(r) = t.strip_prefix("decreases:") {
-                pending.decreases.push(r.trim().to_string());
-            } else if let Some(r) = t.strip_prefix("variant:") {
-                // A loop termination measure. Two would disagree, so a second is
-                // recorded as an unknown clause and the function is refused --
-                // the same discipline as several `invariant:`.
-                if pending.variant.is_some() {
-                    pending.unknown.push((
-                        lineno + 1,
-                        format!("{t} — a second `variant:`; the first is the measure"),
-                    ));
-                } else {
-                    pending.variant = Some(r.trim().to_string());
+        // A `spec! { requires: …, ensures: … }` block writes the clauses *inside
+        // the code* instead of in a doc comment. It is read here, from the source
+        // text, exactly like a `///` line -- the frontend never compiles it, and
+        // the macro expands to nothing, so the artifact carries no trace.
+        //
+        // The block must be *closed* before it is believed. An unterminated one is
+        // recorded as an unknown clause and the function is refused: reading a
+        // partial block would attach half a contract to the next `fn`, which is the
+        // silent-loss shape the clause checks exist to close.
+        if in_code_block_start(line) {
+            let (clauses, consumed) = in_code_block(&lines, lineno);
+            if consumed == 0 {
+                pending.unknown.push((
+                    lineno + 1,
+                    "unterminated `spec! { … }` block; the contract is not read".to_string(),
+                ));
+            } else {
+                for (offset, text) in &clauses {
+                    take_clause(&mut pending, text, lineno + 1 + offset, true);
                 }
-            } else if let Some(r) = t.strip_prefix("unwind:") {
-                // A loop-unwinding bound. It has to be a positive integer: a
-                // non-numeric or zero value is refused rather than defaulted, so a
-                // typo cannot silently fall back to `DEFAULT_UNWIND`.
-                match r.trim().parse::<u32>() {
-                    Ok(n) if n > 0 => pending.unwind = Some(n),
-                    _ => pending.unknown.push((
-                        lineno + 1,
-                        format!("{t} — `unwind:` needs a positive integer"),
-                    )),
-                }
-            } else if let Some(note) = clause_shaped_word(t) {
-                // A line that reads like a clause but is not one this frontend
-                // takes. A typo (`ensuers:`) would otherwise be dropped and the
-                // function verified with no postcondition at all; a `variant:`
-                // would be ignored although the reader expects it honoured.
-                // Recorded and refused, never dropped.
-                pending.unknown.push((lineno + 1, format!("{t} — {note}")));
+                skip_through = Some(lineno + consumed - 1);
             }
+            continue;
+        }
+        // A `verif! { … }` block is *not* a contract block. It was accepted in an
+        // earlier draft, and dropping the acceptance silently would leave the
+        // function below with no contract at all -- verified against `true`, which
+        // is the silent-loss shape the clause checks exist to close. So it is
+        // *refused by name*: the block is consumed (so its tokens are not read as
+        // prose) and the function is skipped with a reason that spells the fix.
+        if is_legacy_verif_block(line) {
+            let (_, consumed) = in_code_block(&lines, lineno);
+            pending.unknown.push((
+                lineno + 1,
+                "`verif! { … }` is not a contract block; write `spec! { … }` (or \
+                 `verif::spec! { … }`) so the block is read as clauses"
+                    .to_string(),
+            ));
+            if consumed > 0 {
+                skip_through = Some(lineno + consumed - 1);
+            }
+            continue;
+        }
+        // A `some_other_crate::spec! { … }` block is *not* this crate's macro, and
+        // the reader cannot resolve the path to prove otherwise. Refused by name,
+        // for the same reason as `verif!` above: reading an unrelated macro's tokens
+        // as clauses would attach a contract the source never stated.
+        if is_foreign_spec_block(line) {
+            let (_, consumed) = in_code_block(&lines, lineno);
+            pending.unknown.push((
+                lineno + 1,
+                "a `*::spec! { … }` block that is not `verif::spec!` cannot be read as \
+                 a contract; write `spec! { … }` or `verif::spec! { … }`"
+                    .to_string(),
+            ));
+            if consumed > 0 {
+                skip_through = Some(lineno + consumed - 1);
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("///") {
+            take_clause(&mut pending, rest.trim(), lineno + 1, false);
             continue;
         }
         // A function item: attach whatever is pending and start fresh. A
@@ -2370,6 +2407,529 @@ pub fn extract(source: &str) -> Specs {
         }
     }
     specs
+}
+
+/// Does this line open an in-code contract block, `spec! { … }`?
+///
+/// The block is *data for the verifier*, not Rust that runs: the `spec!` macro
+/// expands to nothing, so the clauses are inert at runtime and carry no symbols
+/// into the artifact. Writing them here rather than in a `///` comment is the
+/// difference between a contract a reader can edit only in prose and one that
+/// sits next to the code it constrains -- and, more practically, a `spec!` block
+/// is *checked to be syntactically valid Rust*, where a doc comment is not.
+///
+/// Only `spec!` is accepted, and the reason is a soundness one rather than a
+/// naming preference. An earlier draft also accepted a bare `verif! { … }`, to
+/// keep blocks written that way readable. But `verif` is a plausible name for a
+/// *user's own* macro -- a test harness, an assertion helper -- and a macro the
+/// crate did not define cannot promise to expand to nothing. Reading its
+/// argument as a contract means an unrelated macro's token soup is parsed as
+/// `requires:` / `ensures:` and attached to the next `fn`, which is a contract
+/// the source never stated. Worse, it is the *false-proof* direction: a body of
+/// `{ requires: n == 0, ensures: ret == 0 }` passed to a no-op user macro pinned
+/// the precondition and **proved** a function the user never constrained. The
+/// documented spelling is `spec!`; a qualified `verif::spec!` is still accepted,
+/// because that path can only name this crate's macro.
+///
+/// **Only this crate's own paths are accepted, and that is a soundness rule, not a
+/// naming preference.** The frontend reads source *text*; it cannot resolve a macro,
+/// so it cannot tell a re-export of `verif::spec` from an unrelated macro that happens
+/// to be called `spec`. An earlier version accepted any head ending in `::spec`, which
+/// read `my_macros::spec! { requires: …, ensures: … }` as a contract -- the same
+/// false-proof shape the bare `verif!` refusal exists to close, one spelling over. A
+/// crate that re-exports the macro can write `verif::spec!` at the use site; losing
+/// that convenience is a *lost* proof, which is the direction this crate always takes
+/// over a wrong one.
+fn spec_block_head(line: &str) -> Option<&str> {
+    let brace = line.find('{')?;
+    let head = line[..brace].trim_end();
+    let head = head.strip_suffix('!').unwrap_or(head).trim_end();
+    if head == "spec" || head.ends_with("::spec") {
+        Some(head)
+    } else {
+        None
+    }
+}
+
+/// Does this line open a `spec! { … }` block naming *this* crate's macro?
+///
+/// The accepted spellings are the bare `spec!` and the crate's own qualified path,
+/// `verif::spec!` (with the edition-2018 absolute form `::verif::spec!`). Anything
+/// else is refused by `is_foreign_spec_block` rather than read as clauses.
+fn in_code_block_start(line: &str) -> bool {
+    matches!(
+        spec_block_head(line),
+        Some("spec") | Some("verif::spec") | Some("::verif::spec")
+    )
+}
+
+/// Does this line open a `*::spec! { … }` block that is *not* this crate's macro?
+///
+/// It is refused by name for the reason `in_code_block_start` gives: the frontend
+/// cannot resolve the path, so it cannot know the macro expands to nothing, and
+/// reading its argument as clauses would attach a contract the source never stated.
+/// The caller consumes the block so its tokens do not fall through as prose, and
+/// records a reason that names the fix -- a silent drop would leave the function
+/// verified against `true`.
+fn is_foreign_spec_block(line: &str) -> bool {
+    matches!(
+        spec_block_head(line),
+        Some(h) if !matches!(h, "spec" | "verif::spec" | "::verif::spec")
+    )
+}
+
+/// Does this line open a bare `verif! { … }` block, the spelling an earlier draft
+/// accepted as a contract?
+///
+/// It is *not* read as a contract any more -- see `in_code_block_start` for why a
+/// macro the crate does not define cannot be trusted to be a contract. The
+/// question is kept as its own predicate because the caller must still *consume*
+/// the block and refuse the function, rather than let the tokens fall through as
+/// prose and leave the function silently unverified.
+fn is_legacy_verif_block(line: &str) -> bool {
+    let Some(brace) = line.find('{') else {
+        return false;
+    };
+    let head = line[..brace].trim_end();
+    let head = head.strip_suffix('!').unwrap_or(head).trim_end();
+    head == "verif"
+}
+
+/// Read a `spec! { … }` block starting at `start`, returning its clauses as
+/// `(line offset, clause text)` and how many lines the block spans.
+///
+/// Clauses are separated by top-level commas, which is the macro's own grammar:
+///
+/// ```text
+/// spec! {
+///     requires: n <= 200,
+///     ensures: ret == n + 1,
+/// }
+/// ```
+///
+/// `consumed == 0` means the block never closed: the caller records that as a
+/// refusal rather than reading a partial contract.
+///
+/// The split mirrors `macro_rules!`'s matcher on purpose. A clause body may span
+/// lines (`$body:expr` allows it), so splitting per line would cut a body in half
+/// -- and a truncated `ensures` is a *weaker* postcondition, which is a false
+/// proof rather than a refusal. Reading the grammar the macro declares is what
+/// keeps the two from diverging.
+fn in_code_block(lines: &[&str], start: usize) -> (Vec<(usize, String)>, usize) {
+    // The block is read as **one text**, scanned lexically, rather than per line
+    // with `split_once('}')`. Three findings made the per-line version wrong, and
+    // all three were silent:
+    //
+    // * a `}` inside a character literal (`ensures: ret == '}'`) closed the block
+    //   early, truncating the clause inside the literal;
+    // * a `//` comment after a clause comma was carried into the *next* clause, so
+    //   that clause began with `//` and was dropped -- and a dropped `ensures:` is
+    //   a false proof, not a lost one;
+    // * a `}` inside a string or a block comment did the same as the char case.
+    //
+    // One scan fixes all three, because the same quote/comment/nesting state that
+    // finds the closing brace also finds the clause commas. Two scans would be two
+    // chances for them to disagree about where the block ends.
+    let mut text = String::new();
+    let mut origins: Vec<usize> = Vec::new();
+    let mut first = true;
+    let mut consumed = 0usize;
+    let mut closed = false;
+    'lines: for (offset, raw) in lines[start..].iter().enumerate() {
+        let body = if first {
+            first = false;
+            match raw.split_once('{') {
+                Some((_, rest)) => rest,
+                None => continue,
+            }
+        } else {
+            *raw
+        };
+        for ch in body.chars() {
+            text.push(ch);
+            origins.push(offset);
+        }
+        text.push('\n');
+        origins.push(offset);
+        consumed = offset + 1;
+        // A `}` on this line may be inside a literal or a comment, so the closing
+        // brace is decided by the scan, not by the line's text.
+        if let Some(at) = block_close_offset(&text) {
+            text.truncate(at);
+            origins.truncate(at);
+            closed = true;
+            break 'lines;
+        }
+    }
+    if !closed {
+        return (Vec::new(), 0);
+    }
+    let (clauses, _) = split_clauses(&text, &origins);
+    (clauses, consumed)
+}
+
+/// Replace a comment with one space, so the tokens on either side stay separate.
+///
+/// Only added when the piece already has content and does not end in whitespace, so
+/// adjacent comments do not accumulate spaces and a leading comment does not make an
+/// otherwise empty clause look non-empty.
+fn push_separator(piece: &mut String, piece_start: Option<usize>) {
+    if piece_start.is_some() && !piece.ends_with(char::is_whitespace) {
+        piece.push(' ');
+    }
+}
+
+/// Split a closed block's text into `(line offset, clause text)` pairs.
+///
+/// Top-level commas separate clauses -- the macro's grammar is
+/// `$($clause:ident : $body:expr,)*` -- while a comma inside parentheses, brackets,
+/// braces, a string, a char literal or a comment does not.
+///
+/// A comment is *replaced by a space*, never deleted. It is not content -- carrying
+/// it into the clause made the next clause begin with `//`, so `take_clause` saw no
+/// keyword and dropped it, a false proof when the dropped clause was the `ensures:`
+/// -- but it *is* a token separator in Rust: `n/**/as` is the cast `n as`, and
+/// deleting it glued the neighbours into the single identifier `nasu8`, a name nobody
+/// wrote that a body returning an argument of that name could satisfy. The newline
+/// ending a `//` comment is itself a separator and is kept.
+fn split_clauses(text: &str, origins: &[usize]) -> (Vec<(usize, String)>, usize) {
+    let bytes = text.as_bytes();
+    let mut clauses: Vec<(usize, String)> = Vec::new();
+    let mut depth = 0i32;
+    // A turbofish's angle brackets nest like parentheses for the *comma* rule:
+    // `max::<u8, u8>(1, 2)` has a comma inside `<>` that is not a clause separator.
+    // Counting only `()[]{}` split that clause at the generic comma, so the body
+    // became `ret == core::cmp::max::<u8` -- a truncated expression, which is a
+    // weaker (or malformed) postcondition and therefore a false-proof shape.
+    //
+    // Only a `::<` opens the count, never a bare `<`: a comparison `a < b` is an
+    // operator and must not start a generic list. Once inside, `<`/`>` balance so a
+    // nested `Vec<u8>` counts, and a `>` that is half of `->` does not close it (a
+    // `fn(u8) -> u8` is a legal generic argument).
+    let mut angle = 0i32;
+    let mut piece = String::new();
+    let mut piece_start: Option<usize> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        // Comments and literals are consumed whole, so a comma or brace inside one
+        // is never a delimiter. Each branch skips to just past its construct.
+        match ch {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                // A comment is a *token separator* in Rust: `n/**/as` is `n as`, and
+                // `ret == n/**/as/**/u8` is the cast `n as u8`. Deleting the comment
+                // instead of replacing it glued the neighbouring tokens into one
+                // identifier (`nasu8`), so the clause named a variable nobody wrote
+                // -- and a function with an argument of that name verified a
+                // postcondition the source never states. One space preserves the
+                // separation without changing what the clause means.
+                push_separator(&mut piece, piece_start);
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let mut d = 1u32;
+                i += 2;
+                while i < bytes.len() && d > 0 {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        d += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        d -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                push_separator(&mut piece, piece_start);
+                continue;
+            }
+            b'"' => {
+                if piece_start.is_none() {
+                    piece_start = origins.get(i).copied();
+                }
+                let end = skip_string(bytes, i);
+                piece.push_str(&text[i..end]);
+                i = end;
+                continue;
+            }
+            b'\'' if is_char_literal_start_bytes(bytes, i) => {
+                if piece_start.is_none() {
+                    piece_start = origins.get(i).copied();
+                }
+                let end = skip_char(bytes, i);
+                piece.push_str(&text[i..end]);
+                i = end;
+                continue;
+            }
+            b'r' | b'b' | b'c' => {
+                if let Some((hashes, after)) = raw_string_start(bytes, i) {
+                    if piece_start.is_none() {
+                        piece_start = origins.get(i).copied();
+                    }
+                    let end = skip_raw_string(bytes, after, hashes);
+                    piece.push_str(&text[i..end]);
+                    i = end;
+                    continue;
+                }
+                if piece_start.is_none() && !ch.is_ascii_whitespace() {
+                    piece_start = origins.get(i).copied();
+                }
+                piece.push(ch as char);
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        match ch {
+            b'<' if angle > 0 || is_turbofish_open(bytes, i) => {
+                angle += 1;
+                if piece_start.is_none() {
+                    piece_start = origins.get(i).copied();
+                }
+                piece.push('<');
+            }
+            b'>' if angle > 0 && bytes.get(i.wrapping_sub(1)) != Some(&b'-') => {
+                angle -= 1;
+                piece.push('>');
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                if piece_start.is_none() {
+                    piece_start = origins.get(i).copied();
+                }
+                piece.push(ch as char);
+            }
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                piece.push(ch as char);
+            }
+            b',' if depth == 0 && angle == 0 => {
+                let t = piece.trim();
+                if !t.is_empty() {
+                    clauses.push((piece_start.unwrap_or(0), t.to_string()));
+                }
+                piece.clear();
+                piece_start = None;
+            }
+            _ => {
+                if ch.is_ascii() {
+                    if piece_start.is_none() && !(ch as char).is_whitespace() {
+                        piece_start = origins.get(i).copied();
+                    }
+                    piece.push(ch as char);
+                } else {
+                    // A non-ASCII byte is the start of a multi-byte UTF-8 character,
+                    // and every identifier Rust accepts may contain one (`µ`, `日本`).
+                    // `ch as char` reads one byte as Latin-1, so `µ` (0xC2 0xB5) became
+                    // `Âµ` -- a *different identifier* than the one written, which is a
+                    // false proof when a contract names it and an argument of the
+                    // mangled spelling exists. Decode the whole character instead.
+                    let ch = text[i..].chars().next().unwrap_or('\u{fffd}');
+                    if piece_start.is_none() && !ch.is_whitespace() {
+                        piece_start = origins.get(i).copied();
+                    }
+                    piece.push(ch);
+                    i += ch.len_utf8();
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    let t = piece.trim();
+    if !t.is_empty() {
+        clauses.push((piece_start.unwrap_or(0), t.to_string()));
+    }
+    (clauses, 0)
+}
+
+/// Is the `<` at `i` the opening of a turbofish (`::<`)?
+///
+/// Whitespace between the `::` and the `<` is allowed, because a clause body is an
+/// expression a person wrote and rustfmt is not always run. A bare `<` is never a
+/// generic opener here: `a < b` is a comparison, and treating it as one would make
+/// every relational clause need a closing `>` it does not have.
+fn is_turbofish_open(bytes: &[u8], i: usize) -> bool {
+    let mut j = i;
+    while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+        j -= 1;
+    }
+    j >= 2 && bytes[j - 1] == b':' && bytes[j - 2] == b':'
+}
+
+/// The byte offset of the block's closing `}`, ignoring braces inside literals and
+/// comments. `None` while the block is still open.
+///
+/// The scan is the same one [`split_clauses`] runs, so the two cannot disagree about
+/// where the block ends. The offset -- not a bare `bool` -- is what keeps the closing
+/// brace *out* of the last clause: returning only "closed" left `ret == n + 1 }` as
+/// the final clause body, which is a different expression from the one written.
+fn block_close_offset(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let mut d = 1u32;
+                i += 2;
+                while i < bytes.len() && d > 0 {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        d += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        d -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            b'"' => {
+                i = skip_string(bytes, i);
+                continue;
+            }
+            b'\'' if is_char_literal_start_bytes(bytes, i) => {
+                i = skip_char(bytes, i);
+                continue;
+            }
+            b'r' | b'b' | b'c' => {
+                if let Some((hashes, after)) = raw_string_start(bytes, i) {
+                    i = skip_raw_string(bytes, after, hashes);
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The body of clause `keyword`, when `keyword` is exactly that identifier and a
+/// colon followed it.
+///
+/// `keyword` and `rest` come from splitting the clause text at its first colon, so
+/// `rest` is `Some` exactly when a colon was present. The keyword must be a bare
+/// identifier equal to `want` -- not merely a prefix -- so `requires_extra: x` is not
+/// read as a `requires:` clause.
+fn body_after<'a>(keyword: &str, rest: Option<&'a str>, want: &str) -> Option<&'a str> {
+    if keyword == want {
+        rest
+    } else {
+        None
+    }
+}
+
+/// Apply one clause's text to `pending`, whichever spelling produced it.
+///
+/// `lineno` is 1-based and used only for a diagnostic, so a refusal names the
+/// line a reader can find. Both the `///` path and the in-code block go through
+/// here; a second copy of this match is a second chance for the two spellings to
+/// disagree about what `variant:` or an unknown clause does.
+///
+/// The keyword and its colon are split apart, so `requires : true` -- what a comment
+/// before the colon becomes -- reads as a precondition. Rust's matcher is
+/// `$clause:ident : $body:expr`, which allows that spacing.
+fn take_clause(pending: &mut FnContract, text: &str, lineno: usize, from_block: bool) {
+    let t = text.trim();
+    if t.is_empty() {
+        return;
+    }
+    // Split the keyword from its body at the first colon, allowing whitespace
+    // between them: Rust's matcher is `$clause:ident : $body:expr`, which accepts a
+    // comment (now a space) or plain spacing before the colon. Matching the literal
+    // `requires:` refused `requires : true` -- valid syntax -- so a comment before
+    // the colon silently dropped the clause and skipped the function.
+    let (keyword, rest) = match t.split_once(':') {
+        Some((k, r)) => (k.trim(), Some(r)),
+        None => (t, None),
+    };
+    if let Some(r) = body_after(keyword, rest, "requires") {
+        pending.requires.push(r.trim().to_string());
+    } else if let Some(r) = body_after(keyword, rest, "ensures") {
+        pending.ensures.push(r.trim().to_string());
+    } else if let Some(r) = body_after(keyword, rest, "invariant") {
+        pending.invariants.push(r.trim().to_string());
+    } else if let Some(r) = body_after(keyword, rest, "decreases") {
+        pending.decreases.push(r.trim().to_string());
+    } else if let Some(r) = body_after(keyword, rest, "variant") {
+        // A loop termination measure. Two would disagree, so a second is
+        // recorded as an unknown clause and the function is refused -- the same
+        // discipline as several `invariant:`.
+        if pending.variant.is_some() {
+            pending.unknown.push((
+                lineno,
+                format!("{t} — a second `variant:`; the first is the measure"),
+            ));
+        } else {
+            pending.variant = Some(r.trim().to_string());
+        }
+    } else if let Some(r) = body_after(keyword, rest, "unwind") {
+        // A loop-unwinding bound. It has to be a positive integer: a non-numeric
+        // or zero value is refused rather than defaulted, so a typo cannot
+        // silently fall back to `DEFAULT_UNWIND`.
+        match r.trim().parse::<u32>() {
+            Ok(n) if n > 0 => pending.unwind = Some(n),
+            _ => pending
+                .unknown
+                .push((lineno, format!("{t} — `unwind:` needs a positive integer"))),
+        }
+    } else if let Some(note) = clause_shaped_word(t) {
+        // A line that reads like a clause but is not one this frontend takes. A
+        // typo (`ensuers:`) would otherwise be dropped and the function verified
+        // with no postcondition at all; a `variant:` would be ignored although
+        // the reader expects it honoured. Recorded and refused, never dropped.
+        pending.unknown.push((lineno, format!("{t} — {note}")));
+    } else if from_block && looks_like_clause(t) {
+        // Inside a `spec! { … }` block every piece is *guaranteed* by the matcher
+        // (`$($clause:ident : $body:expr,)*`) to be `ident : expr`, so an unknown
+        // keyword here is not prose -- it is a clause the author wrote and this
+        // frontend does not take. `postcondition: ret == 1` is nine edits from
+        // every keyword, so the typo heuristic above does not fire, and the clause
+        // was dropped silently: a function returning 0 was reported `Verified`
+        // against a postcondition nobody read. A doc comment may be prose; a block
+        // may not, so the block is strict.
+        pending.unknown.push((
+            lineno,
+            format!("{t} — not a clause this frontend takes (`requires:`, `ensures:`, `invariant:`, `decreases:`, `variant:`, `unwind:`); a `spec!` block may not contain prose"),
+        ));
+    }
+}
+
+/// True when `t` is shaped `ident: …` -- an identifier, a colon, then a body.
+///
+/// This is the shape `spec!`'s matcher requires, so it distinguishes a clause the
+/// author wrote from a fragment of a malformed block. It is deliberately narrower
+/// than [`clause_shaped_word`]: that one guesses at typos, and this one does not
+/// guess at all, because inside a block the shape is a promise rustc has kept.
+fn looks_like_clause(t: &str) -> bool {
+    let Some((word, body)) = t.split_once(':') else {
+        return false;
+    };
+    let word = word.trim();
+    !word.is_empty()
+        && word.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && !body.trim().is_empty()
 }
 
 /// A note explaining why a clause-shaped doc-comment line was not taken, when
@@ -8164,6 +8724,408 @@ pub fn arg_name_of(
 
 #[cfg(test)]
 mod tests {
+    /// A contract written as a `spec! { … }` block is read from the source text,
+    /// and it must read *exactly* like the `///` spelling.
+    ///
+    /// The three cases below are the ones that cost a defect each when the block
+    /// reader was first written per line:
+    ///
+    /// * a one-line block (`spec! { requires: …; ensures: … }`) was not seen at all,
+    ///   so the function verified with no contract -- a green report for a claim
+    ///   nobody made;
+    /// * a clause body spanning lines was truncated at the newline, and a truncated
+    ///   `ensures` is a *weaker* postcondition, which is a false proof;
+    /// * a body containing a comma inside parentheses must not split, because the
+    ///   macro's grammar is a top-level comma.
+    #[test]
+    fn a_spec_block_is_read_like_a_doc_comment() {
+        use super::extract;
+        let src = "\
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: n <= 200,
+    ensures: ret == n + 1,
+}
+pub fn inc(n: u8) -> u8 { n + 1 }
+";
+        let specs = extract(src);
+        let c = specs.get("inc").expect("the block's contract must be attached");
+        assert_eq!(c.requires, vec!["n <= 200".to_string()]);
+        assert_eq!(c.ensures, vec!["ret == n + 1".to_string()]);
+    }
+
+    #[test]
+    fn a_one_line_spec_block_is_read() {
+        use super::extract;
+        let src = "\
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! { requires: n <= 200, ensures: ret == n + 1 }
+pub fn inc(n: u8) -> u8 { n + 1 }
+";
+        let specs = extract(src);
+        let c = specs.get("inc").expect("a one-line block must still attach");
+        assert_eq!(c.requires, vec!["n <= 200".to_string()]);
+        assert_eq!(c.ensures, vec!["ret == n + 1".to_string()]);
+    }
+
+    /// A bare `verif! { … }` is **not** a contract block, and the function must be
+    /// *refused*, not silently left unverified.
+    ///
+    /// `verif` is a plausible name for a user's own macro, and a macro this crate
+    /// did not define cannot be trusted to expand to nothing. Reading its argument
+    /// as clauses let an unrelated macro's token soup pin a precondition and
+    /// **prove** a function the user never constrained -- the false-proof direction,
+    /// measured before this test existed. Dropping the acceptance without a refusal
+    /// would be the other silent-loss shape: a function verified against `true`.
+    #[test]
+    fn a_bare_verif_block_is_refused_by_name_not_read_as_a_contract() {
+        use super::extract;
+        let src = "\
+macro_rules! verif { ($($t:tt)*) => {}; }
+
+verif! {
+    requires: n == 0,
+    ensures: ret == 0,
+}
+pub fn g(n: u8) -> u8 { n }
+";
+        let specs = extract(src);
+        let c = specs.get("g").expect("the function must be recorded so it is refused");
+        assert!(
+            c.requires.is_empty() && c.ensures.is_empty(),
+            "a `verif!` block must not attach a contract: {c:?}"
+        );
+        assert!(
+            c.unknown.iter().any(|(_, m)| m.contains("verif!")),
+            "the refusal must name `verif!` and the fix: {c:?}"
+        );
+    }
+
+    /// A *path-qualified* `verif::spec!` names this crate's macro, so it is still
+    /// read. This is the spelling a crate uses when it re-exports the macro.
+    ///
+    /// The source really does spell `verif::spec!`. An earlier version of this test
+    /// claimed the qualified spelling in its name and doc but supplied a bare
+    /// `spec!`, so it passed without ever exercising the qualified branch: a
+    /// regression that rejected `verif::spec!` would have kept it green. A test
+    /// named for a spelling has to *write* that spelling.
+    #[test]
+    fn a_path_qualified_spec_block_is_still_read() {
+        use super::extract;
+        let src = "\
+verif::spec! {
+    requires: n <= 200,
+    ensures: ret == n + 1,
+}
+pub fn inc(n: u8) -> u8 { n + 1 }
+";
+        let specs = extract(src);
+        let c = specs.get("inc").expect("a qualified `::spec!` block must attach");
+        assert_eq!(c.requires, vec!["n <= 200".to_string()]);
+        assert_eq!(c.ensures, vec!["ret == n + 1".to_string()]);
+    }
+
+    /// The edition-2018 absolute form of the same path is accepted too.
+    #[test]
+    fn an_absolute_path_qualified_spec_block_is_read() {
+        use super::extract;
+        let src = "\
+::verif::spec! {
+    requires: n <= 200,
+    ensures: ret == n + 1,
+}
+pub fn inc(n: u8) -> u8 { n + 1 }
+";
+        let specs = extract(src);
+        let c = specs
+            .get("inc")
+            .expect("an absolute `::verif::spec!` block must attach");
+        assert_eq!(c.requires, vec!["n <= 200".to_string()]);
+        assert_eq!(c.ensures, vec!["ret == n + 1".to_string()]);
+    }
+
+    /// A `*::spec!` block naming a *different* path is refused, not read.
+    ///
+    /// The frontend reads source text and cannot resolve a macro, so it cannot tell
+    /// a re-export of `verif::spec` from an unrelated macro that happens to be called
+    /// `spec`. Accepting any head ending in `::spec` read
+    /// `my_macros::spec! { requires: …, ensures: … }` as a contract -- the
+    /// false-proof shape the bare `verif!` refusal exists to close, one spelling
+    /// over. This test fails on that code: it asserted a contract *was* attached.
+    #[test]
+    fn a_foreign_spec_block_is_refused_by_name_not_read_as_a_contract() {
+        use super::extract;
+        for head in ["my_macros::spec!", "a::b::spec!", "other::verif::spec!"] {
+            let src = format!(
+                "{head} {{\n    requires: n == 0,\n    ensures: ret == 0,\n}}\n\
+                 pub fn g(n: u8) -> u8 {{ n }}\n"
+            );
+            let specs = extract(&src);
+            let c = specs
+                .get("g")
+                .unwrap_or_else(|| panic!("`{head}`: the function must be recorded so it is refused"));
+            assert!(
+                c.requires.is_empty() && c.ensures.is_empty(),
+                "`{head}` must not attach a contract, got: {c:?}"
+            );
+            assert!(
+                c.unknown.iter().any(|(_, m)| m.contains("verif::spec!")),
+                "`{head}`: the refusal must name the fix, got: {c:?}"
+            );
+        }
+    }
+
+    /// The refusal is *narrow*: a local macro named `spec` written bare, and this
+    /// crate's own qualified path, both still read. A guard that refused every
+    /// `spec!` would pass the test above and fail this one.
+    #[test]
+    fn the_foreign_spec_refusal_does_not_catch_this_crates_own_spellings() {
+        use super::extract;
+        for head in ["spec!", "verif::spec!"] {
+            let src = format!(
+                "{head} {{\n    requires: n <= 200,\n    ensures: ret == n + 1,\n}}\n\
+                 pub fn inc(n: u8) -> u8 {{ n + 1 }}\n"
+            );
+            let specs = extract(&src);
+            let c = specs
+                .get("inc")
+                .unwrap_or_else(|| panic!("`{head}` must attach a contract"));
+            assert!(
+                c.unknown.is_empty(),
+                "`{head}` must be read without a refusal, got: {c:?}"
+            );
+            assert_eq!(c.requires, vec!["n <= 200".to_string()], "`{head}`");
+        }
+    }
+
+    /// The false-proof case. Splitting the block per line read `ensures: ret ==`
+    /// and dropped the continuation, so `ret == n + 1` became the predicate `ret`,
+    /// which is a different and weaker claim. The clause has to survive whole.
+    #[test]
+    fn a_clause_body_may_span_lines() {
+        use super::extract;
+        let src = "\
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: n <= 200,
+    ensures: ret ==
+        n + 1,
+}
+pub fn inc(n: u8) -> u8 { n + 2 }
+";
+        let specs = extract(src);
+        let c = specs.get("inc").expect("a wrapped clause must attach");
+        let joined: String = c.ensures.join(" ");
+        assert!(
+            joined.replace(char::is_whitespace, "").contains("ret==n+1"),
+            "the whole clause must survive, not just its first line: {joined:?}"
+        );
+    }
+
+    /// A block that never closes is a refusal, never a partial contract. Reading
+    /// half of one would attach `requires` without its `ensures`, which verifies a
+    /// weaker claim than the author wrote.
+    #[test]
+    fn an_unterminated_spec_block_is_refused() {
+        use super::extract;
+        let src = "\
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: n <= 200,
+
+pub fn inc(n: u8) -> u8 { n + 2 }
+";
+        let specs = extract(src);
+        // Either the function carries no contract (so nothing is claimed), or the
+        // refusal is recorded. What must never happen is `requires` attaching with
+        // no `ensures`, which would be a weaker claim.
+        if let Some(c) = specs.get("inc") {
+            assert!(
+                c.ensures.is_empty() && !c.unknown.is_empty(),
+                "an unterminated block must not attach half a contract: {c:?}"
+            );
+        }
+    }
+
+    /// A comment after a clause comma must not be carried into the next clause.
+    ///
+    /// It was: the split kept the `// …` tail, so the following `ensures:` began
+    /// with `//`, `take_clause` saw no keyword, and the clause vanished. A dropped
+    /// `ensures:` is a *false proof*, not a lost one -- the function is verified
+    /// against a postcondition the author did not write (here, none at all).
+    #[test]
+    fn a_comment_after_a_clause_comma_is_not_carried_into_the_next_clause() {
+        use super::extract;
+        let src = "\
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    ensures: ret == 0, // a true clause, and a comment
+    ensures: ret == 1,
+}
+pub fn f() -> u8 { 0 }
+";
+        let specs = extract(src);
+        let c = specs.get("f").expect("contract");
+        assert_eq!(
+            c.ensures,
+            vec!["ret == 0".to_string(), "ret == 1".to_string()],
+            "both clauses must survive a comment: {c:?}"
+        );
+    }
+
+    /// A `}` inside a character literal does not close the block, and one inside a
+    /// string does not either. The per-line `split_once('}')` truncated the clause
+    /// inside the literal, so the expression was malformed and the function was
+    /// skipped -- a valid contract refused.
+    #[test]
+    fn a_brace_inside_a_literal_does_not_close_the_block() {
+        use super::extract;
+        for body in ["'}'", "'\\u{7d}'", "\"}\"", "r\"}\"", "b'}'"] {
+            let src = format!(
+                "\
+macro_rules! spec {{ ($($c:ident : $b:expr,)*) => {{}}; }}
+
+spec! {{
+    requires: true,
+    ensures: ret == {body},
+}}
+pub fn h() -> u8 {{ 0 }}
+"
+            );
+            let specs = extract(&src);
+            let c = specs
+                .get("h")
+                .unwrap_or_else(|| panic!("the block must close past {body}: {:?}", specs));
+            assert_eq!(
+                c.ensures,
+                vec![format!("ret == {body}")],
+                "the whole clause must survive a brace inside {body}: {c:?}"
+            );
+        }
+    }
+
+    /// Inside a `spec!` block an unknown keyword is a clause the author wrote, not
+    /// prose, so it is refused. `postcondition:` is far from every real keyword, so
+    /// the typo heuristic did not fire and the clause was dropped silently: with
+    /// `requires: true` and a body returning 0, `postcondition: ret == 1` reported
+    /// `Verified` against a postcondition nobody read.
+    #[test]
+    fn an_unknown_clause_keyword_in_a_block_is_refused() {
+        use super::extract;
+        let src = "\
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    postcondition: ret == 1,
+}
+pub fn g() -> u8 { 0 }
+";
+        let specs = extract(src);
+        let c = specs.get("g").expect("contract");
+        assert!(
+            !c.unknown.is_empty(),
+            "an unknown keyword in a block must be refused, not dropped: {c:?}"
+        );
+    }
+
+    /// The doc-comment path keeps its typo heuristic and is *not* strict about
+    /// prose: a `///` line is documentation first, and ordinary sentences must not
+    /// refuse a function. This is the control for the test above.
+    #[test]
+    fn a_prose_doc_comment_is_not_refused() {
+        use super::extract;
+        let src = "\
+/// direction: this sentence is prose, not a clause.
+/// requires: n <= 200
+/// ensures: ret == n
+pub fn inc(n: u8) -> u8 { n }
+";
+        let specs = extract(src);
+        let c = specs.get("inc").expect("contract");
+        assert!(
+            c.unknown.is_empty(),
+            "prose in a doc comment must not be refused: {c:?}"
+        );
+        assert_eq!(c.ensures, vec!["ret == n".to_string()]);
+    }
+
+    /// A comma inside a turbofish is not a clause separator either.
+    ///
+    /// `max::<u8, u8>(1, 2)` holds a comma that is not a clause boundary, and the
+    /// splitter counted only `()[]{}`. The clause was cut at the generic comma, so
+    /// the postcondition became `ret == core::cmp::max::<u8` -- a truncated (and
+    /// malformed) expression. A truncated `ensures` is a weaker claim, which is the
+    /// false-proof shape this reader exists to prevent.
+    #[test]
+    fn a_comma_inside_a_turbofish_does_not_split_a_clause() {
+        use super::extract;
+        let src = "\
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    ensures: ret == core::cmp::max::<u8, u8>(1, 2),
+}
+pub fn f() -> u8 { 2 }
+";
+        let specs = extract(src);
+        let c = specs.get("f").expect("contract");
+        assert_eq!(
+            c.ensures,
+            vec!["ret == core::cmp::max::<u8, u8>(1, 2)".to_string()],
+            "the turbofish comma must not split the clause: {c:?}"
+        );
+    }
+
+    /// The control for the test above: a *comparison* `<` is an operator, not a
+    /// generic opener, so a clause containing one must still split normally at its
+    /// top-level comma. A fix that counted every `<` would make `a < b` demand a
+    /// closing `>` and swallow the following clause.
+    #[test]
+    fn a_comparison_does_not_open_a_generic_list() {
+        use super::extract;
+        let src = "\
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: n < 200,
+    ensures: ret < 200,
+}
+pub fn f(n: u8) -> u8 { n }
+";
+        let specs = extract(src);
+        let c = specs.get("f").expect("contract");
+        assert_eq!(c.requires, vec!["n < 200".to_string()]);
+        assert_eq!(c.ensures, vec!["ret < 200".to_string()]);
+    }
+
+    /// A comma inside parentheses is not a clause separator: the grammar splits on
+    /// *top-level* commas only, so a call-shaped body stays one clause.
+    #[test]
+    fn a_comma_inside_parentheses_does_not_split_a_clause() {
+        use super::extract;
+        let src = "\
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: n <= 200,
+    ensures: ret == max(n, 1),
+}
+pub fn inc(n: u8) -> u8 { n + 1 }
+";
+        let specs = extract(src);
+        let c = specs.get("inc").expect("the contract must attach");
+        assert_eq!(c.ensures.len(), 1, "one clause, not two: {:?}", c.ensures);
+        assert_eq!(c.ensures[0], "ret == max(n, 1)");
+    }
+
     /// The signature reader, which is only reached for a callee outside the dump.
     ///
     /// A parameter list the reader cannot make sense of has to come back *empty*,
@@ -10849,5 +11811,109 @@ fn h<
             split_leading_attrs("#[cfg(any())] #[doc = \")\"] use a::B;"),
             ("use a::B;", true)
         );
+    }
+
+    /// A comment between two tokens separates them; deleting it joins them.
+    ///
+    /// `ret == n/**/as/**/u8` is the cast `n as u8` in Rust, because a comment is a
+    /// token separator. The block reader skipped comments whole, so the clause came
+    /// out as `ret == nasu8` -- an identifier nobody wrote. A function that also
+    /// takes an argument named `nasu8` then *verified* that postcondition, which is
+    /// the false-proof direction: the source says the result is `n as u8`, and the
+    /// tool checked it against a different variable.
+    ///
+    /// The line-comment case is pinned too, since it shares the fix, and a comment
+    /// at the *start* of a clause must not make the clause look non-empty.
+    #[test]
+    fn a_comment_separates_tokens_rather_than_joining_them() {
+        use super::split_clauses;
+        let cases = [
+            ("ensures: ret == n/**/as/**/u8", vec!["ensures: ret == n as u8"]),
+            ("ensures: ret == n/*c*/+/*c*/1", vec!["ensures: ret == n + 1"]),
+            // A line comment ends at the newline, which stays as the separator, so
+            // the clause continues on the next line instead of joining `n` to `+`.
+            (
+                "ensures: ret == n // trailing\n  + 1",
+                vec!["ensures: ret == n \n  + 1"],
+            ),
+            // Two clauses split on the comma even when a comment sits on it.
+            (
+                "requires: n/*c*/> 0, ensures: ret == n",
+                vec!["requires: n > 0", "ensures: ret == n"],
+            ),
+            // A leading comment must not make an otherwise empty clause non-empty.
+            ("/*c*/", Vec::new()),
+        ];
+        for (text, want) in cases {
+            let (got, _) = split_clauses(text, &vec![0usize; text.len()]);
+            let got: Vec<&str> = got.iter().map(|(_, t)| t.as_str()).collect();
+            assert_eq!(got, want, "clause split of {text:?}");
+        }
+    }
+
+    /// A comment *before* the colon is whitespace, and Rust's matcher allows it.
+    ///
+    /// The matcher is `$($clause:ident : $body:expr,)*`, so `requires/**/: true` is a
+    /// precondition. The separator fix turns the comment into a space, giving
+    /// `requires : true`, and `take_clause` matched the literal `requires:` -- so the
+    /// clause was refused as unknown and the function was *skipped*, a lost proof on
+    /// valid syntax. Every supported keyword is checked, because the split is shared
+    /// and a fix for one is a fix for all.
+    #[test]
+    fn a_comment_before_the_colon_does_not_drop_the_clause() {
+        use super::{extract, split_clauses};
+        for (text, want) in [
+            ("requires/**/: true", "requires : true"),
+            ("ensures/**/: ret == n", "ensures : ret == n"),
+            ("invariant/**/: i <= n", "invariant : i <= n"),
+            ("decreases/**/: n", "decreases : n"),
+            ("variant/**/: n - i", "variant : n - i"),
+            ("unwind/**/: 4", "unwind : 4"),
+        ] {
+            let (got, _) = split_clauses(text, &vec![0usize; text.len()]);
+            assert_eq!(got.first().map(|(_, t)| t.as_str()), Some(want), "split of {text:?}");
+        }
+        // End to end: a block whose clauses carry a comment before the colon is read,
+        // not refused. A `spec!` block with an unknown clause would be reported, so
+        // the absence of `unknown` is the evidence the keywords were recognised.
+        let src = "spec! {\n    requires/**/: n > 0,\n    ensures/**/: ret == n,\n}\npub fn f(n: u8) -> u8 { n }\n";
+        let specs = extract(src);
+        let c = specs.by_fn.get("f").expect("f must carry a contract");
+        assert!(c.unknown.is_empty(), "no clause should be unknown: {:?}", c.unknown);
+        assert_eq!(c.requires, vec!["n > 0".to_string()]);
+        assert_eq!(c.ensures, vec!["ret == n".to_string()]);
+        // The loop clauses take the same path, and each has its own arm in
+        // `take_clause`; a fix that split only the first four would leave a loop
+        // contract dropped. `unwind` parses its body as an integer, so a comment
+        // before its colon also exercises the split-then-parse order.
+        let loop_src = "spec! {\n    invariant/**/: i <= n,\n    variant/**/: n - i,\n    unwind/**/: 4,\n}\npub fn g(n: u8) -> u8 { let mut i = 0u8; while i < n { i += 1; } i }\n";
+        let lspecs = extract(loop_src);
+        let lc = lspecs.by_fn.get("g").expect("g must carry a contract");
+        assert!(lc.unknown.is_empty(), "no loop clause should be unknown: {:?}", lc.unknown);
+        assert_eq!(lc.invariants, vec!["i <= n".to_string()]);
+        assert_eq!(lc.variant, Some("n - i".to_string()));
+        assert_eq!(lc.unwind, Some(4));
+    }
+
+    /// A non-ASCII identifier is read as the character that was written.
+    ///
+    /// `split_clauses` walks bytes, and `byte as char` reads one byte as Latin-1, so
+    /// `µ` (0xC2 0xB5) became `Âµ` -- a *different* identifier. A contract naming `µ`
+    /// was therefore checked against a variable nobody declared, and a function with
+    /// an argument of the mangled spelling verified it. Rust accepts non-ASCII
+    /// identifiers, so this is a shape a real crate can write.
+    #[test]
+    fn a_non_ascii_identifier_is_not_mangled() {
+        use super::split_clauses;
+        for (text, want) in [
+            ("ensures: ret == µ", "ensures: ret == µ"),
+            ("requires: 日本 > 0", "requires: 日本 > 0"),
+            // A multi-byte character next to a comment and a comma: the separator
+            // fix and the decode must not interfere.
+            ("requires: µ/*c*/> 0, ensures: ret == µ", "requires: µ > 0"),
+        ] {
+            let (got, _) = split_clauses(text, &vec![0usize; text.len()]);
+            assert_eq!(got.first().map(|(_, t)| t.as_str()), Some(want), "clause of {text:?}");
+        }
     }
 }

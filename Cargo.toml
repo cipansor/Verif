@@ -12,7 +12,7 @@ resolver = "2"
 
 [package]
 name = "verif"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "In-code formal verification for Rust: an embedded bit-blasting SMT decision procedure, a symbolic DSL, contracts and a machine-checked proof kernel. SPARK-inspired, no_std, no external dependencies."
@@ -47,7 +47,7 @@ exclude = ["*.rlib", "target/", ".sweep/", ".openhands/"]
 # path-only dependency makes the manifest unpackagable ("all dependencies must have a
 # version requirement specified when packaging"). It is a semver *requirement*, not an
 # equality: the two crates version independently, so a `verif` patch that needs no
-# sibling change keeps the requirement here (e.g. `0.1.1` still requires `^0.1.0`).
+# sibling change keeps the requirement here (e.g. `0.2.0` still requires `^0.1.0`).
 # Raise it only when `verif` starts using something the sibling does not have yet.
 verif-arithmetic = { path = "verif-arithmetic", version = "0.1.0" }
 

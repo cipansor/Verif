@@ -144,13 +144,13 @@
 //! | Module | What it is |
 //! |---|---|
 //! | [`smtscript`] | SMT-LIB2 export, so an independent solver can decide the same condition. |
-//! | [`macros`] | `verify!`, `verify_implies!`, `contract!`, `proof!`, `assert_proof!`, `check!`, `verify_exhaustive!`. |
+//! | [`macros`] | `spec!` (in-code contracts), `verify!`, `verify_implies!`, `contract!`, `proof!`, `assert_proof!`, `check!`, `verify_exhaustive!`. |
 //!
 //! ## Verifying real Rust (`std` only)
 //!
 //! | Module | What it is |
 //! |---|---|
-//! | `mir` | Verify **real Rust**: read `rustc`'s own MIR, symbolically execute it, and discharge rustc's overflow, underflow and division-by-zero asserts plus `/// requires:` / `/// ensures:` doc-comment contracts. |
+//! | `mir` | Verify **real Rust**: read `rustc`'s own MIR, symbolically execute it, and discharge rustc's overflow, underflow and division-by-zero asserts plus contracts written as an in-code `spec! { … }` block. |
 //!
 //! The `mir` frontend is the only module that needs a compiler at run time, so it
 //! is behind the `std` feature. Its page appears in this documentation only when
@@ -240,5 +240,7 @@ pub mod prelude {
     };
 
     // Macros live at the crate root; re-export them so `use prelude::*` is enough.
-    pub use crate::{assert_proof, check, contract, proof, verify, verify_exhaustive, verify_implies};
+    pub use crate::{
+        assert_proof, check, contract, proof, spec, verify, verify_exhaustive, verify_implies,
+    };
 }

@@ -125,14 +125,24 @@ you.
 
 ```toml
 [dependencies]
-verif = "0.1"
+verif = "0.2"
 
 # The host-side tools (the MIR frontend, the file-backed helpers) need `std`.
 # The engine itself does not: the default build is `no_std` and links `core`
 # and nothing else, which is what a bare-metal safety build wants.
 [dev-dependencies]
-verif = { version = "0.1", features = ["std"] }
+verif = { version = "0.2", features = ["std"] }
 ```
+
+> **Which version is on crates.io.** The published line is **0.1.x**; `0.2.0` is
+> the release this tree prepares and is not yet uploaded, so a reader copying the
+> block above today should use `verif = "0.1"` until 0.2.0 appears on the
+> [crates.io page](https://crates.io/crates/verif). The `0.2` requirement is
+> deliberate here rather than a stale one: the in-code `spec!` spelling, the
+> `verif!` refusal and the doc-comment migration are all in this tree and not in
+> 0.1.x, so pinning the README to `0.1` would document a crate that does not have
+> the feature the page is about. `tests/readme.rs` pins the `"0.2"` spelling, so
+> this note and that test move together when 0.2.0 ships.
 
 There is nothing else to add: `verif`'s only dependency is `verif-arithmetic`,
 which is itself `no_std` and dependency-free, so the artifact's crates.io supply
@@ -199,8 +209,8 @@ specification surface, the complete-by-enumeration half, and interop.
 | `exhaustive` | Complete proofs by enumeration over `u8`/`u16` |
 | `primitives` | The symbolic oracle for the `safe_*` ops and `Bounded` (the runtime half is `arith`) |
 | `arith` (sibling crate) | `verif-arithmetic`, re-exported: total integer ops and a refinement-typed `Bounded<MIN, MAX>`, each proved by enumeration |
-| `macros` | `verify!`, `verify_implies!`, `contract!`, `proof!`, `assert_proof!`, `check!`, `verify_exhaustive!` |
-| `mir` (`std` only) | verify **real Rust**: read `rustc`'s own MIR, symbolically execute it, discharge rustc's overflow/underflow/div-by-zero asserts and doc-comment contracts |
+| `macros` | `spec!` (in-code contracts), `verify!`, `verify_implies!`, `contract!`, `proof!`, `assert_proof!`, `check!`, `verify_exhaustive!` |
+| `mir` (`std` only) | verify **real Rust**: read `rustc`'s own MIR, symbolically execute it, discharge rustc's overflow/underflow/div-by-zero asserts and contracts (`spec!` blocks or `///` clauses) |
 
 The proved runtime primitives live in the sibling crate and are re-exported as
 `verif::arith`, so a caller never has to name the workspace layout. `arith` is
@@ -1399,7 +1409,7 @@ variable with no source name (a temporary, a promoted constant) keeps its
 `v{index}:u{width}` spelling, so naming is a readability improvement and never a
 loss.
 
-### Contracts are doc comments, and that is forced
+### Contracts: one spelling, in the code it describes
 
 The obvious syntax is an attribute:
 
@@ -1408,29 +1418,109 @@ The obvious syntax is an attribute:
 pub fn clamp(x: u32, lo: u32, hi: u32) -> u32 { … }
 ```
 
-That cannot be done here. An unknown attribute on a function is not Rust; it needs
-a proc-macro to consume it, and a proc-macro is a dependency, which would break the
-zero-dependency gate that `scripts/gate.sh` enforces. So contracts live in doc
-comments, which `rustc` accepts and the frontend reads out of the source:
+That one still cannot be done. An unknown attribute on a function is not Rust; it
+needs a proc-macro to consume it, and a proc-macro is a dependency, which would
+break the zero-dependency gate that `scripts/gate.sh` enforces. So the contract is
+a `spec!` block: a declarative macro that expands to nothing, placed directly
+above the item it describes.
 
 ```rust,ignore
-/// requires: lo <= hi
-/// ensures: lo <= ret
-/// ensures: ret <= hi
+use verif::spec;
+
+spec! {
+    requires: lo <= hi,
+    ensures: lo <= ret,
+    ensures: ret <= hi,
+}
 pub fn clamp(x: u32, lo: u32, hi: u32) -> u32 {
     if x < lo { lo } else if x > hi { hi } else { x }
 }
 ```
 
-A loop is proved by an `invariant:` line rather than by unwinding. It is the
+The specification and the code are one artifact: the same file is compiled,
+executed and verified. There is no separate model to transcribe and no second file
+to keep in step, which is the whole reason a proof here is about the program you
+actually run. The macro expands to nothing, so it costs a deployed artifact zero
+bytes and leaves no symbol behind.
+
+The matcher is structured (`$clause:ident : $body:expr`), not a token soup, so
+`rustc` parses each clause body as a real Rust expression: `requires: n <=,` is a
+compile error *at the contract line*, and a misspelled `ensures` cannot silently
+drop an obligation — the identifier is a token the macro matches, not prose it
+ignores. It needs `use verif::spec;` to resolve, so `verif` must be an ordinary
+dependency and the build script must tell the frontend where to find it; the
+"Shape A" section below has the full recipe. A macro that expands to nothing is a
+claim about the artifact, not about the verification, so `tools/build-verify/run.sh`
+(gate 18) checks both the true and the false direction for this spelling.
+
+**The doc-comment spelling still parses, and the corpus still exercises it.**
+`/// requires:` / `/// ensures:` feed the *same* clause parser, so the two spellings
+cannot disagree about what a clause means. It survives for two reasons: a source
+that must not import `verif` at all (a corpus file a reviewer wants to paste into a
+plain crate), and a `format!`-style fixture whose braces are placeholders. Every
+example and every corpus file in this repository uses `spec!`; the doc-comment form
+appears only where importing `verif` is the thing being avoided, and in the tests
+whose subject *is* that reader.
+
+#### What "fused with the code" looks like
+
+The point of one spelling is that there is no second artifact. This is a whole
+module — the code, its specification and its loop induction argument in the same
+file, compiled by the same `rustc` and verified by the same build:
+
+```rust,ignore
+use verif::spec;
+
+spec! {
+    requires: total <= 10_000,
+    requires: step >= 1 && step <= 1000,
+    invariant: total <= 10_000,
+    variant: 10_000 - total,
+    ensures: ret <= 10_000,
+}
+pub fn accumulate(total: u32, step: u32) -> u32 {
+    let mut total = total;
+    while total < 10_000 {
+        let next = total + step;
+        total = if next > 10_000 { 10_000 } else { next };
+    }
+    total
+}
+```
+
+There is no `accumulate.spec` beside it, no model to re-state, no generated proof
+script to regenerate. The `invariant:` and `variant:` lines are the induction
+argument, sitting next to the `while` they justify; delete the loop and the
+clauses stop describing anything, which the verifier reports rather than ignores.
+When a clause is wrong the build fails naming the obligation and a witness, the
+same way a type error does — the specification is a checked part of the program,
+not a comment about it.
+
+This example is the one in the README, and it is not decorative: it was run
+through `mir_coverage` while it was written. Two earlier drafts were *refuted* —
+the first because `total` was unconstrained at entry (the invariant does not hold
+for `u32::MAX`), the second because `saturating_add` clamps at `u32::MAX` and not
+at `10_000`, so the invariant was not preserved. The version above reports
+`verified`, 7 obligations discharged and 1 panic ruled out. A specification fused
+with the code is only worth having if the tool will tell you when it is wrong,
+which is exactly what those two refutations were.
+
+The same holds for a shape the verifier cannot decide yet: it reports the
+function as `Incomplete` with the reason, rather than quietly proving something
+weaker. A specification that is *fused* with the code is only useful if the tool
+is honest about the part it did not check.
+
+A loop is proved by an `invariant:` clause rather than by unwinding. It is the
 induction hypothesis: true on entry to the loop head, and left true by one
 iteration. Naming it is what makes a loop with a symbolic trip count decidable
 instead of cut off at an unwind bound:
 
 ```rust,ignore
-/// requires: n <= 8
-/// invariant: i <= n && s == i
-/// ensures: ret <= 8
+spec! {
+    requires: n <= 8,
+    invariant: i <= n && s == i,
+    ensures: ret <= 8,
+}
 pub fn sum_to(n: u8) -> u8 {
     let mut s = 0u8;
     let mut i = 0u8;
@@ -1453,9 +1543,11 @@ which a loop that never stops satisfies vacuously. A `variant:` line names the
 quantity the loop counts down, and turns that into *total* correctness:
 
 ```rust,ignore
-/// invariant: i <= n
-/// variant: n - i
-/// ensures: ret == n
+spec! {
+    invariant: i <= n,
+    variant: n - i,
+    ensures: ret == n,
+}
 pub fn count_to(n: u8) -> u8 {
     let mut i = 0u8;
     while i < n { i += 1; }
@@ -1492,9 +1584,11 @@ then answered by the function's own contract instead of being inlined:
   hypothesis.
 
 ```rust,ignore
-/// requires: true
-/// decreases: n
-/// ensures: ret == n
+spec! {
+    requires: true,
+    decreases: n,
+    ensures: ret == n,
+}
 pub fn count_down(n: u8) -> u8 {
     if n == 0 { 0 } else { count_down(n - 1) + 1 }
 }
@@ -1517,14 +1611,18 @@ return, by the same syntax the Rust body uses:
 ```rust,ignore
 struct Bounds { lo: u8, hi: u8 }
 
-/// requires: b.lo <= b.hi
-/// ensures: ret >= b.lo && ret <= b.hi
+spec! {
+    requires: b.lo <= b.hi,
+    ensures: ret >= b.lo && ret <= b.hi,
+}
 pub fn clamp_bounds(b: &Bounds, v: u8) -> u8 {
     if v < b.lo { b.lo } else if v > b.hi { b.hi } else { v }
 }
 
-/// requires: a <= b
-/// ensures: ret.0 <= a
+spec! {
+    requires: a <= b,
+    ensures: ret.0 <= a,
+}
 pub fn split(a: u8, b: u8) -> (u8, u8) {
     if a <= b { (a, b) } else { (b, a) }
 }
@@ -1551,8 +1649,10 @@ function would verify against a weaker contract than the source states.
 A slice argument is named by its length and by its elements:
 
 ```rust,ignore
-/// requires: xs.len() > 0
-/// ensures: ret == xs[0]
+spec! {
+    requires: xs.len() > 0,
+    ensures: ret == xs[0],
+}
 pub fn first_of(xs: &[u8]) -> u8 {
     xs[0]
 }
@@ -1570,8 +1670,10 @@ refused rather than resolved to an arbitrary element.
 A fixed-size array is named the same way, but its length is not an input:
 
 ```rust,ignore
-/// requires: a[0] <= a[1]
-/// ensures: ret == a[1]
+spec! {
+    requires: a[0] <= a[1],
+    ensures: ret == a[1],
+}
 pub fn max_of_pair(a: [u8; 4]) -> u8 {
     if a[0] > a[1] { a[0] } else { a[1] }
 }
@@ -1589,8 +1691,10 @@ A literal in a contract takes its width from the operand it meets, not from the
 widest name in scope:
 
 ```rust,ignore
-/// requires: true
-/// ensures: ret <= 255
+spec! {
+    requires: true,
+    ensures: ret <= 255,
+}
 pub fn idx(a: [u8; 4]) -> u8 { a[0] }
 ```
 
@@ -1783,8 +1887,10 @@ bounds and slice checks `rustc` inserts all lower the same way: a call into
 arm**, because the call never returns.
 
 ```rust,ignore
-/// requires: x <= 200
-/// ensures: ret == 1
+spec! {
+    requires: x <= 200,
+    ensures: ret == 1,
+}
 pub fn f(x: u8) -> u8 { assert!(x <= 200); 1 }
 ```
 
@@ -1893,6 +1999,21 @@ VERIF_EDITION=2021 VERIF_RUSTC="$(rustup which rustc)" \
 A program calls the frontend directly through `MirOptions { edition: Some(..) }`,
 which takes precedence over both; the environment variable is for the examples and
 the tests, which have no options struct to fill in.
+
+**One boundary on the probe tools.** `mir_coverage` (and the other single-file
+examples) runs `rustc` on one file with no Cargo graph behind it, so a source that
+opens with `use verif::spec;` needs an `--extern` entry the example does not supply.
+The corpora in this repository avoid that with a local no-op shim
+(`macro_rules! spec { … }`, one line at the top of the file), which is why
+`mir_coverage` decides them. A file you write for a real crate should import the
+macro instead, and then it is the **build script** route that reads it — `build.rs`
+locates the rlib it is already linked against with
+`verify::extern_options_with` and passes the options to `verify_file_with_opts`,
+which is the recipe in "The same function, two ways" above. If you do want
+`mir_coverage` on a `use verif::spec;` file, add the shim or call the frontend from
+a program that fills `MirOptions.externs` — the example deliberately does not guess
+an rlib path, because a guessed one is either the wrong compiler's or the wrong
+features' and surfaces as a compiler error about a program that is fine.
 
 The five differential oracles (z3, Kani, Lean, Coq, Verus) all build their terms
 with `smt::` calls, so they start *below* the contract reader. That left the reader
@@ -3072,6 +3193,70 @@ fn main() {
 }
 ```
 
+That is the whole recipe when the contracts are `///` doc comments. A source file that
+wants to *name* `verif` — an in-code contract block, `use verif::spec;` — needs one more
+step, because the frontend runs `rustc` on a single file with no Cargo graph behind it, so
+without an `--extern` entry the import is `E0432: unresolved import`. `extern_options`
+supplies it, and the crate must then also be an ordinary dependency (the macro is real
+code the crate's own compilation needs):
+
+```toml
+[dependencies]
+verif = { version = "0.2", features = ["std"] }
+
+[build-dependencies]
+verif = { version = "0.2", features = ["std"] }
+```
+
+```rust,ignore
+// build.rs — the extern-aware form
+fn main() {
+    println!("cargo:rerun-if-changed=src/lib.rs");
+    // One compiler for both steps. `extern_options_with` returns the rlib *this*
+    // compiler accepts, so passing the same name to the emitter cannot disagree.
+    // Cargo sets `RUSTC` for a build script to the compiler that produced the
+    // build-dependency rlibs, which is the one that can read them back.
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let opts = verif::mir::verify::extern_options_with(&rustc, "verif").unwrap_or_default();
+    let report = verif::mir::verify::verify_file_with_opts(
+        &rustc, "src/lib.rs".as_ref(), &[], &opts,
+    )
+    .expect("the MIR frontend could not read the source");
+    // A report with no outcomes verified nothing, and a loop over an empty list
+    // would pass silently. Demand at least one obligation was discharged.
+    assert!(
+        !report.outcomes.is_empty(),
+        "verif: no contract was found in src/lib.rs, so nothing was verified"
+    );
+    for (name, outcome) in &report.outcomes {
+        assert!(outcome.is_verified(), "verif: {name} is not verified: {outcome}");
+    }
+}
+```
+
+**The lookup and the MIR emission must name the same compiler.** An rlib's metadata is
+compiler-specific: a candidate the *producing* compiler accepts is not thereby readable by
+a *different* one, so probing with one toolchain and emitting with another fails `E0514`
+even when both are installed and each has its own artifact. That is why the recipe above
+resolves one `rustc` and passes it to both calls. The convenience form `extern_options`
+(no compiler argument) reads `VERIF_RUSTC`, which is what the emitter uses, so it is
+consistent only when `VERIF_RUSTC` is also the compiler that built the rlib — true for the
+common `cargo build` with no override, and the reason the explicit form exists for every
+other case. Because that reasoning is easy to get wrong, it is also *checked*:
+`extern_options_with` records the compiler it probed with in `MirOptions::probed_with`,
+and `verify_file_with_opts` refuses to emit with a different one, naming both and the fix
+rather than leaving a `E0514`/`E0432` about a program that is fine. Hand-built
+`MirOptions` (where the caller names a prebuilt rlib) are not checked, since only the
+caller knows which compiler built it.
+
+`extern_options` does not guess: a crate that is both a dependency and a build dependency
+has *two* rlibs of one name, and a stale one from another compiler is `E0514`. So each
+candidate is handed to `rustc` on a one-line probe and the first that compiles is returned;
+`None` means nothing compiled, and `unwrap_or_default()` then yields the plain recipe
+above, which is a *skipped* extern rather than a wrong one. The zero-cost property is
+unchanged — the macro expands to nothing, so the artifact carries no prover symbol either
+way (gate 18 measures this).
+
 A build script is a *separate compilation unit*: cargo compiles it for the host, runs it,
 and throws it away. So the decision procedure — the whole BDD blasting and CDCL fallback —
 is never linked into the crate's own artifact. That is not an optimisation, it is a
@@ -3092,7 +3277,12 @@ it creates and removes. It is a gate rather than a paragraph because "zero cost"
 asserted: the script requires a good contract to build *and* the verifier to report
 `verified` (a build script that silently did nothing would otherwise pass), a broken
 contract to fail the build on its named obligation, and the resulting rlib to carry no
-prover symbols.
+prover symbols. It runs those checks for **both spellings** -- a `///` contract and an
+in-code `spec! { … }` block -- because the in-code path is a different compilation (the
+source names `verif` in a `use`), and a macro that expands to nothing is a claim about that
+artifact, not the doc-comment one. The in-code half also requires a *false* contract to fail
+the build: a scanner that read `requires:` and silently dropped `ensures:` would otherwise
+pass the true-contract check while proving nothing.
 
 ### Shape B — verify on the target (the prover in the artifact)
 
@@ -3109,22 +3299,27 @@ binary size and in the time the proofs take when they run.
 ### The same function, two ways
 
 One function, one contract; the difference is only *when* the obligation is discharged.
-The contract is written once, as a doc comment, and read by the MIR frontend:
+The contract is written once, in a `spec!` block in the same file, and read by the MIR
+frontend:
 
 ```rust
-// The function under verification. The contract is a doc comment, because a MIR
-// dump carries no attributes.
-/// requires: n <= 1_000_000
-/// ensures: ret <= 100
+// The function under verification, with its contract fused into the file. The
+// `spec!` block expands to nothing, so this compiles as ordinary Rust too.
+use verif::spec;
+
+spec! {
+    requires: n <= 1_000_000,
+    ensures: ret <= 100,
+}
 pub fn clamp100(n: u32) -> u32 {
     if n > 100 { 100 } else { n }
 }
 ```
 
-The contract is a doc comment rather than an attribute for a reason the
-[contracts-are-doc-comments](#contracts-are-doc-comments-and-that-is-forced) section
-gives: rustc's MIR dump carries no attributes, so the frontend reads the contract
-from the *source text* and the body from MIR.
+The contract is read from the *source text*, not from an attribute, for the reason the
+[contracts](#contracts-one-spelling-in-the-code-it-describes) section gives: rustc's MIR
+dump carries no attributes, so the frontend reads the contract from the source and the
+body from MIR.
 
 **Verified at build time** — nothing about the function changes; the proof lives in
 `build.rs` and runs while the crate is compiled. A false contract stops the build, and the
@@ -3132,15 +3327,40 @@ shipped binary contains none of the prover:
 
 ```rust,ignore
 // build.rs — the verifier, as a build script
+use std::path::Path;
+
 fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
-    let report = verif::mir::verify::verify_file_with("rustc", "src/lib.rs".as_ref(), &[])
-        .expect("the MIR frontend could not read the source");
+    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
+    // The frontend runs `rustc` on one file with no Cargo graph behind it, so the
+    // source's own `use verif::spec;` needs an `--extern` entry. This locates the
+    // rlib the build script is already linked against, and the search paths its
+    // dependencies live on, so `verif` and `verif-arithmetic` both resolve.
+    let opts = verif::mir::verify::extern_options_with(&rustc, "verif").unwrap_or_default();
+    let report = verif::mir::verify::verify_file_with_opts(
+        &rustc,
+        Path::new("src/lib.rs"),
+        &[],
+        &opts,
+    )
+    .expect("the MIR frontend could not read the source");
+    // A report with no outcomes is a build that verified nothing, and a loop over
+    // an empty list would pass silently -- the "harness that cannot fail" this
+    // repository treats as a defect. Demand at least one obligation was discharged.
+    assert!(
+        !report.outcomes.is_empty(),
+        "verif: no contract was found in src/lib.rs, so nothing was verified"
+    );
     for (name, outcome) in &report.outcomes {
         assert!(outcome.is_verified(), "verif: {name} is not verified: {outcome}");
     }
 }
 ```
+
+`extern_options` is the `VERIF_RUSTC`-aware form of the same call; use
+`extern_options_with` when the script resolves its own compiler, so the lookup and the
+emission name one toolchain (an rlib's metadata is compiler-specific, and probing with one
+compiler then emitting with another is an `E0514` against a program that is fine).
 
 **Verified on the target** — the same bound is discharged by the engine compiled into the
 binary, at the moment the function runs. The engine is `no_std`, so this compiles for bare

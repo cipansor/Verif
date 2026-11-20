@@ -1058,7 +1058,10 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     what makes the published crate sound rather than merely buildable. The
     dependency snippets are pinned by `readme_install_uses_the_published_crate`
     in `tests/readme.rs`, so a regression back to a git source is a failing test
-    rather than silent drift.
+    rather than silent drift. (The current release is `verif` `0.2.0`, the minor
+    bump that adds the in-code `spec!` macro, and the README snippet follows it
+    at `verif = "0.2"`; `verif-arithmetic` stays at `0.1.0` because it did not
+    change.)
   - Exit: `cargo add verif` works. ✅
   - Move: **build**.
 - **U2. `cargo verif`.** · P1 · todo · Kani (`cargo kani`)
@@ -1110,6 +1113,47 @@ Exit: one real `no_std` crate with a dependency verified end to end with
 - **U8. A public scoreboard.** · P1 · todo · Kani
   - Exit: `everyday.rs`, an SV-COMP-style set, and `verify-rust-std` functions
     scored for verif **and** Kani on the same inputs, updated by CI.
+  - Move: **build**.
+- **U9. Contracts written in the code, not only in doc comments.** · P1 · done · —
+  - Gap: a `///` clause is unchecked prose. A typo in a *keyword* is now refused
+    (`ensuers:` is caught), but a typo in the *body* is a string the frontend
+    parses leniently, and a contract above a struct could leak (fixed, but by a
+    reset rather than by the syntax). A doc comment also cannot be reached by any
+    of `rustc`'s own checks.
+  - Fix: the `spec! { … }` macro, whose matcher is `$($clause:ident : $body:expr,)*`.
+    `rustc` parses each body as a real expression, so `requires: n <=,` is
+    `error: expected expression` at the contract line; the macro expands to
+    nothing, so the artifact carries no byte and no symbol of it (measured: 4 660 B
+    rlib, 0 `verif` symbols). Both spellings feed one clause parser, so they cannot
+    disagree about what a clause means. A source that says `use verif::spec;` needs
+    the frontend's `rustc` run to be told where the crate is, which is
+    `mir::verify::extern_options` (it probes candidates and returns the first that
+    compiles, so a stale rlib from another compiler is skipped rather than guessed).
+  - Exit: an in-code block verifies at build time, a false one fails the build, a
+    malformed clause is a compile error, and the artifact carries no prover symbol.
+    ✅ Gate 18 check 4 (`tools/build-verify/run.sh`); pinned by
+    `an_in_code_contract_can_name_verif_through_an_extern` (both directions: no
+    extern is `E0432`, with one it verifies) and
+    `an_unresolvable_import_names_the_missing_extern`.
+  - Corpus migrated (0.2.0). Every example and corpus file now uses `spec!`:
+    `actuator.rs`, `everyday.rs`, `realistic.rs`, the `comparison/` fixtures and
+    the inline sources in `tests/mir.rs`. The migration was checked by comparing
+    the *verdict table* before and after (`mir_coverage` on each file, diffed row
+    by row) rather than by reading: `everyday.rs` 24 rows and `realistic.rs` 1151
+    rows came out byte-identical, and the comparison fixtures kept their six
+    claims. The doc-comment form survives only where importing `verif` is the thing
+    being avoided and in the tests whose *subject* is that reader
+    (`scanner_reads_contracts_and_ignores_inner_docs` and its siblings), plus
+    `format!`-template fixtures whose braces are placeholders.
+  - Migration found one real defect: `assert_not_dropped` tested `src.contains("///")`
+    to decide whether a source had a contract, so a `spec!`-only source looked
+    contract-free and a dropped function passed the guard. It now matches the
+    clause keywords both spellings carry.
+  - What remains: the macro is **not** a proc-macro, so it cannot resolve `ret` or
+    check that a clause names a real argument — the frontend does that, and a name
+    it cannot resolve is a `Skipped` function, not a compile error. Making it a
+    proc-macro would need a dependency, which the crate does not take. Recorded,
+    not planned.
   - Move: **build**.
 
 ---

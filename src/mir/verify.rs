@@ -87,6 +87,322 @@ pub struct MirOptions {
     /// first, then `VERIF_EDITION`. A file with neither is an *error*, never a
     /// silent default -- see [`resolve_edition`].
     pub edition: Option<Edition>,
+    /// Crates to make resolvable when `rustc` compiles the file, as
+    /// `(crate name, rlib path)` pairs.
+    ///
+    /// This is what lets a source file *name* `verif` -- `use verif::spec;` above
+    /// an in-code contract block -- compile at all. The frontend runs `rustc` on a
+    /// single file with no Cargo graph behind it, so without an `--extern` entry
+    /// every `use verif::…` is `E0432: unresolved import`.
+    ///
+    /// The paths are the caller's to find: a `build.rs` locates the rlib it is
+    /// already linked against ([`extern_options`] does that), and a test passes a
+    /// known artifact. The frontend deliberately does not guess a path, because a
+    /// guessed rlib is either the wrong compiler's or the wrong features', and
+    /// both surface as a compiler error about a program that is fine.
+    pub externs: Vec<(String, PathBuf)>,
+    /// Extra `-L dependency=` directories `rustc` searches when resolving an
+    /// extern's own dependencies.
+    ///
+    /// An `--extern` names one crate; that crate's *transitive* dependencies are
+    /// found only through a search path. `verif` depends on `verif-arithmetic`, so
+    /// naming `verif` without a search path for `verif-arithmetic` resolves the
+    /// outer crate and then fails on the inner one -- an error naming a crate the
+    /// caller never mentioned. [`extern_options`] fills this in.
+    pub search_paths: Vec<PathBuf>,
+    /// The compiler the externs were *probed* with, when they came from
+    /// [`extern_options`] or [`extern_options_with`].
+    ///
+    /// An rlib's metadata is compiler-specific, so the probe's answer is only about
+    /// *that* compiler: a candidate it accepts is not thereby readable by another.
+    /// Probing with one toolchain and emitting MIR with another therefore fails
+    /// `E0514` -- or worse, silently drops the extern and reports `E0432` for a crate
+    /// that is perfectly usable. Recording the probe compiler lets
+    /// [`verify_file_with_opts`] refuse the mismatch and name both, rather than
+    /// leaving it to a compiler error about a program that is fine.
+    ///
+    /// `None` means "the caller supplied these by hand", which is not checked: a
+    /// hand-built [`MirOptions`] may legitimately name a prebuilt rlib.
+    pub probed_with: Option<String>,
+}
+
+/// Everything a build script needs to let its own source name a crate: the
+/// `--extern` entry for `verif`, and the search paths its dependencies live on.
+///
+/// A `build.rs` is compiled against its `[build-dependencies]`, and Cargo lays those
+/// artifacts out under the `build` directory above `$OUT_DIR`. This finds
+/// `lib<name>-<hash>.rlib` there and returns it together with the directories the
+/// crate's own dependencies live in, so [`MirOptions`] can name `verif` *and*
+/// resolve `verif-arithmetic` through it.
+///
+/// **Two rlibs for one crate name is normal, not an error.** Cargo builds a crate
+/// once per unit, so a crate that is both a `[dependencies]` and a
+/// `[build-dependencies]` entry (which is what the zero-cost recipe is) has two
+/// rlibs of the same name. They are interchangeable for the one job this needs --
+/// resolving the crate name so `use verif::spec;` parses -- but they are not
+/// interchangeable across *toolchains*, so the choice is **verified rather than
+/// guessed**: each candidate in turn is handed to `rustc` on a one-line probe, and
+/// the first that compiles is the one returned. A stale rlib from another compiler
+/// fails the probe (`E0514`) and the next candidate is tried. `None` means no
+/// candidate compiled, which the caller turns into a skipped verification rather
+/// than a wrong one.
+///
+/// The typical `build.rs`:
+///
+/// ```ignore
+/// let opts = verif::mir::verify::extern_options("verif").unwrap_or_default();
+/// let report = verif::mir::verify::verify_file_with_opts("rustc", Path::new("src/lib.rs"), &[], &opts)?;
+/// ```
+#[cfg(feature = "std")]
+pub fn extern_options(name: &str) -> Option<MirOptions> {
+    // The probe must use the compiler that will *consume* the rlib, which is the
+    // MIR emitter -- so this resolves the same way [`verify_file_opts`] does. A
+    // rlib's metadata is compiler-specific: an rlib the producing compiler accepts
+    // is not thereby acceptable to a different one, so probing with any compiler
+    // but the emitter only proves the wrong thing. When the emitter names another
+    // toolchain, a candidate it cannot read fails the probe (`E0514`) and the next
+    // is tried; `None` then means "no rlib this emitter can read", which is the
+    // honest answer. A caller whose emitter is not `VERIF_RUSTC` must use
+    // [`extern_options_with`] so lookup and emission name one compiler.
+    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
+    extern_options_with(&rustc, name)
+}
+
+/// [`extern_options`] with the compiler named explicitly.
+///
+/// The rlib returned is the one **this** compiler accepts, so the caller must pass
+/// the same compiler to [`verify_file_with_opts`]/[`emit_mir_with_opts`]. Use this
+/// when the emitter is chosen by the caller rather than by `VERIF_RUSTC` -- a test
+/// that pins a specific toolchain, or a build script that resolved its own
+/// `rustc`. Mixing the two (probe with one compiler, emit with another) is the
+/// `E0514` failure this parameter exists to prevent.
+#[cfg(feature = "std")]
+pub fn extern_options_with(rustc: &str, name: &str) -> Option<MirOptions> {
+    let roots = build_script_roots()?;
+    let prefix = format!("lib{}-", name.replace('-', "_"));
+    let mut found: Vec<PathBuf> = Vec::new();
+    for root in &roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let Some(f) = p.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if f.starts_with(&prefix) && f.ends_with(".rlib") {
+                found.push(p);
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    // Newest first, so a stale artifact from an earlier build is tried last.
+    found.sort_by_key(|p| {
+        std::cmp::Reverse(
+            std::fs::metadata(p).and_then(|m| m.modified()).ok(),
+        )
+    });
+    let search: Vec<PathBuf> = roots;
+    // One identity for the whole loop: `canonical_compiler` runs `rustc -vV`, and the
+    // probing compiler does not change between candidates.
+    let probed_with = Some(canonical_compiler(rustc));
+    for cand in found {
+        let mut opts = MirOptions {
+            externs: vec![(name.to_string(), cand.clone())],
+            search_paths: search.clone(),
+            probed_with: probed_with.clone(),
+            ..MirOptions::default()
+        };
+        opts.search_paths.retain(|r| r.is_dir());
+        if extern_compiles(rustc, &opts) {
+            return Some(opts);
+        }
+    }
+    None
+}
+
+/// A compiler *identity*, so two spellings of one compiler compare equal.
+///
+/// A path cannot answer this. `rustc` on `PATH` is usually a rustup **shim** -- a
+/// symlink to `rustup` itself, which dispatches to a toolchain at run time -- so
+/// `~/.cargo/bin/rustc` and
+/// `~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc` are the same
+/// compiler under two paths, and `std::fs::canonicalize` reports them as different
+/// (it follows the symlink to `rustup`, not the toolchain `rustup` would dispatch
+/// to). What decides whether an rlib's metadata is readable is the compiler's own
+/// account of which build it is: `-vV`'s `commit-hash` and `host`. Two spellings of
+/// one toolchain agree on both; two toolchains cannot.
+///
+/// A binary that cannot answer `-vV` falls back to its canonical path, which is the
+/// best identity available and still separates two files.
+fn canonical_compiler(p: &str) -> String {
+    commit_identity(p).unwrap_or_else(|| {
+        std::fs::canonicalize(p)
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| p.to_string())
+    })
+}
+
+/// `commit-hash/host` from `rustc -vV`, when the binary answers.
+///
+/// `commit-hash` names the build and `host` the target its metadata is written for,
+/// and both are read rather than the version banner: `1.100.0` names a release while
+/// the commit names a build, and metadata compatibility follows the build.
+fn commit_identity(p: &str) -> Option<String> {
+    let out = Command::new(p).arg("-vV").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut commit = None;
+    let mut host = None;
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("commit-hash: ") {
+            commit = Some(v.trim());
+        } else if let Some(v) = line.strip_prefix("host: ") {
+            host = Some(v.trim());
+        }
+    }
+    Some(format!("{}/{}", commit?, host?))
+}
+
+/// Refuse to emit with a compiler other than the one the externs were probed with.
+///
+/// The probe's answer is about the probing compiler only, so a mismatch is not a
+/// weaker proof -- it is `E0514` on a usable crate, or a dropped extern and `E0432`.
+/// The error names both compilers and the fix, because the alternative is a reader
+/// debugging a compiler message about a program that is fine.
+fn check_probe_compiler(rustc: &str, opts: &MirOptions) -> Result<(), String> {
+    let Some(probed) = opts.probed_with.as_deref() else {
+        return Ok(());
+    };
+    let emitting = canonical_compiler(rustc);
+    if emitting == probed {
+        return Ok(());
+    }
+    Err(format!(
+        "the externs were probed with `{probed}` but MIR would be emitted with `{emitting}`: \
+         an rlib's metadata is compiler-specific, so probe and emit must name one compiler \
+         -- pass the same `rustc` to `extern_options_with` and `verify_file_with_opts`"
+    ))
+}
+
+/// Does `rustc` accept this extern? A one-line probe compiled to metadata: cheap,
+/// toolchain-accurate, and the only way to tell a current rlib from a stale one
+/// without parsing rustc's metadata format.
+#[cfg(feature = "std")]
+fn extern_compiles(rustc: &str, opts: &MirOptions) -> bool {
+    let Some((name, _)) = opts.externs.first() else {
+        return false;
+    };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-extern-probe-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let src = dir.join("probe.rs");
+    // `extern crate` rather than `use`, so this works on every edition and does not
+    // depend on the crate exporting any particular path.
+    let body = format!("#![allow(unused_extern_crates)]\nextern crate {name};\n");
+    if std::fs::write(&src, body).is_err() {
+        return false;
+    }
+    let mut cmd = Command::new(rustc);
+    cmd.arg("--edition=2021")
+        .arg("--crate-type=lib")
+        .arg("--emit=metadata")
+        .arg("-o")
+        .arg(dir.join("probe.rmeta"));
+    for (n, p) in &opts.externs {
+        cmd.arg("--extern").arg(format!("{}={}", n, p.display()));
+    }
+    for d in &opts.search_paths {
+        cmd.arg("-L").arg(format!("dependency={}", d.display()));
+    }
+    let ok = cmd.arg(&src).output().map(|o| o.status.success()).unwrap_or(false);
+    let _ = std::fs::remove_dir_all(&dir);
+    ok
+}
+
+/// The directories a build script's dependency artifacts live in.
+///
+/// `$OUT_DIR` is `<target>/<profile>/build/<pkg>/<hash>/out` -- but the number of
+/// components between `build` and `out` is Cargo's business, not ours, so this
+/// walks up to the directory *named* `build` rather than counting levels. The
+/// artifacts then sit in `<profile>/deps` and in every `<profile>/build/<dep>/*/out`
+/// beside it. A depth-based walk broke the first time Cargo nested a package
+/// directory under `build/`, which is why this one is structural.
+///
+/// **Under cross-compilation the profile directory in `OUT_DIR` is the wrong one.**
+/// `OUT_DIR` belongs to the package being built, so for `--target <triple>` it sits
+/// under `target/<triple>/<profile>/`, while a *build dependency* is compiled for the
+/// **host** and lands in `target/<profile>/`. The frontend's `rustc` runs on the
+/// host too, so only the host artifact can pass its probe -- searching the target
+/// directory finds rlibs for the wrong machine, every candidate fails, and
+/// `extern_options` returns `None` even though the usable rlib exists. So when
+/// `HOST != TARGET` the host profile directory is added, derived from the target
+/// profile directory by replacing the triple component. The target directory is kept
+/// as well: it costs one failed probe and it is what a non-cross build uses.
+#[cfg(feature = "std")]
+fn build_script_roots() -> Option<Vec<PathBuf>> {
+    let out = PathBuf::from(std::env::var("OUT_DIR").ok()?);
+    let host = std::env::var("HOST").ok();
+    let target = std::env::var("TARGET").ok();
+    build_script_roots_from(&out, host.as_deref(), target.as_deref())
+}
+
+/// The pure core of [`build_script_roots`]: no environment, no globals.
+///
+/// Split out so the cross-compilation layout can be tested by passing paths and
+/// names directly. The first version of the test set `OUT_DIR`/`HOST`/`TARGET` with
+/// `std::env::set_var`, which needs an `unsafe` block on edition 2024 -- and gate 17
+/// pins the number of `unsafe` blocks in `src/`, so a test must not need one. Making
+/// the logic a function of its inputs is the fix that keeps the surface at two.
+fn build_script_roots_from(
+    out: &std::path::Path,
+    host: Option<&str>,
+    target: Option<&str>,
+) -> Option<Vec<PathBuf>> {
+    let build_dir = out.ancestors().find(|a| a.file_name().is_some_and(|n| n == "build"))?;
+    let profile = build_dir.parent()?;
+    let mut roots = vec![profile.join("deps")];
+    collect_outs(build_dir, &mut roots);
+    // `target/<triple>/<profile>` -> `target/<profile>`, but only when the triple
+    // component is really there (a host build has `target/<profile>` already).
+    if let (Some(h), Some(t)) = (host, target) {
+        if h != t {
+            if let (Some(triple_dir), Some(root)) =
+                (profile.parent(), profile.parent().and_then(|p| p.parent()))
+            {
+                if triple_dir.file_name().is_some_and(|n| n == t) {
+                    if let Some(name) = profile.file_name() {
+                        let host_profile = root.join(name);
+                        roots.push(host_profile.join("deps"));
+                        collect_outs(&host_profile.join("build"), &mut roots);
+                    }
+                }
+            }
+        }
+    }
+    roots.retain(|r| r.is_dir());
+    if roots.is_empty() {
+        None
+    } else {
+        Some(roots)
+    }
+}
+
+/// Add every `<build>/<dep>/<hash>/out` directory under `build_dir` to `roots`.
+fn collect_outs(build_dir: &std::path::Path, roots: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(build_dir) {
+        for e in entries.flatten() {
+            if let Ok(inner) = std::fs::read_dir(e.path()) {
+                for i in inner.flatten() {
+                    roots.push(i.path().join("out"));
+                }
+            }
+        }
+    }
 }
 
 /// Resolve the edition to compile `file` under: explicit first, then
@@ -397,12 +713,24 @@ pub fn emit_mir_with_opts(
         seq,
         file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
     ));
-    let out = Command::new(rustc)
-        .arg(format!("--edition={}", edition.as_str()))
+    let mut cmd = Command::new(rustc);
+    cmd.arg(format!("--edition={}", edition.as_str()))
         .arg("--crate-type=lib")
         .arg("--emit=mir")
         .arg("-o")
-        .arg(&out_path)
+        .arg(&out_path);
+    // An `--extern name=path` makes the crate nameable; the crate's own
+    // dependencies are found through `-L dependency=` search paths, which the
+    // caller supplies because only it knows where the artifacts live. Without the
+    // search path the extern resolves and its *dependency* does not, and the error
+    // names the inner crate rather than the one the caller asked for.
+    for (name, path) in &opts.externs {
+        cmd.arg("--extern").arg(format!("{}={}", name, path.display()));
+    }
+    for dir in &opts.search_paths {
+        cmd.arg("-L").arg(format!("dependency={}", dir.display()));
+    }
+    let out = cmd
         .arg(file)
         .envs(bootstrap_env(file))
         .output()
@@ -1147,6 +1475,7 @@ pub fn verify_file_with_opts(
     only: &[String],
     opts: &MirOptions,
 ) -> Result<FileReport, String> {
+    check_probe_compiler(rustc, opts)?;
     let text = std::fs::read_to_string(source)
         .map_err(|e| format!("could not read {}: {e}", source.display()))?;
     let specs = spec::extract(&text);
@@ -1559,5 +1888,350 @@ mod edition_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&root);
+    }
+    /// `extern_options` names the crate *and* the search path its dependencies live
+    /// on, because an `--extern` alone resolves the outer crate and then fails on its
+    /// transitive dependency. An artifact that no build produced is a refusal rather
+    /// than a guessed path -- the guess would surface as a compiler error about
+    /// correct code, the confusing direction.
+    #[test]
+    fn extern_options_refuses_when_the_artifact_is_absent() {
+        // A crate name that no build ever produced has no rlib to find, so the
+        // answer is a refusal rather than a guessed path. (This deliberately does
+        // not mutate `OUT_DIR`: `set_var` is unsafe in edition 2024 and mutating the
+        // environment under a parallel test harness is a data race.)
+        assert!(
+            extern_options("a-crate-that-no-build-ever-produced").is_none(),
+            "an absent artifact must be refused, never guessed"
+        );
+    }
+
+    /// Under cross-compilation the *host* profile directory is the one that holds a
+    /// usable build dependency, and the search must reach it.
+    ///
+    /// `$OUT_DIR` belongs to the package being built, so for `--target <triple>` it
+    /// sits under `target/<triple>/<profile>/`, while a build dependency is compiled
+    /// for the host and lands in `target/<profile>/`. Before the fix the host
+    /// directory was never searched: every candidate was a target rlib, every probe
+    /// failed, and `extern_options` returned `None` though the usable rlib existed.
+    ///
+    /// The test drives the *pure* core with explicit paths and names, so it needs no
+    /// `std::env::set_var` and therefore no `unsafe` block -- gate 17 pins that
+    /// surface at two, and a test is not allowed to raise it.
+    #[test]
+    fn a_cross_build_searches_the_host_profile_directory() {
+        let root = std::env::temp_dir().join(format!("verif-cross-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let triple = "thumbv7em-none-eabihf";
+        // target/<triple>/debug/build/pkg/hash/out  (the package being built)
+        let out = root.join(triple).join("debug").join("build").join("pkg").join("hash").join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        // target/debug/deps  (where the host build dependency lives)
+        let host_deps = root.join("debug").join("deps");
+        std::fs::create_dir_all(&host_deps).unwrap();
+        // target/<triple>/debug/deps  (the target artifact, unusable by a host probe)
+        let target_deps = root.join(triple).join("debug").join("deps");
+        std::fs::create_dir_all(&target_deps).unwrap();
+
+        let roots = build_script_roots_from(&out, Some("x86_64-unknown-linux-gnu"), Some(triple))
+            .expect("a build directory exists");
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            roots.contains(&host_deps),
+            "the host profile's deps directory must be searched under cross-compilation: {roots:?}"
+        );
+        assert!(
+            roots.contains(&target_deps),
+            "the target profile directory is still searched (a non-cross build uses it): {roots:?}"
+        );
+    }
+
+    /// A *host* build (`HOST == TARGET`) does not add a phantom directory, and the
+    /// profile directory it already has is the one it searches. This is the control
+    /// for the test above: a fix that always appended a "host" root would pass the
+    /// cross case and pollute every ordinary build.
+    #[test]
+    fn a_host_build_searches_only_its_own_profile_directory() {
+        let root = std::env::temp_dir().join(format!("verif-host-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let out = root.join("debug").join("build").join("pkg").join("hash").join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let deps = root.join("debug").join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+
+        let roots = build_script_roots_from(&out, Some("x86_64-unknown-linux-gnu"), Some("x86_64-unknown-linux-gnu"))
+            .expect("a build directory exists");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let deps_roots: Vec<_> = roots.iter().filter(|r| r.ends_with("deps")).collect();
+        assert_eq!(
+            deps_roots,
+            vec![&deps],
+            "a host build searches exactly one deps directory -- its own: {roots:?}"
+        );
+    }
+
+    /// The extern plumbing reaches `rustc`: a file that imports a crate the frontend
+    /// was not told about fails with `E0432`, and the same file with the crate passed
+    /// as an extern compiles. This is the failure the `externs` field exists to fix,
+    /// and it is pinned here because a silent `--extern` that never reaches the
+    /// command line would otherwise look identical to one that works.
+    #[test]
+    fn an_unresolvable_import_names_the_missing_extern() {
+        let dir = std::env::temp_dir().join(format!("verif-extern-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("m.rs");
+        std::fs::write(
+            &src,
+            "use some_crate_nobody_linked::thing;\npub fn f() -> u8 { thing() }\n",
+        )
+        .unwrap();
+        let opts = MirOptions { edition: Some(Edition::Rust2021), ..MirOptions::default() };
+        let err = emit_mir_with_opts("rustc", &src, &opts).expect_err("an unknown crate cannot resolve");
+        assert!(
+            err.contains("E0432") || err.contains("unresolved import"),
+            "the refusal must name the unresolved import, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+}
+
+/// The extern probe must be run by the compiler that will *consume* the rlib.
+///
+/// A rlib carries compiler-specific metadata, so an rlib one toolchain produced is
+/// not thereby readable by another. This pins the consequence the API is built on:
+/// [`extern_compiles`] answers about *that* compiler, so a caller that probes with
+/// one toolchain and emits MIR with another has proved the wrong thing. It also
+/// pins the positive half -- the same rlib is accepted by its own compiler -- so the
+/// test cannot pass by refusing everything.
+#[cfg(all(test, feature = "std"))]
+mod extern_probe_tests {
+    use super::*;
+
+    /// The *path* and the *identity* of a toolchain's `rustc`, when it is installed.
+    ///
+    /// The two are deliberately returned together, because they are not
+    /// interchangeable: `canonical_compiler` yields an identity (`commit-hash/host`),
+    /// which is what the probe guard compares, but it is **not** an executable --
+    /// `Command::new` on it fails. A test that used the identity as the program
+    /// would skip itself at the first spawn and report `ok` having tested nothing,
+    /// which is the defect this helper exists to make impossible to write by accident.
+    fn have(toolchain: &str) -> Option<(String, String)> {
+        let out = Command::new("rustup")
+            .args(["which", "--toolchain", toolchain, "rustc"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        if path.is_empty() {
+            return None;
+        }
+        let id = canonical_compiler(&path);
+        Some((path, id))
+    }
+
+    /// The path `rustc` on `PATH` actually runs, and that path's identity.
+    ///
+    /// `rustup which rustc` (no `--toolchain`) resolves the *active* toolchain, which
+    /// is the one a bare `rustc` dispatches to -- including a directory override. Using
+    /// `--toolchain stable` here would be wrong under an override: the bare name would
+    /// then name a different build than the one asked about.
+    fn active() -> Option<(String, String)> {
+        let out = Command::new("rustup").args(["which", "rustc"]).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        if path.is_empty() {
+            return None;
+        }
+        let id = canonical_compiler(&path);
+        Some((path, id))
+    }
+
+    #[test]
+    fn the_probe_answers_for_the_compiler_that_will_read_the_rlib() {
+        // The compiler that built this test binary's `verif` rlib. The *path* is what
+        // gets spawned; the identity is only ever compared.
+        let producer_path = std::env::var("RUSTC")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "rustc".into());
+        let producer = canonical_compiler(&producer_path);
+        // A *different* toolchain, if one is installed. Without one there is nothing
+        // to compare against, and the test says so rather than passing vacuously.
+        let other = ["1.85", "nightly", "stable"]
+            .into_iter()
+            .filter_map(have)
+            .find(|(_, id)| *id != producer);
+        let Some((other_path, other_id)) = other else {
+            eprintln!(
+                "skipped: no second toolchain installed, so there is no cross-compiler \
+                 case to test (producer identity {producer})"
+            );
+            return;
+        };
+
+        // Build a tiny rlib with `producer`, then ask both compilers to read it.
+        let dir = std::env::temp_dir().join(format!(
+            "verif-extern-cross-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("lib.rs");
+        std::fs::write(&src, "pub fn seven() -> u8 { 7 }\n").unwrap();
+        let rlib = dir.join("libprobe_crate.rlib");
+        let built = Command::new(&producer_path)
+            .args(["--crate-type=lib", "--crate-name", "probe_crate", "-o"])
+            .arg(&rlib)
+            .arg(&src)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !built {
+            let _ = std::fs::remove_dir_all(&dir);
+            panic!(
+                "the producing compiler ({producer_path}, identity {producer}) must be able \
+                 to build a trivial rlib; without it there is nothing to probe"
+            );
+        }
+
+        let opts = MirOptions {
+            externs: vec![("probe_crate".into(), rlib.clone())],
+            ..MirOptions::default()
+        };
+        // The producing compiler reads its own rlib. `extern_compiles` *spawns* the
+        // compiler, so it takes the path -- passing the identity here would fail to
+        // spawn and read as "rejected", which is why the two are kept apart.
+        assert!(
+            extern_compiles(&producer_path, &opts),
+            "the compiler that built the rlib must accept it ({producer_path}, {producer})"
+        );
+        // A different toolchain must not -- and that is exactly why the probe and
+        // the emitter have to name one compiler. The identities are asserted apart
+        // first, so a wrong `other` (the same build under another spelling) cannot
+        // make the negative assertion below pass for the wrong reason.
+        assert_ne!(producer, other_id, "the cross toolchain must be a different build");
+        assert!(
+            !extern_compiles(&other_path, &opts),
+            "a different toolchain ({other_path}, {other_id}) must not accept an rlib \
+             built by {producer_path} ({producer})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A probed-extern set may only be used by the compiler that probed it.
+    ///
+    /// This is the invariant the whole `extern_options_with` signature exists for, so
+    /// it is checked rather than documented: a mismatch is refused with both compilers
+    /// named. The `None` case (hand-built options) is *not* refused -- a caller may
+    /// legitimately point at a prebuilt rlib -- so the guard cannot pass by refusing
+    /// everything.
+    #[test]
+    fn a_probed_extern_set_is_refused_by_a_different_compiler() {
+        let dir = std::env::temp_dir().join(format!("verif-probe-guard-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("lib.rs");
+        std::fs::write(&src, "pub fn one() -> u8 { 1 }\n").unwrap();
+
+        // Hand-built options are not checked: `probed_with` is `None`.
+        let hand_built = MirOptions { edition: Some(Edition::Rust2021), ..MirOptions::default() };
+        assert!(
+            check_probe_compiler("rustc", &hand_built).is_ok(),
+            "a hand-built option set names its own rlib and must not be refused"
+        );
+
+        // A probed set records its compiler and refuses any other. `check_probe_compiler`
+        // canonicalises whatever it is given, so it must be handed an *executable path*
+        // here: an identity is not a program, and passing one would exercise the
+        // fallback that returns the string unchanged rather than a second compiler.
+        let probed = MirOptions {
+            edition: Some(Edition::Rust2021),
+            probed_with: Some(canonical_compiler("rustc")),
+            ..MirOptions::default()
+        };
+        assert!(
+            check_probe_compiler("rustc", &probed).is_ok(),
+            "the probing compiler must be accepted"
+        );
+        let active_id = canonical_compiler("rustc");
+        if let Some((other_path, other_id)) = ["1.85", "nightly", "stable"]
+            .into_iter()
+            .filter_map(have)
+            .find(|(_, id)| *id != active_id)
+        {
+            let err = check_probe_compiler(&other_path, &probed)
+                .expect_err("a different compiler must be refused");
+            // The error names the *identity* of the emitting compiler, which is what the
+            // guard compares; asserting on the identity is what proves the second
+            // toolchain was actually identified rather than failing to spawn.
+            assert!(
+                err.contains(&other_id),
+                "the error must name the emitting compiler's identity {other_id}: {err}"
+            );
+            assert_ne!(active_id, other_id, "the two must be different builds");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bare name and the absolute path naming the same compiler are one identity.
+    ///
+    /// This is the whole point of [`canonical_compiler`], and it is easy to get wrong.
+    /// `rustc` on `PATH` is the rustup *shim*, a different file from the toolchain
+    /// binary, so neither `fs::canonicalize` nor a `PATH` search equates them -- only
+    /// the compiler's own `-vV` does. The previous version of the guard test could not
+    /// see that: it canonicalised *both* operands with the same helper, so a helper
+    /// that returned its input unchanged still compared equal. This test compares a
+    /// bare name against an absolute path obtained independently, from `rustup which`.
+    ///
+    /// The absolute path is the **active** toolchain's, resolved by `rustup which rustc`
+    /// with no `--toolchain`, not `stable`'s: a bare `rustc` dispatches to whatever the
+    /// override selects, so asking for `stable` explicitly would compare two different
+    /// builds whenever a directory override points elsewhere, and fail while the
+    /// identification was correct.
+    #[test]
+    fn a_bare_compiler_name_and_its_absolute_path_are_one_identity() {
+        let Some((abs, abs_id)) = active() else {
+            eprintln!("skipped: no rustup, so there is no shim/path pair to compare");
+            return;
+        };
+        let bare = canonical_compiler("rustc");
+        assert_eq!(
+            bare, abs_id,
+            "a bare `rustc` (the rustup shim) and `rustup which`'s path ({abs}) name one \
+             compiler and must canonicalise to one identity; got {bare:?} vs {abs_id:?}"
+        );
+        // The property the guard depends on: a probed set built from the absolute path
+        // accepts the bare name rather than refusing it as a second toolchain.
+        let probed = MirOptions {
+            probed_with: Some(canonical_compiler(&abs)),
+            ..MirOptions::default()
+        };
+        assert!(
+            check_probe_compiler("rustc", &probed).is_ok(),
+            "a bare name naming the probed compiler must not be refused"
+        );
+    }
+
+    /// Two different toolchains are two identities.
+    ///
+    /// The guard is only useful if it can tell them apart, so the identity is not
+    /// "some string that two binaries might share". `1.85` and stable are different
+    /// builds and must differ.
+    #[test]
+    fn two_toolchains_are_two_identities() {
+        let (Some((a_path, a)), Some((b_path, b))) = (have("stable"), have("1.85")) else {
+            eprintln!("skipped: stable and 1.85 must both be installed to compare them");
+            return;
+        };
+        assert_ne!(
+            a, b,
+            "stable ({a_path}) and 1.85 ({b_path}) are different builds and must not \
+             share an identity"
+        );
     }
 }

@@ -436,21 +436,12 @@ fn degenerate() -> Vec<(String, String)> {
     vec![
         (
             "sat_add".to_string(),
-            "/// requires: true\n\
-             /// ensures: ret >= a\n\
-             /// ensures: ret >= b\n\
-             /// ensures: a <= 65535u16 - b || ret == 65535u16\n\
-             /// ensures: a > 65535u16 - b || ret == a + b\n\
-             pub fn sat_add(a: u16, b: u16) -> u16 { 65535u16 }\n"
+            "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: ret >= a,\n    ensures: ret >= b,\n    ensures: a <= 65535u16 - b || ret == 65535u16,\n    ensures: a > 65535u16 - b || ret == a + b,\n}\npub fn sat_add(a: u16, b: u16) -> u16 { 65535u16 }\n"
                 .to_string(),
         ),
         (
             "clamp".to_string(),
-            "/// requires: lo <= hi\n\
-             /// ensures: !(x < lo) || ret == lo\n\
-             /// ensures: !(lo <= x && x > hi) || ret == hi\n\
-             /// ensures: !(lo <= x && x <= hi) || ret == x\n\
-             pub fn clamp(x: u16, lo: u16, hi: u16) -> u16 { lo }\n"
+            "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: lo <= hi,\n    ensures: !(x < lo) || ret == lo,\n    ensures: !(lo <= x && x > hi) || ret == hi,\n    ensures: !(lo <= x && x <= hi) || ret == x,\n}\npub fn clamp(x: u16, lo: u16, hi: u16) -> u16 { lo }\n"
                 .to_string(),
         ),
     ]

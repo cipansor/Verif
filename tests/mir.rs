@@ -1008,7 +1008,7 @@ fn an_unreadable_ensures_is_reported_not_ignored() {
     let src = dir.join("u.rs");
     std::fs::write(
         &src,
-        "/// requires: true\n/// ensures: ret == nonsense_name\npub fn f(a: u8) -> u8 { a }\n",
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: ret == nonsense_name,\n}\npub fn f(a: u8) -> u8 { a }\n",
     )
     .expect("write source");
     let report =
@@ -1238,7 +1238,7 @@ fn every_edition_compiles_the_corpus_to_the_same_verdicts() {
         [Edition::Rust2015, Edition::Rust2018, Edition::Rust2021, Edition::Rust2024];
     let mut baseline: Option<Vec<(String, String)>> = None;
     for ed in editions {
-        let opts = verify::MirOptions { edition: Some(ed) };
+        let opts = verify::MirOptions { edition: Some(ed), ..Default::default() };
         let report = verify::verify_file_with_opts(&rustc, std::path::Path::new(TARGET), &[], &opts)
             .unwrap_or_else(|e| panic!("frontend failed under {}: {e}", ed.as_str()));
         // The verdict *shape*, so a `Failed { kind }` change is caught too, not
@@ -1275,9 +1275,7 @@ fn every_edition_compiles_the_corpus_to_the_same_verdicts() {
 fn a_2021_only_file_is_verified_under_its_own_edition() {
     use verify::Edition;
     let Some(rustc) = rustc() else { return };
-    let src = "extern \"C\" {\n    fn abs(x: i32) -> i32;\n}\n\
-               /// ensures: ret == x\n\
-               pub fn f(x: u8) -> u8 { x }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nextern \"C\" {\n    fn abs(x: i32) -> i32;\n}\nspec! {\n    ensures: ret == x,\n}\npub fn f(x: u8) -> u8 { x }\n";
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("verif-edition-{}-{seq}", std::process::id()));
@@ -1285,7 +1283,7 @@ fn a_2021_only_file_is_verified_under_its_own_edition() {
     let file = dir.join("probe.rs");
     std::fs::write(&file, src).expect("write probe");
 
-    let opts21 = verify::MirOptions { edition: Some(Edition::Rust2021) };
+    let opts21 = verify::MirOptions { edition: Some(Edition::Rust2021), ..Default::default() };
     let report = verify::verify_file_with_opts(&rustc, &file, &[], &opts21)
         .expect("a 2021 file with `extern \"C\"` must compile under 2021");
     let o = report.outcomes.iter().find(|(n, _)| n == "f").map(|(_, o)| o.clone());
@@ -1296,7 +1294,7 @@ fn a_2021_only_file_is_verified_under_its_own_edition() {
 
     // The same bytes under 2024 are a rustc error, so the frontend reports it
     // rather than a verdict. That is the evidence the edition is *used*.
-    let opts24 = verify::MirOptions { edition: Some(Edition::Rust2024) };
+    let opts24 = verify::MirOptions { edition: Some(Edition::Rust2024), ..Default::default() };
     assert!(
         verify::verify_file_with_opts(&rustc, &file, &[], &opts24).is_err(),
         "the 2021-only file must be refused under 2024, not silently compiled"
@@ -1334,11 +1332,11 @@ fn a_package_that_omits_an_edition_is_verified_as_2015() {
     )
     .expect("write manifest");
     let file = dir.join("probe.rs");
-    std::fs::write(&file, "/// ensures: ret == x\npub fn f(x: u8) -> u8 { x }\n")
+    std::fs::write(&file, "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    ensures: ret == x,\n}\npub fn f(x: u8) -> u8 { x }\n")
         .expect("write probe");
 
     // No explicit edition: the manifest supplies it. A refusal here is the bug.
-    let opts = verify::MirOptions { edition: None };
+    let opts = verify::MirOptions { edition: None, ..Default::default() };
     let (text, edition) = verify::emit_mir_with_opts(&rustc, &file, &opts)
         .expect("a package without an `edition` must resolve to Cargo's 2015 default");
     assert_eq!(edition, verify::Edition::Rust2015, "the default edition is 2015");
@@ -1355,10 +1353,7 @@ fn a_package_that_omits_an_edition_is_verified_as_2015() {
 /// `diverges`, which is the honest label.
 #[test]
 fn a_non_panicking_diverging_call_is_not_labelled_a_panic() {
-    let src = "pub fn die() -> ! { loop {} }\n\
-               /// requires: true\n\
-               /// ensures: ret == 1\n\
-               pub fn f(x: u8) -> u8 { if x == 0 { die(); } 1 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub fn die() -> ! { loop {} }\nspec! {\n    requires: true,\n    ensures: ret == 1,\n}\npub fn f(x: u8) -> u8 { if x == 0 { die(); } 1 }\n";
     let Some(o) = verify_src("f", src) else { return };
     match o {
         FnOutcome::Failed { kind, .. } => {
@@ -1381,8 +1376,7 @@ fn a_non_panicking_diverging_call_is_not_labelled_a_panic() {
 /// to `diverges`. An `assert!` is a panic, and the report says so.
 #[test]
 fn a_panicking_diverging_call_is_labelled_a_panic() {
-    let src = "/// ensures: ret == 1\n\
-               pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"boom\"); } 1 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    ensures: ret == 1,\n}\npub fn f(x: u8) -> u8 { if x == 0 { panic!(\"boom\"); } 1 }\n";
     let Some(o) = verify_src("f", src) else { return };
     match o {
         FnOutcome::Failed { kind, .. } => assert!(
@@ -2184,7 +2178,8 @@ fn a_local_trait_named_from_does_not_answer_the_std_trait() {
 ///   fix cannot pass by refusing every range call.
 #[test]
 fn a_user_type_named_range_is_not_answered_by_the_range_model() {
-    let spoof = r#"
+    let spoof = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub mod a {
     pub trait Custom {
         fn into_iter(self) -> Self
@@ -2211,8 +2206,10 @@ pub struct Range<T> {
 }
 impl a::Custom for Range<u8> {}
 
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn caller() -> u8 {
     let r = Range { start: 1u8, end: 2u8 };
     let x = <Range<u8> as a::Custom>::into_iter(r);
@@ -2232,9 +2229,12 @@ pub fn caller() -> u8 {
     );
 
     // The positive control: the standard library's own `for` loop is still modelled.
-    let real = r#"
-/// requires: true
-/// ensures: ret == 3
+    let real = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 pub fn sums() -> u32 {
     let mut c = 0u32;
     for i in 1u32..=2u32 {
@@ -2256,7 +2256,8 @@ pub fn sums() -> u32 {
     // *proved* `ret == 1` for a caller whose real result is `42` -- a false proof,
     // pre-existing and independent of the range model. The call is refused now, so
     // the soundness property is "never `verified`".
-    let self_receiver = r#"
+    let self_receiver = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 #[derive(Clone, Copy)]
 pub struct P {
     pub v: u8,
@@ -2279,8 +2280,10 @@ impl T for P {
     }
 }
 
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn caller() -> u8 {
     let p = P { v: 1 };
     let q = <P as T>::go(p);
@@ -2372,20 +2375,25 @@ fn an_unrelated_same_named_trait_does_not_answer_a_bare_call() {
 /// trait, which hides the bare spelling.
 #[test]
 fn a_local_impl_of_an_imported_trait_does_not_answer_the_model() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct Local;
 impl From<Local> for u16 {
     fn from(_x: Local) -> Self {
         107
     }
 }
-/// requires: true
-/// ensures: ret == 107
+spec! {
+    requires: true,
+    ensures: ret == 107,
+}
 pub fn imported_from_verifies_from_the_local_body() -> u16 {
     <u16 as From<Local>>::from(Local)
 }
-/// requires: true
-/// ensures: ret == 7
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 pub fn imported_from_is_not_the_model_tripwire() -> u16 {
     <u16 as From<Local>>::from(Local)
 }
@@ -2419,20 +2427,27 @@ pub fn imported_from_is_not_the_model_tripwire() -> u16 {
 /// overrides the method.
 #[test]
 fn an_override_wins_over_the_traits_default_body() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub trait T { fn value(&self) -> u8 { 1 } }
 pub struct Foo(pub u8);
 impl T for Foo { fn value(&self) -> u8 { 2 } }
 pub struct Bar(pub u8);
 impl T for Bar {}
-/// requires: true
-/// ensures: ret == 2
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
 pub fn override_verifies(f: &Foo) -> u8 { <Foo as T>::value(f) }
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn override_is_not_the_default_tripwire(f: &Foo) -> u8 { <Foo as T>::value(f) }
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn default_still_used_when_not_overridden(b: &Bar) -> u8 { <Bar as T>::value(b) }
 "#;
     let Some(o) = verify_src("override_verifies", src) else { return };
@@ -2456,17 +2471,24 @@ pub fn default_still_used_when_not_overridden(b: &Bar) -> u8 { <Bar as T>::value
 /// `<u16 as From<Local>>::from(...)` must reach its body (`107`).
 #[test]
 fn a_generic_traits_arguments_separate_its_impls() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct Local;
 impl From<Local> for u16 { fn from(_: Local) -> Self { 107 } }
-/// requires: true
-/// ensures: ret == 7
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 pub fn library_call_is_seven() -> u16 { <u16 as From<u8>>::from(7u8) }
-/// requires: true
-/// ensures: ret == 107
+spec! {
+    requires: true,
+    ensures: ret == 107,
+}
 pub fn library_call_is_not_the_local_body_tripwire() -> u16 { <u16 as From<u8>>::from(7u8) }
-/// requires: true
-/// ensures: ret == 107
+spec! {
+    requires: true,
+    ensures: ret == 107,
+}
 pub fn local_call_is_onehundredseven() -> u16 { <u16 as From<Local>>::from(Local) }
 "#;
     let Some(o) = verify_src("library_call_is_seven", src) else { return };
@@ -2489,15 +2511,18 @@ pub fn local_call_is_onehundredseven() -> u16 { <u16 as From<Local>>::from(Local
 /// must hold after a nested module, whose scope used to reset the parent's imports.
 #[test]
 fn an_imported_trait_keeps_its_imported_path() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct Local;
 pub mod m {
     use std::convert::From;
     pub mod nested {}
     impl From<crate::Local> for u16 { fn from(_: crate::Local) -> Self { 107 } }
 }
-/// requires: true
-/// ensures: ret == 107
+spec! {
+    requires: true,
+    ensures: ret == 107,
+}
 pub fn imported_trait_after_nested_module() -> u16 {
     <u16 as std::convert::From<crate::Local>>::from(crate::Local)
 }
@@ -2514,7 +2539,8 @@ pub fn imported_trait_after_nested_module() -> u16 {
 /// matched -- a lost proof.
 #[test]
 fn a_multiline_restricted_import_is_read() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct Local;
 pub mod m {
     pub(crate) use std::convert::{
@@ -2522,8 +2548,10 @@ pub mod m {
     };
     impl From<crate::Local> for u16 { fn from(_: crate::Local) -> Self { 107 } }
 }
-/// requires: true
-/// ensures: ret == 107
+spec! {
+    requires: true,
+    ensures: ret == 107,
+}
 pub fn multiline_imported_trait() -> u16 {
     <u16 as std::convert::From<crate::Local>>::from(crate::Local)
 }
@@ -2544,15 +2572,20 @@ pub fn multiline_imported_trait() -> u16 {
 /// or refused would not refute it.
 #[test]
 fn a_nested_trait_argument_keeps_its_balanced_spelling() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub trait Wrap<T> { fn get(&self) -> u8; }
 pub struct W;
 impl Wrap<Option<u8>> for W { fn get(&self) -> u8 { 9 } }
-/// requires: true
-/// ensures: ret == 9
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 pub fn nested_arg(w: &W) -> u8 { <W as Wrap<Option<u8>>>::get(w) }
-/// requires: true
-/// ensures: ret == 4
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
 pub fn nested_arg_tripwire(w: &W) -> u8 { <W as Wrap<Option<u8>>>::get(w) }
 "#;
     let Some(o) = verify_src("nested_arg", src) else { return };
@@ -2576,7 +2609,8 @@ pub fn nested_arg_tripwire(w: &W) -> u8 { <W as Wrap<Option<u8>>>::get(w) }
 /// the attribute hides the `use` keyword from the scanner there.
 #[test]
 fn a_cfg_disabled_import_does_not_displace_a_live_alias() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub trait From { fn make() -> u8 { 0 } }
 pub mod m {
     use std::convert::From as Conv;
@@ -2586,11 +2620,15 @@ pub mod m {
     use crate::Other as Conv;
 }
 pub struct Other;
-/// requires: true
-/// ensures: ret == 107
+spec! {
+    requires: true,
+    ensures: ret == 107,
+}
 pub fn cfg_live() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
-/// requires: true
-/// ensures: ret == 5
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 pub fn cfg_tripwire() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
 "#;
     let Some(o) = verify_src("cfg_live", src) else { return };
@@ -2613,14 +2651,17 @@ pub fn cfg_tripwire() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Lo
 /// still reach the impl's body.
 #[test]
 fn a_same_line_cfg_import_is_read() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub mod m {
     #[cfg(all())] use std::convert::From as Conv;
     pub struct Local;
     impl Conv<Local> for u16 { fn from(_: Local) -> Self { 107 } }
 }
-/// requires: true
-/// ensures: ret == 107
+spec! {
+    requires: true,
+    ensures: ret == 107,
+}
 pub fn same_line_live_import() -> u16 {
     <u16 as std::convert::From<m::Local>>::from(m::Local)
 }
@@ -2640,7 +2681,8 @@ pub fn same_line_live_import() -> u16 {
 /// evidence the local body (returning `107`) answers, not the model.
 #[test]
 fn a_multiline_cfg_import_does_not_displace_a_live_alias() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub trait From { fn make() -> u8 { 0 } }
 pub mod m {
     use std::convert::From as Conv;
@@ -2652,11 +2694,15 @@ pub mod m {
     use crate::Other as Conv;
 }
 pub struct Other;
-/// requires: true
-/// ensures: ret == 107
+spec! {
+    requires: true,
+    ensures: ret == 107,
+}
 pub fn multi_cfg_live() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
-/// requires: true
-/// ensures: ret == 5
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 pub fn multi_cfg_tripwire() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
 "#;
     let Some(o) = verify_src("multi_cfg_live", src) else { return };
@@ -2680,7 +2726,8 @@ pub fn multi_cfg_tripwire() -> u16 { <u16 as std::convert::From<m::Local>>::from
 /// `107`) answers, not the model.
 #[test]
 fn a_quoted_delimiter_does_not_hide_a_cfg_import() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub trait From { fn make() -> u8 { 0 } }
 pub mod m {
     use std::convert::From as Conv;
@@ -2691,11 +2738,15 @@ pub mod m {
     use crate::Other as Conv;
 }
 pub struct Other;
-/// requires: true
-/// ensures: ret == 107
+spec! {
+    requires: true,
+    ensures: ret == 107,
+}
 pub fn quoted_cfg_live() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
-/// requires: true
-/// ensures: ret == 5
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 pub fn quoted_cfg_tripwire() -> u16 { <u16 as std::convert::From<m::Local>>::from(m::Local) }
 "#;
     let Some(o) = verify_src("quoted_cfg_live", src) else { return };
@@ -4312,8 +4363,7 @@ fn a_variant_measure_proves_loop_termination() {
     // bounds every other wide query.
     let ok = verify_src(
         "f",
-        "/// invariant: i <= n\n/// variant: n - i\n/// ensures: ret == n\n\
-         pub fn f(n: u8) -> u8 { let mut i = 0u8; while i < n { i += 1; } i }\n",
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    invariant: i <= n,\n    variant: n - i,\n    ensures: ret == n,\n}\npub fn f(n: u8) -> u8 { let mut i = 0u8; while i < n { i += 1; } i }\n",
     );
     let Some(o) = ok else { return };
     assert!(o.is_verified(), "a decreasing measure must prove termination; got: {o}");
@@ -4331,8 +4381,7 @@ fn a_variant_measure_proves_loop_termination() {
 fn a_loop_that_cannot_terminate_fails() {
     let div = verify_src(
         "f",
-        "/// invariant: i >= 0\n/// variant: i\n/// ensures: ret == 0\n\
-         pub fn f(n: u32) -> u32 { let _ = n; let mut i = 0u32; while i < 5 { i += 0; } i }\n",
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    invariant: i >= 0,\n    variant: i,\n    ensures: ret == 0,\n}\npub fn f(n: u32) -> u32 { let _ = n; let mut i = 0u32; while i < 5 { i += 0; } i }\n",
     );
     let Some(o) = div else { return };
     assert!(!o.is_verified(), "a divergent loop must not verify; got: {o}");
@@ -4350,8 +4399,7 @@ fn a_loop_that_cannot_terminate_fails() {
 fn a_measure_that_increases_fails() {
     let wrong = verify_src(
         "f",
-        "/// invariant: i <= n\n/// variant: i\n/// ensures: ret == n\n\
-         pub fn f(n: u8) -> u8 { let mut i = 0u8; while i < n { i += 1; } i }\n",
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    invariant: i <= n,\n    variant: i,\n    ensures: ret == n,\n}\npub fn f(n: u8) -> u8 { let mut i = 0u8; while i < n { i += 1; } i }\n",
     );
     let Some(o) = wrong else { return };
     assert!(!o.is_verified(), "an increasing measure must fail; got: {o}");
@@ -4365,8 +4413,7 @@ fn a_measure_that_increases_fails() {
 fn a_loop_without_a_measure_is_still_verified_for_partial_correctness() {
     let partial = verify_src(
         "f",
-        "/// invariant: i <= n\n/// ensures: ret == n\n\
-         pub fn f(n: u8) -> u8 { let mut i = 0u8; while i < n { i += 1; } i }\n",
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    invariant: i <= n,\n    ensures: ret == n,\n}\npub fn f(n: u8) -> u8 { let mut i = 0u8; while i < n { i += 1; } i }\n",
     );
     let Some(o) = partial else { return };
     assert!(o.is_verified(), "partial correctness must still be proved; got: {o}");
@@ -4379,7 +4426,7 @@ fn a_loop_without_a_measure_is_still_verified_for_partial_correctness() {
 fn a_measure_without_an_invariant_is_refused() {
     let orphan = verify_src(
         "f",
-        "/// variant: n\n/// ensures: ret == 5\npub fn f(n: u32) -> u32 { let _ = n; 5 }\n",
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    variant: n,\n    ensures: ret == 5,\n}\npub fn f(n: u32) -> u32 { let _ = n; 5 }\n",
     );
     let Some(o) = orphan else { return };
     assert!(!o.is_verified(), "an orphan measure must not verify; got: {o}");
@@ -4397,8 +4444,7 @@ fn a_measure_without_an_invariant_is_refused() {
 fn an_unwind_clause_raises_the_unwinding_bound() {
     let default = verify_src(
         "count_twelve_default",
-        "/// requires: true\n/// ensures: ret == 12\n\
-         pub fn count_twelve_default() -> u8 { let mut i = 0u8; while i < 12 { i += 1; } i }\n",
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: ret == 12,\n}\npub fn count_twelve_default() -> u8 { let mut i = 0u8; while i < 12 { i += 1; } i }\n",
     );
     let Some(o) = default else { return };
     assert!(
@@ -4415,8 +4461,7 @@ fn an_unwind_clause_raises_the_unwinding_bound() {
 
     let raised = verify_src(
         "count_twelve_unwind",
-        "/// requires: true\n/// unwind: 20\n/// ensures: ret == 12\n\
-         pub fn count_twelve_unwind() -> u8 { let mut i = 0u8; while i < 12 { i += 1; } i }\n",
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    unwind: 20,\n    ensures: ret == 12,\n}\npub fn count_twelve_unwind() -> u8 { let mut i = 0u8; while i < 12 { i += 1; } i }\n",
     );
     let Some(o) = raised else { return };
     assert!(o.is_verified(), "an explicit larger bound must decide the loop; got: {o}");
@@ -4436,8 +4481,7 @@ fn an_unwind_clause_raises_the_unwinding_bound() {
 fn an_unwind_bound_too_small_for_the_loop_is_refuted() {
     let small = verify_src(
         "count_five_unwind3",
-        "/// requires: true\n/// unwind: 3\n/// ensures: ret == 5\n\
-         pub fn count_five_unwind3() -> u8 { let mut i = 0u8; while i < 5 { i += 1; } i }\n",
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    unwind: 3,\n    ensures: ret == 5,\n}\npub fn count_five_unwind3() -> u8 { let mut i = 0u8; while i < 5 { i += 1; } i }\n",
     );
     let Some(o) = small else { return };
     assert!(!o.is_verified(), "a bound below the trip count must not verify; got: {o}");
@@ -4456,8 +4500,7 @@ fn an_unwind_bound_too_small_for_the_loop_is_refuted() {
 fn an_unwind_clause_does_not_turn_a_false_postcondition_true() {
     let bad = verify_src(
         "count_twelve_bad",
-        "/// requires: true\n/// unwind: 20\n/// ensures: ret == 11\n\
-         pub fn count_twelve_bad() -> u8 { let mut i = 0u8; while i < 12 { i += 1; } i }\n",
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    unwind: 20,\n    ensures: ret == 11,\n}\npub fn count_twelve_bad() -> u8 { let mut i = 0u8; while i < 12 { i += 1; } i }\n",
     );
     let Some(o) = bad else { return };
     assert!(!o.is_verified(), "a false postcondition must not verify; got: {o}");
@@ -6907,8 +6950,16 @@ fn a_slice_subscript_missing_either_bound_is_refused() {
 /// case that mattered.
 #[track_caller]
 fn assert_not_dropped(name: &str, src: &str, present: bool, missing: &[String]) {
+    // "Has a contract" must cover both spellings. It used to test only for `///`,
+    // which is the doc-comment form: a source whose only contract is a `spec!`
+    // block looked contract-free, so a dropped function passed the guard. The
+    // marker is the clause *keyword*, which both spellings carry.
+    let has_contract = src.contains("///")
+        || ["requires", "ensures", "invariant", "decreases", "variant", "unwind"]
+            .iter()
+            .any(|k| src.contains(&format!("{k}:")));
     assert!(
-        present || !src.contains("///"),
+        present || !has_contract,
         "`{name}` was dropped from the report: it has a contract but no outcome, so this test \
          would have passed without checking anything (missing: {missing:?})"
     );
@@ -6940,6 +6991,142 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     o
 }
 
+/// A source file may *name* `verif` -- `use verif::spec;` above an in-code
+/// contract block -- but the frontend runs `rustc` on a single file with no Cargo
+/// graph behind it, so without an `--extern` entry that import is `E0432`. This
+/// pins both halves: the same source is refused with no extern and verified with
+/// one, so a `--extern` that never reaches the command line cannot pass.
+#[test]
+fn an_in_code_contract_can_name_verif_through_an_extern() {
+    // Lookup and emission must name ONE compiler: a rlib's metadata is
+    // compiler-specific, so probing with one toolchain and emitting with another
+    // fails `E0514` even when both are installed and each has its own artifact.
+    //
+    // The compiler here is the one the *emitter* will use, and it is cargo's: the
+    // rlib this test binary links was built by it, and a test binary has no `RUSTC`
+    // in its environment. `--emit=mir` is stable, so no nightly is needed. The test
+    // deliberately does NOT read `VERIF_RUSTC`: CI points that at a nightly, and
+    // probing the stable-built rlib with a nightly is exactly the mismatch this
+    // test exists to catch.
+    let rustc = std::env::var("RUSTC")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "rustc".to_string());
+    if std::process::Command::new(&rustc)
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        return;
+    }
+
+    // `build_script_roots()` needs `OUT_DIR`, which a test binary does not have, so
+    // the profile directory is found from the test binary's own path instead.
+    // Cargo's layout is its own business (`deps/` or `build/<pkg>/<hash>/out/`, and
+    // a stale rlib from an earlier build can sit beside a fresh one), so the walk
+    // covers the whole profile and the choice is made by *trying* candidates
+    // newest-first until one compiles -- the same rule `extern_options_with` uses.
+    let exe = std::env::current_exe().expect("current exe");
+    let profile = exe
+        .ancestors()
+        .find(|a| a.file_name().is_some_and(|n| n == "debug" || n == "release"))
+        .expect("a debug or release profile directory above the test binary");
+
+    fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, depth - 1, out);
+            } else if p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("libverif") && n.ends_with(".rlib"))
+            {
+                out.push(p);
+            }
+        }
+    }
+
+    let mut rlibs = Vec::new();
+    walk(profile, 6, &mut rlibs);
+    let mut search: Vec<std::path::PathBuf> = rlibs
+        .iter()
+        .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
+        .collect();
+    search.sort();
+    search.dedup();
+    let mut verif_rlibs: Vec<std::path::PathBuf> = rlibs
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("libverif-"))
+        })
+        .collect();
+    verif_rlibs.sort();
+    verif_rlibs.dedup();
+    verif_rlibs.sort_by_key(|p| {
+        std::cmp::Reverse(std::fs::metadata(p).and_then(|m| m.modified()).ok())
+    });
+    assert!(
+        !verif_rlibs.is_empty(),
+        "an rlib of `verif` must exist under {}",
+        profile.display()
+    );
+
+    let src = "use verif::spec;\n\nspec! {\n    requires: n <= 200,\n    ensures: ret == n + 1,\n}\npub fn inc(n: u8) -> u8 { n + 1 }\n";
+
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-extern-e2e-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, src).expect("write probe");
+
+    // Without the extern, `use verif::spec;` cannot resolve: the frontend reports it.
+    let bare = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts());
+    assert!(
+        bare.is_err(),
+        "an import of `verif` must fail without an extern, got: {:?}",
+        bare.map(|r| r.outcomes.len())
+    );
+
+    // With the extern, the same source verifies. Candidates are tried newest-first,
+    // because a stale rlib from another compiler fails the probe (`E0514`) and the
+    // next one is the answer -- which is the *same* compiler that emits the MIR.
+    let mut verified = false;
+    let mut last_err = String::new();
+    for rlib in &verif_rlibs {
+        let mut opts = probe_opts();
+        opts.externs = vec![("verif".to_string(), rlib.clone())];
+        opts.search_paths = search.clone();
+        match verify::verify_file_with_opts(&rustc, &file, &[], &opts) {
+            Ok(report) => {
+                verified = report
+                    .outcomes
+                    .iter()
+                    .find(|(n, _)| n == "inc")
+                    .is_some_and(|(_, o)| o.is_verified());
+                if verified {
+                    break;
+                }
+                last_err = format!("{:?}", report.outcomes);
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        verified,
+        "with a working extern the in-code contract must verify; last error: {last_err}"
+    );
+}
+
 /// Options for a probe written to a loose temp file.
 ///
 /// A probe has no `Cargo.toml` above it, so the edition cannot be resolved from a
@@ -6948,7 +7135,7 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
 /// under this repository's `Cargo.toml`, so those tests use the plain entry point
 /// and exercise the manifest resolution path instead.
 fn probe_opts() -> verify::MirOptions {
-    verify::MirOptions { edition: Some(verify::Edition::Rust2024) }
+    verify::MirOptions { edition: Some(verify::Edition::Rust2024), ..Default::default() }
 }
 
 /// Every outcome and the `missing` list for one source, without the
@@ -6978,7 +7165,7 @@ fn verify_all_outcomes(src: &str) -> (Vec<(String, FnOutcome)>, Vec<String>) {
 #[test]
 #[should_panic(expected = "was dropped")]
 fn a_dropped_contracted_function_fails_even_when_missing_names_it() {
-    assert_not_dropped("ghost", "/// ensures: true\npub fn ghost() {}", false, &["ghost".to_string()]);
+    assert_not_dropped("ghost", "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    ensures: true,\n}\npub fn ghost() {}", false, &["ghost".to_string()]);
 }
 
 /// The guard is not a blanket refusal: a function present in the report passes,
@@ -6986,7 +7173,7 @@ fn a_dropped_contracted_function_fails_even_when_missing_names_it() {
 /// frontend drop).
 #[test]
 fn a_present_function_passes_the_drop_guard() {
-    assert_not_dropped("f", "/// ensures: true\npub fn f() {}", true, &[]);
+    assert_not_dropped("f", "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    ensures: true,\n}\npub fn f() {}", true, &[]);
     assert_not_dropped("f", "pub fn f() {}", false, &[]);
 }
 
@@ -7000,9 +7187,12 @@ fn a_present_function_passes_the_drop_guard() {
 /// value, and `Verified` here would be a false proof.
 #[test]
 fn an_element_write_reaches_the_symbolic_chain() {
-    let src = r#"
-/// requires: i < 4 && i == 0
-/// ensures: ret == a[i]
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: i < 4 && i == 0,
+    ensures: ret == a[i],
+}
 pub fn written_then_symbolic(mut a: [u8; 4], i: usize) -> u8 {
     a[0] = 0;
     a[i]
@@ -7018,9 +7208,12 @@ pub fn written_then_symbolic(mut a: [u8; 4], i: usize) -> u8 {
 /// The same property through a `&mut [u8; 4]` reborrow.
 #[test]
 fn an_element_write_through_a_mutable_reference_reaches_the_chain() {
-    let src = r#"
-/// requires: i < 4 && i == 0
-/// ensures: ret == a[i]
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: i < 4 && i == 0,
+    ensures: ret == a[i],
+}
 pub fn ref_written_then_symbolic(a: &mut [u8; 4], i: usize) -> u8 {
     a[0] = 0;
     a[i]
@@ -7044,83 +7237,122 @@ pub fn ref_written_then_symbolic(a: &mut [u8; 4], i: usize) -> u8 {
 /// pins that a length the run never set is *refused* rather than invented.
 #[test]
 fn a_vec_length_is_tracked_through_new_push_and_len() {
-    let src = r#"
-/// requires: true
-/// ensures: ret == 1
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn make_ok(n: u8) -> usize { let mut v = Vec::new(); v.push(n); v.len() }
 
-/// requires: true
-/// ensures: ret == 2
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
 pub fn make_bad(n: u8) -> usize { let mut v = Vec::new(); v.push(n); v.len() }
 
-/// requires: true
-/// ensures: ret == 2
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
 pub fn two_ok(n: u8) -> usize { let mut v = Vec::new(); v.push(n); v.push(n); v.len() }
 
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn two_bad(n: u8) -> usize { let mut v = Vec::new(); v.push(n); v.push(n); v.len() }
 
-/// requires: true
-/// ensures: ret == 0
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 pub fn empty_ok() -> usize { Vec::<u8>::new().len() }
 
-/// requires: true
-/// ensures: ret == 3
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 pub fn empty_bad() -> usize { Vec::<u8>::new().len() }
 
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn helper_ok(n: u8) -> usize { let mut v = Vec::new(); add(&mut v, n); v.len() }
 
-/// requires: true
-/// ensures: ret == 0
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 pub fn helper_bad(n: u8) -> usize { let mut v = Vec::new(); add(&mut v, n); v.len() }
 
 fn add(v: &mut Vec<u8>, x: u8) { v.push(x); }
 
-/// requires: true
-/// ensures: ret == 0
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 pub fn arg_len_refused(v: &Vec<u8>) -> usize { v.len() }
 
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn is_empty_new_ok() -> u8 { Vec::<u8>::new().is_empty() as u8 }
 
-/// requires: true
-/// ensures: ret == 0
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 pub fn is_empty_new_bad() -> u8 { Vec::<u8>::new().is_empty() as u8 }
 
-/// requires: true
-/// ensures: ret == 0
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 pub fn not_empty_after_push_ok() -> u8 { let mut v = Vec::<u8>::new(); v.push(1); v.is_empty() as u8 }
 
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn not_empty_after_push_bad() -> u8 { let mut v = Vec::<u8>::new(); v.push(1); v.is_empty() as u8 }
 
-/// requires: true
-/// ensures: ret == 0
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 pub fn pop_then_len_ok() -> usize { let mut v = Vec::<u8>::new(); v.push(1); v.pop(); v.len() }
 
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn pop_then_len_bad() -> usize { let mut v = Vec::<u8>::new(); v.push(1); v.pop(); v.len() }
 
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn pop_empty_is_none_ok() -> u8 { let mut v = Vec::<u8>::new(); v.pop().is_none() as u8 }
 
-/// requires: true
-/// ensures: ret == 0
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 pub fn pop_empty_is_none_bad() -> u8 { let mut v = Vec::<u8>::new(); v.pop().is_none() as u8 }
 
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn pop_nonempty_is_some_ok() -> u8 { let mut v = Vec::<u8>::new(); v.push(9); v.pop().is_some() as u8 }
 
-/// requires: true
-/// ensures: ret == 0
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 pub fn pop_nonempty_is_some_bad() -> u8 { let mut v = Vec::<u8>::new(); v.push(9); v.pop().is_some() as u8 }
 "#;
     for name in [
@@ -7183,7 +7415,8 @@ pub fn pop_nonempty_is_some_bad() -> u8 { let mut v = Vec::<u8>::new(); v.push(9
 ///   the destination, or `w.len()`/`mk().len()` read a receiver with no length.
 #[test]
 fn a_vec_length_model_does_not_leak_across_a_drop_havoc_or_move() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 mod m {
     pub struct Vec<T>(pub T);
     impl<T> Drop for Vec<T> {
@@ -7191,17 +7424,21 @@ mod m {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// A user `Vec` whose destructor always panics: `drop` runs it, so this must not
 /// be `verified`. The bare-name model treated `m::Vec<u8>` as glue-free.
-/// requires: true
-/// ensures: true
 pub fn user_vec_drop_panics() { let _x = m::Vec(0u8); }
 
+spec! {
+    requires: true,
+    invariant: i <= 3,
+    ensures: ret == 0,
+}
 /// The loop's entry length must be havoced at the header. A model that kept it
 /// reads `0` at the exit and proves this; the body really returns `3`.
-/// requires: true
-/// invariant: i <= 3
-/// ensures: ret == 0
 pub fn loop_push_cannot_prove_this() -> usize {
     let mut v = Vec::<u8>::new();
     let mut i = 0u8;
@@ -7209,14 +7446,16 @@ pub fn loop_push_cannot_prove_this() -> usize {
     v.len()
 }
 
+spec! {
+    requires: true,
+    invariant: i <= 3,
+    ensures: ret == 3,
+}
 /// The control: the same loop, but the postcondition is about the *counter*,
 /// which the invariant does relate (`i <= 3` and the exit guard `i >= 3` give
 /// `i == 3`). Havocing the vector's length must not break this -- a model that
 /// refused every `Vec`-carrying loop would pass the twin above while checking
 /// nothing.
-/// requires: true
-/// invariant: i <= 3
-/// ensures: ret == 3
 pub fn loop_counter_ok() -> u8 {
     let mut v = Vec::<u8>::new();
     let mut i = 0u8;
@@ -7224,25 +7463,33 @@ pub fn loop_counter_ok() -> u8 {
     i
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// A move (`let w = v`) must carry the tracked length to the destination.
-/// requires: true
-/// ensures: ret == 1
 pub fn move_ok(n: u8) -> usize { let mut v = Vec::new(); v.push(n); let w = v; w.len() }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The false twin: a model that dropped the length on the move reads a receiver
 /// with no length and refuses; one that kept the *source* length and read it
 /// through the wrong local would prove this.
-/// requires: true
-/// ensures: ret == 0
 pub fn move_bad(n: u8) -> usize { let mut v = Vec::new(); v.push(n); let w = v; w.len() }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// A returned vector must carry its length to the caller's destination.
-/// requires: true
-/// ensures: ret == 0
 pub fn mk() -> Vec<u8> { Vec::new() }
 
-/// requires: true
-/// ensures: ret == 0
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 pub fn returned_ok() -> usize { let v = mk(); v.len() }
 "#;
     // The user `Vec`'s destructor panics, so the function must be *refused*.
@@ -7312,22 +7559,27 @@ pub fn returned_ok() -> usize { let v = mk(); v.len() }
 /// the model is not consulted for a call that names a body in the dump.
 #[test]
 fn a_user_vec_method_is_answered_by_its_own_body() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct Vec<T>(pub T);
 impl Vec<u8> {
     pub fn new() -> Self { Vec(0) }
     pub fn len(&self) -> usize { 7 }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The user body returns 7, so this verifies -- the model's `0` would refute it.
-/// requires: true
-/// ensures: ret == 7
 pub fn body_wins() -> usize { let v = Vec::new(); v.len() }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The twin: the container model would answer `0` and prove this, so a refutation
 /// is the evidence the user body was used.
-/// requires: true
-/// ensures: ret == 0
 pub fn model_would_say_zero() -> usize { let v = Vec::new(); v.len() }
 "#;
     let Some(o) = verify_src("body_wins", src) else { return };
@@ -7358,24 +7610,33 @@ pub fn model_would_say_zero() -> usize { let v = Vec::new(); v.len() }
 /// than being answered with a length the model does not hold.
 #[test]
 fn a_str_length_is_a_symbolic_input() {
-    let src = r#"
-/// requires: true
-/// ensures: ret <= s.len()
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    ensures: ret <= s.len(),
+}
 pub fn len_bound(s: &str) -> usize { s.len() }
 
+spec! {
+    requires: s.len() == 3,
+    ensures: ret == 3,
+}
 /// The length is pinned by the precondition, so the body's read is that value.
-/// requires: s.len() == 3
-/// ensures: ret == 3
 pub fn pinned_len(s: &str) -> usize { s.len() }
 
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
 /// The false twin: an unbounded `&str` length is not 4.
-/// requires: true
-/// ensures: ret == 4
 pub fn wrong_len_cannot_prove_this(s: &str) -> usize { s.len() }
 
+spec! {
+    requires: s.len() == 0,
+    ensures: ret,
+}
 /// `is_empty` reads the same variable, so it agrees with `len`.
-/// requires: s.len() == 0
-/// ensures: ret
 pub fn empty_is_empty(s: &str) -> bool { s.is_empty() }
 "#;
     for name in ["len_bound", "pinned_len", "empty_is_empty"] {
@@ -7398,17 +7659,24 @@ pub fn empty_is_empty(s: &str) -> bool { s.is_empty() }
 /// `Some` path can carry any payload.
 #[test]
 fn option_unwrap_or_default_is_the_payload_or_zero() {
-    let src = r#"
-/// requires: true
-/// ensures: ret <= 255
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    ensures: ret <= 255,
+}
 pub fn or_zero(x: Option<u8>) -> u8 { x.unwrap_or_default() }
 
-/// requires: x.is_none()
-/// ensures: ret == 0
+spec! {
+    requires: x.is_none(),
+    ensures: ret == 0,
+}
 pub fn none_is_zero(x: Option<u8>) -> u8 { x.unwrap_or_default() }
 
-/// requires: true
-/// ensures: ret == 7
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 pub fn cannot_prove_this(x: Option<u8>) -> u8 { x.unwrap_or_default() }
 "#;
     for name in ["or_zero", "none_is_zero"] {
@@ -7435,15 +7703,20 @@ pub fn cannot_prove_this(x: Option<u8>) -> u8 { x.unwrap_or_default() }
 /// `str` argument would fail this test.
 #[test]
 fn a_user_type_named_str_is_not_the_primitive_str() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct str { pub value: u8 }
 
-/// requires: s.value == 3
-/// ensures: ret == 3
+spec! {
+    requires: s.value == 3,
+    ensures: ret == 3,
+}
 pub fn read(s: &str) -> u8 { s.value }
 
-/// requires: true
-/// ensures: ret == 3
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 pub fn read_cannot_prove_this(s: &str) -> u8 { s.value }
 "#;
     let Some(o) = verify_src("read", src) else { return };
@@ -7458,13 +7731,18 @@ pub fn read_cannot_prove_this(s: &str) -> u8 { s.value }
     );
 
     // The primitive is still modelled when nothing declares `str`.
-    let prim = r#"
-/// requires: s.len() == 3
-/// ensures: ret == 3
+    let prim = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: s.len() == 3,
+    ensures: ret == 3,
+}
 pub fn len_is_symbolic(s: &str) -> usize { s.len() }
 
-/// requires: true
-/// ensures: ret == 4
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
 pub fn wrong_len_cannot_prove_this(s: &str) -> usize { s.len() }
 "#;
     let Some(o) = verify_src("len_is_symbolic", prim) else { return };
@@ -7488,16 +7766,21 @@ pub fn wrong_len_cannot_prove_this(s: &str) -> usize { s.len() }
 /// element readable and prove it.
 #[test]
 fn a_slice_element_write_reaches_the_store_the_read_consults() {
-    let src = r#"
-/// requires: s.len() > 0
-/// ensures: ret == v
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: s.len() > 0,
+    ensures: ret == v,
+}
 pub fn slice_written_then_read(s: &mut [u8], v: u8) -> u8 {
     s[0] = v;
     s[0]
 }
 
-/// requires: s.len() > 0
-/// ensures: ret == s[0]
+spec! {
+    requires: s.len() > 0,
+    ensures: ret == s[0],
+}
 pub fn slice_written_then_read_tripwire(s: &mut [u8], v: u8) -> u8 {
     s[0] = v;
     s[0]
@@ -7523,9 +7806,12 @@ pub fn slice_written_then_read_tripwire(s: &mut [u8], v: u8) -> u8 {
 /// undecided, which is what a missing `PtrMetadata` would have made it.
 #[test]
 fn a_slice_element_write_reaches_the_symbolic_chain() {
-    let src = r#"
-/// requires: i < s.len() && s.len() <= 64 && i == 0
-/// ensures: ret == s[i]
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: i < s.len() && s.len() <= 64 && i == 0,
+    ensures: ret == s[i],
+}
 pub fn slice_written_then_symbolic(s: &mut [u8], i: usize) -> u8 {
     s[0] = 0;
     s[i]
@@ -7549,63 +7835,84 @@ pub fn slice_written_then_symbolic(s: &mut [u8], i: usize) -> u8 {
 /// ones alike.
 #[test]
 fn slice_first_and_get_reach_the_slices_own_element() {
-    let src = r#"
-/// requires: xs.len() > 0 && xs[0] == 5
-/// ensures: ret == 5
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: xs.len() > 0 && xs[0] == 5,
+    ensures: ret == 5,
+}
 pub fn first_reads_the_element(xs: &[u8]) -> u8 {
     *xs.first().unwrap()
 }
 
-/// requires: xs.len() > 0 && xs[0] == 5
-/// ensures: ret == 6
+spec! {
+    requires: xs.len() > 0 && xs[0] == 5,
+    ensures: ret == 6,
+}
 pub fn first_wrong_element_cannot_prove_this(xs: &[u8]) -> u8 {
     *xs.first().unwrap()
 }
 
-/// requires: xs.len() == 0
-/// ensures: ret
+spec! {
+    requires: xs.len() == 0,
+    ensures: ret,
+}
 pub fn first_is_none_when_empty(xs: &[u8]) -> bool {
     xs.first().is_none()
 }
 
-/// requires: xs.len() > 1 && xs[1] == 7
-/// ensures: ret == 7
+spec! {
+    requires: xs.len() > 1 && xs[1] == 7,
+    ensures: ret == 7,
+}
 pub fn get_reads_the_indexed_element(xs: &[u8]) -> u8 {
     *xs.get(1).unwrap()
 }
 
-/// requires: xs.len() > 1 && xs[1] == 7
-/// ensures: ret == 8
+spec! {
+    requires: xs.len() > 1 && xs[1] == 7,
+    ensures: ret == 8,
+}
 pub fn get_wrong_element_cannot_prove_this(xs: &[u8]) -> u8 {
     *xs.get(1).unwrap()
 }
 
-/// requires: xs.len() > 0
-/// ensures: ret == 7
+spec! {
+    requires: xs.len() > 0,
+    ensures: ret == 7,
+}
 pub fn get_out_of_range_unwrap_panics(xs: &[u8]) -> u8 {
     *xs.get(1).unwrap()
 }
 
-/// requires: xs.len() > 0 && xs[0] == 5
-/// ensures: ret == 5
+spec! {
+    requires: xs.len() > 0 && xs[0] == 5,
+    ensures: ret == 5,
+}
 pub fn first_match_reads_the_element(xs: &[u8]) -> u8 {
     match xs.first() { Some(v) => *v, None => 0 }
 }
 
-/// requires: xs.len() > 0 && xs[0] == 5
-/// ensures: ret == 6
+spec! {
+    requires: xs.len() > 0 && xs[0] == 5,
+    ensures: ret == 6,
+}
 pub fn first_match_tripwire(xs: &[u8]) -> u8 {
     match xs.first() { Some(v) => *v, None => 0 }
 }
 
-/// requires: xs.len() == 0
-/// ensures: ret == 0
+spec! {
+    requires: xs.len() == 0,
+    ensures: ret == 0,
+}
 pub fn first_match_empty_takes_none(xs: &[u8]) -> u8 {
     match xs.first() { Some(v) => *v, None => 0 }
 }
 
-/// requires: i < xs.len() && xs.len() <= 64
-/// ensures: true
+spec! {
+    requires: i < xs.len() && xs.len() <= 64,
+    ensures: true,
+}
 pub fn get_symbolic_index_is_refused(xs: &[u8], i: usize) -> u8 {
     *xs.get(i).unwrap()
 }
@@ -7685,33 +7992,44 @@ pub fn get_symbolic_index_is_refused(xs: &[u8], i: usize) -> u8 {
 /// has no width, so a claim about it cannot be discharged).
 #[test]
 fn a_generic_slices_length_is_modelled_but_its_element_is_not() {
-    let src = r#"
-/// requires: true
-/// ensures: ret == v.len()
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    ensures: ret == v.len(),
+}
 pub fn len_of<T: Copy>(v: &[T]) -> usize {
     v.len()
 }
 
-/// requires: true
-/// ensures: ret == (v.len() == 0)
+spec! {
+    requires: true,
+    ensures: ret == (v.len() == 0),
+}
 pub fn empty_of<T: Copy>(v: &[T]) -> bool {
     v.is_empty()
 }
 
-/// requires: true
-/// ensures: true
+spec! {
+    requires: true,
+    ensures: true,
+}
 pub fn first_or_of<T: Copy>(v: &[T], d: T) -> T {
     if v.is_empty() { d } else { v[0] }
 }
 
-/// requires: true
-/// ensures: ret == 0
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 pub fn len_is_zero_cannot_prove_this<T: Copy>(v: &[T]) -> usize {
     v.len()
 }
 
-/// requires: true
-/// ensures: ret == d
+spec! {
+    requires: true,
+    ensures: ret == d,
+}
 pub fn element_cannot_prove_this<T: Copy>(v: &[T], d: T) -> T {
     if v.is_empty() { d } else { v[0] }
 }
@@ -7758,11 +8076,14 @@ pub fn element_cannot_prove_this<T: Copy>(v: &[T], d: T) -> T {
 /// refused or refuted -- anything but `Verified`.
 #[test]
 fn a_whole_struct_assignment_invalidates_its_fields() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct B { pub lo: u8 }
 
-/// requires: true
-/// ensures: ret == c.lo
+spec! {
+    requires: true,
+    ensures: ret == c.lo,
+}
 pub fn reassigned_then_field(mut c: B, d: B) -> u8 {
     c = d;
     c.lo
@@ -7799,11 +8120,14 @@ pub fn reassigned_then_field(mut c: B, d: B) -> u8 {
 /// real and worth pinning, but a missing toolchain is not evidence against it.
 #[test]
 fn a_one_line_struct_does_not_swallow_the_functions_after_it() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct B { pub lo: u8 }
 
-/// requires: true
-/// ensures: ret == 0
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 pub fn after_inline_struct(x: u8) -> u8 {
     0
 }
@@ -7823,9 +8147,12 @@ pub fn after_inline_struct(x: u8) -> u8 {
 /// it.
 #[test]
 fn a_generated_binding_cannot_shadow_an_argument() {
-    let src = r#"
-/// requires: i < 4
-/// ensures: ret == a__chain
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: i < 4,
+    ensures: ret == a__chain,
+}
 pub fn shadow_probe(a: [u8; 4], i: usize, a__chain: u8) -> u8 {
     a[i]
 }
@@ -7841,9 +8168,12 @@ pub fn shadow_probe(a: [u8; 4], i: usize, a__chain: u8) -> u8 {
 /// what is dropped rather than the argument.
 #[test]
 fn a_generated_length_binding_cannot_shadow_an_argument() {
-    let src = r#"
-/// requires: a.len() == 4
-/// ensures: ret == a__len
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: a.len() == 4,
+    ensures: ret == a__len,
+}
 pub fn shadow_len_probe(a: [u8; 4], a__len: usize) -> usize {
     a.len()
 }
@@ -7857,9 +8187,12 @@ pub fn shadow_len_probe(a: [u8; 4], a__len: usize) -> usize {
 
 #[test]
 fn a_false_symbolic_index_postcondition_is_caught() {
-    let src = r#"
-/// requires: i < 4
-/// ensures: ret <= 9
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: i < 4,
+    ensures: ret <= 9,
+}
 pub fn chain_must_be_read(a: [u8; 4], i: usize) -> u8 {
     a[i]
 }
@@ -8318,14 +8651,19 @@ fn a_standard_enum_argument_is_a_switch_on_a_seeded_tag() {
 /// would fail.
 #[test]
 fn a_standard_enum_argument_payload_has_its_own_width() {
-    let src = r#"
-        /// requires: true
-        /// ensures: ret <= 255
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+        spec! {
+            requires: true,
+            ensures: ret <= 255,
+        }
         pub fn opt_payload(x: Option<u8>) -> u8 {
             match x { Some(v) => v, None => 0 }
         }
-        /// requires: true
-        /// ensures: ret <= 1
+        spec! {
+            requires: true,
+            ensures: ret <= 1,
+        }
         pub fn res_payload(r: Result<u8, u16>) -> u8 {
             match r { Ok(_) => 0, Err(_) => 1 }
         }
@@ -8398,14 +8736,19 @@ fn a_cast_in_a_contract_extends_like_rust() {
 /// read is a `Skipped`, i.e. a dropped obligation) and must hold.
 #[test]
 fn a_contract_cast_is_read_and_proved() {
-    let src = r#"
-        /// requires: true
-        /// ensures: ret == x as u32
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+        spec! {
+            requires: true,
+            ensures: ret == x as u32,
+        }
         pub fn widen(x: u8) -> u32 {
             x as u32
         }
-        /// requires: true
-        /// ensures: ret == x as u8
+        spec! {
+            requires: true,
+            ensures: ret == x as u8,
+        }
         pub fn narrow(x: u16) -> u8 {
             x as u8
         }
@@ -8692,8 +9035,7 @@ fn a_128_bit_function_is_refused_not_panicked() {
 /// panic there. Pinned in isolation so the refusal does not depend on the corpus.
 #[test]
 fn a_contract_cast_to_128_bits_is_refused() {
-    let src = "/// requires: true\n/// ensures: ret == x as u128\n\
-               pub fn f(x: u8) -> u64 { x as u64 }";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: ret == x as u128,\n}\npub fn f(x: u8) -> u64 { x as u64 }";
     let Some(o) = verify_src("f", src) else { return };
     let FnOutcome::Skipped { reason } = o else {
         panic!("a cast to `u128` must be refused, got: {o}");
@@ -8707,13 +9049,13 @@ fn a_contract_cast_to_128_bits_is_refused() {
 #[test]
 fn contract_operators_parse_in_isolation() {
     let cases: &[(&str, &str)] = &[
-        ("shr", "/// requires: true\n/// ensures: ret == x >> 1\npub fn shr(x: u8) -> u8 { x >> 1 }"),
-        ("shl", "/// requires: true\n/// ensures: ret == x << 2\npub fn shl(x: u8) -> u8 { x << 2 }"),
-        ("udiv", "/// requires: true\n/// ensures: ret == x / 3\npub fn udiv(x: u32) -> u32 { x / 3 }"),
-        ("urem", "/// requires: true\n/// ensures: ret == x % 10\npub fn urem(x: u32) -> u32 { x % 10 }"),
+        ("shr", "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: ret == x >> 1,\n}\npub fn shr(x: u8) -> u8 { x >> 1 }"),
+        ("shl", "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: ret == x << 2,\n}\npub fn shl(x: u8) -> u8 { x << 2 }"),
+        ("udiv", "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: ret == x / 3,\n}\npub fn udiv(x: u32) -> u32 { x / 3 }"),
+        ("urem", "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: ret == x % 10,\n}\npub fn urem(x: u32) -> u32 { x % 10 }"),
         (
             "prec",
-            "/// requires: true\n/// ensures: ret == x & 1 + 1\npub fn prec(x: u8) -> u8 { x & 2 }",
+            "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: ret == x & 1 + 1,\n}\npub fn prec(x: u8) -> u8 { x & 2 }",
         ),
     ];
     for (name, src) in cases {
@@ -8735,24 +9077,18 @@ fn a_constant_signed_expression_uses_the_signed_engine() {
     let srcs = [
         (
             "srem",
-            "/// requires: true\n/// ensures: ret == -7 % 3\n\
-             pub fn srem() -> i32 { -7i32 % 3i32 }",
-            "/// requires: true\n/// ensures: ret == 2\n\
-             pub fn srem() -> i32 { -7i32 % 3i32 }",
+            "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: ret == -7 % 3,\n}\npub fn srem() -> i32 { -7i32 % 3i32 }",
+            "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: ret == 2,\n}\npub fn srem() -> i32 { -7i32 % 3i32 }",
         ),
         (
             "sdiv",
-            "/// requires: true\n/// ensures: ret == -7 / 2\n\
-             pub fn sdiv() -> i32 { -7i32 / 2i32 }",
-            "/// requires: true\n/// ensures: ret == 3\n\
-             pub fn sdiv() -> i32 { -7i32 / 2i32 }",
+            "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: ret == -7 / 2,\n}\npub fn sdiv() -> i32 { -7i32 / 2i32 }",
+            "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: ret == 3,\n}\npub fn sdiv() -> i32 { -7i32 / 2i32 }",
         ),
         (
             "ashr",
-            "/// requires: true\n/// ensures: ret == -8 >> 1\n\
-             pub fn ashr() -> i32 { -8i32 >> 1 }",
-            "/// requires: true\n/// ensures: ret == -1\n\
-             pub fn ashr() -> i32 { -8i32 >> 1 }",
+            "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: ret == -8 >> 1,\n}\npub fn ashr() -> i32 { -8i32 >> 1 }",
+            "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: ret == -1,\n}\npub fn ashr() -> i32 { -8i32 >> 1 }",
         ),
     ];
     for (name, true_src, false_src) in srcs {
@@ -8773,20 +9109,17 @@ fn a_negation_binds_tighter_than_a_cast() {
     let cases = [
         (
             "neg_cast_gt",
-            "/// requires: -x as u8 > 127\n/// ensures: ret == 1\n\
-             pub fn neg_cast_gt(x: i8) -> u8 { 1 }",
+            "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: -x as u8 > 127,\n    ensures: ret == 1,\n}\npub fn neg_cast_gt(x: i8) -> u8 { 1 }",
             true,
         ),
         (
             "neg_cast_lt_tripwire",
-            "/// requires: x == 1\n/// ensures: -x as u8 < 127\n\
-             pub fn neg_cast_lt_tripwire(x: i8) -> u8 { 1 }",
+            "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: x == 1,\n    ensures: (-x as u8) < 127,\n}\npub fn neg_cast_lt_tripwire(x: i8) -> u8 { 1 }",
             false,
         ),
         (
             "neg_cast_value",
-            "/// requires: x == -5\n/// ensures: ret == -x as u8\n\
-             pub fn neg_cast_value(x: i8) -> u8 { -x as u8 }",
+            "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: x == -5,\n    ensures: ret == -x as u8,\n}\npub fn neg_cast_value(x: i8) -> u8 { -x as u8 }",
             true,
         ),
     ];
@@ -9002,8 +9335,7 @@ fn a_folded_constant_is_read_as_a_constant() {
     // A folded shift amount verifies: the body shifts by the same constant.
     let Some(o) = verify_src(
         "folded_shift_amount",
-        "/// requires: x == 8\n/// ensures: ret == x >> 1 + 1\n\
-         pub fn folded_shift_amount(x: u8) -> u8 { x >> 2 }\n",
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: x == 8,\n    ensures: ret == x >> 1 + 1,\n}\npub fn folded_shift_amount(x: u8) -> u8 { x >> 2 }\n",
     ) else {
         return;
     };
@@ -9014,8 +9346,7 @@ fn a_folded_constant_is_read_as_a_constant() {
     // would be a verdict about nothing.
     let Some(o) = verify_src(
         "folded_zero_divisor",
-        "/// requires: x == 3\n/// ensures: ret == x % (1 - 1)\n\
-         pub fn folded_zero_divisor(x: u8) -> u8 { x % 3 }\n",
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: x == 3,\n    ensures: ret == x % (1 - 1),\n}\npub fn folded_zero_divisor(x: u8) -> u8 { x % 3 }\n",
     ) else {
         return;
     };
@@ -9028,8 +9359,7 @@ fn a_folded_constant_is_read_as_a_constant() {
     // is `4 / 2` is `2`, the same as the body, so the two agree.
     let Some(o) = verify_src(
         "folded_nonzero_divisor",
-        "/// requires: x == 4\n/// ensures: ret == x / (1 + 1)\n\
-         pub fn folded_nonzero_divisor(x: u8) -> u8 { x / 2 }\n",
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: x == 4,\n    ensures: ret == x / (1 + 1),\n}\npub fn folded_nonzero_divisor(x: u8) -> u8 { x / 2 }\n",
     ) else {
         return;
     };
@@ -9042,8 +9372,7 @@ fn a_folded_constant_is_read_as_a_constant() {
     // not a barrel shifter, so the query is decided rather than left incomplete.
     let Some(o) = verify_src(
         "folded_body_shift",
-        "/// requires: x == 8\n/// ensures: ret == 2\n\
-         pub fn folded_body_shift(x: u8) -> u8 { x >> 1 + 1 }\n",
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: x == 8,\n    ensures: ret == 2,\n}\npub fn folded_body_shift(x: u8) -> u8 { x >> 1 + 1 }\n",
     ) else {
         return;
     };
@@ -9748,8 +10077,7 @@ fn an_untyped_shift_that_needs_a_wider_operand_is_refused_but_a_fitting_shift_re
 /// instead of taking the run down, which is what a panic does.
 #[test]
 fn a_u128_suffix_literal_is_refused_not_panicked() {
-    let src = "/// requires: true\n/// ensures: 0u128 == 0u128\n\
-               pub fn f(x: u8) -> u8 { x }";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: true,\n    ensures: 0u128 == 0u128,\n}\npub fn f(x: u8) -> u8 { x }";
     let Some(o) = verify_src("f", src) else { return };
     let FnOutcome::Skipped { reason } = o else {
         panic!("a `u128`-suffixed literal must be refused, got: {o}");
@@ -10195,7 +10523,8 @@ fn a_string_literal_does_not_leak_a_local_const() {
 /// pre-existing hazard in `resolve_callee`'s owner-type match.
 #[test]
 fn a_local_trait_from_is_answered_by_its_body() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub mod conv_shim {
     pub trait From<T> {
         fn from(t: T) -> Self;
@@ -10206,8 +10535,10 @@ pub mod conv_shim {
         }
     }
 }
-/// requires: x == 0
-/// ensures: ret == x as u16
+spec! {
+    requires: x == 0,
+    ensures: ret == x as u16,
+}
 pub fn local_from_is_not_the_model(x: u8) -> u16 {
     conv_shim::From::from(x)
 }
@@ -10226,14 +10557,19 @@ pub fn local_from_is_not_the_model(x: u8) -> u16 {
 /// arm uses; if the two ever disagreed, `ret == x as u16` would be refuted here.
 #[test]
 fn a_conversion_agrees_with_a_cast_of_the_same_shape() {
-    let src = r#"
-/// requires: true
-/// ensures: ret == x as u16
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    ensures: ret == x as u16,
+}
 pub fn from_matches_cast(x: u8) -> u16 {
     u16::from(x)
 }
-/// requires: true
-/// ensures: ret == x as i32
+spec! {
+    requires: true,
+    ensures: ret == x as i32,
+}
 pub fn into_signed_matches_cast(x: i8) -> i32 {
     x.into()
 }
@@ -10259,9 +10595,12 @@ fn an_unmodelled_conversion_is_reported_unknown_not_guessed() {
     // is not one of the integer widenings), so it stays unmodelled. `u8::from(bool)`
     // used to be the example here and is now modelled (the zero-extended bit), so
     // the test names a conversion that is still a refusal.
-    let src = r#"
-/// requires: true
-/// ensures: ret == 1
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn from_char_is_unmodelled(c: char) -> u32 {
     u32::from(c)
 }
@@ -10382,7 +10721,7 @@ fn two_impls_with_a_shared_method_tail_do_not_conflate_contracts() {
 /// so it was dropped and the false postcondition verified with zero obligations.
 #[test]
 fn a_trait_default_method_is_checked_against_its_contract() {
-    let src = "pub trait T {\n    /// ensures: ret == 9\n    fn value(&self) -> u8 { 7 }\n}\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub trait T {\n    spec! {\n        ensures: ret == 9,\n    }\n    fn value(&self) -> u8 { 7 }\n}\n";
     let o = verify_src("T::value", src).expect("T::value must be verified, not dropped");
     let FnOutcome::Failed { kind, .. } = o else {
         panic!("a trait default with a false postcondition must be refuted, got: {o}");
@@ -10396,7 +10735,7 @@ fn a_trait_default_method_is_checked_against_its_contract() {
 /// postcondition verified with zero obligations.
 #[test]
 fn a_module_nested_free_function_is_checked_against_its_contract() {
-    let src = "pub mod m {\n    /// ensures: ret == 9\n    pub fn f() -> u8 { 7 }\n}\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub mod m {\n    spec! {\n        ensures: ret == 9,\n    }\n    pub fn f() -> u8 { 7 }\n}\n";
     let o = verify_src("m::f", src).expect("m::f must be verified, not dropped");
     let FnOutcome::Failed { kind, .. } = o else {
         panic!("a module function with a false postcondition must be refuted, got: {o}");
@@ -10412,8 +10751,7 @@ fn a_module_nested_free_function_is_checked_against_its_contract() {
 /// by its own.
 #[test]
 fn two_sibling_modules_do_not_share_a_contract() {
-    let src = "pub mod a {\n    /// ensures: ret == 9\n    pub fn f() -> u8 { 1 }\n}\n\
-               pub mod b {\n    /// ensures: ret == 2\n    pub fn f() -> u8 { 2 }\n}\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub mod a {\n    spec! {\n        ensures: ret == 9,\n    }\n    pub fn f() -> u8 { 1 }\n}\npub mod b {\n    spec! {\n        ensures: ret == 2,\n    }\n    pub fn f() -> u8 { 2 }\n}\n";
     let left = verify_src("a::f", src).expect("a::f must be present");
     let FnOutcome::Failed { kind, .. } = left else {
         panic!("a::f has a false postcondition and must be refuted, got: {left}");
@@ -10435,8 +10773,7 @@ fn two_sibling_modules_do_not_share_a_contract() {
 /// several keys suffix-match.
 #[test]
 fn a_cfg_excluded_contract_does_not_steal_a_compiled_body() {
-    let src = "pub mod a {\n    /// ensures: ret == 1\n    pub fn f() -> u8 { 1 }\n}\n\
-               pub mod b {\n    pub mod a {\n        /// ensures: ret == 1\n        #[cfg(any())]\n        pub fn f() -> u8 { 2 }\n    }\n}\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub mod a {\n    spec! {\n        ensures: ret == 1,\n    }\n    pub fn f() -> u8 { 1 }\n}\npub mod b {\n    pub mod a {\n        spec! {\n            ensures: ret == 1,\n        }\n        #[cfg(any())]\n        pub fn f() -> u8 { 2 }\n    }\n}\n";
     let rustc = rustc().expect("rustc");
     let dir = std::env::temp_dir().join(format!("verif-cfg-steal-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -10463,7 +10800,7 @@ fn a_cfg_excluded_contract_does_not_steal_a_compiled_body() {
 /// refusal of any qualified key.
 #[test]
 fn a_nested_free_function_is_still_resolved_by_its_suffix() {
-    let src = "pub mod a {\n    /// ensures: ret == 9\n    pub fn f() -> u8 { 1 }\n}\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub mod a {\n    spec! {\n        ensures: ret == 9,\n    }\n    pub fn f() -> u8 { 1 }\n}\n";
     let o = verify_src("a::f", src).expect("a::f must be present");
     let FnOutcome::Failed { kind, .. } = o else {
         panic!("a::f has a false postcondition and must be refuted, got: {o}");
@@ -10475,8 +10812,7 @@ fn a_nested_free_function_is_still_resolved_by_its_suffix() {
 /// contracts: `A::v` is the trait's, `v` the function's.
 #[test]
 fn a_trait_default_and_a_free_function_do_not_share_a_contract() {
-    let src = "/// ensures: ret == 9\npub fn v() -> u8 { 1 }\n\
-               pub trait A {\n    /// ensures: ret == 2\n    fn v(&self) -> u8 { 2 }\n}\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    ensures: ret == 9,\n}\npub fn v() -> u8 { 1 }\npub trait A {\n    spec! {\n        ensures: ret == 2,\n    }\n    fn v(&self) -> u8 { 2 }\n}\n";
     let free = verify_src("v", src).expect("v must be present");
     let FnOutcome::Failed { kind, .. } = free else {
         panic!("the free `v` has a false postcondition and must be refuted, got: {free}");
@@ -10523,7 +10859,7 @@ fn a_contract_on_a_trait_implementation_is_checked() {
 /// obligations.
 #[test]
 fn a_multiline_impl_header_still_owns_its_methods() {
-    let src = "pub struct Foo;\nimpl Foo\n{\n    /// ensures: ret == 9\n    pub fn m(&self) -> u8 { 1 }\n}\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub struct Foo;\nimpl Foo\n{\n    spec! {\n        ensures: ret == 9,\n    }\n    pub fn m(&self) -> u8 { 1 }\n}\n";
     let o = verify_src("m", src).expect("m must be present");
     let FnOutcome::Failed { kind, .. } = o else {
         panic!("a method of a multiline impl with a false postcondition must be refuted, got: {o}");
@@ -10547,8 +10883,7 @@ fn a_multiline_impl_header_still_owns_its_methods() {
 /// An implementation that breaks the trait's declared postcondition is refuted.
 #[test]
 fn an_implementation_that_breaks_its_traits_contract_is_refuted() {
-    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n\
-               pub struct S;\nimpl Bump for S { fn bump(&self) -> u8 { 7 } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub trait Bump {\n    spec! {\n        ensures: ret == 9,\n    }\n    fn bump(&self) -> u8;\n}\npub struct S;\nimpl Bump for S { fn bump(&self) -> u8 { 7 } }\n";
     let (outcomes, missing) = verify_all_outcomes(src);
     assert!(missing.is_empty(), "the impl carries the promise, so nothing is missing: {missing:?}");
     let o = pick(&outcomes, "bump");
@@ -10562,8 +10897,7 @@ fn an_implementation_that_breaks_its_traits_contract_is_refuted() {
 /// pins the refutation and not a blanket failure.
 #[test]
 fn an_implementation_that_keeps_its_traits_contract_verifies() {
-    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n\
-               pub struct S;\nimpl Bump for S { fn bump(&self) -> u8 { 9 } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub trait Bump {\n    spec! {\n        ensures: ret == 9,\n    }\n    fn bump(&self) -> u8;\n}\npub struct S;\nimpl Bump for S { fn bump(&self) -> u8 { 9 } }\n";
     let (outcomes, _) = verify_all_outcomes(src);
     let o = pick(&outcomes, "bump");
     assert!(o.is_verified(), "a body of 9 against `ret == 9` must verify, got: {o}");
@@ -10578,8 +10912,7 @@ fn an_implementation_that_keeps_its_traits_contract_verifies() {
 /// implementation existed in the file at all.
 #[test]
 fn a_free_function_does_not_borrow_a_trait_declarations_contract() {
-    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n\
-               pub fn bump() -> u8 { 9 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub trait Bump {\n    spec! {\n        ensures: ret == 9,\n    }\n    fn bump(&self) -> u8;\n}\npub fn bump() -> u8 { 9 }\n";
     let (outcomes, missing) = verify_all_outcomes(src);
     for (key, _) in &outcomes {
         assert_ne!(
@@ -10601,7 +10934,7 @@ fn a_free_function_does_not_borrow_a_trait_declarations_contract() {
 /// the run clean while the claim was never checked.
 #[test]
 fn a_trait_declaration_with_no_implementation_is_reported() {
-    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub trait Bump {\n    spec! {\n        ensures: ret == 9,\n    }\n    fn bump(&self) -> u8;\n}\n";
     let (outcomes, missing) = verify_all_outcomes(src);
     assert!(outcomes.is_empty(), "there is no body to verify, got: {outcomes:?}");
     assert!(
@@ -10616,9 +10949,7 @@ fn a_trait_declaration_with_no_implementation_is_reported() {
 /// without a word. The refusal names both sides instead.
 #[test]
 fn two_contracts_for_one_method_are_refused_not_silently_chosen() {
-    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n\
-               pub struct S;\nimpl Bump for S {\n    /// ensures: ret == 7\n    \
-               fn bump(&self) -> u8 { 7 }\n}\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub trait Bump {\n    spec! {\n        ensures: ret == 9,\n    }\n    fn bump(&self) -> u8;\n}\npub struct S;\nimpl Bump for S {\n    spec! {\n        ensures: ret == 7,\n    }\n    fn bump(&self) -> u8 { 7 }\n}\n";
     let (outcomes, _) = verify_all_outcomes(src);
     let o = pick(&outcomes, "bump");
     let FnOutcome::Skipped { reason } = o else {
@@ -10637,10 +10968,7 @@ fn two_contracts_for_one_method_are_refused_not_silently_chosen() {
 /// other: one body's verdict was simply not reported.
 #[test]
 fn two_implementations_of_a_contracted_trait_are_both_checked() {
-    let src = "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\n\
-               pub struct A; pub struct B;\n\
-               impl Bump for A { fn bump(&self) -> u8 { 7 } }\n\
-               impl Bump for B { fn bump(&self) -> u8 { 9 } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub trait Bump {\n    spec! {\n        ensures: ret == 9,\n    }\n    fn bump(&self) -> u8;\n}\npub struct A; pub struct B;\nimpl Bump for A { fn bump(&self) -> u8 { 7 } }\nimpl Bump for B { fn bump(&self) -> u8 { 9 } }\n";
     let (outcomes, missing) = verify_all_outcomes(src);
     assert!(missing.is_empty(), "both impls carry the promise: {missing:?}");
     let a = pick(&outcomes, "A::bump");
@@ -10656,9 +10984,7 @@ fn two_implementations_of_a_contracted_trait_are_both_checked() {
 /// contract is checked by that one alone.
 #[test]
 fn an_impl_of_an_uncontracted_trait_keeps_its_own_contract() {
-    let src = "pub trait Bump { fn bump(&self) -> u8; }\n\
-               pub struct S;\nimpl Bump for S {\n    /// ensures: ret == 7\n    \
-               fn bump(&self) -> u8 { 7 }\n}\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub trait Bump { fn bump(&self) -> u8; }\npub struct S;\nimpl Bump for S {\n    spec! {\n        ensures: ret == 7,\n    }\n    fn bump(&self) -> u8 { 7 }\n}\n";
     let (outcomes, _) = verify_all_outcomes(src);
     let o = pick(&outcomes, "bump");
     assert!(o.is_verified(), "the impl's own `ret == 7` with a body of 7 must verify, got: {o}");
@@ -10674,7 +11000,7 @@ fn an_impl_of_an_uncontracted_trait_keeps_its_own_contract() {
 /// never be checked, while the run still looked clean.
 #[test]
 fn a_trait_default_returning_an_array_is_still_checked() {
-    let src = "pub trait T {\n    /// ensures: ret == 9\n    fn v(&self, xs: [u8; 4]) -> u8 { 7 }\n}\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub trait T {\n    spec! {\n        ensures: ret == 9,\n    }\n    fn v(&self, xs: [u8; 4]) -> u8 { 7 }\n}\n";
     let (outcomes, missing) = verify_all_outcomes(src);
     assert!(missing.is_empty(), "a default has a body, so nothing is missing: {missing:?}");
     let o = pick(&outcomes, "T::v");
@@ -10688,7 +11014,7 @@ fn a_trait_default_returning_an_array_is_still_checked() {
 /// not swept into the declaration table.
 #[test]
 fn a_trait_default_method_is_not_treated_as_a_declaration() {
-    let src = "pub trait T {\n    /// ensures: ret == 9\n    fn value(&self) -> u8 { 7 }\n}\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub trait T {\n    spec! {\n        ensures: ret == 9,\n    }\n    fn value(&self) -> u8 { 7 }\n}\n";
     let (outcomes, missing) = verify_all_outcomes(src);
     assert!(missing.is_empty(), "a default has a body, so nothing is missing: {missing:?}");
     let o = pick(&outcomes, "T::value");
@@ -10705,8 +11031,7 @@ fn a_trait_default_method_is_not_treated_as_a_declaration() {
 /// method of that `impl` -- keyed by location, and so never matched.
 #[test]
 fn a_one_line_impl_body_does_not_leak_its_scope() {
-    let src = "pub struct Foo;\nimpl Foo { pub fn m(&self) -> u8 { 1 } }\n\
-               /// ensures: ret == 9\npub fn g() -> u8 { 1 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub struct Foo;\nimpl Foo { pub fn m(&self) -> u8 { 1 } }\nspec! {\n    ensures: ret == 9,\n}\npub fn g() -> u8 { 1 }\n";
     let o = verify_src("g", src).expect("g must be present");
     let FnOutcome::Failed { kind, .. } = o else {
         panic!("g has a false postcondition and must be refuted, got: {o}");
@@ -10729,9 +11054,7 @@ fn a_one_line_impl_body_does_not_leak_its_scope() {
 /// item at all, so it must be ignored.
 #[test]
 fn a_const_generic_does_not_leak_a_local_const() {
-    let src = "pub fn cg<const N: usize>() -> u8 { N as u8 }\n\
-               pub fn owner() -> u8 { const N: u8 = 3; N }\n\
-               /// requires: N == 3\n/// ensures: ret == N\npub fn reads() -> u8 { 3 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub fn cg<const N: usize>() -> u8 { N as u8 }\npub fn owner() -> u8 { const N: u8 = 3; N }\nspec! {\n    requires: N == 3,\n    ensures: ret == N,\n}\npub fn reads() -> u8 { 3 }\n";
     let o = verify_src("reads", src).expect("reads must be present");
     assert!(
         matches!(o, FnOutcome::Skipped { .. }),
@@ -10742,9 +11065,7 @@ fn a_const_generic_does_not_leak_a_local_const() {
 /// The same leak with the parameter list split across lines.
 #[test]
 fn a_split_const_generic_does_not_leak_a_local_const() {
-    let src = "pub fn cg<\n    const N: usize,\n>() -> u8 { N as u8 }\n\
-               pub fn owner() -> u8 { const N: u8 = 3; N }\n\
-               /// requires: N == 3\n/// ensures: ret == N\npub fn reads() -> u8 { 3 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub fn cg<\n    const N: usize,\n>() -> u8 { N as u8 }\npub fn owner() -> u8 { const N: u8 = 3; N }\nspec! {\n    requires: N == 3,\n    ensures: ret == N,\n}\npub fn reads() -> u8 { 3 }\n";
     let o = verify_src("reads", src).expect("reads must be present");
     assert!(
         matches!(o, FnOutcome::Skipped { .. }),
@@ -10785,8 +11106,7 @@ fn a_const_generic_after_whitespace_or_a_comment_does_not_leak_a_local_const() {
 /// set. The real body brace is the one reached with no `<` open.
 #[test]
 fn a_const_expression_in_an_impl_header_does_not_hide_its_method() {
-    let src = "pub struct Foo<const N: usize>;\nimpl Foo<{ 1 }>\n{\n    \
-               /// ensures: ret == 9\n    pub fn m(&self) -> u8 { 7 }\n}\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub struct Foo<const N: usize>;\nimpl Foo<{ 1 }>\n{\n    spec! {\n        ensures: ret == 9,\n    }\n    pub fn m(&self) -> u8 { 7 }\n}\n";
     let o = verify_src("m", src).expect("m must be present");
     let FnOutcome::Failed { kind, .. } = o else {
         panic!("a method with a false postcondition must be refuted, got: {o}");
@@ -10799,8 +11119,7 @@ fn a_const_expression_in_an_impl_header_does_not_hide_its_method() {
 /// refusal of the name.
 #[test]
 fn a_crate_level_const_is_still_read_beside_a_const_generic() {
-    let src = "pub const N: u8 = 5;\npub fn cg<const N: usize>() -> usize { N }\n\
-               /// ensures: ret == N\npub fn reads() -> u8 { 5 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub const N: u8 = 5;\npub fn cg<const N: usize>() -> usize { N }\nspec! {\n    ensures: ret == N,\n}\npub fn reads() -> u8 { 5 }\n";
     let specs = spec::extract(src);
     assert!(specs.crate_consts.contains("N"), "the crate-level `N` must still be read");
     assert!(specs.const_generics.contains("N"), "the const-generic `N` must be recognized");
@@ -10821,8 +11140,7 @@ fn a_crate_level_const_is_still_read_beside_a_const_generic() {
 /// fold, leaving the name unresolved rather than decided.
 #[test]
 fn a_local_const_does_not_shadow_a_crate_const_in_another_contract() {
-    let src = "pub const K: u8 = 7;\npub fn owner() -> u8 { const K: u8 = 3; K }\n\
-               /// ensures: ret == K\npub fn reads() -> u8 { 3 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub const K: u8 = 7;\npub fn owner() -> u8 { const K: u8 = 3; K }\nspec! {\n    ensures: ret == K,\n}\npub fn reads() -> u8 { 3 }\n";
     let o = verify_src("reads", src).expect("reads must be present");
     assert!(
         !o.is_verified(),
@@ -10846,9 +11164,7 @@ fn a_local_const_does_not_shadow_a_crate_const_in_another_contract() {
 /// on a claim the function could not have written.
 #[test]
 fn a_cfg_disabled_crate_const_does_not_let_a_local_shadow_it() {
-    let src = "#[cfg(any())]\npub const K: u8 = 7;\n\
-               pub fn owner() -> u8 { const K: u8 = 3; K }\n\
-               /// ensures: ret == K\npub fn reads() -> u8 { 3 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n#[cfg(any())]\npub const K: u8 = 7;\npub fn owner() -> u8 { const K: u8 = 3; K }\nspec! {\n    ensures: ret == K,\n}\npub fn reads() -> u8 { 3 }\n";
     let o = verify_src("reads", src).expect("reads must be present");
     assert!(
         matches!(o, FnOutcome::Skipped { .. }),
@@ -10860,8 +11176,7 @@ fn a_cfg_disabled_crate_const_does_not_let_a_local_shadow_it() {
 /// must also be refused, because the name is still not a crate-level one.
 #[test]
 fn a_cfg_disabled_crate_const_alone_is_not_a_program_wide_name() {
-    let src = "#[cfg(any())]\npub const K: u8 = 7;\n\
-               /// ensures: ret == K\npub fn reads() -> u8 { 3 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n#[cfg(any())]\npub const K: u8 = 7;\nspec! {\n    ensures: ret == K,\n}\npub fn reads() -> u8 { 3 }\n";
     let o = verify_src("reads", src).expect("reads must be present");
     assert!(
         matches!(o, FnOutcome::Skipped { .. }),
@@ -10874,8 +11189,7 @@ fn a_cfg_disabled_crate_const_alone_is_not_a_program_wide_name() {
 /// local's value.
 #[test]
 fn a_local_const_alone_is_not_a_program_wide_name() {
-    let src = "pub fn owner() -> u8 { const K: u8 = 3; K }\n\
-               /// ensures: ret == K\npub fn reads() -> u8 { 3 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub fn owner() -> u8 { const K: u8 = 3; K }\nspec! {\n    ensures: ret == K,\n}\npub fn reads() -> u8 { 3 }\n";
     let o = verify_src("reads", src).expect("reads must be present");
     assert!(
         matches!(o, FnOutcome::Skipped { .. }),
@@ -10895,11 +11209,7 @@ fn a_local_const_alone_is_not_a_program_wide_name() {
 /// path prefix is a *function*.
 #[test]
 fn an_associated_const_does_not_hide_a_crate_const() {
-    let src = "const K: u8 = 7;\n\
-               pub struct Foo;\n\
-               impl Foo { pub const K: u8 = 3; }\n\
-               pub fn uses_assoc() -> u8 { Foo::K }\n\
-               /// ensures: ret == K\npub fn reads() -> u8 { 7 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nconst K: u8 = 7;\npub struct Foo;\nimpl Foo { pub const K: u8 = 3; }\npub fn uses_assoc() -> u8 { Foo::K }\nspec! {\n    ensures: ret == K,\n}\npub fn reads() -> u8 { 7 }\n";
     let o = verify_src("reads", src).expect("reads must be present");
     assert!(
         o.is_verified(),
@@ -10919,12 +11229,7 @@ fn an_associated_const_does_not_hide_a_crate_const() {
 /// against the local's 4) rather than merely a different skip reason.
 #[test]
 fn a_nested_or_method_local_const_is_not_a_program_wide_name() {
-    let src = "pub const L: u8 = 40;\npub const M: u8 = 10;\n\
-               pub struct Foo;\n\
-               impl Foo { pub fn method(&self) -> u8 { const L: u8 = 4; L } }\n\
-               pub fn outer() -> u8 { fn inner() -> u8 { const M: u8 = 1; M } inner() }\n\
-               /// ensures: ret == L\npub fn reads_l() -> u8 { 4 }\n\
-               /// ensures: ret == M\npub fn reads_m() -> u8 { 1 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub const L: u8 = 40;\npub const M: u8 = 10;\npub struct Foo;\nimpl Foo { pub fn method(&self) -> u8 { const L: u8 = 4; L } }\npub fn outer() -> u8 { fn inner() -> u8 { const M: u8 = 1; M } inner() }\nspec! {\n    ensures: ret == L,\n}\npub fn reads_l() -> u8 { 4 }\nspec! {\n    ensures: ret == M,\n}\npub fn reads_m() -> u8 { 1 }\n";
     for (name, local) in [("reads_l", "L"), ("reads_m", "M")] {
         let o = verify_src(name, src).expect("contracted function must be present");
         assert!(
@@ -10954,9 +11259,7 @@ fn a_nested_or_method_local_const_is_not_a_program_wide_name() {
 /// not confined to the MSRV the earlier fix was written for.
 #[test]
 fn a_branching_const_does_not_fold_to_its_first_arm() {
-    let src = "pub const K: u8 = if false { 7 } else { 8 };\n\
-               /// ensures: ret == 8\npub fn true_claim() -> u8 { K }\n\
-               /// ensures: ret == 7\npub fn false_claim() -> u8 { K }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub const K: u8 = if false { 7 } else { 8 };\nspec! {\n    ensures: ret == 8,\n}\npub fn true_claim() -> u8 { K }\nspec! {\n    ensures: ret == 7,\n}\npub fn false_claim() -> u8 { K }\n";
     let true_claim = verify_src("true_claim", src).expect("true_claim must be present");
     let false_claim = verify_src("false_claim", src).expect("false_claim must be present");
     assert!(
@@ -11042,10 +11345,7 @@ fn pick<'a>(outcomes: &'a [(String, FnOutcome)], name: &str) -> &'a FnOutcome {
 /// postcondition proved from it.
 #[test]
 fn a_callee_contract_decides_a_call_with_no_body() {
-    let src = "unsafe extern \"C\" {\n    /// requires: n <= 10\n    /// ensures: ret <= n + 1\n    \
-               fn ext_bump(n: u32) -> u32;\n}\n\n\
-               /// requires: x <= 10\n/// ensures: ret <= 11\n\
-               pub fn caller_ok(x: u32) -> u32 { unsafe { ext_bump(x) } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nunsafe extern \"C\" {\n    spec! {\n        requires: n <= 10,\n        ensures: ret <= n + 1,\n    }\n    fn ext_bump(n: u32) -> u32;\n}\n\nspec! {\n    requires: x <= 10,\n    ensures: ret <= 11,\n}\npub fn caller_ok(x: u32) -> u32 { unsafe { ext_bump(x) } }\n";
     let Some(all) = verify_all_src(src) else { return };
     let o = pick(&all, "caller_ok");
     assert!(o.is_verified(), "the contract should decide this call, got: {o}");
@@ -11068,10 +11368,7 @@ fn a_callee_contract_decides_a_call_with_no_body() {
 /// why the precondition has to be a proof obligation rather than a comment.
 #[test]
 fn a_caller_that_does_not_establish_the_precondition_fails() {
-    let src = "unsafe extern \"C\" {\n    /// requires: n <= 10\n    /// ensures: ret <= n + 1\n    \
-               fn ext_bump(n: u32) -> u32;\n}\n\n\
-               /// requires: x <= 100\n/// ensures: ret <= 101\n\
-               pub fn caller_pre_fails(x: u32) -> u32 { unsafe { ext_bump(x) } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nunsafe extern \"C\" {\n    spec! {\n        requires: n <= 10,\n        ensures: ret <= n + 1,\n    }\n    fn ext_bump(n: u32) -> u32;\n}\n\nspec! {\n    requires: x <= 100,\n    ensures: ret <= 101,\n}\npub fn caller_pre_fails(x: u32) -> u32 { unsafe { ext_bump(x) } }\n";
     let Some(all) = verify_all_src(src) else { return };
     let o = pick(&all, "caller_pre_fails");
     match o {
@@ -11093,10 +11390,7 @@ fn a_caller_that_does_not_establish_the_precondition_fails() {
 /// postcondition -- `Unsat` -- so its discharge is `Unsat` rather than `Valid`.
 #[test]
 fn a_call_to_a_callee_whose_postcondition_is_unsatisfiable_fails() {
-    let src = "unsafe extern \"C\" {\n    /// requires: n <= 10\n    /// ensures: false\n    \
-               fn ext_never_returns(n: u32) -> u32;\n}\n\n\
-               /// requires: x <= 10\n/// ensures: ret == 0\n\
-               pub fn caller_of_divergent(x: u32) -> u32 { unsafe { ext_never_returns(x) } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nunsafe extern \"C\" {\n    spec! {\n        requires: n <= 10,\n        ensures: false,\n    }\n    fn ext_never_returns(n: u32) -> u32;\n}\n\nspec! {\n    requires: x <= 10,\n    ensures: ret == 0,\n}\npub fn caller_of_divergent(x: u32) -> u32 { unsafe { ext_never_returns(x) } }\n";
     let Some(all) = verify_all_src(src) else { return };
     let o = pick(&all, "caller_of_divergent");
     match o {
@@ -11116,9 +11410,7 @@ fn a_call_to_a_callee_whose_postcondition_is_unsatisfiable_fails() {
 /// the absence of a promise, not a promise of everything.
 #[test]
 fn a_callee_with_no_postcondition_is_not_assumed_to_promise_everything() {
-    let src = "unsafe extern \"C\" {\n    /// requires: n <= 10\n    fn ext_no_post(n: u32) -> u32;\n}\n\n\
-               /// requires: x <= 10\n/// ensures: ret <= 11\n\
-               pub fn caller_of_silent(x: u32) -> u32 { unsafe { ext_no_post(x) } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nunsafe extern \"C\" {\n    spec! {\n        requires: n <= 10,\n    }\n    fn ext_no_post(n: u32) -> u32;\n}\n\nspec! {\n    requires: x <= 10,\n    ensures: ret <= 11,\n}\npub fn caller_of_silent(x: u32) -> u32 { unsafe { ext_no_post(x) } }\n";
     let Some(all) = verify_all_src(src) else { return };
     let o = pick(&all, "caller_of_silent");
     assert!(
@@ -11146,10 +11438,7 @@ fn a_callee_with_no_postcondition_is_not_assumed_to_promise_everything() {
 /// nobody stated, so the call is refused.
 #[test]
 fn a_signature_the_scanner_cannot_read_refuses_the_call() {
-    let src = "unsafe extern \"C\" {\n    /// requires: n <= 10\n    /// ensures: ret <= n + 1\n    \
-               fn ext_bump(_: u32) -> u32;\n}\n\n\
-               /// requires: x <= 10\n/// ensures: ret <= 11\n\
-               pub fn caller_unnamed(x: u32) -> u32 { unsafe { ext_bump(x) } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nunsafe extern \"C\" {\n    spec! {\n        requires: n <= 10,\n        ensures: ret <= n + 1,\n    }\n    fn ext_bump(_: u32) -> u32;\n}\n\nspec! {\n    requires: x <= 10,\n    ensures: ret <= 11,\n}\npub fn caller_unnamed(x: u32) -> u32 { unsafe { ext_bump(x) } }\n";
     let Some(all) = verify_all_src(src) else { return };
     let o = pick(&all, "caller_unnamed");
     assert!(
@@ -11174,11 +11463,7 @@ fn a_signature_the_scanner_cannot_read_refuses_the_call() {
 /// no contract route.
 #[test]
 fn a_call_passing_a_reference_to_a_bodyless_callee_is_refused() {
-    let src = "unsafe extern \"C\" {\n    /// requires: *r <= 10\n    /// ensures: true\n    \
-               fn ext_take(r: &mut u32);\n}\n\n\
-               /// requires: x <= 10\n/// ensures: ret <= 10\n\
-               pub fn caller_by_ref(x: u32) -> u32 {\n    let mut y = x;\n    \
-               unsafe { ext_take(&mut y) };\n    y\n}\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nunsafe extern \"C\" {\n    spec! {\n        requires: *r <= 10,\n        ensures: true,\n    }\n    fn ext_take(r: &mut u32);\n}\n\nspec! {\n    requires: x <= 10,\n    ensures: ret <= 10,\n}\npub fn caller_by_ref(x: u32) -> u32 {\n    let mut y = x;\n    unsafe { ext_take(&mut y) };\n    y\n}\n";
     let Some(all) = verify_all_src(src) else { return };
     let o = pick(&all, "caller_by_ref");
     assert!(
@@ -11204,10 +11489,7 @@ fn a_call_passing_a_reference_to_a_bodyless_callee_is_refused() {
 /// used. A contract-only route would leave it undecided.
 #[test]
 fn a_callee_with_a_body_is_inlined_rather_than_answered_from_its_contract() {
-    let src = "/// ensures: ret <= 100\n\
-               pub fn callee(a: u32) -> u32 { a }\n\n\
-               /// requires: x <= 3\n/// ensures: ret <= 3\n\
-               pub fn caller(x: u32) -> u32 { callee(x) }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    ensures: ret <= 100,\n}\npub fn callee(a: u32) -> u32 { a }\n\nspec! {\n    requires: x <= 3,\n    ensures: ret <= 3,\n}\npub fn caller(x: u32) -> u32 { callee(x) }\n";
     let Some(all) = verify_all_src(src) else { return };
     let o = pick(&all, "caller");
     assert!(
@@ -11238,12 +11520,7 @@ fn a_callee_with_a_body_is_inlined_rather_than_answered_from_its_contract() {
 /// name would get exactly these two backwards.
 #[test]
 fn an_inherited_contract_binds_parameters_by_position_not_by_name() {
-    let src = "pub trait T {\n\
-               /// ensures: ret == a\n\
-               fn f(&self, a: u8, b: u8) -> u8;\n\
-               }\n\
-               pub struct S;\n\
-               impl T for S { fn f(&self, b: u8, a: u8) -> u8 { a } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub trait T {\nspec! {\n    ensures: ret == a,\n}\nfn f(&self, a: u8, b: u8) -> u8;\n}\npub struct S;\nimpl T for S { fn f(&self, b: u8, a: u8) -> u8 { a } }\n";
     let (outcomes, missing) = verify_all_outcomes(src);
     assert!(missing.is_empty(), "the impl carries the declaration's contract, so nothing is missing: {missing:?}");
     let o = pick(&outcomes, "f");
@@ -11253,12 +11530,7 @@ fn an_inherited_contract_binds_parameters_by_position_not_by_name() {
          `ret == a` (the trait's `a`) must be refuted, got: {o}"
     );
 
-    let src = "pub trait T {\n\
-               /// ensures: ret == a\n\
-               fn f(&self, a: u8, b: u8) -> u8;\n\
-               }\n\
-               pub struct S;\n\
-               impl T for S { fn f(&self, b: u8, a: u8) -> u8 { b } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub trait T {\nspec! {\n    ensures: ret == a,\n}\nfn f(&self, a: u8, b: u8) -> u8;\n}\npub struct S;\nimpl T for S { fn f(&self, b: u8, a: u8) -> u8 { b } }\n";
     let (outcomes, _) = verify_all_outcomes(src);
     let o = pick(&outcomes, "f");
     assert!(
@@ -11278,14 +11550,7 @@ fn an_inherited_contract_binds_parameters_by_position_not_by_name() {
 /// lost proof.
 #[test]
 fn an_inherited_contract_binds_a_field_to_the_declarations_parameter() {
-    let src = "pub struct Config { pub lo: u8, pub hi: u8 }\n\
-               pub trait T {\n\
-               /// requires: c.lo <= c.hi\n\
-               /// ensures: ret == c.hi\n\
-               fn hi_of(&self, c: Config) -> u8;\n\
-               }\n\
-               pub struct S;\n\
-               impl T for S { fn hi_of(&self, k: Config) -> u8 { k.hi } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub struct Config { pub lo: u8, pub hi: u8 }\npub trait T {\nspec! {\n    requires: c.lo <= c.hi,\n    ensures: ret == c.hi,\n}\nfn hi_of(&self, c: Config) -> u8;\n}\npub struct S;\nimpl T for S { fn hi_of(&self, k: Config) -> u8 { k.hi } }\n";
     let (outcomes, missing) = verify_all_outcomes(src);
     assert!(missing.is_empty(), "nothing is missing here: {missing:?}");
     let o = pick(&outcomes, "hi_of");
@@ -11307,12 +11572,7 @@ fn an_inherited_contract_binds_a_field_to_the_declarations_parameter() {
 /// guess or silently dropped.
 #[test]
 fn an_inherited_contract_that_cannot_be_aligned_is_refused() {
-    let src = "pub trait T {\n\
-               /// ensures: ret == 1\n\
-               fn f(&self, _: u8) -> u8;\n\
-               }\n\
-               pub struct S;\n\
-               impl T for S { fn f(&self, a: u8) -> u8 { let _ = a; 2 } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub trait T {\nspec! {\n    ensures: ret == 1,\n}\nfn f(&self, _: u8) -> u8;\n}\npub struct S;\nimpl T for S { fn f(&self, a: u8) -> u8 { let _ = a; 2 } }\n";
     let (outcomes, missing) = verify_all_outcomes(src);
     assert!(missing.is_empty(), "the impl is present, so nothing is missing: {missing:?}");
     let o = pick(&outcomes, "f");
@@ -11343,13 +11603,7 @@ fn an_inherited_contract_that_cannot_be_aligned_is_refused() {
 /// which is the same discipline the parameter list already followed.
 #[test]
 fn a_return_type_that_wraps_to_the_next_line_refuses_the_call() {
-    let src = "unsafe extern \"C\" {\n\
-               /// ensures: ret == i8::MIN\n\
-               fn ext() ->\n\
-               i8;\n\
-               }\n\
-               /// ensures: ret == 0\n\
-               pub fn caller() -> u8 { if unsafe { ext() } < 0 { 1u8 } else { 0u8 } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nunsafe extern \"C\" {\nspec! {\n    ensures: ret == i8::MIN,\n}\nfn ext() ->\ni8;\n}\nspec! {\n    ensures: ret == 0,\n}\npub fn caller() -> u8 { if unsafe { ext() } < 0 { 1u8 } else { 0u8 } }\n";
     let (outcomes, _) = verify_all_outcomes(src);
     let o = pick(&outcomes, "caller");
     assert!(
@@ -11370,12 +11624,7 @@ fn a_return_type_that_wraps_to_the_next_line_refuses_the_call() {
 /// postcondition is refuted rather than verified.
 #[test]
 fn a_return_type_on_one_line_is_read_and_refutes_the_false_claim() {
-    let src = "unsafe extern \"C\" {\n\
-               /// ensures: ret == i8::MIN\n\
-               fn ext() -> i8;\n\
-               }\n\
-               /// ensures: ret == 0\n\
-               pub fn caller() -> u8 { if unsafe { ext() } < 0 { 1u8 } else { 0u8 } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nunsafe extern \"C\" {\nspec! {\n    ensures: ret == i8::MIN,\n}\nfn ext() -> i8;\n}\nspec! {\n    ensures: ret == 0,\n}\npub fn caller() -> u8 { if unsafe { ext() } < 0 { 1u8 } else { 0u8 } }\n";
     let (outcomes, _) = verify_all_outcomes(src);
     let o = pick(&outcomes, "caller");
     assert!(
@@ -11438,12 +11687,7 @@ fn a_trait_impl_written_with_a_relative_root_is_checked() {
 /// reader to ignore the report. The call itself must still be verified.
 #[test]
 fn a_bodyless_declaration_is_assumed_not_reported_missing() {
-    let src = "unsafe extern \"C\" {\n\
-               /// ensures: ret == 1\n\
-               fn ext() -> u8;\n\
-               }\n\
-               /// ensures: ret == 1\n\
-               pub fn caller() -> u8 { unsafe { ext() } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nunsafe extern \"C\" {\nspec! {\n    ensures: ret == 1,\n}\nfn ext() -> u8;\n}\nspec! {\n    ensures: ret == 1,\n}\npub fn caller() -> u8 { unsafe { ext() } }\n";
     let (outcomes, missing) = verify_all_outcomes(src);
     assert!(
         missing.is_empty(),
@@ -11457,12 +11701,7 @@ fn a_bodyless_declaration_is_assumed_not_reported_missing() {
 /// still a failure -- being assumed is not being ignored.
 #[test]
 fn an_assumed_bodyless_contract_is_still_refuted_when_unsatisfiable() {
-    let src = "unsafe extern \"C\" {\n\
-               /// ensures: ret == 1 && ret == 2\n\
-               fn ext() -> u8;\n\
-               }\n\
-               /// ensures: ret == 1\n\
-               pub fn caller() -> u8 { unsafe { ext() } }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nunsafe extern \"C\" {\nspec! {\n    ensures: ret == 1 && ret == 2,\n}\nfn ext() -> u8;\n}\nspec! {\n    ensures: ret == 1,\n}\npub fn caller() -> u8 { unsafe { ext() } }\n";
     let (outcomes, _) = verify_all_outcomes(src);
     let o = pick(&outcomes, "caller");
     assert!(
@@ -11484,15 +11723,7 @@ fn an_assumed_bodyless_contract_is_still_refuted_when_unsatisfiable() {
 /// function verifies on the reachable ones.
 #[test]
 fn an_unreachable_call_is_not_a_divergence() {
-    let src = "unsafe extern \"C\" {\n\
-               /// ensures: true\n\
-               fn ext() -> u8;\n\
-               }\n\
-               /// ensures: ret == 0\n\
-               pub fn caller(x: u8) -> u8 {\n\
-               if x == 0 { if x != 0 { unsafe { ext() }; } }\n\
-               0\n\
-               }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nunsafe extern \"C\" {\nspec! {\n    ensures: true,\n}\nfn ext() -> u8;\n}\nspec! {\n    ensures: ret == 0,\n}\npub fn caller(x: u8) -> u8 {\nif x == 0 { if x != 0 { unsafe { ext() }; } }\n0\n}\n";
     let (outcomes, missing) = verify_all_outcomes(src);
     assert!(missing.is_empty(), "the extern is assumed, so nothing is missing: {missing:?}");
     let o = pick(&outcomes, "caller");
@@ -11517,18 +11748,7 @@ fn an_unreachable_call_is_not_a_divergence() {
 /// defect. The two now travel together.
 #[test]
 fn a_helper_call_in_a_measured_loop_keeps_the_termination_measure() {
-    let src = "/// requires: i < 255\n\
-               /// ensures: ret == i + 1\n\
-               pub fn step(i: u8) -> u8 { i + 1 }\n\n\
-               /// requires: n <= 200\n\
-               /// invariant: i <= n\n\
-               /// variant: n - i\n\
-               /// ensures: ret == n\n\
-               pub fn f(n: u8) -> u8 {\n\
-               let mut i = 0u8;\n\
-               while i < n { i = step(i); }\n\
-               i\n\
-               }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: i < 255,\n    ensures: ret == i + 1,\n}\npub fn step(i: u8) -> u8 { i + 1 }\n\nspec! {\n    requires: n <= 200,\n    invariant: i <= n,\n    variant: n - i,\n    ensures: ret == n,\n}\npub fn f(n: u8) -> u8 {\nlet mut i = 0u8;\nwhile i < n { i = step(i); }\ni\n}\n";
     let (outcomes, missing) = verify_all_outcomes(src);
     assert!(missing.is_empty(), "both bodies are present: {missing:?}");
     let o = pick(&outcomes, "f");
@@ -11554,9 +11774,7 @@ fn a_helper_call_in_a_measured_loop_keeps_the_termination_measure() {
 /// when it is not.
 #[test]
 fn an_assert_is_checked_and_discharged_under_its_precondition() {
-    let src = "/// requires: x <= 200\n\
-               /// ensures: ret == 1\n\
-               pub fn f(x: u8) -> u8 { assert!(x <= 200); 1 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: x <= 200,\n    ensures: ret == 1,\n}\npub fn f(x: u8) -> u8 { assert!(x <= 200); 1 }\n";
     let o = verify_src("f", src).expect("f must be in the report");
     assert!(
         o.is_verified(),
@@ -11572,8 +11790,7 @@ fn an_assert_is_checked_and_discharged_under_its_precondition() {
 /// makes the missing precondition a *failure*, the sound direction.
 #[test]
 fn an_unproved_assert_is_refuted_with_a_counterexample() {
-    let src = "/// ensures: ret == 1\n\
-               pub fn f(x: u8) -> u8 { assert!(x <= 200); 1 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    ensures: ret == 1,\n}\npub fn f(x: u8) -> u8 { assert!(x <= 200); 1 }\n";
     let o = verify_src("f", src).expect("f must be in the report");
     match o {
         FnOutcome::Failed { kind, detail } => {
@@ -11596,9 +11813,7 @@ fn an_unproved_assert_is_refuted_with_a_counterexample() {
 /// assumption load-bearing: it only holds if the guard is carried forward.
 #[test]
 fn an_assert_guard_is_assumed_by_the_code_after_it() {
-    let src = "/// requires: x <= 200\n\
-               /// ensures: ret == x + 1\n\
-               pub fn f(x: u8) -> u8 { assert!(x <= 200); x + 1 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: x <= 200,\n    ensures: ret == x + 1,\n}\npub fn f(x: u8) -> u8 { assert!(x <= 200); x + 1 }\n";
     let o = verify_src("f", src).expect("f must be in the report");
     assert!(o.is_verified(), "the assert must be assumed on the fall-through path: {o}");
 }
@@ -11606,9 +11821,7 @@ fn an_assert_guard_is_assumed_by_the_code_after_it() {
 /// `debug_assert!` lowers the same way, so it is checked and assumed too.
 #[test]
 fn a_debug_assert_is_checked_like_an_assert() {
-    let src = "/// requires: x <= 200\n\
-               /// ensures: ret == 1\n\
-               pub fn f(x: u8) -> u8 { debug_assert!(x <= 200); 1 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: x <= 200,\n    ensures: ret == 1,\n}\npub fn f(x: u8) -> u8 { debug_assert!(x <= 200); 1 }\n";
     let o = verify_src("f", src).expect("f must be in the report");
     assert!(o.is_verified(), "a debug_assert is the same terminator as an assert: {o}");
 }
@@ -11620,8 +11833,7 @@ fn a_debug_assert_is_checked_like_an_assert() {
 /// names the panic rather than the mangled callee path.
 #[test]
 fn a_panic_is_refuted_unless_its_guard_excludes_it() {
-    let unguarded = "/// ensures: ret == 1\n\
-                     pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"zero\"); } 1 }\n";
+    let unguarded = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    ensures: ret == 1,\n}\npub fn f(x: u8) -> u8 { if x == 0 { panic!(\"zero\"); } 1 }\n";
     let o = verify_src("f", unguarded).expect("f must be in the report");
     match o {
         FnOutcome::Failed { kind, .. } => {
@@ -11629,9 +11841,7 @@ fn a_panic_is_refuted_unless_its_guard_excludes_it() {
         }
         other => panic!("an unguarded panic must fail, got: {other}"),
     }
-    let guarded = "/// requires: x != 0\n\
-                   /// ensures: ret == 1\n\
-                   pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"zero\"); } 1 }\n";
+    let guarded = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: x != 0,\n    ensures: ret == 1,\n}\npub fn f(x: u8) -> u8 { if x == 0 { panic!(\"zero\"); } 1 }\n";
     let o = verify_src("f", guarded).expect("f must be in the report");
     assert!(o.is_verified(), "the precondition excludes the panic: {o}");
 }
@@ -11648,8 +11858,7 @@ fn a_panic_is_refuted_unless_its_guard_excludes_it() {
 /// same assertion on the two toolchains the gate uses.
 #[test]
 fn a_formatted_panic_message_is_recovered_from_the_fmt_chain() {
-    let unguarded = "/// ensures: ret == 1\n\
-                     pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"bad {}\", x); } 1 }\n";
+    let unguarded = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    ensures: ret == 1,\n}\npub fn f(x: u8) -> u8 { if x == 0 { panic!(\"bad {}\", x); } 1 }\n";
     let Some(o) = verify_src("f", unguarded) else { return };
     match o {
         FnOutcome::Failed { kind, .. } => {
@@ -11661,13 +11870,10 @@ fn a_formatted_panic_message_is_recovered_from_the_fmt_chain() {
         other => panic!("a formatted panic with no guard must fail, got: {other}"),
     }
     // A formatted `assert!` is the same chain with the guard in front of it.
-    let guarded = "/// requires: x <= 100\n\
-                   /// ensures: ret == 1\n\
-                   pub fn f(x: u8) -> u8 { assert!(x <= 100, \"bad {}\", x); 1 }\n";
+    let guarded = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: x <= 100,\n    ensures: ret == 1,\n}\npub fn f(x: u8) -> u8 { assert!(x <= 100, \"bad {}\", x); 1 }\n";
     let o = verify_src("f", guarded).expect("f must be in the report");
     assert!(o.is_verified(), "the precondition implies the formatted assert: {o}");
-    let misguarded = "/// ensures: ret == 1\n\
-                      pub fn f(x: u8) -> u8 { assert!(x <= 100, \"bad {}\", x); 1 }\n";
+    let misguarded = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    ensures: ret == 1,\n}\npub fn f(x: u8) -> u8 { assert!(x <= 100, \"bad {}\", x); 1 }\n";
     let o = verify_src("f", misguarded).expect("f must be in the report");
     match o {
         FnOutcome::Failed { kind, .. } => assert!(
@@ -11682,8 +11888,7 @@ fn a_formatted_panic_message_is_recovered_from_the_fmt_chain() {
     // *name*, read through the generics, and not the type arguments: the report
     // used to read `<u8>`, which is a mangled path rather than a fallback. The
     // two toolchains spell the callee differently, so only the shape is pinned.
-    let no_pieces = "/// ensures: ret == 1\n\
-                     pub fn f(x: u8) -> u8 { if x == 0 { panic!(\"{}\", x); } 1 }\n";
+    let no_pieces = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    ensures: ret == 1,\n}\npub fn f(x: u8) -> u8 { if x == 0 { panic!(\"{}\", x); } 1 }\n";
     let o = verify_src("f", no_pieces).expect("f must be in the report");
     match o {
         FnOutcome::Failed { kind, .. } => assert!(
@@ -11703,8 +11908,7 @@ fn a_formatted_panic_message_is_recovered_from_the_fmt_chain() {
 /// must not regress the plain one.
 #[test]
 fn a_literal_panic_macro_names_its_message() {
-    let src = "/// ensures: ret == 1\n\
-               pub fn f(x: u8) -> u8 { if x == 0 { unreachable!(); } 1 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    ensures: ret == 1,\n}\npub fn f(x: u8) -> u8 { if x == 0 { unreachable!(); } 1 }\n";
     let Some(o) = verify_src("f", src) else { return };
     match o {
         FnOutcome::Failed { kind, .. } => assert!(
@@ -11713,8 +11917,7 @@ fn a_literal_panic_macro_names_its_message() {
         ),
         other => panic!("an unguarded `unreachable!` must fail, got: {other}"),
     }
-    let src = "/// ensures: ret == 1\n\
-               pub fn f(x: u8) -> u8 { if x == 0 { todo!(); } 1 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    ensures: ret == 1,\n}\npub fn f(x: u8) -> u8 { if x == 0 { todo!(); } 1 }\n";
     let o = verify_src("f", src).expect("f must be in the report");
     match o {
         FnOutcome::Failed { kind, .. } => assert!(
@@ -11732,9 +11935,7 @@ fn a_literal_panic_macro_names_its_message() {
 /// makes a `&[T]` argument safe to reason about at all.
 #[test]
 fn an_index_bounds_check_is_proved_unreachable() {
-    let src = "/// requires: xs.len() >= 1\n\
-               /// ensures: ret == 0\n\
-               pub fn f(xs: &[u8]) -> u8 { xs[0] * 0 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\nspec! {\n    requires: xs.len() >= 1,\n    ensures: ret == 0,\n}\npub fn f(xs: &[u8]) -> u8 { xs[0] * 0 }\n";
     let o = verify_src("f", src).expect("f must be in the report");
     assert!(o.is_verified(), "the length precondition rules the bounds check out: {o}");
 }
@@ -11756,10 +11957,7 @@ fn an_index_bounds_check_is_proved_unreachable() {
 /// is a failure, not a silently dropped check.
 #[test]
 fn a_diverging_call_in_a_function_with_a_drop_local_is_checked() {
-    let src = "pub struct Guard(pub u8);\n\
-               impl Drop for Guard {\n    fn drop(&mut self) {}\n}\n\
-               /// ensures: ret == 1\n\
-               pub fn f(x: u8) -> u8 { let _g = Guard(0); assert!(x < 200); 1 }\n";
+    let src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\npub struct Guard(pub u8);\nimpl Drop for Guard {\n    fn drop(&mut self) {}\n}\nspec! {\n    ensures: ret == 1,\n}\npub fn f(x: u8) -> u8 { let _g = Guard(0); assert!(x < 200); 1 }\n";
     let o = verify_src("f", src).expect("f must be in the report");
     match o {
         FnOutcome::Failed { kind, detail } => {
@@ -12109,22 +12307,27 @@ fn the_u32_product_surface_is_modelled() {
 /// a fix that refused every `drop` would pass the second and fail the first.
 #[test]
 fn a_drop_terminator_is_modelled_and_its_destructor_runs() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct Guard(pub u8);
 impl Drop for Guard {
     fn drop(&mut self) {}
 }
 
-/// requires: x < 200
-/// ensures: ret == 1
+spec! {
+    requires: x < 200,
+    ensures: ret == 1,
+}
 pub fn guarded(x: u8) -> u8 {
     let _g = Guard(0);
     assert!(x < 200);
     1
 }
 
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn misguarded(x: u8) -> u8 {
     let _g = Guard(0);
     assert!(x < 200);
@@ -12156,7 +12359,8 @@ pub fn misguarded(x: u8) -> u8 {
 /// is not merely refusing the shape.
 #[test]
 fn a_destructor_body_is_executed_and_its_panic_is_an_obligation() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct PanicGuard { pub v: u8 }
 impl Drop for PanicGuard {
     fn drop(&mut self) {
@@ -12164,15 +12368,19 @@ impl Drop for PanicGuard {
     }
 }
 
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn unguarded(x: u8) -> u8 {
     let _p = PanicGuard { v: x };
     1
 }
 
-/// requires: x < 10
-/// ensures: ret == 1
+spec! {
+    requires: x < 10,
+    ensures: ret == 1,
+}
 pub fn guarded(x: u8) -> u8 {
     let _p = PanicGuard { v: x };
     1
@@ -12209,9 +12417,12 @@ pub fn guarded(x: u8) -> u8 {
 /// print `drop(_x) -> [return: …]`), which is why the no-op is not taken here.
 #[test]
 fn an_unmodelled_drop_is_refused_not_assumed_away() {
-    let src = r#"
-/// requires: true
-/// ensures: ret == 1
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn owns_string(s: String) -> u8 {
     let _owned = s;
     1
@@ -12289,7 +12500,8 @@ fn the_drop_fixtures_decide_and_the_false_ones_are_refuted() {
 /// honest answer rather than an assumed no-op.
 #[test]
 fn a_combinator_that_destroys_a_value_respects_its_drop_glue() {
-    let src = r#"
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct Boom;
 impl Drop for Boom {
     fn drop(&mut self) {
@@ -12297,14 +12509,18 @@ impl Drop for Boom {
     }
 }
 
-/// requires: true
-/// ensures: ret <= 255
+spec! {
+    requires: true,
+    ensures: ret <= 255,
+}
 pub fn boom_default(r: Result<u8, Boom>) -> u8 {
     r.unwrap_or_default()
 }
 
-/// requires: true
-/// ensures: ret <= 255
+spec! {
+    requires: true,
+    ensures: ret <= 255,
+}
 pub fn boom_or(r: Result<u8, Boom>) -> u8 {
     r.unwrap_or(7)
 }
@@ -12346,7 +12562,8 @@ mod review_round {
     /// answer: the drop is unmodelled, not proved safe.
     #[test]
     fn a_field_with_its_own_destructor_is_refused_not_assumed_safe() {
-        let src = r#"
+        let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct Inner { pub v: u8 }
 impl Drop for Inner {
     fn drop(&mut self) { assert!(self.v < 10); }
@@ -12356,15 +12573,19 @@ impl Drop for Outer {
     fn drop(&mut self) {}
 }
 
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn outer_with_panicking_field(x: u8) -> u8 {
     let _o = Outer { inner: Inner { v: x } };
     1
 }
 
-/// requires: x < 10
-/// ensures: ret == 1
+spec! {
+    requires: x < 10,
+    ensures: ret == 1,
+}
 pub fn outer_guarded(x: u8) -> u8 {
     let _o = Outer { inner: Inner { v: x } };
     1
@@ -12397,20 +12618,25 @@ pub fn outer_guarded(x: u8) -> u8 {
     /// decides, which is the positive control that the refusal is not blanket.
     #[test]
     fn unwrap_or_refuses_an_error_type_whose_drop_is_unmodelled() {
-        let src = r#"
+        let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct Boom;
 impl Drop for Boom {
     fn drop(&mut self) { assert!(false); }
 }
 
-/// requires: true
-/// ensures: ret <= 255
+spec! {
+    requires: true,
+    ensures: ret <= 255,
+}
 pub fn unwrap_or_dropping_error(r: Result<u8, Boom>) -> u8 {
     r.unwrap_or(0)
 }
 
-/// requires: true
-/// ensures: ret <= 255
+spec! {
+    requires: true,
+    ensures: ret <= 255,
+}
 pub fn unwrap_or_scalar_error(r: Result<u8, u8>) -> u8 {
     r.unwrap_or(0)
 }
@@ -12437,10 +12663,13 @@ pub fn unwrap_or_scalar_error(r: Result<u8, u8>) -> u8 {
     /// now the number of iterations, which is what a caller means.
     #[test]
     fn the_unwind_bound_counts_iterations_not_header_entries() {
-        let src = r#"
-/// requires: true
-/// unwind: 3
-/// ensures: ret == 3
+        let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    unwind: 3,
+    ensures: ret == 3,
+}
 pub fn while_exact() -> u32 {
     let mut i = 0u32;
     let mut s = 0u32;
@@ -12448,9 +12677,11 @@ pub fn while_exact() -> u32 {
     s
 }
 
-/// requires: true
-/// unwind: 3
-/// ensures: ret == 3
+spec! {
+    requires: true,
+    unwind: 3,
+    ensures: ret == 3,
+}
 pub fn for_exact() -> u32 {
     let mut s = 0u32;
     for _i in 0..3u32 { s += 1; }
@@ -12459,9 +12690,11 @@ pub fn for_exact() -> u32 {
 
 fn helper(x: u8) -> u8 { if x == 0 { 0 } else { 1 } }
 
-/// requires: x == 0
-/// unwind: 1
-/// ensures: ret == 0
+spec! {
+    requires: x == 0,
+    unwind: 1,
+    ensures: ret == 0,
+}
 pub fn loop_free_helper_calls(x: u8) -> u8 {
     let a = helper(x);
     let b = helper(0);
@@ -12485,10 +12718,13 @@ pub fn loop_free_helper_calls(x: u8) -> u8 {
     /// the latch fix could pass by accepting every bound.
     #[test]
     fn an_unwind_bound_below_the_iterations_still_fails() {
-        let src = r#"
-/// requires: true
-/// unwind: 2
-/// ensures: ret == 3
+        let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    unwind: 2,
+    ensures: ret == 3,
+}
 pub fn for_too_few() -> u32 {
     let mut s = 0u32;
     for _i in 0..3u32 { s += 1; }
@@ -12567,46 +12803,57 @@ pub fn for_too_few() -> u32 {
     /// `tri_invariant_cannot_prove_this` is asserted to be refuted.
     #[test]
     fn the_for_loop_range_desugaring_is_modelled() {
-        let src = r#"
-/// requires: n <= 3
-/// unwind: 4
-/// ensures: ret <= 6
+        let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: n <= 3,
+    unwind: 4,
+    ensures: ret <= 6,
+}
 pub fn for_inclusive_sum(n: u32) -> u32 {
     let mut s = 0;
     for i in 0..=n { s += i; }
     s
 }
 
-/// requires: n <= 3
-/// unwind: 4
-/// ensures: ret <= 5
+spec! {
+    requires: n <= 3,
+    unwind: 4,
+    ensures: ret <= 5,
+}
 pub fn for_inclusive_sum_cannot_prove_this(n: u32) -> u32 {
     let mut s = 0;
     for i in 0..=n { s += i; }
     s
 }
 
-/// requires: true
-/// unwind: 3
-/// ensures: ret == 3
+spec! {
+    requires: true,
+    unwind: 3,
+    ensures: ret == 3,
+}
 pub fn for_exclusive_counts() -> u32 {
     let mut s = 0;
     for _i in 0..3u32 { s += 1; }
     s
 }
 
-/// requires: n <= 100
-/// invariant: s <= 5050
-/// ensures: ret <= 5050
+spec! {
+    requires: n <= 100,
+    invariant: s <= 5050,
+    ensures: ret <= 5050,
+}
 pub fn tri_invariant(n: u32) -> u32 {
     let mut s = 0;
     for i in 0..=n { s = i.min(5050); }
     s
 }
 
-/// requires: n <= 100
-/// invariant: s <= 5050
-/// ensures: ret <= 3
+spec! {
+    requires: n <= 100,
+    invariant: s <= 5050,
+    ensures: ret <= 3,
+}
 pub fn tri_invariant_cannot_prove_this(n: u32) -> u32 {
     let mut s = 0;
     for i in 0..=n { s = i.min(5050); }
@@ -12675,71 +12922,86 @@ pub fn tri_invariant_cannot_prove_this(n: u32) -> u32 {
     /// carries it.
     #[test]
     fn a_loop_that_calls_a_recursive_function_terminates_and_is_sound() {
-        let src = r#"
-/// requires: true
-/// decreases: n
-/// ensures: ret == n
+        let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    decreases: n,
+    ensures: ret == n,
+}
 pub fn count_down(n: u8) -> u8 {
     if n == 0 { 0 } else { count_down(n - 1) + 1 }
 }
 
-/// requires: true
-/// decreases: n
-/// ensures: ret == 0
+spec! {
+    requires: true,
+    decreases: n,
+    ensures: ret == 0,
+}
 pub fn walk(n: u8, c: &mut u8) -> u8 {
     if n == 0 { 0 } else { *c = c.wrapping_add(1); walk(n - 1, c) }
 }
 
-/// requires: n <= 3
-/// invariant: i <= 3
-/// ensures: ret <= 3
+spec! {
+    requires: n <= 3,
+    invariant: i <= 3,
+    ensures: ret <= 3,
+}
 pub fn loop_calls_recursive(n: u8) -> u8 {
     let mut i = 0u8; let mut s = 0u8;
     while i < 3 { s = count_down(n); i += 1; }
     s
 }
 
-/// requires: n <= 3
-/// invariant: i <= 3
-/// ensures: ret == 0
+spec! {
+    requires: n <= 3,
+    invariant: i <= 3,
+    ensures: ret == 0,
+}
 pub fn loop_calls_recursive_cannot_prove_this(n: u8) -> u8 {
     let mut i = 0u8; let mut s = 0u8;
     while i < 3 { s = count_down(n); i += 1; }
     s
 }
 
+spec! {
+    requires: x == 0,
+    invariant: i <= 3,
+    ensures: ret <= 255,
+}
 /// A loop calling a *reference-carrying* recursive callee: the call cycle is
 /// refused rather than followed, and the call's reference argument is added
 /// directly. `x` is written through `walk`, so the exit state cannot keep `0`.
-/// requires: x == 0
-/// invariant: i <= 3
-/// ensures: ret <= 255
 pub fn loop_calls_ref_recursive(x: &mut u8) -> u8 {
     let mut i = 0u8;
     while i < 3 { walk(1, x); i += 1; }
     *x
 }
 
+spec! {
+    requires: x == 0,
+    invariant: i <= 3,
+    ensures: ret == 0,
+}
 /// The false twin: `walk` writes `x`, so `ret == 0` is false. A model that
 /// dropped the reference from the cycle's havoc would prove it.
-/// requires: x == 0
-/// invariant: i <= 3
-/// ensures: ret == 0
 pub fn loop_calls_ref_recursive_cannot_prove_this(x: &mut u8) -> u8 {
     let mut i = 0u8;
     while i < 3 { walk(1, x); i += 1; }
     *x
 }
 
+spec! {
+    requires: n <= 8,
+    invariant: i <= 3,
+    ensures: ret <= 1,
+}
 /// A *mutual* recursion cycle reached from an invariant loop: `even_w` calls
 /// `odd_w` calls `even_w`. The write-set walk must terminate on the cycle
 /// (`visiting` holds the functions on the stack), and neither callee writes a
 /// reference, so the loop's only write is its own counter. Before the cycle
 /// guard this was an unbounded recursion between *invocations* and overflowed the
 /// stack, aborting the whole run.
-/// requires: n <= 8
-/// invariant: i <= 3
-/// ensures: ret <= 1
 pub fn loop_calls_mutual_recursive(n: u8) -> u8 {
     let mut i = 0u8;
     let mut s = 0u8;
@@ -12747,16 +13009,20 @@ pub fn loop_calls_mutual_recursive(n: u8) -> u8 {
     s
 }
 
-/// requires: true
-/// decreases: n
-/// ensures: ret <= 1
+spec! {
+    requires: true,
+    decreases: n,
+    ensures: ret <= 1,
+}
 pub fn even_w(n: u8) -> u8 {
     if n == 0 { 1 } else { odd_w(n - 1) }
 }
 
-/// requires: true
-/// decreases: n
-/// ensures: ret <= 1
+spec! {
+    requires: true,
+    decreases: n,
+    ensures: ret <= 1,
+}
 pub fn odd_w(n: u8) -> u8 {
     if n == 0 { 0 } else { even_w(n - 1) }
 }
@@ -12836,9 +13102,12 @@ pub fn odd_w(n: u8) -> u8 {
     /// could not model this".
     #[test]
     fn a_loop_without_a_contract_names_the_missing_contract() {
-        let src = r#"
-/// requires: true
-/// ensures: true
+        let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    ensures: true,
+}
 pub fn tri(n: u32) -> u32 {
     let mut s = 0;
     for i in 0..=n { s += i; }
@@ -12889,37 +13158,46 @@ mod range_and_layout_review {
     /// the language's semantics rather than the model's.
     #[test]
     fn a_signed_inclusive_range_stops_at_its_boundary() {
-        let src = r#"
-/// requires: true
-/// unwind: 8
-/// ensures: ret == 1
+        let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    unwind: 8,
+    ensures: ret == 1,
+}
 pub fn single_signed_incl() -> u32 {
     let mut c = 0u32;
     for _ in 127i8..=127i8 { c += 1; }
     c
 }
 
-/// requires: true
-/// unwind: 8
-/// ensures: ret == 2
+spec! {
+    requires: true,
+    unwind: 8,
+    ensures: ret == 2,
+}
 pub fn two_signed_incl() -> u32 {
     let mut c = 0u32;
     for _ in 126i8..=127i8 { c += 1; }
     c
 }
 
-/// requires: true
-/// unwind: 8
-/// ensures: ret == 3
+spec! {
+    requires: true,
+    unwind: 8,
+    ensures: ret == 3,
+}
 pub fn three_signed_incl() -> u32 {
     let mut c = 0u32;
     for _ in (-128i8)..=(-126i8) { c += 1; }
     c
 }
 
-/// requires: true
-/// unwind: 4
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    unwind: 4,
+    ensures: ret == 1,
+}
 pub fn single_unsigned_incl() -> u32 {
     let mut c = 0u32;
     for _ in 255u8..=255u8 { c += 1; }
@@ -12948,9 +13226,12 @@ pub fn single_unsigned_incl() -> u32 {
     /// second call (`Some(0)`), turning a true contract into a refutation.
     #[test]
     fn an_empty_inclusive_range_stays_empty() {
-        let src = r#"
-/// requires: true
-/// ensures: ret == 0
+        let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 pub fn empty_incl_twice() -> u8 {
     let mut r = 255u8..=254u8;
     let _a = r.next();
@@ -12958,8 +13239,10 @@ pub fn empty_incl_twice() -> u8 {
     match b { Some(_) => 1, None => 0 }
 }
 
-/// requires: true
-/// ensures: ret == 0
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 pub fn empty_excl_twice() -> u8 {
     let mut r = 255u8..255u8;
     let _a = r.next();
@@ -12986,10 +13269,13 @@ pub fn empty_excl_twice() -> u8 {
     /// the loop header, and a `switchInt` block no longer clears it.
     #[test]
     fn the_unwind_bound_counts_the_whole_loop_not_one_latch() {
-        let src = r#"
-/// requires: n == 2
-/// unwind: 1
-/// ensures: ret == 2
+        let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: n == 2,
+    unwind: 1,
+    ensures: ret == 2,
+}
 pub fn two_latches(n: u8) -> u8 {
     let mut i = 0u8;
     while i < n {
@@ -12998,9 +13284,11 @@ pub fn two_latches(n: u8) -> u8 {
     i
 }
 
-/// requires: n == 1
-/// unwind: 1
-/// ensures: ret == 1
+spec! {
+    requires: n == 1,
+    unwind: 1,
+    ensures: ret == 1,
+}
 pub fn one_latch(n: u8) -> u8 {
     let mut i = 0u8;
     while i < n {
@@ -13030,7 +13318,8 @@ pub fn one_latch(n: u8) -> u8 {
     /// a false `Verified`. The layout is now keyed by the module-qualified path.
     #[test]
     fn two_same_named_structs_do_not_share_a_layout() {
-        let src = r#"
+        let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub mod m {
     pub struct Outer { pub inner: Inner }
     pub struct Inner(pub u8);
@@ -13043,8 +13332,10 @@ pub mod n {
     pub struct Outer { pub only: u8 }
 }
 
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn same_name() -> u8 {
     let _g = m::Outer { inner: m::Inner(0) };
     1
@@ -13078,16 +13369,21 @@ pub fn same_name() -> u8 {
     /// qualified names in general.
     #[test]
     fn a_qualified_type_is_not_answered_by_a_bare_layout() {
-        let src = r#"
+        let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct Outer { pub lo: u8, pub hi: u8 }
 pub mod m { pub struct Outer { pub hi: u8, pub lo: u8 } }
 
-/// requires: o.hi == 5
-/// ensures: ret == 5
+spec! {
+    requires: o.hi == 5,
+    ensures: ret == 5,
+}
 pub fn reads_the_other_field(o: &m::Outer) -> u8 { o.lo }
 
-/// requires: o.lo == 5
-/// ensures: ret == 5
+spec! {
+    requires: o.lo == 5,
+    ensures: ret == 5,
+}
 pub fn reads_the_other_field_mirror(o: &m::Outer) -> u8 { o.hi }
 "#;
         for name in ["reads_the_other_field", "reads_the_other_field_mirror"] {
@@ -13107,14 +13403,17 @@ pub fn reads_the_other_field_mirror(o: &m::Outer) -> u8 { o.hi }
     /// above.
     #[test]
     fn a_module_struct_on_its_own_lines_still_reads_its_fields() {
-        let src = r#"
+        let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct Outer { pub lo: u8, pub hi: u8 }
 pub mod m {
     pub struct Outer { pub hi: u8, pub lo: u8 }
 }
 
-/// requires: o.hi == 5
-/// ensures: ret == 5
+spec! {
+    requires: o.hi == 5,
+    ensures: ret == 5,
+}
 pub fn reads_its_own_field(o: &m::Outer) -> u8 { o.hi }
 "#;
         let Some(o) = verify_src("reads_its_own_field", src) else { return };
@@ -13134,12 +13433,15 @@ pub fn reads_its_own_field(o: &m::Outer) -> u8 { o.hi }
     /// panicking one must be a real obligation.
     #[test]
     fn a_unit_struct_runs_its_destructor() {
-        let src = r#"
+        let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
 pub struct Guard;
 impl Drop for Guard { fn drop(&mut self) {} }
 
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn unit_drop() -> u8 {
     let _g = Guard;
     1
@@ -13148,8 +13450,10 @@ pub fn unit_drop() -> u8 {
 pub struct Boom;
 impl Drop for Boom { fn drop(&mut self) { panic!("boom"); } }
 
-/// requires: true
-/// ensures: ret == 1
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 pub fn panics_on_drop() -> u8 {
     let _g = Boom;
     1
@@ -13164,6 +13468,58 @@ pub fn panics_on_drop() -> u8 {
         assert!(
             !p.is_verified(),
             "a unit struct whose destructor panics must not verify, got: {p}"
+        );
+    }
+}
+
+/// A comment *before* a clause's colon is whitespace, and Rust's matcher allows it.
+///
+/// The matcher is `$($clause:ident : $body:expr,)*`, so `requires/**/: n > 0` is a
+/// precondition. The separator fix turns the comment into a space -- `requires : n > 0`
+/// -- and `take_clause` matched the literal `requires:`, so the clause was refused as
+/// unknown and the whole function was *skipped*: a lost proof on valid syntax. The
+/// contract here is true, so only reading both clauses can verify it; the second
+/// function carries a false postcondition behind the same spelling, so "verified"
+/// cannot be the clauses being dropped.
+#[test]
+fn a_comment_before_a_clause_colon_is_whitespace_not_a_dropped_clause() {
+    let macros = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n\n";
+    let true_src = format!("{macros}spec! {{\n    requires/**/: n > 0,\n    ensures/**/: ret == n,\n}}\npub fn f(n: u8) -> u8 {{ n }}\n");
+    let outcome = verify_src("f", &true_src).expect("the function must be reported");
+    assert!(
+        matches!(outcome, FnOutcome::Verified { .. }),
+        "a comment before the colon must not drop the clause, got: {outcome:?}"
+    );
+    let false_src = format!("{macros}spec! {{\n    requires/**/: n > 0,\n    ensures/**/: ret == n + 1,\n}}\npub fn g(n: u8) -> u8 {{ n }}\n");
+    let bad = verify_src("g", &false_src).expect("the function must be reported");
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "a false postcondition behind a comment must still be refuted, got: {bad:?}"
+    );
+}
+
+/// A comment between two tokens separates them, and a non-ASCII identifier is read
+/// as written -- both are false-proof shapes when the block reader gets them wrong.
+///
+/// `ensures: ret == n/**/as/**/u8` is the cast `n as u8`. Deleting the comment glued
+/// the tokens into `nasu8`, so a body returning an *argument* of that name satisfied
+/// the clause while the real postcondition (`ret == n as u8`) is false. The `µ` case
+/// is the same defect through `byte as char`: `µ` decoded to `Âµ`, a different
+/// identifier, and a body returning an argument named `Âµ` verified it.
+///
+/// Both bodies here return the *mangled* spelling, so the verdict discriminates:
+/// read correctly the clause is false and must be refuted; read under the bug it is
+/// true and would be proved. That is the shape the ledger calls a false proof.
+#[test]
+fn a_comment_and_a_non_ascii_name_cannot_smuggle_a_false_proof() {
+    let comment_src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n\nspec! {\n    requires: true,\n    ensures: ret == n/**/as/**/u8,\n}\npub fn f(n: u8, nasu8: u8) -> u8 { let _ = n; nasu8 }\n";
+    let uni_src = "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n\nspec! {\n    requires: true,\n    ensures: ret == \u{b5},\n}\npub fn g(\u{b5}: u8, \u{c2}\u{b5}: u8) -> u8 { let _ = \u{b5}; \u{c2}\u{b5} }\n";
+
+    for (name, src) in [("f", comment_src), ("g", uni_src)] {
+        let outcome = verify_src(name, src).expect("the function must be reported");
+        assert!(
+            matches!(outcome, FnOutcome::Failed { .. }),
+            "a clause naming a variable the body does not return must be refuted, got: {outcome:?}"
         );
     }
 }

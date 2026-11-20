@@ -162,6 +162,56 @@ macro_rules! verify_exhaustive {
     }};
 }
 
+/// State a contract **inside the code**, as a block the build-time verifier reads
+/// from the source text.
+///
+/// The macro expands to nothing. That is the whole point: the clauses are data
+/// for `verif::mir::verify`, not code that runs, so a `spec!` block costs a
+/// deployed artifact exactly zero bytes and leaves no symbol behind. Verification
+/// happens in a `build.rs` (see `tools/build-verify/run.sh`), where a contract that
+/// does not hold is a **compile error**, and the shipped binary is the crate's own
+/// code with nothing of the prover in it.
+///
+/// ```
+/// # use verif::spec;
+/// spec! {
+///     requires: n <= 200,
+///     ensures: ret == n + 1,
+/// }
+/// pub fn inc(n: u8) -> u8 { n + 1 }
+/// ```
+///
+/// The matcher is deliberately **structured** (`$clause:ident : $body:expr`), not
+/// a token soup. That is what makes this more than a comment: `rustc` parses each
+/// clause body as a real Rust expression, so `requires: n <=,` is
+/// `error: expected expression, found ','` at the contract line rather than a
+/// sentence a reader has to notice is wrong. A `///` clause gets no such check.
+///
+/// Both spellings feed the same clause parser, so they cannot disagree about what
+/// a clause means; the difference is that one is verified syntax and the other is
+/// unchecked prose.
+///
+/// # Using it from a `build.rs`
+///
+/// The macro is real code, so `verif` must be an ordinary dependency for the
+/// `use verif::spec;` to resolve. The frontend then compiles the file itself with
+/// `rustc`, which needs to be told where `verif` is: `verif::mir::verify::extern_options`
+/// supplies that, and the README's "Shape A" section has the full recipe. Without
+/// it the frontend's single-file run cannot resolve the crate and reports
+/// `E0432: unresolved import` rather than silently skipping the block.
+///
+/// That helper is `std`-only (it reads the build directory), so this note is plain
+/// text rather than an intra-doc link: in the default `no_std` build the item does
+/// not exist, and a link to it would be a `broken_intra_doc_links` warning there.
+#[macro_export]
+macro_rules! spec {
+    // `ret` is a contract-only name, so a clause body is *not* required to be a
+    // Rust expression that compiles -- it is only parsed. `$body:expr` still
+    // rejects a body that is not expression-shaped (`n <=,`), which is the check
+    // that matters; `ret` reaches the verifier as text.
+    ($($clause:ident : $body:expr,)*) => {};
+}
+
 #[cfg(test)]
 mod tests {
     use crate::smt;

@@ -7,6 +7,13 @@
 //! reports which. Nothing here asserts a verdict, so adding a shape that fails
 //! is the point rather than a broken test: it is how the gap is measured.
 //!
+//! The contracts are written as `spec! { … }` blocks, inline above each item, so
+//! the specification and the code it describes are one artifact: the same file is
+//! compiled, executed and verified. The macro is defined locally as a no-op, so
+//! this file still builds with a bare `rustc` and imports nothing from `verif` --
+//! a coverage baseline is most useful when it is ordinary Rust a reader could
+//! paste into their own crate.
+//!
 //! Every shape below is decided: fields of by-value and by-reference structs,
 //! tuple components, slice lengths and elements, fixed-size array lengths and
 //! elements, `core::num` intrinsics and loops with invariants. The three
@@ -66,18 +73,32 @@
 // They are here so the scoreboard has a floor that must not regress.
 // ---------------------------------------------------------------------------
 
-/// requires: x > 0
-/// ensures: ret <= x
+
+// The contract blocks below are *data for the verifier*, not code this file runs.
+// A no-op definition keeps the corpus ordinary Rust: it still builds with a bare
+// `rustc`, imports nothing from `verif`, and the macro expands to nothing.
+macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! {
+    requires: x > 0,
+    ensures: ret <= x,
+}
 pub fn halve_guarded(x: u8) -> u8 {
     x / 2
 }
 
-/// requires: a <= 3
-/// ensures: ret == a + 1
+spec! {
+    requires: a <= 3,
+    ensures: ret == a + 1,
+}
 pub fn increment_tiny(a: u8) -> u8 {
     a + 1
 }
 
+spec! {
+    requires: a <= 250,
+    ensures: ret == a + 5,
+}
 /// A literal in *arithmetic* is sized like one in a comparison.
 ///
 /// The slice length puts a 64-bit name in scope, so `a + 5` would add an 8-bit
@@ -86,15 +107,15 @@ pub fn increment_tiny(a: u8) -> u8 {
 /// addresses, reached through `+` instead of `<=`. The `*` and `&` forms are
 /// sized the same way.
 ///
-/// requires: a <= 250
-/// ensures: ret == a + 5
 pub fn add_literal_wide_scope(a: u8, xs: &[u8]) -> u8 {
     let _ = xs.len();
     a.wrapping_add(5)
 }
 
-/// requires: lo <= hi
-/// ensures: ret <= hi
+spec! {
+    requires: lo <= hi,
+    ensures: ret <= hi,
+}
 pub fn clamp_simple(lo: u8, hi: u8, v: u8) -> u8 {
     if v < lo {
         lo
@@ -109,9 +130,11 @@ pub fn clamp_simple(lo: u8, hi: u8, v: u8) -> u8 {
 // Contracts that name a field, an element, or a length.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: c.lo <= c.hi,
+    ensures: ret >= c.lo,
+}
 /// A struct passed by reference. The natural precondition is about two fields.
-/// requires: c.lo <= c.hi
-/// ensures: ret >= c.lo
 pub fn pick_from(c: &Config, v: u8) -> u8 {
     if v < c.lo {
         c.lo
@@ -122,69 +145,85 @@ pub fn pick_from(c: &Config, v: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: xs.len() > 0,
+    ensures: ret == xs[0],
+}
 /// A slice argument. The natural precondition is about its length.
-/// requires: xs.len() > 0
-/// ensures: ret == xs[0]
 pub fn first_of(xs: &[u8]) -> u8 {
     xs[0]
 }
 
+spec! {
+    requires: xs.len() > 0 && xs[0] == 5,
+    ensures: ret == 5,
+}
 /// The same element reached through `slice::first`, which returns `Option<&u8>`.
 /// The payload is the slice's own element variable -- the same one `xs[0]` names
 /// -- so this proves the method and the subscript agree.
-/// requires: xs.len() > 0 && xs[0] == 5
-/// ensures: ret == 5
 pub fn first_method(xs: &[u8]) -> u8 {
     *xs.first().unwrap()
 }
 
+spec! {
+    requires: xs.len() > 0 && xs[0] == 5,
+    ensures: ret == 6,
+}
 /// The false direction: the method's element is the slice's element, not a fresh
 /// value, so a claim about a *different* element fails.
-/// requires: xs.len() > 0 && xs[0] == 5
-/// ensures: ret == 6
 pub fn first_method_tripwire(xs: &[u8]) -> u8 {
     *xs.first().unwrap()
 }
 
+spec! {
+    requires: xs.len() == 0,
+    ensures: ret,
+}
 /// `first` is `None` exactly when the slice is empty, so `is_none` is the same
 /// predicate `is_empty` is.
-/// requires: xs.len() == 0
-/// ensures: ret
 pub fn first_method_is_none_when_empty(xs: &[u8]) -> bool {
     xs.first().is_none()
 }
 
+spec! {
+    requires: xs.len() > 1 && xs[1] == 7,
+    ensures: ret == 7,
+}
 /// `slice::get(k)` with a constant index: `Some(xs[k])` when `k < len`, `None`
 /// otherwise, and the element is the slice's own `xs[k]`.
-/// requires: xs.len() > 1 && xs[1] == 7
-/// ensures: ret == 7
 pub fn get_method(xs: &[u8]) -> u8 {
     *xs.get(1).unwrap()
 }
 
+spec! {
+    requires: xs.len() > 1 && xs[1] == 7,
+    ensures: ret == 8,
+}
 /// The false direction for `get`: a claim about the wrong element fails.
-/// requires: xs.len() > 1 && xs[1] == 7
-/// ensures: ret == 8
 pub fn get_method_tripwire(xs: &[u8]) -> u8 {
     *xs.get(1).unwrap()
 }
 
+spec! {
+    requires: xs.len() > 0,
+    ensures: ret == 7,
+}
 /// `get` past the end is `None`, so `unwrap` panics -- and the panic is a real
 /// obligation, not a silent `Some`.
-/// requires: xs.len() > 0
-/// ensures: ret == 7
 pub fn get_method_out_of_range_panics(xs: &[u8]) -> u8 {
     *xs.get(1).unwrap()
 }
 
+spec! {
+    requires: xs.len() > 0 && xs[0] == 5,
+    ensures: ret == 5,
+}
 /// The `match` form of `first`, as opposed to the `unwrap` form: the desugaring
 /// reads the payload through a downcast temp (`_4 = copy ((_2 as Some).0)`) and
 /// dereferences *that*, so the element reference has to be carried onto the temp.
 /// A model that only answered `unwrap` would leave this `incomplete` in both
 /// directions -- which is a coverage gap, since a `match` on the `Option` is at
 /// least as common as an `unwrap`.
-/// requires: xs.len() > 0 && xs[0] == 5
-/// ensures: ret == 5
 pub fn first_match_reads_the_element(xs: &[u8]) -> u8 {
     match xs.first() {
         Some(v) => *v,
@@ -192,10 +231,12 @@ pub fn first_match_reads_the_element(xs: &[u8]) -> u8 {
     }
 }
 
+spec! {
+    requires: xs.len() > 0 && xs[0] == 5,
+    ensures: ret == 6,
+}
 /// The false direction for the `match` form: a claim about a different element
 /// fails, which only happens if the downcast temp names the slice's own element.
-/// requires: xs.len() > 0 && xs[0] == 5
-/// ensures: ret == 6
 pub fn first_match_tripwire(xs: &[u8]) -> u8 {
     match xs.first() {
         Some(v) => *v,
@@ -203,10 +244,12 @@ pub fn first_match_tripwire(xs: &[u8]) -> u8 {
     }
 }
 
+spec! {
+    requires: xs.len() == 0,
+    ensures: ret == 0,
+}
 /// The empty case takes the `None` arm, so `first`'s tag is the same predicate
 /// the `match` switches on.
-/// requires: xs.len() == 0
-/// ensures: ret == 0
 pub fn first_match_empty_takes_none(xs: &[u8]) -> u8 {
     match xs.first() {
         Some(v) => *v,
@@ -222,45 +265,57 @@ pub fn first_match_empty_takes_none(xs: &[u8]) -> u8 {
 // one word. Only the tag passes through; a model that dropped the tag, or produced
 // a fresh payload, proves a tripwire.
 
+spec! {
+    requires: xs.len() > 0 && xs[0] == 5,
+    ensures: ret == 5,
+}
 /// `xs.first().copied()` is the slice's own element 0, reached without a deref.
-/// requires: xs.len() > 0 && xs[0] == 5
-/// ensures: ret == 5
 pub fn copied_first_is_the_element(xs: &[u8]) -> u8 {
     xs.first().copied().unwrap()
 }
 
+spec! {
+    requires: xs.len() > 0 && xs[0] == 5,
+    ensures: ret == 6,
+}
 /// The false direction: the copied value is the element, not a fresh one.
-/// requires: xs.len() > 0 && xs[0] == 5
-/// ensures: ret == 6
 pub fn copied_first_tripwire(xs: &[u8]) -> u8 {
     xs.first().copied().unwrap()
 }
 
+spec! {
+    requires: xs.len() > 1 && xs[1] == 7,
+    ensures: ret == 7,
+}
 /// `get(k).copied()` names `xs[k]`, so the subscript and the method agree.
-/// requires: xs.len() > 1 && xs[1] == 7
-/// ensures: ret == 7
 pub fn copied_get_is_the_element(xs: &[u8]) -> u8 {
     xs.get(1).copied().unwrap()
 }
 
+spec! {
+    requires: xs.len() > 1 && xs[1] == 7,
+    ensures: ret == 8,
+}
 /// The false direction for `get`'s `copied` form.
-/// requires: xs.len() > 1 && xs[1] == 7
-/// ensures: ret == 8
 pub fn copied_get_tripwire(xs: &[u8]) -> u8 {
     xs.get(1).copied().unwrap()
 }
 
+spec! {
+    requires: xs.len() == 0,
+    ensures: ret == 0,
+}
 /// `copied` keeps the receiver's tag, so on an empty slice `unwrap_or` takes the
 /// default -- a model that fixed the tag to `Some` would panic here.
-/// requires: xs.len() == 0
-/// ensures: ret == 0
 pub fn copied_empty_is_none(xs: &[u8]) -> u8 {
     xs.first().copied().unwrap_or(0)
 }
 
+spec! {
+    requires: xs.len() > 0 && xs[0] == 9,
+    ensures: ret == 9,
+}
 /// `cloned` is the same shape as `copied` for a `Copy` element.
-/// requires: xs.len() > 0 && xs[0] == 9
-/// ensures: ret == 9
 pub fn cloned_first_is_the_element(xs: &[u8]) -> u8 {
     xs.first().cloned().unwrap()
 }
@@ -275,66 +330,86 @@ pub fn cloned_first_is_the_element(xs: &[u8]) -> u8 {
 // them, which is what `char::is_ascii_digit` means too (`'\u{130}'.is_ascii_digit()`
 // is `false` though its low byte is `'0'`).
 
+spec! {
+    requires: c == '\u{1F600}',
+    ensures: ret == 0,
+}
 /// `c as u8` truncates the 32-bit value to its low byte: `'\u{1F600}'` is
 /// `0x1F600`, whose low byte is `0`.
-/// requires: c == '\u{1F600}'
-/// ensures: ret == 0
 pub fn char_as_byte(c: char) -> u8 {
     c as u8
 }
 
+spec! {
+    requires: c == 'A',
+    ensures: ret == 65,
+}
 /// A `char` literal in a contract is its Unicode scalar value, so `'A'` is `65`.
-/// requires: c == 'A'
-/// ensures: ret == 65
 pub fn char_ord_of_a(c: char) -> u8 {
     c as u8
 }
 
+spec! {
+    requires: c == '5',
+    ensures: ret == 1,
+}
 /// `c.is_ascii_digit()` is true exactly for `'0'..='9'`.
-/// requires: c == '5'
-/// ensures: ret == 1
 pub fn char_digit_is_true(c: char) -> u8 {
     c.is_ascii_digit() as u8
 }
 
+spec! {
+    requires: c == 'x',
+    ensures: ret == 1,
+}
 /// The false direction: `is_ascii_digit` is `0` for a non-digit, so a contract
 /// claiming `1` is refuted.
-/// requires: c == 'x'
-/// ensures: ret == 1
 pub fn char_digit_tripwire(c: char) -> u8 {
     c.is_ascii_digit() as u8
 }
 
+spec! {
+    requires: c == '\u{130}',
+    ensures: ret == 1,
+}
 /// A `char` whose *low byte* is `'0'` is still not an ASCII digit: the predicate
 /// is on the whole 32-bit value, not the byte. `'\u{130}'` is refuted for a claim
 /// of `1`, which a model that masked to eight bits would prove.
-/// requires: c == '\u{130}'
-/// ensures: ret == 1
 pub fn char_high_digit_tripwire(c: char) -> u8 {
     c.is_ascii_digit() as u8
 }
 
+spec! {
+    requires: c == '\u{130}',
+    ensures: ret == 0,
+}
 /// The high-`char` case read the *correct* way: it is not a digit.
-/// requires: c == '\u{130}'
-/// ensures: ret == 0
 pub fn char_high_is_not_digit(c: char) -> u8 {
     c.is_ascii_digit() as u8
 }
 
+spec! {
+    requires: c == '\n',
+    ensures: ret == 1,
+}
 /// A whitespace escape in a contract is its scalar value: `'\n'` is `0x0a`.
-/// requires: c == '\n'
-/// ensures: ret == 1
 pub fn char_newline_is_whitespace(c: char) -> u8 {
     c.is_ascii_whitespace() as u8
 }
 
+spec! {
+    requires: c == '\u{1F600}',
+    ensures: ret == 0,
+}
 /// A Unicode escape names a scalar value directly.
-/// requires: c == '\u{1F600}'
-/// ensures: ret == 0
 pub fn char_emoji_not_alphabetic(c: char) -> u8 {
     c.is_ascii_alphabetic() as u8
 }
 
+spec! {
+    requires: c == '\u{10ffff}',
+    ensures: ret == true,
+}
 /// `char::MAX` is the Unicode scalar maximum `0x10FFFF`, not `2^32 - 1`.
 ///
 /// A `char` is modelled at 32 bits so a `char` comparison is exact, but the value
@@ -343,36 +418,40 @@ pub fn char_emoji_not_alphabetic(c: char) -> u8 {
 /// `true` for the only input the precondition admits -- was *refuted*, and the
 /// false twin below was *proved*: a comparison different from the one the program
 /// executes. The `char` bounds are now read from the type.
-/// requires: c == '\u{10ffff}'
-/// ensures: ret == true
 pub fn char_max_is_the_scalar_maximum(c: char) -> bool {
     c == char::MAX
 }
 
+spec! {
+    requires: c == '\u{10ffff}',
+    ensures: ret == false,
+}
 /// The false twin: `char::MAX` is `0x10FFFF`, so a claim that it is not the
 /// maximum is false at the only admitted input. A model that compared against
 /// `2^32 - 1` would prove this.
-/// requires: c == '\u{10ffff}'
-/// ensures: ret == false
 pub fn char_max_is_the_scalar_maximum_cannot_prove_this(c: char) -> bool {
     c == char::MAX
 }
 
+spec! {
+    requires: c == '\0',
+    ensures: ret == true,
+}
 /// `char::MIN` is `'\0'`, and a `char` has no signed bound, so the read must not
 /// fall back to the signed `1 << 31` either.
-/// requires: c == '\0'
-/// ensures: ret == true
 pub fn char_min_is_nul(c: char) -> bool {
     c == char::MIN
 }
 
+spec! {
+    requires: a[0] <= a[1],
+    ensures: ret == a[1],
+}
 /// A fixed-size array argument. Unlike a slice the length is a *type*
 /// constant, so `a.len()` is not an input and the bounds check is against a
 /// literal: `_3 = Lt(_2, const 4_usize)`. That literal is what makes this shape
 /// a separate case from `first_of` -- the array's length never becomes a
 /// symbolic variable, and the element width comes from `[u8; 4]` itself.
-/// requires: a[0] <= a[1]
-/// ensures: ret == a[1]
 pub fn max_of_pair(a: [u8; 4]) -> u8 {
     if a[0] > a[1] {
         a[0]
@@ -381,12 +460,14 @@ pub fn max_of_pair(a: [u8; 4]) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret <= a[0],
+}
 /// The array-length tripwire: the same shape as `max_of_pair` but the contract
 /// claims a bound the body does not meet. It must FAIL, and the counterexample
 /// must assign `a[0]` and `a[1]` to *different* variables -- a pass would mean
 /// the elements collapsed to one input and the array proof was vacuous.
-/// requires: true
-/// ensures: ret <= a[0]
 pub fn array_alias_tripwire(a: [u8; 4]) -> u8 {
     if a[0] > a[1] {
         a[0]
@@ -395,39 +476,49 @@ pub fn array_alias_tripwire(a: [u8; 4]) -> u8 {
     }
 }
 
+spec! {
+    requires: a.len() == 4,
+    ensures: ret == a[2],
+}
 /// The array length is a constant, so a contract can *rely* on it: `a.len()` is
 /// `4` here regardless of the caller, which a slice's length never is.
-/// requires: a.len() == 4
-/// ensures: ret == a[2]
 pub fn array_third(a: [u8; 4]) -> u8 {
     a[2]
 }
 
+spec! {
+    requires: i < 4,
+    ensures: ret == a[i],
+}
 /// A *symbolic* subscript of an array. `a[i]` is not a single element, but an
 /// array has a finite domain, so it is the exact ite chain over `0..4` -- a
 /// definition, not an approximation. The chain is only `a[i]` where `i < 4`, so
 /// the precondition has to establish that; `i < 4` here is what makes the
 /// subscript admissible, and without it the function is refused rather than
 /// checked against a chain that quietly returned the last element.
-/// requires: i < 4
-/// ensures: ret == a[i]
 pub fn array_symbolic_index(a: [u8; 4], i: usize) -> u8 {
     a[i]
 }
 
+spec! {
+    requires: i < 4,
+    ensures: ret == a[j],
+}
 /// The contract subscripts with an index *other* than the one the precondition
 /// bounds. `requires: i < 4` says nothing about `j`, and `a[j]` is only modelled
 /// where `j < 4`, so the contract is refused -- it is not silently rewritten to
 /// the `a[i]` chain, which would prove `a[j] == a[i]` and be wrong for every
 /// `i != j`. Both indices are live, so the refusal is about the contract's
 /// subscript, not a dead argument.
-/// requires: i < 4
-/// ensures: ret == a[j]
 pub fn array_wrong_index_refused(a: [u8; 4], i: usize, j: usize) -> u8 {
     let _ = a[j];
     a[i]
 }
 
+spec! {
+    requires: i < 4,
+    ensures: ret == a[k],
+}
 /// The contract subscripts with a name that is not an argument — but which is a
 /// *direct alias* of one. `let k = i;` of a `Copy` value lowers to no local at
 /// all: the body's `a[k]` is `a[i]` (`_1[_2]`), and `k` survives only as a
@@ -435,25 +526,29 @@ pub fn array_wrong_index_refused(a: [u8; 4], i: usize, j: usize) -> u8 {
 /// same value, and resolving the name makes the contract name what the body
 /// reads. This is the "alias to an argument" case, distinct from the refusal
 /// below where the name is not an alias at all.
-/// requires: i < 4
-/// ensures: ret == a[k]
 pub fn array_local_index_through_alias(a: [u8; 4], i: usize) -> u8 {
     let k = i;
     a[k]
 }
 
+spec! {
+    requires: i < 4,
+    ensures: ret <= a[0],
+}
 /// The tripwire for the alias: the same shape, with a postcondition that is
 /// false. `a[k]` is an arbitrary element, so claiming it is at most `a[0]` must
 /// FAIL — and the witness has to name an index where it is not, which only
 /// happens if `k` resolved to the real index variable rather than to a constant
 /// the contract happened to accept.
-/// requires: i < 4
-/// ensures: ret <= a[0]
 pub fn array_local_index_tripwire(a: [u8; 4], i: usize) -> u8 {
     let k = i;
     a[k]
 }
 
+spec! {
+    requires: i < 4,
+    ensures: ret == a[k],
+}
 /// The alias rule's soundness gate: the local is a *copy* of the argument, and a
 /// later write to the argument must not be aliased through.
 ///
@@ -462,14 +557,16 @@ pub fn array_local_index_tripwire(a: [u8; 4], i: usize) -> u8 {
 /// materialises a real local for the copy, so `k` is not an alias of the
 /// argument and the name is refused. That refusal is what keeps a contract's `k`
 /// from silently following a reassigned `i`.
-/// requires: i < 4
-/// ensures: ret == a[k]
 pub fn array_local_index_written_refused(a: [u8; 4], mut i: usize) -> u8 {
     let k = i;
     i = 2;
     a[k]
 }
 
+spec! {
+    requires: k == 0,
+    ensures: ret == a[i],
+}
 /// A subscript by a name that has been *shadowed* is refused.
 ///
 /// `let k = i; let k = 0;` prints **two** bindings for `k`: `debug k => _2;` and,
@@ -480,14 +577,16 @@ pub fn array_local_index_written_refused(a: [u8; 4], mut i: usize) -> u8 {
 /// and `ensures: ret == a[i]` would prove, although the body returns `a[0]` and
 /// the postcondition is false whenever `i == 1` and `a[0] != a[1]`. The name is
 /// bound more than once, so it is refused rather than resolved.
-/// requires: k == 0
-/// ensures: ret == a[i]
 pub fn array_shadowed_alias_refused(a: [u8; 4], i: usize) -> u8 {
     let k = i;
     let k = 0usize;
     a[k]
 }
 
+spec! {
+    requires: i < 4,
+    ensures: ret == a[k] && ret == a[i],
+}
 /// A contract that names the *same* index under two spellings verifies.
 ///
 /// `a[i]` and `a[k]` with `let k = i` are one element, so a contract that uses
@@ -496,35 +595,41 @@ pub fn array_shadowed_alias_refused(a: [u8; 4], i: usize) -> u8 {
 /// the parser refused the whole contract, which skipped a function that should
 /// have verified. This is a completeness gate, not a soundness one: the answer
 /// was a refusal, never a wrong proof.
-/// requires: i < 4
-/// ensures: ret == a[k] && ret == a[i]
 pub fn array_two_spellings_of_one_index(a: [u8; 4], i: usize) -> u8 {
     let k = i;
     a[k]
 }
 
+spec! {
+    requires: i < 4,
+    ensures: ret == a[i] && a[k] != a[i],
+}
 /// The tripwire for two spellings: both must name the *same* element.
 ///
 /// `a[i]` and `a[k]` are the same subscript here, so claiming they differ must
 /// FAIL. If the two spellings were rewritten to different chains — or one were
 /// left as a fresh variable — this would verify, which is the wrong answer the
 /// single-spelling code path was one step away from.
-/// requires: i < 4
-/// ensures: ret == a[i] && a[k] != a[i]
 pub fn array_two_spellings_tripwire(a: [u8; 4], i: usize) -> u8 {
     let k = i;
     a[k]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == a[i],
+}
 /// A symbolic subscript the precondition does *not* bound. `requires: true` says
 /// nothing about `i`, so the ite chain would fall through for `i >= 4` and the
 /// subscript is refused. This is the soundness gate for the whole feature.
-/// requires: true
-/// ensures: ret == a[i]
 pub fn array_unbounded_index_refused(a: [u8; 4], i: usize) -> u8 {
     a[i]
 }
 
+spec! {
+    requires: i < xs.len() && xs.len() <= 64,
+    ensures: ret == xs[i],
+}
 /// A *slice* subscripted symbolically, with both facts the model needs.
 ///
 /// A slice's length is a symbolic input, so unlike an array there is no type
@@ -533,12 +638,14 @@ pub fn array_unbounded_index_refused(a: [u8; 4], i: usize) -> u8 {
 /// body reads -- but only where the length is within that bound. Both halves are
 /// obligations on the precondition: `i < xs.len()` puts the named index in range,
 /// and `xs.len() <= 64` keeps the whole slice inside the enumeration.
-/// requires: i < xs.len() && xs.len() <= 64
-/// ensures: ret == xs[i]
 pub fn slice_symbolic_index(xs: &[u8], i: usize) -> u8 {
     xs[i]
 }
 
+spec! {
+    requires: i < xs.len() && xs.len() <= 64,
+    ensures: ret == xs[i] && ret == xs[0],
+}
 /// The tripwire: the chain must genuinely depend on the index.
 ///
 /// The body returns `xs[i]`, and the contract claims that is also `xs[0]` — false
@@ -551,35 +658,41 @@ pub fn slice_symbolic_index(xs: &[u8], i: usize) -> u8 {
 /// contract names a symbolic index — and the tripwire would come back a refusal
 /// rather than a refutation, which a "not verified" assertion would accept for
 /// the wrong reason.
-/// requires: i < xs.len() && xs.len() <= 64
-/// ensures: ret == xs[i] && ret == xs[0]
 pub fn slice_symbolic_index_tripwire(xs: &[u8], i: usize) -> u8 {
     xs[i]
 }
 
+spec! {
+    requires: i < xs.len(),
+    ensures: ret == xs[i],
+}
 /// A slice whose *length* the precondition does not bound.
 ///
 /// `i < xs.len()` puts the index in range, but says nothing about how long the
 /// slice is, and the chain can only enumerate `0..64`. An index past 64 would fall
 /// through it, so the subscript is refused rather than modelled. This is the half
 /// an index-only bound would miss.
-/// requires: i < xs.len()
-/// ensures: ret == xs[i]
 pub fn slice_unbounded_length_refused(xs: &[u8], i: usize) -> u8 {
     xs[i]
 }
 
+spec! {
+    requires: xs.len() <= 64,
+    ensures: ret == xs[i],
+}
 /// A slice whose *index* the precondition does not bound, with the length bounded.
 ///
 /// The mirror of the entry above: `xs.len() <= 64` keeps the chain's range honest,
 /// but nothing says `i` is in it, so `xs[i]` is refused. Two separate obligations,
 /// each with its own refusal.
-/// requires: xs.len() <= 64
-/// ensures: ret == xs[i]
 pub fn slice_unbounded_index_refused(xs: &[u8], i: usize) -> u8 {
     xs[i]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == v.len(),
+}
 /// A *generic* slice's length is a value even though `T` has no width.
 ///
 /// `&[T]` with `T` an unbound type parameter has no element width to model, but
@@ -587,19 +700,23 @@ pub fn slice_unbounded_index_refused(xs: &[u8], i: usize) -> u8 {
 /// So the length is bound and the function decides; every *element* operation on
 /// the same receiver stays refused (see the entry below), which is the split that
 /// keeps the answer honest.
-/// requires: true
-/// ensures: ret == v.len()
 pub fn generic_slice_len<T: Copy>(v: &[T]) -> usize {
     v.len()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == (v.len() == 0),
+}
 /// `is_empty` is `len == 0`, so it needs the length and nothing about `T`.
-/// requires: true
-/// ensures: ret == (v.len() == 0)
 pub fn generic_slice_is_empty<T: Copy>(v: &[T]) -> bool {
     v.is_empty()
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// The ordinary "first element or default" helper over a generic slice.
 ///
 /// This is `everyday.rs`'s `first_or`: the `else` arm reads `v[0]`, whose width
@@ -608,8 +725,6 @@ pub fn generic_slice_is_empty<T: Copy>(v: &[T]) -> bool {
 /// *names* the element would be unreadable (see the tripwire below); the shape
 /// that decides is the one whose postcondition does not, which is exactly the
 /// honest split.
-/// requires: true
-/// ensures: true
 pub fn generic_slice_first_or<T: Copy>(v: &[T], d: T) -> T {
     if v.is_empty() {
         d
@@ -618,6 +733,10 @@ pub fn generic_slice_first_or<T: Copy>(v: &[T], d: T) -> T {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// A generic slice's *element* has no width, so a contract about one is refused,
 /// never proved.
 ///
@@ -625,20 +744,20 @@ pub fn generic_slice_first_or<T: Copy>(v: &[T], d: T) -> T {
 /// non-empty slice. `v.len()` is modelled (the length is a `usize`), so this is
 /// refuted rather than skipped; the point is that the *length* half of a generic
 /// slice is real and the verdict is not vacuous.
-/// requires: true
-/// ensures: ret == 0
 pub fn generic_slice_len_is_zero_cannot_prove_this<T: Copy>(v: &[T]) -> usize {
     v.len()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == d,
+}
 /// A generic slice's element read is unmodelled, so a contract naming the result
 /// is unreadable rather than proved.
 ///
 /// `ret == d` is false whenever the slice is non-empty, and this must never be
 /// reported `verified`. The element has no width, so the read is a missing value,
 /// which surfaces as a refusal — the honest direction.
-/// requires: true
-/// ensures: ret == d
 pub fn generic_slice_element_cannot_prove_this<T: Copy>(v: &[T], d: T) -> T {
     if v.is_empty() {
         d
@@ -647,17 +766,21 @@ pub fn generic_slice_element_cannot_prove_this<T: Copy>(v: &[T], d: T) -> T {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 20,
+}
 /// An array built in the body, so the elements are concrete rather than inputs.
-/// requires: true
-/// ensures: ret == 20
 pub fn array_literal_elem() -> u8 {
     let a = [10u8, 20, 30, 40];
     a[1]
 }
 
+spec! {
+    requires: c.lo <= c.hi,
+    ensures: ret <= c.hi,
+}
 /// A struct by value, to separate "field projection" from "behind a reference".
-/// requires: c.lo <= c.hi
-/// ensures: ret <= c.hi
 pub fn clamp_by_value(c: Config, v: u8) -> u8 {
     if v < c.lo {
         c.lo
@@ -668,9 +791,11 @@ pub fn clamp_by_value(c: Config, v: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret.0 <= a,
+}
 /// A tuple return, whose components the postcondition would want to name.
-/// requires: true
-/// ensures: ret.0 <= a
 pub fn split(a: u8, b: u8) -> (u8, u8) {
     if a < b {
         (a, b)
@@ -743,10 +868,12 @@ pub struct SignedConfig {
 // Gap 2: a loop cannot carry an invariant.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: n <= 8,
+    invariant: i <= n && s == i,
+    ensures: ret <= 8,
+}
 /// A counted loop whose result is bounded by its precondition.
-/// requires: n <= 8
-/// invariant: i <= n && s == i
-/// ensures: ret <= 8
 pub fn sum_to(n: u8) -> u8 {
     let mut s = 0u8;
     let mut i = 0u8;
@@ -757,11 +884,13 @@ pub fn sum_to(n: u8) -> u8 {
     s
 }
 
+spec! {
+    requires: n <= 4,
+    invariant: i <= n,
+    ensures: ret == n,
+}
 /// A loop that accumulates into a different variable, so a proof needs a
 /// relation between two variables and not just a bound on one.
-/// requires: n <= 4
-/// invariant: i <= n
-/// ensures: ret == n
 pub fn count_up(n: u8) -> u8 {
     let mut i = 0u8;
     while i < n {
@@ -770,11 +899,13 @@ pub fn count_up(n: u8) -> u8 {
     i
 }
 
+spec! {
+    requires: n <= 8,
+    invariant: i <= n && c <= i,
+    ensures: ret <= n,
+}
 /// A loop with a conditional body, which needs the invariant to survive a
 /// branch rather than holding trivially.
-/// requires: n <= 8
-/// invariant: i <= n && c <= i
-/// ensures: ret <= n
 pub fn count_evens(n: u8) -> u8 {
     let mut c = 0u8;
     let mut i = 0u8;
@@ -798,10 +929,12 @@ pub fn count_evens(n: u8) -> u8 {
 // contract verifies, the false twin is refuted.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: n <= 100,
+    invariant: s <= 5050,
+    ensures: ret <= 5050,
+}
 /// A `for` loop whose postcondition the loop actually establishes.
-/// requires: n <= 100
-/// invariant: s <= 5050
-/// ensures: ret <= 5050
 pub fn for_loop_invariant_holds(n: u32) -> u32 {
     let mut s = 0;
     for i in 0..=n {
@@ -810,11 +943,13 @@ pub fn for_loop_invariant_holds(n: u32) -> u32 {
     s
 }
 
+spec! {
+    requires: n <= 100,
+    invariant: s <= 5050,
+    ensures: ret <= 3,
+}
 /// The false twin: the same loop, a postcondition it does not establish. When the
 /// iterator state was not havoced this came back `Verified` -- the false proof.
-/// requires: n <= 100
-/// invariant: s <= 5050
-/// ensures: ret <= 3
 pub fn for_loop_invariant_cannot_prove_this(n: u32) -> u32 {
     let mut s = 0;
     for i in 0..=n {
@@ -823,13 +958,15 @@ pub fn for_loop_invariant_cannot_prove_this(n: u32) -> u32 {
     s
 }
 
+spec! {
+    requires: true,
+    invariant: x == i && i <= 3,
+    ensures: ret <= 3,
+}
 /// A `while` loop that writes through a reference taken *before* the loop, so the
 /// referent must be havoced at the header. The invariant is a *relation* between
 /// the referent and the counter -- `x <= k` alone is never inductive for
 /// `x += 1` -- which is what makes it both preserved and enough for the exit.
-/// requires: true
-/// invariant: x == i && i <= 3
-/// ensures: ret <= 3
 pub fn while_writes_through_ref_holds() -> u8 {
     let mut x = 0u8;
     let p = &mut x;
@@ -841,10 +978,12 @@ pub fn while_writes_through_ref_holds() -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    invariant: x == i && i <= 3,
+    ensures: ret == 0,
+}
 /// The false twin for the reference write.
-/// requires: true
-/// invariant: x == i && i <= 3
-/// ensures: ret == 0
 pub fn while_writes_through_ref_cannot_prove_this() -> u8 {
     let mut x = 0u8;
     let p = &mut x;
@@ -856,15 +995,17 @@ pub fn while_writes_through_ref_cannot_prove_this() -> u8 {
     x
 }
 
+spec! {
+    requires: x == 0,
+    invariant: x == i && i <= 3,
+    ensures: ret <= 3,
+}
 /// A `&mut u8` *argument* written inside a loop. `Ty::Ref` is modelled as its
 /// referent, so the argument's value is seeded at the referent's width -- but its
 /// `width()` is `None`, so the header havoc skipped it and the referent kept its
 /// entry value. The exit guard then folded and a false postcondition came back
 /// `Verified` (`w_false` is the twin). The relational invariant is what makes the
 /// true direction inductive and the panic (`x += 1` at `x == 255`) unprovable.
-/// requires: x == 0
-/// invariant: x == i && i <= 3
-/// ensures: ret <= 3
 pub fn ref_arg_written_in_a_loop_holds(x: &mut u8) -> u8 {
     let mut i = 0u8;
     while i < 3 {
@@ -874,10 +1015,12 @@ pub fn ref_arg_written_in_a_loop_holds(x: &mut u8) -> u8 {
     *x
 }
 
+spec! {
+    requires: x == 0,
+    invariant: x == i && i <= 3,
+    ensures: ret == 0,
+}
 /// The false twin: the referent is written three times, so `ret == 0` is false.
-/// requires: x == 0
-/// invariant: x == i && i <= 3
-/// ensures: ret == 0
 pub fn ref_arg_written_in_a_loop_cannot_prove_this(x: &mut u8) -> u8 {
     let mut i = 0u8;
     while i < 3 {
@@ -887,21 +1030,25 @@ pub fn ref_arg_written_in_a_loop_cannot_prove_this(x: &mut u8) -> u8 {
     *x
 }
 
+spec! {
+    requires: c == 0,
+    ensures: ret == c + 1,
+}
 /// A helper that writes through its `&mut` argument. Called in a loop, its write
 /// reaches the caller local `x`, so `x` must be in the loop's havoc set.
-/// requires: c == 0
-/// ensures: ret == c + 1
 pub fn bump_once(c: &mut u8) -> u8 {
     *c += 1;
     *c
 }
 
+spec! {
+    requires: x == 0,
+    invariant: x == i && i <= 3,
+    ensures: ret <= 3,
+}
 /// A call in a loop whose *write-through* reaches `x`. Only the call's
 /// *destination* was collected by the havoc, so `x` kept its entry value, the exit
 /// guard folded, and `ensures: ret == 0` was `Verified` for a body returning 3.
-/// requires: x == 0
-/// invariant: x == i && i <= 3
-/// ensures: ret <= 3
 pub fn call_writes_through_in_a_loop_holds(x: &mut u8) -> u8 {
     let mut i = 0u8;
     while i < 3 {
@@ -911,10 +1058,12 @@ pub fn call_writes_through_in_a_loop_holds(x: &mut u8) -> u8 {
     *x
 }
 
+spec! {
+    requires: x == 0,
+    invariant: x == i && i <= 3,
+    ensures: ret == 0,
+}
 /// The false twin: `bump_once` runs three times, so `ret == 0` is false.
-/// requires: x == 0
-/// invariant: x == i && i <= 3
-/// ensures: ret == 0
 pub fn call_writes_through_in_a_loop_cannot_prove_this(x: &mut u8) -> u8 {
     let mut i = 0u8;
     while i < 3 {
@@ -924,20 +1073,24 @@ pub fn call_writes_through_in_a_loop_cannot_prove_this(x: &mut u8) -> u8 {
     *x
 }
 
+spec! {
+    requires: n <= 3,
+    decreases: n,
+    ensures: ret == n,
+}
 /// A loop calling a *self-recursive* function. The interprocedural write-set walk
 /// follows a resolved callee to find what it writes through a reference; without a
 /// call-cycle guard it followed `count_down`'s self-call forever and overflowed the
 /// stack, aborting the whole run -- even though `count_down` takes no reference and
 /// so cannot write anything of the caller's.
-/// requires: n <= 3
-/// decreases: n
-/// ensures: ret == n
 pub fn count_down(n: u8) -> u8 {
     if n == 0 { 0 } else { count_down(n - 1) + 1 }
 }
 
-/// invariant: s <= 2 && i <= 3
-/// ensures: ret <= 2
+spec! {
+    invariant: s <= 2 && i <= 3,
+    ensures: ret <= 2,
+}
 pub fn loop_calls_recursive() -> u8 {
     let mut i = 0u8;
     let mut s = 0u8;
@@ -948,9 +1101,11 @@ pub fn loop_calls_recursive() -> u8 {
     s
 }
 
+spec! {
+    invariant: s <= 2 && i <= 3,
+    ensures: ret == 0,
+}
 /// The false twin: `count_down(2)` is 2, so `ret == 0` is false.
-/// invariant: s <= 2 && i <= 3
-/// ensures: ret == 0
 pub fn loop_calls_recursive_cannot_prove_this() -> u8 {
     let mut i = 0u8;
     let mut s = 0u8;
@@ -961,24 +1116,30 @@ pub fn loop_calls_recursive_cannot_prove_this() -> u8 {
     s
 }
 
+spec! {
+    requires: n <= 3,
+    decreases: n,
+    ensures: ret <= 1,
+}
 /// A loop calling a *mutually* recursive pair. `is_even`/`is_odd` call each other,
 /// so the write-set walk meets a two-function cycle, not just a self-call.
-/// requires: n <= 3
-/// decreases: n
-/// ensures: ret <= 1
 pub fn is_even(n: u8) -> u8 {
     if n == 0 { 0 } else { is_odd(n - 1) }
 }
 
-/// requires: n <= 3
-/// decreases: n
-/// ensures: ret <= 1
+spec! {
+    requires: n <= 3,
+    decreases: n,
+    ensures: ret <= 1,
+}
 pub fn is_odd(n: u8) -> u8 {
     if n == 0 { 1 } else { is_even(n - 1) }
 }
 
-/// invariant: s <= 1 && i <= 3
-/// ensures: ret <= 1
+spec! {
+    invariant: s <= 1 && i <= 3,
+    ensures: ret <= 1,
+}
 pub fn loop_calls_mutual_recursive() -> u8 {
     let mut i = 0u8;
     let mut s = 0u8;
@@ -989,9 +1150,11 @@ pub fn loop_calls_mutual_recursive() -> u8 {
     s
 }
 
+spec! {
+    invariant: s <= 1 && i <= 3,
+    ensures: ret == 2,
+}
 /// The false twin: `is_even(2)` is 0, so `ret == 2` is false.
-/// invariant: s <= 1 && i <= 3
-/// ensures: ret == 2
 pub fn loop_calls_mutual_recursive_cannot_prove_this() -> u8 {
     let mut i = 0u8;
     let mut s = 0u8;
@@ -1002,6 +1165,11 @@ pub fn loop_calls_mutual_recursive_cannot_prove_this() -> u8 {
     s
 }
 
+spec! {
+    requires: true,
+    decreases: n,
+    ensures: ret == 0,
+}
 /// A loop calling a *reference-carrying* self-recursive function. The call cycle
 /// is refused rather than followed, but the call's reference argument is included
 /// directly -- a callee can only affect caller storage through a reference -- so
@@ -1009,16 +1177,15 @@ pub fn loop_calls_mutual_recursive_cannot_prove_this() -> u8 {
 /// would keep its entry value `0` and `ret == 0` would be *proven*. The return is
 /// always `0` (the recursion counts the writes, it does not sum them), so the
 /// contract says so rather than claiming the measure.
-/// requires: true
-/// decreases: n
-/// ensures: ret == 0
 pub fn bump_n(n: u8, c: &mut u8) -> u8 {
     if n == 0 { 0 } else { *c = c.wrapping_add(1); bump_n(n - 1, c) }
 }
 
-/// requires: x == 0
-/// invariant: i <= 3
-/// ensures: ret <= 255
+spec! {
+    requires: x == 0,
+    invariant: i <= 3,
+    ensures: ret <= 255,
+}
 pub fn loop_calls_ref_recursive(x: &mut u8) -> u8 {
     let mut i = 0u8;
     while i < 3 {
@@ -1028,11 +1195,13 @@ pub fn loop_calls_ref_recursive(x: &mut u8) -> u8 {
     *x
 }
 
+spec! {
+    requires: x == 0,
+    invariant: i <= 3,
+    ensures: ret == 0,
+}
 /// The false twin: `x` is written through the recursive callee, so `ret == 0` is
 /// false -- a model that dropped the reference from the havoc would prove it.
-/// requires: x == 0
-/// invariant: i <= 3
-/// ensures: ret == 0
 pub fn loop_calls_ref_recursive_cannot_prove_this(x: &mut u8) -> u8 {
     let mut i = 0u8;
     while i < 3 {
@@ -1050,9 +1219,11 @@ pub fn loop_calls_ref_recursive_cannot_prove_this(x: &mut u8) -> u8 {
 // operands, so the paths below are decided without `core`'s MIR being available.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: true,
+    ensures: ret <= 1,
+}
 /// `checked_add` is the idiomatic way to write this, and it is a `core` call.
-/// requires: true
-/// ensures: ret <= 1
 pub fn is_nonzero_after(x: u8) -> u8 {
     match x.checked_add(1) {
         Some(_) => 1,
@@ -1060,20 +1231,28 @@ pub fn is_nonzero_after(x: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: a >= b,
+    ensures: ret <= a,
+}
 /// `saturating_sub` is likewise `core`, and it is the idiomatic clamp.
-/// requires: a >= b
-/// ensures: ret <= a
 pub fn saturating_drop(a: u8, b: u8) -> u8 {
     a.saturating_sub(b)
 }
 
+spec! {
+    requires: a <= 15,
+    ensures: ret <= 225,
+}
 /// `wrapping_mul` is `core`; a verifier has to know it is the wrapping product.
-/// requires: a <= 15
-/// ensures: ret <= 225
 pub fn wrapped_product(a: u8) -> u8 {
     a.wrapping_mul(15)
 }
 
+spec! {
+    requires: a <= 100 && b <= 100,
+    ensures: ret == a * b,
+}
 /// A `u16` `saturating_mul`, which the widened product now reaches.
 ///
 /// This width used to be refused outright: the model's product test widened the
@@ -1087,12 +1266,14 @@ pub fn wrapped_product(a: u8) -> u8 {
 /// `u16` `MAX`, and `a <= 100 && b <= 100` is the reason. A guard that permitted
 /// a product above `65535` would make this fail, which is what the tripwire
 /// below pins.
-/// requires: a <= 100 && b <= 100
-/// ensures: ret == a * b
 pub fn u16_product_guarded(a: u16, b: u16) -> u16 {
     a.saturating_mul(b)
 }
 
+spec! {
+    requires: a <= 50000 && b <= 50000,
+    ensures: ret == a * b,
+}
 /// The tripwire for the fixture above: the same body under a guard that does
 /// **not** rule out overflow, so the postcondition must fail.
 ///
@@ -1100,12 +1281,14 @@ pub fn u16_product_guarded(a: u16, b: u16) -> u16 {
 /// saturating product clamps to `65535` rather than wrapping — so `ret == a * b`
 /// is false there. `tests/mir.rs` requires the failure; a frontend that verified
 /// this would be proving the wrong thing.
-/// requires: a <= 50000 && b <= 50000
-/// ensures: ret == a * b
 pub fn u16_product_unguarded_tripwire(a: u16, b: u16) -> u16 {
     a.saturating_mul(b)
 }
 
+spec! {
+    requires: h == 100000,
+    ensures: ret == 3100000,
+}
 /// The `u32` `wrapping_mul` — the shape `hash_step` needs, and the value half of
 /// the widened-product story.
 ///
@@ -1119,50 +1302,56 @@ pub fn u16_product_unguarded_tripwire(a: u16, b: u16) -> u16 {
 /// makes the fixture discriminating: `100000 * 31` is `3_100_000`, which fits
 /// neither an 8- nor a 16-bit result, so a model that wrapped at a narrower width
 /// would refute this rather than prove it.
-/// requires: h == 100000
-/// ensures: ret == 3100000
 pub fn u32_wrapping_product(h: u32) -> u32 {
     h.wrapping_mul(31)
 }
 
+spec! {
+    requires: h == 100000,
+    ensures: ret == 100000,
+}
 /// The tripwire for the fixture above: the same pinned argument under a
 /// postcondition that is false of the real product, so the obligation must fail.
 ///
 /// `100000 * 31` is `3_100_000`, not `100000`. `tests/mir.rs` requires the
 /// failure; a frontend that verified this would be proving the wrong thing.
-/// requires: h == 100000
-/// ensures: ret == 100000
 pub fn u32_wrapping_product_tripwire(h: u32) -> u32 {
     h.wrapping_mul(31)
 }
 
+spec! {
+    requires: h <= 1000000,
+    ensures: ret <= 3000000,
+}
 /// A `u32` `saturating_mul` by a *constant*, so the widened failure predicate is
 /// built at `2w == 64` and the obligation settles by cancellation rather than by
 /// blasting the 64-bit multiplier.
 ///
 /// `h <= 1000000` and `h.saturating_mul(3)` is at most `3_000_000`, well below
 /// `u32::MAX`, so the saturating product is the exact product and the bound holds.
-/// requires: h <= 1000000
-/// ensures: ret <= 3000000
 pub fn u32_saturating_product(h: u32) -> u32 {
     h.saturating_mul(3)
 }
 
+spec! {
+    requires: h <= 1000000,
+    ensures: ret <= 1000000,
+}
 /// The tripwire for the `u32` `saturating_mul`: the guard does not rule out the
 /// product reaching the bound, so the tighter postcondition must fail.
 ///
 /// At `h == 1000000` the product is `3_000_000`, which is above `1_000_000`, so
 /// `ret <= 1000000` is false. `tests/mir.rs` requires the failure; a frontend that
 /// verified this would be proving the wrong thing about a saturating product.
-/// requires: h <= 1000000
-/// ensures: ret <= 1000000
 pub fn u32_saturating_product_tripwire(h: u32) -> u32 {
     h.saturating_mul(3)
 }
 
+spec! {
+    requires: true,
+    ensures: ret <= a,
+}
 /// A comparison through `core::cmp::Ord` rather than the builtin operator.
-/// requires: true
-/// ensures: ret <= a
 pub fn min_via_ord(a: u8, b: u8) -> u8 {
     if a < b {
         a
@@ -1171,6 +1360,10 @@ pub fn min_via_ord(a: u8, b: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: c.lo <= c.hi,
+    ensures: ret >= c.hi,
+}
 /// A field contract that must **fail**, as the tripwire for field independence.
 ///
 /// If the frontend bound `c.lo` and `c.hi` to the same symbolic variable, this
@@ -1178,8 +1371,6 @@ pub fn min_via_ord(a: u8, b: u8) -> u8 {
 /// `ret >= c.hi` would hold. Independent fields make it false — `v < c.lo`
 /// returns `c.lo < c.hi` — so the counterexample is exactly the evidence that the
 /// two fields are distinct inputs. `tests/mir.rs` requires the failure.
-/// requires: c.lo <= c.hi
-/// ensures: ret >= c.hi
 pub fn field_alias_tripwire(c: Config, v: u8) -> u8 {
     if v < c.lo {
         c.lo
@@ -1190,14 +1381,16 @@ pub fn field_alias_tripwire(c: Config, v: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: xs.len() > 1,
+    ensures: ret == xs[1],
+}
 /// A slice contract that must **fail**, as the tripwire for element independence.
 ///
 /// If `xs[0]` and `xs[1]` were bound to the same symbolic variable, the body's
 /// `xs[0]` would equal `xs[1]` and this would verify. Independent elements make
 /// it false — take `xs[0] != xs[1]` — so the counterexample is exactly the
 /// evidence that two indices are two inputs. `tests/mir.rs` requires the failure.
-/// requires: xs.len() > 1
-/// ensures: ret == xs[1]
 pub fn slice_alias_tripwire(xs: &[u8]) -> u8 {
     xs[0]
 }
@@ -1206,6 +1399,10 @@ pub fn slice_alias_tripwire(xs: &[u8]) -> u8 {
 // Soundness tripwires: a write must reach the store the read consults.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: i < 4 && i == 0,
+    ensures: ret == a[i],
+}
 /// An element write, then a *symbolic* read of the same array.
 ///
 /// The seeded elements are what the ite chain is built from, so an element write
@@ -1214,13 +1411,15 @@ pub fn slice_alias_tripwire(xs: &[u8]) -> u8 {
 /// `i == 0` the body returns the `0` it just wrote, not `a[i]` -- so it must
 /// FAIL. A `verified` verdict would be a false contract proved, which is the one
 /// outcome this crate exists to prevent.
-/// requires: i < 4 && i == 0
-/// ensures: ret == a[i]
 pub fn array_write_then_symbolic_read(mut a: [u8; 4], i: usize) -> u8 {
     a[0] = 0;
     a[i]
 }
 
+spec! {
+    requires: i < 4,
+    ensures: ret == a[i],
+}
 /// The same shape through a `&mut [u8; 4]`, which is how a helper that mutates
 /// its caller's array lowers.
 ///
@@ -1228,13 +1427,15 @@ pub fn array_write_then_symbolic_read(mut a: [u8; 4], i: usize) -> u8 {
 /// rather than the by-value one. The contract is false for the same reason as
 /// `array_write_then_symbolic_read` -- with `i == 0` the body returns the `0` it
 /// wrote -- so it must FAIL.
-/// requires: i < 4
-/// ensures: ret == a[i]
 pub fn mut_ref_array_write_then_symbolic_read(a: &mut [u8; 4], i: usize) -> u8 {
     a[0] = 0;
     a[i]
 }
 
+spec! {
+    requires: i < s.len() && s.len() <= 64 && i == 0,
+    ensures: ret == s[i],
+}
 /// The `&mut [u8]` *slice* form of the same shape.
 ///
 /// This used to be a separate gap: rustc lowers the bounds check through a
@@ -1246,13 +1447,15 @@ pub fn mut_ref_array_write_then_symbolic_read(a: &mut [u8; 4], i: usize) -> u8 {
 /// The contract is false for the same reason -- with `i == 0` the body returns
 /// the `0` it wrote, not `s[i]` -- so it must FAIL. A `verified` verdict would be
 /// a false contract proved.
-/// requires: i < s.len() && s.len() <= 64 && i == 0
-/// ensures: ret == s[i]
 pub fn mut_ref_slice_write_then_symbolic_read(s: &mut [u8], i: usize) -> u8 {
     s[0] = 0;
     s[i]
 }
 
+spec! {
+    requires: s.len() > 0,
+    ensures: ret == v,
+}
 /// The true half of the slice shape: a write then a read of the *same* index
 /// returns what was written, and the `s.len() > 0` precondition puts index `0`
 /// in range so the bounds check is discharged rather than a panic.
@@ -1260,23 +1463,27 @@ pub fn mut_ref_slice_write_then_symbolic_read(s: &mut [u8], i: usize) -> u8 {
 /// This is the entry that shows the write reaches the store the read consults:
 /// if the write had landed anywhere else, the read would find the seeded element
 /// and the contract would be refuted, not proved.
-/// requires: s.len() > 0
-/// ensures: ret == v
 pub fn mut_ref_slice_write_then_read(s: &mut [u8], v: u8) -> u8 {
     s[0] = v;
     s[0]
 }
 
+spec! {
+    requires: s.len() > 0,
+    ensures: ret == s[0],
+}
 /// The tripwire for the true half above: the same body claiming the *pre-write*
 /// value is false, so a model that dropped the write -- leaving the seeded
 /// element readable -- would prove it.
-/// requires: s.len() > 0
-/// ensures: ret == s[0]
 pub fn mut_ref_slice_write_then_read_tripwire(s: &mut [u8], v: u8) -> u8 {
     s[0] = v;
     s[0]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == c.lo,
+}
 /// A whole-struct reassignment, then a field read.
 ///
 /// The contract's `c.lo` denotes the field of the *argument*, and the body
@@ -1284,14 +1491,16 @@ pub fn mut_ref_slice_write_then_read_tripwire(s: &mut [u8], v: u8) -> u8 {
 /// local, so an assignment that updated only the local would leave `c.lo` holding
 /// the argument's value and this false contract (`ret` is `d.lo`, not `c.lo`)
 /// would verify. It must be refused or refuted, never proved.
-/// requires: true
-/// ensures: ret == c.lo
 #[allow(unused_assignments)]
 pub fn struct_reassign_then_field_read(mut c: Config, d: Config) -> u8 {
     c = d;
     c.lo
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A field *write* through a `&mut`: `c.lo = 5`.
 ///
 /// The write is the mirror of the read, and it is the shape that was silently
@@ -1302,13 +1511,15 @@ pub fn struct_reassign_then_field_read(mut c: Config, d: Config) -> u8 {
 /// contract could be proved (the postcondition was checked against the value the
 /// write was supposed to replace). This entry pins the true direction: the write
 /// lands and the read after it is `5`, so `ret == 5` verifies.
-/// requires: true
-/// ensures: ret == 5
 pub fn field_write_through_ref_mut_takes_effect(c: &mut Config) -> u8 {
     c.lo = 5;
     c.lo
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The false direction of [`field_write_through_ref_mut_takes_effect`].
 ///
 /// The body writes `5` and returns it, so `ret == 0` is false for every input. With
@@ -1317,8 +1528,6 @@ pub fn field_write_through_ref_mut_takes_effect(c: &mut Config) -> u8 {
 /// this *provable* -- a false proof in already-shipped code. It must be refuted, and
 /// the refutation must be "false on every input" rather than a one-value witness:
 /// that is the term-level evidence the write fixes `ret` to `5`.
-/// requires: true
-/// ensures: ret == 0
 pub fn field_write_through_ref_mut_is_not_dropped(c: &mut Config) -> u8 {
     c.lo = 5;
     c.lo
@@ -1340,6 +1549,10 @@ pub fn set_five_by_value(mut x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A helper's field write through a `&mut` reaches the caller.
 ///
 /// The write happens one frame down: `set_lo_through_ref(c)` runs `c.lo = 5` in
@@ -1347,26 +1560,30 @@ pub fn set_five_by_value(mut x: u8) -> u8 {
 /// boundary the write-back used to miss -- only an *indexed* reference argument's
 /// store crossed back, so a field write died with the callee's frame and the
 /// caller read its own seed.
-/// requires: true
-/// ensures: ret == 5
 pub fn helper_field_write_reaches_the_caller(c: &mut Config) -> u8 {
     set_lo_through_ref(c);
     c.lo
 }
 
+spec! {
+    requires: c.lo == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`helper_field_write_reaches_the_caller`].
 ///
 /// The helper sets `c.lo = 5` and the caller returns it, so `ret == 0` is false.
 /// With the field write lost across the boundary, the caller's `c.lo` kept the
 /// seed the precondition pinned to 0, so this was *proved* against a body that
 /// returns 5.
-/// requires: c.lo == 0
-/// ensures: ret == 0
 pub fn a_stale_caller_field_cannot_prove_this(c: &mut Config) -> u8 {
     set_lo_through_ref(c);
     c.lo
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A helper's write to the *whole* referent (`*v = 5`) reaches the caller.
 ///
 /// `&mut x` is passed as a temp (`_5 = &mut _2; set_five(_5)`), so the caller's
@@ -1374,20 +1591,20 @@ pub fn a_stale_caller_field_cannot_prove_this(c: &mut Config) -> u8 {
 /// to follow the recorded address to `_2`, and the callee's own `(*_1) = 5` has to
 /// be modelled at all: a deref of an argument with no recorded referent was
 /// dropped, so the write vanished twice over.
-/// requires: true
-/// ensures: ret == 5
 pub fn helper_scalar_write_reaches_the_caller(mut x: u8) -> u8 {
     set_five(&mut x);
     x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`helper_scalar_write_reaches_the_caller`].
 ///
 /// The helper writes `5` and the caller returns it, so `ret == 0` is false. With
 /// both the callee's write and the write-back lost, the caller read its seed and
 /// this was *proved*.
-/// requires: x == 0
-/// ensures: ret == 0
 pub fn a_stale_caller_scalar_cannot_prove_this(mut x: u8) -> u8 {
     set_five(&mut x);
     x
@@ -1410,79 +1627,99 @@ pub fn set_five_if(v: &mut u8, c: bool) {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// A helper's *nested* field write through a `&mut` reaches the caller.
-/// requires: true
-/// ensures: ret == 9
 pub fn helper_nested_write_reaches_the_caller(o: &mut OuterBox) -> u8 {
     set_nested_through_ref(o);
     o.i.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The false direction of [`helper_nested_write_reaches_the_caller`].
-/// requires: true
-/// ensures: ret == 0
 pub fn a_stale_caller_nested_cannot_prove_this(o: &mut OuterBox) -> u8 {
     set_nested_through_ref(o);
     o.i.v
 }
 
+spec! {
+    requires: c.lo == 0,
+    ensures: ret == 5,
+}
 /// A helper writes through a `&mut` to a *field* of the caller's struct.
 ///
 /// The reference names a sub-place (`&mut c.lo`), so the callee's write belongs at
 /// `c.0` and not on `c`. Landing it on `c` would put a bit-vector where a struct
 /// lives and leave `c.lo` at its seed -- which is why the false twin below was
 /// *proved* before the write-back keyed the target's projection.
-/// requires: c.lo == 0
-/// ensures: ret == 5
 pub fn helper_write_reaches_a_field_target(mut c: Config) -> u8 {
     set_five(&mut c.lo);
     c.lo
 }
 
+spec! {
+    requires: c.lo == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`helper_write_reaches_a_field_target`].
-/// requires: c.lo == 0
-/// ensures: ret == 0
 pub fn a_stale_field_target_cannot_prove_this(mut c: Config) -> u8 {
     set_five(&mut c.lo);
     c.lo
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A helper write through a `&mut` to a *nested* field target.
 ///
 /// The reference names a two-step chain (`&mut o.i.v`), so the write-back has to
 /// key the whole chain, not just the first field.
-/// requires: true
-/// ensures: ret == 5
 pub fn helper_write_reaches_a_nested_target(mut o: OuterBox) -> u8 {
     set_five(&mut o.i.v);
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`helper_write_reaches_a_nested_target`].
-/// requires: o.i.v == 0
-/// ensures: ret == 0
 pub fn a_stale_nested_target_cannot_prove_this(mut o: OuterBox) -> u8 {
     set_five(&mut o.i.v);
     o.i.v
 }
 
+spec! {
+    requires: c == true,
+    ensures: ret == 5,
+}
 /// A *conditional* helper write: the caller reads 5 when the flag holds and its
 /// seed otherwise, so the caller's value has to follow the callee's branch.
-/// requires: c == true
-/// ensures: ret == 5
 pub fn conditional_helper_write_reaches_the_caller(mut x: u8, c: bool) -> u8 {
     set_five_if(&mut x, c);
     x
 }
 
+spec! {
+    requires: x == 0 && c == true,
+    ensures: ret == 0,
+}
 /// The false direction of [`conditional_helper_write_reaches_the_caller`].
-/// requires: x == 0 && c == true
-/// ensures: ret == 0
 pub fn a_conditional_helper_write_cannot_prove_this(mut x: u8, c: bool) -> u8 {
     set_five_if(&mut x, c);
     x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A helper writes through a `&mut` to an *array element* target.
 ///
 /// The reference names `a[0]`, so the callee is handed a scalar and its store for
@@ -1490,50 +1727,58 @@ pub fn a_conditional_helper_write_cannot_prove_this(mut x: u8, c: bool) -> u8 {
 /// store back unconditionally would carry the poison its whole-place write left on
 /// that store, so the caller's *untouched* `a[1]` would read unknown. Gating the
 /// element copy-back on a whole-local target is what keeps the sibling readable.
-/// requires: true
-/// ensures: ret == 5
 pub fn helper_write_reaches_an_element_target(mut a: [u8; 3]) -> u8 {
     set_five(&mut a[0]);
     a[0]
 }
 
+spec! {
+    requires: a[0] == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`helper_write_reaches_an_element_target`].
-/// requires: a[0] == 0
-/// ensures: ret == 0
 pub fn a_stale_element_target_cannot_prove_this(mut a: [u8; 3]) -> u8 {
     set_five(&mut a[0]);
     a[0]
 }
 
+spec! {
+    requires: a[1] == 7,
+    ensures: ret == 7,
+}
 /// A write to one element leaves its *sibling* alone.
-/// requires: a[1] == 7
-/// ensures: ret == 7
 pub fn an_element_write_leaves_its_sibling(mut a: [u8; 3]) -> u8 {
     set_five(&mut a[0]);
     a[1]
 }
 
+spec! {
+    requires: a[1] == 7,
+    ensures: ret == 0,
+}
 /// The false direction of [`an_element_write_leaves_its_sibling`].
-/// requires: a[1] == 7
-/// ensures: ret == 0
 pub fn a_stale_element_sibling_cannot_prove_this(mut a: [u8; 3]) -> u8 {
     set_five(&mut a[0]);
     a[1]
 }
 
+spec! {
+    requires: x == 3,
+    ensures: ret == 3,
+}
 /// A callee's write to a *by-value* argument is its own copy and must not reach
 /// the caller.
-/// requires: x == 3
-/// ensures: ret == 3
 pub fn a_by_value_callee_write_stays_in_the_callee(x: u8) -> u8 {
     let _ = set_five_by_value(x);
     x
 }
 
+spec! {
+    requires: x == 3,
+    ensures: ret == 5,
+}
 /// The false direction of [`a_by_value_callee_write_stays_in_the_callee`]: if the
 /// callee's write leaked back, `ret == 5` would prove.
-/// requires: x == 3
-/// ensures: ret == 5
 pub fn a_by_value_callee_write_cannot_prove_this(x: u8) -> u8 {
     let _ = set_five_by_value(x);
     x
@@ -1549,58 +1794,74 @@ pub fn method_set_lo(c: &mut Config, v: u8) {
     c.lo = v;
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A method's write through `&mut self` reaches the caller.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_method_write_reaches_the_caller(mut c: Config) -> u8 {
     c.set_lo(5);
     c.lo
 }
 
+spec! {
+    requires: c.lo == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_method_write_reaches_the_caller`].
-/// requires: c.lo == 0
-/// ensures: ret == 0
 pub fn a_method_write_cannot_prove_this(mut c: Config) -> u8 {
     c.set_lo(5);
     c.lo
 }
 
+spec! {
+    requires: c.lo == 3,
+    ensures: ret == 4,
+}
 /// A read-modify-write *method*.
-/// requires: c.lo == 3
-/// ensures: ret == 4
 pub fn a_method_read_modify_write(mut c: Config) -> u8 {
     c.bump_lo();
     c.lo
 }
 
+spec! {
+    requires: c.lo == 7,
+    ensures: ret == 7,
+}
 /// A method writing one field leaves its *sibling* alone.
-/// requires: c.lo == 7
-/// ensures: ret == 7
 pub fn a_method_leaves_its_sibling(mut c: Config) -> u8 {
     c.set_hi(9);
     c.lo
 }
 
+spec! {
+    requires: c.lo == 7,
+    ensures: ret == 9,
+}
 /// The false direction of [`a_method_leaves_its_sibling`].
-/// requires: c.lo == 7
-/// ensures: ret == 9
 pub fn a_stale_sibling_cannot_prove_this(mut c: Config) -> u8 {
     c.set_hi(9);
     c.lo
 }
 
+spec! {
+    requires: c.lo == 3,
+    ensures: ret == 8,
+}
 /// A read-modify-write helper through a `&mut` is modelled, not left incomplete.
 ///
 /// The callee reads `c.lo` before writing it, so the caller's field seed has to
 /// cross *into* the callee as well as back out. Carrying only the write-back would
 /// leave the callee's read unmodelled and this contract incomplete.
-/// requires: c.lo == 3
-/// ensures: ret == 8
 pub fn read_modify_write_through_helper(c: &mut Config) -> u8 {
     add_lo_through_ref(c, 5);
     c.lo
 }
 
+spec! {
+    requires: i < 4,
+    ensures: ret == a__chain,
+}
 /// A generated binding name that a real argument also uses.
 ///
 /// The contract's `a[i]` is rewritten to a binding named `a__chain`, and the
@@ -1609,13 +1870,15 @@ pub fn read_modify_write_through_helper(c: &mut Config) -> u8 {
 /// the array's chain rather than against the argument the source names. The
 /// contract is false for `i == 0 && a__chain == 0` with `a[0] != 0`, so it must
 /// be refused or refuted, never proved.
-/// requires: i < 4
-/// ensures: ret == a__chain
 #[allow(unused_variables, non_snake_case)]
 pub fn generated_name_shadows_argument(a: [u8; 4], i: usize, a__chain: u8) -> u8 {
     a[i]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == a[0],
+}
 /// A helper that indexes its by-value array parameter, called from a contract.
 ///
 /// The callee's `a[0]` must be the *same* symbolic input the caller passed, so
@@ -1623,38 +1886,46 @@ pub fn generated_name_shadows_argument(a: [u8; 4], i: usize, a__chain: u8) -> u8
 /// than an unknown. Before the call handed the callee a copy of the indexed
 /// store, the callee's `_1[_2]` had nothing to read and the caller was
 /// incomplete.
-/// requires: true
-/// ensures: ret == a[0]
 pub fn head(a: [u8; 4]) -> u8 {
     a[0]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == a[0],
+}
 /// The caller of [`head`], whose contract the helper's element read must satisfy.
-/// requires: true
-/// ensures: ret == a[0]
 pub fn caller_of_head(a: [u8; 4]) -> u8 {
     head(a)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// A helper that writes through a `&mut [u8; 4]` and returns the element.
 ///
 /// The write is to the *caller's* storage, so on return the caller's `a[0]` is
 /// the `0` the helper wrote, and `ret == 0` must verify.
-/// requires: true
-/// ensures: ret == 0
 pub fn clear_head(a: &mut [u8; 4]) -> u8 {
     a[0] = 0;
     a[0]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The caller of [`clear_head`]: the helper's write to the shared store is what
 /// makes `ret == 0` true here.
-/// requires: true
-/// ensures: ret == 0
 pub fn caller_of_clear_head(a: &mut [u8; 4]) -> u8 {
     clear_head(a)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The by-value counterpart: a helper's write to its *own* copy must not reach
 /// the caller.
 ///
@@ -1662,22 +1933,26 @@ pub fn caller_of_clear_head(a: &mut [u8; 4]) -> u8 {
 /// the array it passed, untouched, so `ret == 0` is FALSE (the caller returns
 /// its own `a[0]`). If the callee's copy were shared with the caller's store --
 /// the tempting wrong model -- this would verify. It must fail.
-/// requires: true
-/// ensures: ret == 0
 pub fn caller_of_written_copy(a: [u8; 4]) -> u8 {
     let _ = clear_copy(a);
     a[0]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// A helper that clears its by-value copy and returns it.
-/// requires: true
-/// ensures: ret == 0
 #[allow(unused_assignments)]
 pub fn clear_copy(mut a: [u8; 4]) -> u8 {
     a[0] = 0;
     a[0]
 }
 
+spec! {
+    requires: c.lo == i8::MIN,
+    ensures: ret == 1,
+}
 /// A signed field compared against a signed constant, where the constant is the
 /// *left* operand: `0 < c.lo`.
 ///
@@ -1686,131 +1961,157 @@ pub fn clear_copy(mut a: [u8; 4]) -> u8 {
 /// `i8::MIN` (0x80) is the largest value and `ret == 1` was *proved* for
 /// `c.lo == i8::MIN` -- a false proof, because `i8::MIN` is negative. It must
 /// FAIL.
-/// requires: c.lo == i8::MIN
-/// ensures: ret == 1
 pub fn signed_const_left_false(c: SignedConfig) -> u8 {
     if 0 < c.lo { 1 } else { 0 }
 }
 
+spec! {
+    requires: c.lo == i8::MIN,
+    ensures: ret == 0,
+}
 /// The true counterpart of [`signed_const_left_false`]: for `i8::MIN` the branch
 /// is not taken, so `ret == 0` must verify.
-/// requires: c.lo == i8::MIN
-/// ensures: ret == 0
 pub fn signed_const_left_true(c: SignedConfig) -> u8 {
     if 0 < c.lo { 1 } else { 0 }
 }
 
+spec! {
+    requires: a < 3,
+    ensures: ret.0 == true,
+}
 /// A `(bool, u8)` tuple return with a postcondition on the bool component.
 ///
 /// `ret.0` is a `bool` in the type but a one-bit word in the postcondition, so
 /// the component has to be widened. Before that, `ret.0` had no binding and the
 /// contract was refused as unreadable.
-/// requires: a < 3
-/// ensures: ret.0 == true
 pub fn bool_component(a: u8) -> (bool, u8) {
     (a < 3, 0)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.0 == a,
+}
 /// A `(u8, &u8)` return with a postcondition on the *first* component only.
 ///
 /// Component 1 is a reference with no bit width, so binding every declared
 /// component skipped the function. Only `ret.0`, which the contract names, needs
 /// a binding.
-/// requires: true
-/// ensures: ret.0 == a
 pub fn first_component_only(a: u8, r: &u8) -> (u8, &u8) {
     (a, r)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == a,
+}
 /// A tuple local whose component is read back: `let t = (a, b); t.0`.
 ///
 /// `_3 = (a, b)` stores the components under an *index* projection, but rustc
 /// prints the read as `_3.0` -- a *field* projection. The two spellings have to
 /// meet in one store, or `t.0` reads `Unknown` and a contract about the return is
 /// unreadable.
-/// requires: true
-/// ensures: ret == a
 pub fn tuple_local_component(a: u8, b: u8) -> u8 {
     let t = (a, b);
     t.0
 }
 
+spec! {
+    requires: true,
+    ensures: ret.0 == a || ret.0 == b,
+}
 /// A helper returning a tuple.
-/// requires: true
-/// ensures: ret.0 == a || ret.0 == b
 pub fn min2(a: u8, b: u8) -> (u8, bool) {
     if a < b { (a, true) } else { (b, false) }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == a || ret == b,
+}
 /// A caller that reads a component of a tuple-returning call: `min2(a, b).0`.
 ///
 /// The callee stores its result in its *own* return place (`_0.0`, `_0.1`), so
 /// the components have to cross the call boundary with the aggregate; carrying
 /// only the aggregate loses them and the contract is unreadable rather than
 /// checked.
-/// requires: true
-/// ensures: ret == a || ret == b
 pub fn min_call(a: u8, b: u8) -> u8 {
     min2(a, b).0
 }
 
+spec! {
+    requires: true,
+    ensures: ret == b,
+}
 /// The soundness tripwire for the tuple-component read: the *other* component.
 ///
 /// `t.0` is `a`, so claiming `ret == b` is false. If the field-projection
 /// fallback into the element store picked the wrong component -- or read the
 /// last-written one regardless of index -- this would verify. It must FAIL.
-/// requires: true
-/// ensures: ret == b
 pub fn tuple_component_tripwire(a: u8, b: u8) -> u8 {
     let t = (a, b);
     t.0
 }
 
+spec! {
+    requires: true,
+    ensures: ret == b,
+}
 /// The call-boundary counterpart: a false claim about the component that crossed.
 ///
 /// `min2(a, b).0` is the smaller of the two, so claiming `ret == b` is false
 /// whenever `a < b`. If the components crossed the boundary in the wrong order,
 /// or as one shared value, this would verify. It must FAIL.
-/// requires: true
-/// ensures: ret == b
 pub fn min_call_tripwire(a: u8, b: u8) -> u8 {
     min2(a, b).0
 }
 
+spec! {
+    requires: a == -1,
+    ensures: ret == -1,
+}
 /// A signed widening cast sign-extends: `-1i8 as i16` is `-1`.
-/// requires: a == -1
-/// ensures: ret == -1
 pub fn widen_signed_true(a: i8) -> i16 {
     a as i16
 }
 
+spec! {
+    requires: a == -1,
+    ensures: ret == 255,
+}
 /// The soundness tripwire for the signed widening cast.
 ///
 /// `truncate` zero-fills, so modelling every cast with it made `-1i8 as i16` the
 /// bit pattern `255` -- and `ret == 255` was *proved* for `a == -1`, a reachable
 /// false proof. The real value is `-1`. It must FAIL.
-/// requires: a == -1
-/// ensures: ret == 255
 pub fn widen_signed_false(a: i8) -> i16 {
     a as i16
 }
 
+spec! {
+    requires: a == 255,
+    ensures: ret == 255,
+}
 /// An unsigned widening cast zero-fills: `255u8 as u16` is `255`.
-/// requires: a == 255
-/// ensures: ret == 255
 pub fn widen_unsigned_true(a: u8) -> u16 {
     a as u16
 }
 
+spec! {
+    requires: a == 255,
+    ensures: ret == 65535,
+}
 /// The counterpart tripwire for the unsigned widening: zero-filling is right
 /// here, so `65535` is wrong and must FAIL. A single sign-extend-everything rule
 /// would prove it.
-/// requires: a == 255
-/// ensures: ret == 65535
 pub fn widen_unsigned_false(a: u8) -> u16 {
     a as u16
 }
 
+spec! {
+    requires: x == 255,
+    ensures: (x as i16) == 255,
+}
 /// A *contract literal* widened to meet a signed operand zero-fills, because the
 /// literal's own signedness is what decides the fill, not the operand's.
 ///
@@ -1819,21 +2120,25 @@ pub fn widen_unsigned_false(a: u8) -> u16 {
 /// `i16` by *sign-extending* it -- filling from the operand's sign instead of the
 /// constant's -- giving `65535`, and refuted a postcondition Rust accepts: a false
 /// *refutation*, the mirror of a false proof. It must verify.
-/// requires: x == 255
-/// ensures: (x as i16) == 255
 pub fn contract_literal_widened_to_signed_zero_fills(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 255,
+    ensures: (x as i16) == 254,
+}
 /// The control that the fix did not simply stop widening or verify everything:
 /// `254` is neither the zero-filled nor the sign-extended reading of `255`, so
 /// this is false in Rust and must FAIL.
-/// requires: x == 255
-/// ensures: (x as i16) == 254
 pub fn contract_literal_widened_to_signed_tripwire(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: (x as u16 + !0) == 255,
+}
 /// The soundness tripwire for an *untyped* (opaque) constant widened to an
 /// unsigned operand.
 ///
@@ -1841,28 +2146,34 @@ pub fn contract_literal_widened_to_signed_tripwire(x: u8) -> u8 {
 /// at the *scope's*. `!0` against a `u16` is `65535`, so `(x as u16 + !0) == 255`
 /// is false in Rust; the reader held `255` and zero-extended it, and *verified* the
 /// equality -- a false proof. The shape is refused, so this must not verify.
-/// requires: x == 0
-/// ensures: (x as u16 + !0) == 255
 pub fn contract_opaque_widened_to_unsigned_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: (x as i16 + !128) == 127,
+}
 /// The signed counterpart, which fails the same way when the literal's top bit is
 /// clear: `!128` against an `i16` is `-129`, not `127`. Also refused.
-/// requires: x == 0
-/// ensures: (x as i16 + !128) == 127
 pub fn contract_opaque_widened_to_signed_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x <= 100,
+    ensures: (x as u16) <= 200 + 100,
+}
 /// The control: a *fold* (`200 + 100` = `300`) is a value, not a width-dependent
 /// bit pattern, so it widens into a `u16` exactly and must verify.
-/// requires: x <= 100
-/// ensures: (x as u16) <= 200 + 100
 pub fn contract_fold_widens_to_unsigned_reads(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: 128i16 as i32 == -128,
+}
 /// A *suffixed* literal keeps its own width, so a cast of it is not re-read from
 /// the names in scope.
 ///
@@ -1871,31 +2182,37 @@ pub fn contract_fold_widens_to_unsigned_reads(x: u8) -> u8 {
 /// eight bits, so `128i16` was `0x80`, read as `-128`, and `128i16 as i32` became
 /// `-128`. The false postcondition below was *verified* under that reading and is
 /// false in Rust, so it must not verify.
-/// requires: x == 0
-/// ensures: 128i16 as i32 == -128
 pub fn contract_suffixed_literal_keeps_its_width(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: 128i16 as i32 == 128,
+}
 /// The true counterpart: `128i16 as i32` is `128`, so this must verify.
-/// requires: x == 0
-/// ensures: 128i16 as i32 == 128
 pub fn contract_suffixed_literal_is_its_own_value(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 255,
+    ensures: (x as i16 + 2) == !0 + 2,
+}
 /// The false proof that a *fold* of a complement was read at the scope's width.
 ///
 /// `!0` is `-1` in Rust, so `!0 + 2` is `1`, and `(x as i16 + 2) == !0 + 2` is
 /// false. The reader held the complement at the scope's width (`255`), added `2`
 /// to get `257`, and a later resize truncated it into `i16`'s `1`, *verifying* the
 /// false equality. The fold must not verify now.
-/// requires: x == 255
-/// ensures: (x as i16 + 2) == !0 + 2
 pub fn contract_complement_fold_widening_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: (!0 + 1) < 1u8,
+}
 /// An untyped fold that *overflows* the operand width is refused, not truncated
 /// into a verdict.
 ///
@@ -1904,67 +2221,79 @@ pub fn contract_complement_fold_widening_is_refused(x: u8) -> u8 {
 /// scope's width (`256`) and truncated it to the `u8` partner's width, so
 /// `(!0 + 1) < 1u8` *verified* (`0 < 1`) for a program rustc rejects. The fold's
 /// value depends on the width it is read at, so it must be refused, not decided.
-/// requires: true
-/// ensures: (!0 + 1) < 1u8
 pub fn contract_untyped_fold_overflow_is_refused() -> u8 {
     0
 }
 
+spec! {
+    requires: true,
+    ensures: (!0 + 2) == 1u8,
+}
 /// The equality form of the same shape: `(!0 + 2) == 1u8` was *verified* by
 /// truncating the fold's scope-width `257` to the `u8`'s `1`, again for a program
 /// rustc rejects as an overflow.
-/// requires: true
-/// ensures: (!0 + 2) == 1u8
 pub fn contract_untyped_fold_overflow_equality_is_refused() -> u8 {
     0
 }
 
+spec! {
+    requires: x <= 100,
+    ensures: (x as u16) <= 200 + 100,
+}
 /// The control: a fold that *fits* is width-independent and must still read.
 ///
 /// `200 + 100` is `300` at any width holding it, so it widens exactly, and
 /// `(x as u16) <= 200 + 100` holds for every `u8` `x`. Refusing the overflow must
 /// not refuse this.
-/// requires: x <= 100
-/// ensures: (x as u16) <= 200 + 100
 pub fn contract_fitting_fold_still_reads(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 1,
+    ensures: (x as u16) == (!0 & 1),
+}
 /// The valid control the same shape dropped: a complement *masked* to a value that
 /// does not depend on the width is width-independent, so it widens exactly.
 ///
 /// `!0 & 1` is `1` at any width, so `(x as u16) == (!0 & 1)` holds for `x == 1`.
 /// The reader carried the masked result as an opaque constant and refused the
 /// widening, dropping a valid postcondition.
-/// requires: x == 1
-/// ensures: (x as u16) == (!0 & 1)
 pub fn contract_complement_mask_widens_exactly(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 255,
+    ensures: x == (!0 >> 0),
+}
 /// A shift by zero is the identity, so an opaque operand is unambiguous.
 ///
 /// `!0 >> 0` is `!0`, and for a `u8` operand that is `255`, so `x == (!0 >> 0)`
 /// holds at `x == 255`. The reader refused *every* right shift of an opaque
 /// constant as sign-ambiguous, dropping this valid postcondition.
-/// requires: x == 255
-/// ensures: x == (!0 >> 0)
 pub fn contract_complement_shift_by_zero_reads(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: x / !0 == 0,
+}
 /// A division with a typed operand on one side is not sign-ambiguous.
 ///
 /// `!0` is `-1` read as `i32`, but the *typed* `u8` `x` fixes the reading to
 /// unsigned, so `!0` is `255` and `x / !0 == 0` for any `x < 255`. The reader saw
 /// `!0`'s opaque sign and refused the division as untyped, dropping a valid
 /// postcondition.
-/// requires: x == 0
-/// ensures: x / !0 == 0
 pub fn contract_complement_division_with_typed_operand_reads(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: y == 0,
+    ensures: y == !(!1 + 1),
+}
 /// A complement's *provisional* unsigned value must not be range-checked as if it
 /// were a written literal.
 ///
@@ -1974,21 +2303,25 @@ pub fn contract_complement_division_with_typed_operand_reads(x: u8) -> u8 {
 /// refused a contract naming it although no `255` is written. The fold now records
 /// only its operands' envelopes, so the guess is not checked while a genuine
 /// literal under the fold still is.
-/// requires: y == 0
-/// ensures: y == !(!1 + 1)
 pub fn contract_opaque_fold_provisional_value_is_not_range_checked(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: y == 127,
+    ensures: y == !128,
+}
 /// The negative control: a literal *under* the fold is still range-checked against
 /// the type the complement meets, so `!128` for an `i8` is a `literal out of
 /// range` error even though `!128` is `127`.
-/// requires: y == 127
-/// ensures: y == !128
 pub fn contract_literal_under_complement_is_still_range_checked(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: 0u128 == 0u128,
+}
 /// A `u128`-suffixed literal must be *refused*, not panicked.
 ///
 /// The suffix carries width 128, and the range check that guards the literal
@@ -1998,12 +2331,14 @@ pub fn contract_literal_under_complement_is_still_range_checked(y: i8) -> i8 {
 /// problem -- the *type* is, and the contract has to be refused rather than
 /// decided. This pins that the reader reports the function instead of taking the
 /// run down.
-/// requires: true
-/// ensures: 0u128 == 0u128
 pub fn contract_u128_suffix_literal_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: (x & 128) == y,
+}
 /// A *symbolic* masked operand keeps its own type, so a signed/unsigned pairing
 /// is refused.
 ///
@@ -2012,12 +2347,14 @@ pub fn contract_u128_suffix_literal_is_refused(x: u8) -> u8 {
 /// the result untyped let `refuse_mixed_signedness` accept `(x & 128) == y` for a
 /// signed `y`, a pairing rustc rejects (E0308), and give it a signed reading
 /// instead of refusing it. The contract must not be decided.
-/// requires: true
-/// ensures: (x & 128) == y
 pub fn contract_symbolic_mask_keeps_its_type(x: u8, y: i8) -> u8 {
     x
 }
 
+spec! {
+    requires: y == 1,
+    ensures: (-1i8 & 1) == y,
+}
 /// A *signed* constant mask keeps its signed type, so a signed/unsigned pairing is
 /// refused.
 ///
@@ -2027,23 +2364,27 @@ pub fn contract_symbolic_mask_keeps_its_type(x: u8, y: i8) -> u8 {
 /// reader marked the constant result `Literal` (a width-independent value that may
 /// widen), which hid the `i8`, and decided the comparison instead of refusing it.
 /// The contract must not be verified.
-/// requires: y == 1
-/// ensures: (-1i8 & 1) == y
 pub fn contract_signed_mask_vs_unsigned_is_refused(y: u8) -> u8 {
     y
 }
 
+spec! {
+    requires: y == 1,
+    ensures: (-1i8 & 1) == y,
+}
 /// The valid control for the signed mask: against a *signed* partner it reads.
 ///
 /// `(-1i8 & 1) == y` for an `i8` `y` is well-typed, and `-1i8 & 1` is `1`, so the
 /// equality holds at `y == 1`. The fix must keep the signed-mask shape readable
 /// rather than refuse every mask with a signed operand.
-/// requires: y == 1
-/// ensures: (-1i8 & 1) == y
 pub fn contract_signed_mask_with_signed_partner_reads(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: y == 1,
+    ensures: (1u8 & 1) == y,
+}
 /// The *unsigned* counterpart: a `u8` mask keeps its `u8` type, so a signed/unsigned
 /// pairing is refused too.
 ///
@@ -2052,22 +2393,26 @@ pub fn contract_signed_mask_with_signed_partner_reads(y: i8) -> i8 {
 /// `(1u8 & 1) == y` for an `i8` `y` is `E0308` (`expected u8, found i8`). The
 /// reader still marked the constant `Literal` (the mark needed only "not signed")
 /// and verified it. The contract must not be decided.
-/// requires: y == 1
-/// ensures: (1u8 & 1) == y
 pub fn contract_unsigned_mask_vs_signed_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: y == 1,
+    ensures: (1u8 & 1) == y,
+}
 /// The valid control for the unsigned mask: against an *unsigned* partner it reads.
 ///
 /// `(1u8 & 1) == y` for a `u8` `y` is well-typed and holds at `y == 1`, so the
 /// symmetric fix must not refuse every mask with an unsigned typed operand.
-/// requires: y == 1
-/// ensures: (1u8 & 1) == y
 pub fn contract_unsigned_mask_with_unsigned_partner_reads(y: u8) -> u8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: -1i8 < (x as i16),
+}
 /// A constant whose *type is fixed* may not meet a partner of another width.
 ///
 /// `-1i8` is an `i8`, so `-1i8 < (x as i16)` is `E0308` (`expected i8, found
@@ -2075,35 +2420,41 @@ pub fn contract_unsigned_mask_with_unsigned_partner_reads(y: u8) -> u8 {
 /// two signed operands and passes, so the *width* is the only remaining evidence.
 /// `align_widths` used to resize the constant to the cast's width instead, erasing
 /// it, and the contract was *verified*. It must not be decided.
-/// requires: true
-/// ensures: -1i8 < (x as i16)
 pub fn contract_fixed_width_constant_vs_wider_cast_is_refused(x: u8) -> i16 {
     x as i16
 }
 
+spec! {
+    requires: true,
+    ensures: -1 < (x as i16),
+}
 /// A bare negation has no width of its own, so it *does* meet a wider operand.
 ///
 /// The valid control for the width rule: `-1` is a negation of a bare literal, so
 /// Rust infers its type from `(x as i16)` and `-1 < (x as i16)` is well-typed
 /// (`-1` is less than any `x as i16`, so it holds for every `x`). The rule must
 /// refuse only a *fixed* width, not every negation.
-/// requires: true
-/// ensures: -1 < (x as i16)
 pub fn contract_bare_negation_meets_a_wider_operand(x: u8) -> i16 {
     x as i16
 }
 
+spec! {
+    requires: true,
+    ensures: 1i8 == 1i16,
+}
 /// Two fixed-width constants of different widths may not be compared.
 ///
 /// The both-constant counterpart: `1i8 == 1i16` is `E0308` in Rust. With neither
 /// operand a bare literal there is no operand to infer a width from, so the
 /// mismatch is the Rust error and the contract must not be decided.
-/// requires: true
-/// ensures: 1i8 == 1i16
 pub fn contract_two_fixed_width_constants_are_refused() -> i16 {
     0
 }
 
+spec! {
+    requires: xs.len() > 0 && xs[0] == i8::MIN,
+    ensures: ret == 1,
+}
 /// A comparison of a *signed* array element is a signed comparison.
 ///
 /// This is the element-side counterpart of the `const 0_i8` case. The element's
@@ -2112,8 +2463,6 @@ pub fn contract_two_fixed_width_constants_are_refused() -> i16 {
 /// and the largest `u8`, so the two readings of `xs[0] < 0` disagree on it:
 /// signed says the branch is taken and returns `1`, unsigned says `0`. The
 /// contract claims `1`, so it verifies only under the signed reading.
-/// requires: xs.len() > 0 && xs[0] == i8::MIN
-/// ensures: ret == 1
 pub fn signed_slice_element_is_signed(xs: &[i8]) -> i8 {
     if xs[0] < 0 {
         1
@@ -2122,6 +2471,10 @@ pub fn signed_slice_element_is_signed(xs: &[i8]) -> i8 {
     }
 }
 
+spec! {
+    requires: xs.len() > 0 && xs[0] == i8::MIN,
+    ensures: ret == 0,
+}
 /// The tripwire for the signed element read.
 ///
 /// The same body and the same precondition as
@@ -2129,8 +2482,6 @@ pub fn signed_slice_element_is_signed(xs: &[i8]) -> i8 {
 /// answer the *unsigned* reading gives -- an unsigned value is never below zero
 /// -- so this false contract is *proved* by exactly the bug. It must FAIL, and
 /// the counterexample is the element being negative.
-/// requires: xs.len() > 0 && xs[0] == i8::MIN
-/// ensures: ret == 0
 pub fn signed_slice_element_tripwire(xs: &[i8]) -> i8 {
     if xs[0] < 0 {
         1
@@ -2139,6 +2490,10 @@ pub fn signed_slice_element_tripwire(xs: &[i8]) -> i8 {
     }
 }
 
+spec! {
+    requires: xs.len() > 0,
+    ensures: xs[0] >= 0,
+}
 /// The signed-element read on the *postcondition* side, which is where the
 /// missing sign record actually produced a false proof.
 ///
@@ -2150,24 +2505,28 @@ pub fn signed_slice_element_tripwire(xs: &[i8]) -> i8 {
 /// element as the witness. The earlier `signed_slice_element_tripwire` did not
 /// catch this: the body's own reading of `xs[0]` dominated its verdict, so the
 /// bug hid behind a verdict that was already FAILED for another reason.
-/// requires: xs.len() > 0
-/// ensures: xs[0] >= 0
 pub fn signed_slice_element_ensures_tripwire(xs: &[i8]) -> i8 {
     xs[0]
 }
 
+spec! {
+    requires: i < 4,
+    ensures: a[i] >= 0,
+}
 /// The same hole on the *symbolic* index chain.
 ///
 /// `a[i]` is rewritten to an ite chain over the elements, and the chain was
 /// inserted into the name table without the element's sign -- so `a[i] >= 0` over
 /// an `i8` array read as unsigned and was proved for a body returning `a[i]`. It
 /// is refuted now, with `a[i] == i8::MIN` as the witness.
-/// requires: i < 4
-/// ensures: a[i] >= 0
 pub fn signed_array_chain_ensures_tripwire(a: [i8; 4], i: usize) -> i8 {
     a[i]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// A struct literal builds a value whose *fields* the body can read back.
 ///
 /// `Config { lo: 7, hi: 9 }` lowers to a struct-literal rvalue, which this
@@ -2177,13 +2536,15 @@ pub fn signed_array_chain_ensures_tripwire(a: [i8; 4], i: usize) -> i8 {
 /// unknown and the contract was unreadable. The fields are printed in
 /// declaration order, which is the order the `Field(N)` projections count in, so
 /// the literal's `lo` is field `0`.
-/// requires: true
-/// ensures: ret == 7
 pub fn struct_literal_reads_its_field() -> u8 {
     let c = Config { lo: 7, hi: 9 };
     c.lo
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// A struct literal's fields are read back by *declaration* order, not by the
 /// order they were written in the source.
 ///
@@ -2191,13 +2552,15 @@ pub fn struct_literal_reads_its_field() -> u8 {
 /// order (`lo`, then `hi`), which is the order the `Field(N)` projections index.
 /// The contract names `lo` and claims the constant, so it holds only if `lo` is
 /// the first operand.
-/// requires: true
-/// ensures: ret == 7
 pub fn struct_literal_order(a: u8) -> u8 {
     let c = Config { lo: 7, hi: a };
     c.lo
 }
 
+spec! {
+    requires: true,
+    ensures: ret == a,
+}
 /// The tripwire for the struct-literal field *order*.
 ///
 /// Same body as [`struct_literal_order`], but the contract claims the `hi`
@@ -2205,34 +2568,36 @@ pub fn struct_literal_order(a: u8) -> u8 {
 /// order they were *written* rather than by declaration order, so a reversed
 /// model would prove this false contract. It must FAIL, with a witness in which
 /// `a` is not `7`.
-/// requires: true
-/// ensures: ret == a
 pub fn struct_literal_order_tripwire(a: u8) -> u8 {
     let c = Config { lo: 7, hi: a };
     c.lo
 }
 
+spec! {
+    requires: a == 5,
+    ensures: ret == 5,
+}
 /// A reference to an argument is read back through the reference.
 ///
 /// `let r = &a; *r` lowers to `_2 = &_1; _0 = copy (*_2)`. The deref is of a
 /// local the run itself created, not of a `&T` argument, so the argument-only
 /// `deref_ok` path did not apply and the read came back unknown. Modelling
 /// `&place` as the place it addresses is what makes `*r` read `a`.
-/// requires: a == 5
-/// ensures: ret == 5
 pub fn reference_reads_through(a: u8) -> u8 {
     let r = &a;
     *r
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// A reference *write* is seen by the target, so the borrow is not a copy.
 ///
 /// `r` addresses `a`, and the write through `r` must be visible in `a`. If the
 /// reference were modelled as a snapshot of `a`'s value rather than as the place
 /// `a`, the read after the write would return the pre-write value and this
 /// contract would be refuted. It must verify.
-/// requires: true
-/// ensures: ret == 7
 pub fn reference_write_reaches_target() -> u8 {
     let mut a = 5u8;
     let r = &mut a;
@@ -2240,13 +2605,15 @@ pub fn reference_write_reaches_target() -> u8 {
     a
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// The tripwire for the reference-write direction.
 ///
 /// Same body as [`reference_write_reaches_target`], but the contract claims the
 /// value the target held *before* the write. That is the answer a snapshot model
 /// gives, so this false contract is proved by exactly the bug. It must FAIL.
-/// requires: true
-/// ensures: ret == 5
 pub fn reference_write_tripwire() -> u8 {
     let mut a = 5u8;
     let r = &mut a;
@@ -2254,6 +2621,10 @@ pub fn reference_write_tripwire() -> u8 {
     a
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
 /// `.len()` on an array argument is the length in its type.
 ///
 /// `a.len()` on `a: [u8; 4]` lowers to `_3 = &_1; _2 = _3 as &[u8];
@@ -2261,26 +2632,30 @@ pub fn reference_write_tripwire() -> u8 {
 /// length is the type's constant, so it is exactly `4` and the contract has
 /// something to agree with. Before this, the `PtrMetadata` named the slice local
 /// with no `indexed` entry and read unknown.
-/// requires: true
-/// ensures: ret == 4
 pub fn array_len_is_the_type_constant() -> usize {
     let a = [1u8, 2, 3, 4];
     a.len()
 }
 
+spec! {
+    requires: d.lo == 3,
+    ensures: ret == 3,
+}
 /// A struct argument reassigned wholesale carries its *fields* across.
 ///
 /// `c = d` copies a value the frontend models as its parts, so the copy has to
 /// move the fields or `c.lo` afterwards reads nothing. This is the readable half
 /// of [`struct_reassign_then_field_read`]: the contract names `d.lo`, which is
 /// what `c.lo` is after the assignment.
-/// requires: d.lo == 3
-/// ensures: ret == 3
 pub fn struct_reassign_reads_new_field(mut c: Config, d: Config) -> u8 {
     c = d;
     c.lo
 }
 
+spec! {
+    requires: true,
+    ensures: ret <= 2,
+}
 /// A `match` on an enum lowers to `switchInt(discriminant(m))`, and the tag is
 /// an input this frontend now models.
 ///
@@ -2288,8 +2663,6 @@ pub fn struct_reassign_reads_new_field(mut c: Config, d: Config) -> u8 {
 /// three arms are reachable exactly as the type says and the `otherwise` arm --
 /// which rustc lowers to `unreachable` for an exhaustive `match` -- is genuinely
 /// unreachable. Every arm returns a value at most `2`, so the bound holds.
-/// requires: true
-/// ensures: ret <= 2
 pub fn enum_match_is_bounded(m: Mode) -> u8 {
     match m {
         Mode::Off => 0,
@@ -2298,6 +2671,10 @@ pub fn enum_match_is_bounded(m: Mode) -> u8 {
     }
 }
 
+spec! {
+    requires: m == Mode::Run,
+    ensures: ret == 2,
+}
 /// The tag is the *only* thing a `match` reads, so a precondition on it selects
 /// the arm.
 ///
@@ -2305,8 +2682,6 @@ pub fn enum_match_is_bounded(m: Mode) -> u8 {
 /// tag to `2`, which is the arm that returns `2`. A model that guessed the tag
 /// (or read it as zero) would send every input down the `Off` arm and refute
 /// this contract.
-/// requires: m == Mode::Run
-/// ensures: ret == 2
 pub fn enum_match_selects_by_tag(m: Mode) -> u8 {
     match m {
         Mode::Off => 0,
@@ -2315,6 +2690,10 @@ pub fn enum_match_selects_by_tag(m: Mode) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
 /// The tripwire for the enum tag: an unconditional claim that only one arm's
 /// value can satisfy.
 ///
@@ -2322,8 +2701,6 @@ pub fn enum_match_selects_by_tag(m: Mode) -> u8 {
 /// always `2`. The `Off` and `Idle` arms make that false, so it must be refuted
 /// -- and the witness must name the tag, which is the evidence the tag is
 /// genuinely symbolic rather than a constant the model picked.
-/// requires: true
-/// ensures: ret == 2
 pub fn enum_match_tripwire(m: Mode) -> u8 {
     match m {
         Mode::Off => 0,
@@ -2332,6 +2709,10 @@ pub fn enum_match_tripwire(m: Mode) -> u8 {
     }
 }
 
+spec! {
+    requires: g == Gap::C,
+    ensures: ret == 2,
+}
 /// A variant after an *explicit* discriminant takes rustc's value, not its
 /// position.
 ///
@@ -2344,8 +2725,6 @@ pub fn enum_match_tripwire(m: Mode) -> u8 {
 ///
 /// The body returns `7` exactly when the tag is `4`, so the contract holds for
 /// the real numbering and would fail for a positional one.
-/// requires: g == Gap::C
-/// ensures: ret == 2
 pub fn enum_explicit_discriminant_selects_by_tag(g: Gap) -> u8 {
     match g {
         Gap::A => 0,
@@ -2354,6 +2733,10 @@ pub fn enum_explicit_discriminant_selects_by_tag(g: Gap) -> u8 {
     }
 }
 
+spec! {
+    requires: g == Gap::C,
+    ensures: ret == 1,
+}
 /// The tripwire for explicit discriminants: the *positional* value must not be
 /// what `Gap::C` means.
 ///
@@ -2363,8 +2746,6 @@ pub fn enum_explicit_discriminant_selects_by_tag(g: Gap) -> u8 {
 /// FAIL. A positional reader would call `Gap::C` the tag `1`, truncate the arm
 /// constants to the arity's width, and land on the `B` arm -- proving this false
 /// contract. Refuting it is the evidence the discriminant is rustc's value.
-/// requires: g == Gap::C
-/// ensures: ret == 1
 pub fn enum_explicit_discriminant_tripwire(g: Gap) -> u8 {
     match g {
         Gap::A => 0,
@@ -2373,14 +2754,16 @@ pub fn enum_explicit_discriminant_tripwire(g: Gap) -> u8 {
     }
 }
 
+spec! {
+    requires: m == Msg::Data,
+    ensures: ret == m.Data,
+}
 /// A variant *payload* is a symbolic input, read through the downcast.
 ///
 /// `Msg::Data(x)` lowers to `_3 = copy ((_1 as Data).0)`, so the payload is read
 /// as field 0 of variant 1. The contract names `m.Data`, which is bound to the
 /// same variable, so `ret == m.Data` on the `Data` arm is a claim about one value
 /// and not two that look alike.
-/// requires: m == Msg::Data
-/// ensures: ret == m.Data
 pub fn enum_payload_reads_through(m: Msg) -> u8 {
     match m {
         Msg::Ping => 0,
@@ -2389,13 +2772,15 @@ pub fn enum_payload_reads_through(m: Msg) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == m.Ping,
+}
 /// The tripwire for the payload: the *wrong* variant's payload.
 ///
 /// `m.Ping` is a unit variant, so it has no payload to read. The contract must be
 /// refused rather than bound to a fabricated value -- a model that bound every
 /// variant to the same payload would prove this false contract.
-/// requires: true
-/// ensures: ret == m.Ping
 pub fn enum_payload_tripwire(m: Msg) -> u8 {
     match m {
         Msg::Ping => 0,
@@ -2404,6 +2789,10 @@ pub fn enum_payload_tripwire(m: Msg) -> u8 {
     }
 }
 
+spec! {
+    requires: m == Msg::Data,
+    ensures: ret <= m.Data,
+}
 /// A `match` arm *guard* reads the payload through a borrow of a downcast place.
 ///
 /// `Msg::Data(n) if n < 10` lowers to `_4 = &((_1 as Data).0: u8); _6 = copy
@@ -2420,8 +2809,6 @@ pub fn enum_payload_tripwire(m: Msg) -> u8 {
 /// itself) and the fall-through arm returns `10`, which a payload of ten or more
 /// still dominates. The contract holds for every payload, so a model that read
 /// the guard's payload as an unconstrained input would refute it.
-/// requires: m == Msg::Data
-/// ensures: ret <= m.Data
 pub fn guarded_match_reads_its_payload(m: Msg) -> u8 {
     match m {
         Msg::Data(n) if n < 10 => n,
@@ -2431,6 +2818,10 @@ pub fn guarded_match_reads_its_payload(m: Msg) -> u8 {
     }
 }
 
+spec! {
+    requires: m == Msg::Data,
+    ensures: ret == 10,
+}
 /// The tripwire for a guarded match: the guard's *other* arm, claimed to be the
 /// one taken.
 ///
@@ -2439,8 +2830,6 @@ pub fn guarded_match_reads_its_payload(m: Msg) -> u8 {
 /// and the arm returns the payload, so the contract is false and must be refuted
 /// with a witness naming the payload. A model that dropped the guard's payload
 /// read (or read it as zero) would take the same arm on every path and prove it.
-/// requires: m == Msg::Data
-/// ensures: ret == 10
 pub fn guarded_match_tripwire(m: Msg) -> u8 {
     match m {
         Msg::Data(n) if n < 10 => n,
@@ -2450,6 +2839,10 @@ pub fn guarded_match_tripwire(m: Msg) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// A *locally constructed* variant has a known tag, so its `match` is decided
 /// rather than symbolic.
 ///
@@ -2457,8 +2850,6 @@ pub fn guarded_match_tripwire(m: Msg) -> u8 {
 /// `Mode::Idle` is a path constant. Resolving it to the enum's declaration index
 /// is what makes the tag a *constant* `1` here, so only the `Idle` arm is
 /// reachable and the contract is decided rather than left as a coverage gap.
-/// requires: true
-/// ensures: ret == 1
 pub fn enum_constructed_locally() -> u8 {
     let m = Mode::Idle;
     match m {
@@ -2468,14 +2859,16 @@ pub fn enum_constructed_locally() -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The tripwire for construction: the wrong variant's arm.
 ///
 /// Same body as [`enum_constructed_locally`], but the contract claims the
 /// `Off` arm ran. A model that resolved `Mode::Idle` to `Off` -- or to a
 /// symbolic tag -- would prove this, so refuting it is the evidence the
 /// discriminant is the declaration index and not a guess.
-/// requires: true
-/// ensures: ret == 0
 pub fn enum_constructed_locally_tripwire() -> u8 {
     let m = Mode::Idle;
     match m {
@@ -2485,13 +2878,15 @@ pub fn enum_constructed_locally_tripwire() -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// A constructed variant's payload is read through the downcast.
 ///
 /// `Msg::Data(9)` lowers to a construction of tag `1` with payload `9` written
 /// into field 0, and the match's `Data(x)` arm reads that field. The contract
 /// names the constant, so it is decided.
-/// requires: true
-/// ensures: ret == 9
 pub fn enum_constructed_payload_reads_through() -> u8 {
     let m = Msg::Data(9);
     match m {
@@ -2510,9 +2905,11 @@ pub fn enum_constructed_payload_reads_through() -> u8 {
 /// contract and the `match` arm would then disagree about which variant `s` is.
 pub enum Shadow { Some, None }
 
+spec! {
+    requires: s == Shadow::Some,
+    ensures: ret == 0,
+}
 /// The contract names `Shadow::Some`, which is tag `0` for this enum.
-/// requires: s == Shadow::Some
-/// ensures: ret == 0
 pub fn enum_user_variant_not_option(s: Shadow) -> u8 {
     match s {
         Shadow::Some => 0,
@@ -2520,10 +2917,12 @@ pub fn enum_user_variant_not_option(s: Shadow) -> u8 {
     }
 }
 
+spec! {
+    requires: s == Shadow::Some,
+    ensures: ret == 1,
+}
 /// The tripwire: `Option`'s numbering for `Some` is `1`, so a reader that used it
 /// would pin the tag to `1` -- the `None` arm -- and prove this false contract.
-/// requires: s == Shadow::Some
-/// ensures: ret == 1
 pub fn enum_user_variant_not_option_tripwire(s: Shadow) -> u8 {
     match s {
         Shadow::Some => 0,
@@ -2531,6 +2930,10 @@ pub fn enum_user_variant_not_option_tripwire(s: Shadow) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The construction path for the same collision: `let s = Shadow::Some;`.
 ///
 /// A local construction resolves the variant name through the same table a
@@ -2538,8 +2941,6 @@ pub fn enum_user_variant_not_option_tripwire(s: Shadow) -> u8 {
 /// return is `0`. A reader that took the built-in `Option` numbering for the
 /// qualified name would build the tag `1` -- the `None` arm -- and the run would
 /// report `1` instead of `0`.
-/// requires: true
-/// ensures: ret == 0
 pub fn enum_user_variant_not_option_constructed() -> u8 {
     let s = Shadow::Some;
     match s {
@@ -2548,10 +2949,12 @@ pub fn enum_user_variant_not_option_constructed() -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// The tripwire for the constructed collision: `ret == 1` is what the built-in
 /// `Option` numbering produces, and it is false for every input.
-/// requires: true
-/// ensures: ret == 1
 pub fn enum_user_variant_not_option_constructed_tripwire() -> u8 {
     let s = Shadow::Some;
     match s {
@@ -2560,6 +2963,10 @@ pub fn enum_user_variant_not_option_constructed_tripwire() -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// A *qualified* standard construction resolves to the same tag as the
 /// unqualified one.
 ///
@@ -2571,8 +2978,6 @@ pub fn enum_user_variant_not_option_constructed_tripwire() -> u8 {
 /// layout finds none and refuses the construction -- losing a shape the
 /// unqualified spelling handles. The `::<u8>` is part of the spelling, not the
 /// variant, so it is dropped before the qualifier is read.
-/// requires: true
-/// ensures: ret == 9
 pub fn option_qualified_some_payload() -> u8 {
     let o: Option<u8> = Option::<u8>::Some(9);
     match o {
@@ -2581,10 +2986,12 @@ pub fn option_qualified_some_payload() -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The tripwire for the qualified standard construction: `None` is tag `0` and
 /// takes the other arm, so the payload `9` is never returned.
-/// requires: true
-/// ensures: ret == 0
 pub fn option_qualified_some_payload_tripwire() -> u8 {
     let o: Option<u8> = Option::<u8>::Some(9);
     match o {
@@ -2607,9 +3014,11 @@ pub enum Commented {
     C,
 }
 
+spec! {
+    requires: c == Commented::C,
+    ensures: ret == 2,
+}
 /// The contract names `Commented::C`, which is tag `4` (it follows `B = 3`).
-/// requires: c == Commented::C
-/// ensures: ret == 2
 pub fn enum_trailing_comment_keeps_the_layout(c: Commented) -> u8 {
     match c {
         Commented::A => 0,
@@ -2618,9 +3027,11 @@ pub fn enum_trailing_comment_keeps_the_layout(c: Commented) -> u8 {
     }
 }
 
+spec! {
+    requires: c == Commented::C,
+    ensures: ret == 1,
+}
 /// The tripwire: `Commented::C` is not the `B` arm, so `ret == 1` is false.
-/// requires: c == Commented::C
-/// ensures: ret == 1
 pub fn enum_trailing_comment_tripwire(c: Commented) -> u8 {
     match c {
         Commented::A => 0,
@@ -2629,6 +3040,10 @@ pub fn enum_trailing_comment_tripwire(c: Commented) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret <= 1,
+}
 /// A `match` on a *standard-library* enum **argument**.
 ///
 /// `Option` and `Result` are read by real functions (`checked_add` returns
@@ -2639,8 +3054,6 @@ pub fn enum_trailing_comment_tripwire(c: Commented) -> u8 {
 /// argument form is the one the reader has to know without a declaration.
 /// The contract is true for every input, so it must VERIFY -- `None` gives `0`
 /// and `Some` gives `1`, and both are `<= 1`.
-/// requires: true
-/// ensures: ret <= 1
 pub fn option_arg_match(x: Option<u8>) -> u8 {
     match x {
         Some(_) => 1,
@@ -2648,12 +3061,14 @@ pub fn option_arg_match(x: Option<u8>) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The tripwire for the standard-enum argument: the body returns `1` for `Some`
 /// and `0` for `None`, so `ret == 0` is false whenever the caller passes `Some`.
 /// A model that seeded no tag would not reach this -- it refused -- but one that
 /// seeded a *constant* tag would take one arm always and could prove this.
-/// requires: true
-/// ensures: ret == 0
 pub fn option_arg_match_tripwire(x: Option<u8>) -> u8 {
     match x {
         Some(_) => 1,
@@ -2661,11 +3076,13 @@ pub fn option_arg_match_tripwire(x: Option<u8>) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret <= 1,
+}
 /// The `Result` half: `Ok` is tag `0` and `Err` is tag `1`, and the two type
 /// arguments are the payloads in order, so `Ok`'s payload is a `u8` and `Err`'s is
 /// a `u16`. The contract is true for both arms.
-/// requires: true
-/// ensures: ret <= 1
 pub fn result_arg_match(r: Result<u8, u16>) -> u8 {
     match r {
         Ok(_) => 0,
@@ -2673,10 +3090,12 @@ pub fn result_arg_match(r: Result<u8, u16>) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The tripwire: `Err` takes the second arm, so `ret == 0` is false when the
 /// caller passes `Err`.
-/// requires: true
-/// ensures: ret == 0
 pub fn result_arg_match_tripwire(r: Result<u8, u16>) -> u8 {
     match r {
         Ok(_) => 0,
@@ -2684,14 +3103,16 @@ pub fn result_arg_match_tripwire(r: Result<u8, u16>) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret <= x.Some,
+}
 /// The `Option` payload read through the argument: `Some`'s payload is the type
 /// argument, so `Option<u8>::Some` carries a `u8`. The body's downcast read
 /// `((_1 as Some).0)` must name the same seeded payload variable the contract's
 /// `x.Some` does. A tautology like `ret <= 255` would hold even if the payload
 /// came back unconstrained, so it would pin nothing; `ret <= x.Some` fails on the
 /// `Some` arm whenever the body returns anything but the seeded payload.
-/// requires: true
-/// ensures: ret <= x.Some
 pub fn option_arg_payload_passthrough(x: Option<u8>) -> u8 {
     match x {
         Some(v) => v,
@@ -2699,11 +3120,13 @@ pub fn option_arg_payload_passthrough(x: Option<u8>) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x.Some + 1,
+}
 /// The tripwire: the contract claims the payload is one more than it is, so the
 /// `Some` arm is false for every input -- the payload is read, not a free
 /// variable the contract could make true.
-/// requires: true
-/// ensures: ret == x.Some + 1
 pub fn option_arg_payload_tripwire(x: Option<u8>) -> u8 {
     match x {
         Some(v) => v,
@@ -2720,127 +3143,155 @@ pub fn option_arg_payload_tripwire(x: Option<u8>) -> u8 {
 // receiver is `self` for the first three and `&self` for the two predicates, so
 // the executor follows the reference either way.
 
+spec! {
+    requires: true,
+    ensures: ret >= a,
+}
 /// `checked_add` then `unwrap_or(u32::MAX)`: the payload on `Some`, the maximum on
 /// the `None` (overflow) path. The contract is true for every input -- the sum is
 /// `>= a` when it does not overflow, and `u32::MAX >= a` always -- so it must
 /// VERIFY. This is the `checked_or_max` scoreboard entry's shape.
-/// requires: true
-/// ensures: ret >= a
 pub fn option_unwrap_or_fallback(a: u32, b: u32) -> u32 {
     a.checked_add(b).unwrap_or(u32::MAX)
 }
 
+spec! {
+    requires: true,
+    ensures: ret >= a,
+}
 /// The tripwire: the fallback is not `u32::MAX` but `0`, so `ret >= a` fails
 /// whenever the sum overflows and `a > 0`. A model that returned the payload
 /// unconditionally, ignoring the tag, could prove this.
-/// requires: true
-/// ensures: ret >= a
 pub fn option_unwrap_or_fallback_tripwire(a: u32, b: u32) -> u32 {
     a.checked_add(b).unwrap_or(0)
 }
 
+spec! {
+    requires: a == 0 && b == 0,
+    ensures: ret == true,
+}
 /// `is_some` on a checked add pinned to a successful add: the tag is `Some`, so
 /// `is_some()` is `true`. Pinning the inputs is what gives this teeth -- the
 /// contract language cannot call `checked_add`, so "the add succeeds" has to be a
 /// precondition rather than an expression.
-/// requires: a == 0 && b == 0
-/// ensures: ret == true
 pub fn option_is_some_true_on_some(a: u8, b: u8) -> bool {
     a.checked_add(b).is_some()
 }
 
+spec! {
+    requires: a == 0 && b == 0,
+    ensures: ret == false,
+}
 /// The tripwire: the same successful add, where `is_some()` is `true`, so
 /// `ret == false` is refutable. A model that read the tag as a constant `None`
 /// would prove this.
-/// requires: a == 0 && b == 0
-/// ensures: ret == false
 pub fn option_is_some_true_on_some_tripwire(a: u8, b: u8) -> bool {
     a.checked_add(b).is_some()
 }
 
+spec! {
+    requires: a == 255 && b == 1,
+    ensures: ret == false,
+}
 /// `is_some` on a checked add pinned to an *overflowing* add: the tag is `None`,
 /// so `is_some()` is `false`. This is the other tag, so the pair pins that the
 /// model reads the tag rather than returning a constant.
-/// requires: a == 255 && b == 1
-/// ensures: ret == false
 pub fn option_is_some_false_on_none(a: u8, b: u8) -> bool {
     a.checked_add(b).is_some()
 }
 
+spec! {
+    requires: a == 255 && b == 1,
+    ensures: ret == true,
+}
 /// The tripwire: the overflowing add gives `is_some() == false`, so `ret == true`
 /// is refutable.
-/// requires: a == 255 && b == 1
-/// ensures: ret == true
 pub fn option_is_some_false_on_none_tripwire(a: u8, b: u8) -> bool {
     a.checked_add(b).is_some()
 }
 
+spec! {
+    requires: a == 0 && b == 0,
+    ensures: ret == false,
+}
 /// `is_none` on a successful add: the tag is `Some`, so `is_none()` is `false`.
 /// `is_none` tests the tag against `0`, so a model that tested against `1` would
 /// return `true` here and prove the tripwire below.
-/// requires: a == 0 && b == 0
-/// ensures: ret == false
 pub fn option_is_none_false_on_some(a: u8, b: u8) -> bool {
     a.checked_add(b).is_none()
 }
 
+spec! {
+    requires: a == 0 && b == 0,
+    ensures: ret == true,
+}
 /// The tripwire: a successful add gives `is_none() == false`, so `ret == true` is
 /// refutable. A model that read `is_none` as `is_some` (testing tag `1`) would
 /// prove this.
-/// requires: a == 0 && b == 0
-/// ensures: ret == true
 pub fn option_is_none_false_on_some_tripwire(a: u8, b: u8) -> bool {
     a.checked_add(b).is_none()
 }
 
+spec! {
+    requires: a == 255 && b == 1,
+    ensures: ret == true,
+}
 /// `is_none` on an overflowing add: the tag is `None`, so `is_none()` is `true`.
-/// requires: a == 255 && b == 1
-/// ensures: ret == true
 pub fn option_is_none_true_on_none(a: u8, b: u8) -> bool {
     a.checked_add(b).is_none()
 }
 
+spec! {
+    requires: a == 255 && b == 1,
+    ensures: ret == false,
+}
 /// The tripwire: an overflowing add gives `is_none() == true`, so `ret == false`
 /// is refutable.
-/// requires: a == 255 && b == 1
-/// ensures: ret == false
 pub fn option_is_none_true_on_none_tripwire(a: u8, b: u8) -> bool {
     a.checked_add(b).is_none()
 }
 
+spec! {
+    requires: a <= 100 && b <= 100,
+    ensures: ret == a + b,
+}
 /// `unwrap` on a checked add that the precondition proves cannot overflow, so the
 /// `None` panic is unreachable and the value is the sum. The contract must VERIFY,
 /// and the panic obligation must be *ruled out* (a `None` path is impossible).
-/// requires: a <= 100 && b <= 100
-/// ensures: ret == a + b
 pub fn option_unwrap_guarded(a: u8, b: u8) -> u8 {
     a.checked_add(b).unwrap()
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// The panic tripwire: the same body with no guard, so the add *can* overflow and
 /// `unwrap` panics. The contract is true (it is a tautology) but the panic
 /// obligation must be refuted -- `a == 255, b == 1` reaches `None` and unwraps.
-/// requires: true
-/// ensures: true
 pub fn option_unwrap_unguarded(a: u8, b: u8) -> u8 {
     a.checked_add(b).unwrap()
 }
 
+spec! {
+    requires: a <= 100 && b <= 100,
+    ensures: ret == a + b,
+}
 /// `expect` is `unwrap` with a message, so a guarded one verifies exactly as
 /// `option_unwrap_guarded` does.
-/// requires: a <= 100 && b <= 100
-/// ensures: ret == a + b
 pub fn option_expect_guarded(a: u8, b: u8) -> u8 {
     a.checked_add(b).expect("overflow")
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// The idiom `if x.is_some() { x.unwrap() } else { 0 }`: the `is_some` tag test
 /// drives the branch, so the `unwrap` inside it is on a path where the tag is
 /// `Some` and the panic is unreachable. The contract is true for every input, so
 /// it must VERIFY with the panic ruled out -- which only happens if `is_some` and
 /// `unwrap` read the *same* tag.
-/// requires: true
-/// ensures: true
 pub fn option_is_some_guards_unwrap(x: Option<u8>) -> u8 {
     if x.is_some() {
         x.unwrap()
@@ -2849,11 +3300,13 @@ pub fn option_is_some_guards_unwrap(x: Option<u8>) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// The `is_none` mirror of the guard: the `else` arm unwraps, on the path where
 /// `is_none` was false, so the tag is `Some` and the panic is unreachable. Must
 /// VERIFY.
-/// requires: true
-/// ensures: true
 pub fn option_is_none_guards_unwrap(x: Option<u8>) -> u8 {
     if x.is_none() {
         0
@@ -2862,12 +3315,14 @@ pub fn option_is_none_guards_unwrap(x: Option<u8>) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// The guard tripwire: the same `is_some` guard, but the `else` arm unwraps
 /// instead -- on the path where the tag is `None`, so `unwrap` panics. The
 /// contract is a tautology but the panic obligation must be refuted, which is the
 /// evidence the guard and the unwrap are about the same tag.
-/// requires: true
-/// ensures: true
 pub fn option_guard_tripwire(x: Option<u8>) -> u8 {
     if x.is_some() {
         0
@@ -2876,42 +3331,50 @@ pub fn option_guard_tripwire(x: Option<u8>) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// The `expect` panic tripwire, the same shape as `option_unwrap_unguarded`.
-/// requires: true
-/// ensures: true
 pub fn option_expect_unguarded(a: u8, b: u8) -> u8 {
     a.checked_add(b).expect("overflow")
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x.Some || ret == 7,
+}
 /// `unwrap_or` on a *contract-bound* `Option` argument: the payload on `Some`,
 /// the default on `None`. The receiver's tag and payload come from the argument
 /// seed, not from a modelled call, which is the other way the stores are filled.
 /// The contract holds on both arms: on `Some` the result is `x.Some` itself, on
 /// `None` it is `7`, and both are `<= x.Some || x.Some < 7` -- so it must VERIFY.
-/// requires: true
-/// ensures: ret == x.Some || ret == 7
 pub fn option_arg_unwrap_or(x: Option<u8>) -> u8 {
     x.unwrap_or(7)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x.Some,
+}
 /// The tripwire: the default is `7`, so on the `None` path the result is `7`; the
 /// contract claims it is `x.Some` exactly, which the `None` path violates for
 /// every `x.Some != 7`. A model that ignored the tag and returned the payload
 /// unconditionally would prove this.
-/// requires: true
-/// ensures: ret == x.Some
 pub fn option_arg_unwrap_or_tripwire(x: Option<u8>) -> u8 {
     x.unwrap_or(7)
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// `unwrap` on a contract-bound `Option` argument with no `is_some` guard, so the
 /// `None` path reaches `unwrap` and panics. The contract is a tautology but the
 /// panic obligation must be refuted -- the tag is a free input and `None` is
 /// reachable. (A *guarded* argument unwrap is deliberately not in the corpus: the
 /// contract language cannot name an `Option`'s tag, so "the caller passed `Some`"
 /// is not expressible, and pinning only `x.Some` leaves the tag free.)
-/// requires: true
-/// ensures: true
 pub fn option_arg_unwrap_unguarded(x: Option<u8>) -> u8 {
     x.unwrap()
 }
@@ -2923,63 +3386,77 @@ pub fn option_arg_unwrap_unguarded(x: Option<u8>) -> u8 {
 // `Err`. One executor arm answers both families because the method name says which
 // variant carries the payload.
 
+spec! {
+    requires: true,
+    ensures: ret == true || ret == false,
+}
 /// `Result::is_ok` on a contract-bound `Result` argument: `true` on `Ok` and
 /// `false` on `Err`, so the contract holds on both arms.
-/// requires: true
-/// ensures: ret == true || ret == false
 pub fn result_is_ok(r: Result<u8, u16>) -> bool {
     r.is_ok()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == false,
+}
 /// The tripwire: `is_ok` is `true` exactly on `Ok`, so `ret == false` is refutable
 /// with an `Ok` receiver. A model that tested the tag against `1` (the `Err` tag)
 /// would prove this.
-/// requires: true
-/// ensures: ret == false
 pub fn result_is_ok_tripwire(r: Result<u8, u16>) -> bool {
     r.is_ok()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == true || ret == false,
+}
 /// `Result::is_err` is the complement of `is_ok`, so it is `true` exactly on
 /// `Err`. The contract holds on both arms.
-/// requires: true
-/// ensures: ret == true || ret == false
 pub fn result_is_err(r: Result<u8, u16>) -> bool {
     r.is_err()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == false,
+}
 /// The tripwire: `is_err` is `true` on `Err`, so `ret == false` is refutable with
 /// an `Err` receiver -- which is what separates `is_err` (tag `1`) from `is_ok`
 /// (tag `0`).
-/// requires: true
-/// ensures: ret == false
 pub fn result_is_err_tripwire(r: Result<u8, u16>) -> bool {
     r.is_err()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == r.Ok || ret == 7,
+}
 /// `Result::unwrap_or(default)` on a contract-bound argument: the `Ok` payload on
 /// `Ok`, the default on `Err`. The contract holds on both arms.
-/// requires: true
-/// ensures: ret == r.Ok || ret == 7
 pub fn result_unwrap_or(r: Result<u8, u16>) -> u8 {
     r.unwrap_or(7)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == r.Ok,
+}
 /// The tripwire: the default is `7`, so on the `Err` path the result is `7`; the
 /// contract claims it is the `Ok` payload exactly, which the `Err` path violates
 /// for every `r.Ok != 7`. A model that ignored the tag would prove this.
-/// requires: true
-/// ensures: ret == r.Ok
 pub fn result_unwrap_or_tripwire(r: Result<u8, u16>) -> u8 {
     r.unwrap_or(7)
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// `Result::unwrap` with no guard, so the `Err` path panics. The contract is a
 /// tautology but the panic obligation must be refuted -- and the message must
 /// name `Err`, which is the evidence the model read the `Result` tag rather than
 /// the `Option` one.
-/// requires: true
-/// ensures: true
 pub fn result_unwrap_unguarded(r: Result<u8, u16>) -> u8 {
     r.unwrap()
 }
@@ -3006,108 +3483,134 @@ pub fn result_unwrap_unguarded(r: Result<u8, u16>) -> u8 {
 // test the success tag (`Ok` is 0, `Some` is 1) and `is_err`/`is_none` the failure
 // tag, so a model that swapped the two tags would prove the tripwires.
 
+spec! {
+    requires: true,
+    ensures: ret.is_some(),
+}
 /// `ret.is_some()` on a body that always returns `Some`, so the contract is true.
 /// The body reads the tag the executor passed, and the pair with the tripwire is
 /// what pins the success tag.
-/// requires: true
-/// ensures: ret.is_some()
 pub fn enum_ret_is_some(x: u8) -> Option<u8> {
     Some(x)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_none(),
+}
 /// The tripwire: the body is always `Some`, so `ret.is_none()` is refutable. A
 /// model that read `is_none` as the success tag (or the tag as a constant) would
 /// prove this.
-/// requires: true
-/// ensures: ret.is_none()
 pub fn enum_ret_is_some_tripwire(x: u8) -> Option<u8> {
     Some(x)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_none(),
+}
 /// `ret.is_none()` on a body that always returns `None`: the failure tag.
-/// requires: true
-/// ensures: ret.is_none()
 pub fn enum_ret_is_none() -> Option<u8> {
     None
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_some(),
+}
 /// The tripwire: the body is always `None`, so `ret.is_some()` is refutable.
-/// requires: true
-/// ensures: ret.is_some()
 pub fn enum_ret_is_none_tripwire() -> Option<u8> {
     None
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_ok(),
+}
 /// `ret.is_ok()` on a body that always returns `Ok`: the `Ok` tag is 0, so a
 /// model that tested against `Some`'s tag 1 would refute this.
-/// requires: true
-/// ensures: ret.is_ok()
 pub fn enum_ret_is_ok(x: u8) -> Result<u8, u8> {
     Ok(x)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_err(),
+}
 /// The tripwire: the body is always `Ok`, so `ret.is_err()` is refutable.
-/// requires: true
-/// ensures: ret.is_err()
 pub fn enum_ret_is_ok_tripwire(x: u8) -> Result<u8, u8> {
     Ok(x)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_err(),
+}
 /// `ret.is_err()` on a body that always returns `Err`: the failure tag.
-/// requires: true
-/// ensures: ret.is_err()
 pub fn enum_ret_is_err(x: u8) -> Result<u8, u8> {
     Err(x)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_ok(),
+}
 /// The tripwire: the body is always `Err`, so `ret.is_ok()` is refutable. This is
 /// the pair that separates the `Ok` tag (0) from the `Err` tag (1) on a *return*,
 /// exactly as `result_is_ok`/`result_is_err` do for an argument.
-/// requires: true
-/// ensures: ret.is_ok()
 pub fn enum_ret_is_err_tripwire(x: u8) -> Result<u8, u8> {
     Err(x)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_ok() || ret.is_err(),
+}
 /// A contract that names *both* methods: `ret.is_ok() || ret.is_err()` is a
 /// tautology over the two tags, so it must verify. This is the evidence the two
 /// read the same tag at the two discriminants rather than one being constant.
-/// requires: true
-/// ensures: ret.is_ok() || ret.is_err()
 pub fn enum_ret_is_ok_or_err(x: u8) -> Result<u8, u8> {
     Ok(x)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_ok() && ret.is_err(),
+}
 /// The tripwire: the body is always `Ok`, so `ret.is_ok() && ret.is_err()` is
 /// refutable -- the two methods are not the same predicate.
-/// requires: true
-/// ensures: ret.is_ok() && ret.is_err()
 pub fn enum_ret_is_ok_and_err_tripwire(x: u8) -> Result<u8, u8> {
     Ok(x)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_ok() || ret.is_err(),
+}
 /// A *pass-through* return: the tag comes from an enum *argument*, so the contract
 /// reads the argument's tag, which the executor seeds. This is the shape a real
 /// function has when it forwards a `Result`.
-/// requires: true
-/// ensures: ret.is_ok() || ret.is_err()
 pub fn enum_ret_passthrough(r: Result<u8, u8>) -> Result<u8, u8> {
     r
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_ok(),
+}
 /// The tripwire for the pass-through: the tag is the argument's, so `ret.is_ok()`
 /// is refutable with an `Err` receiver -- a model that read the return tag as a
 /// constant would prove it.
-/// requires: true
-/// ensures: ret.is_ok()
 pub fn enum_ret_passthrough_tripwire(r: Result<u8, u8>) -> Result<u8, u8> {
     r
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_ok() || ret.is_err(),
+}
 /// A `match` on the returned enum, so the body's own `switchInt` reads the same
 /// tag the contract does. The contract must hold on both arms.
-/// requires: true
-/// ensures: ret.is_ok() || ret.is_err()
 pub fn enum_ret_from_match(r: Result<u8, u8>) -> Result<u8, u8> {
     match r {
         Ok(v) => Ok(v),
@@ -3115,10 +3618,12 @@ pub fn enum_ret_from_match(r: Result<u8, u8>) -> Result<u8, u8> {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_err(),
+}
 /// The tripwire: the body preserves the argument's tag, so `ret.is_err()` alone is
 /// refutable with an `Ok` receiver.
-/// requires: true
-/// ensures: ret.is_err()
 pub fn enum_ret_from_match_tripwire(r: Result<u8, u8>) -> Result<u8, u8> {
     match r {
         Ok(v) => Ok(v),
@@ -3131,169 +3636,211 @@ pub fn enum_ret_from_match_tripwire(r: Result<u8, u8>) -> Result<u8, u8> {
 // below is a true clause on the variant it names and a tripwire claiming a value
 // the payload cannot be.
 
+spec! {
+    requires: r.is_ok() && r.Ok == 9,
+    ensures: ret.Ok == 9,
+}
 /// `ret.Ok` on a `Result` pass-through under `r.Ok == 9`: the result is `r`, so
 /// the `Ok` payload is `9` on the `Ok` path. The body's `((_0 as Ok).0)` and the
 /// contract's `ret.Ok` are one variable, which is what makes this verify.
-/// requires: r.is_ok() && r.Ok == 9
-/// ensures: ret.Ok == 9
 pub fn ret_ok_payload(r: Result<u8, u8>) -> Result<u8, u8> {
     r
 }
 
+spec! {
+    requires: r.is_ok() && r.Ok == 9,
+    ensures: ret.Ok == 8,
+}
 /// The tripwire: the payload is `9`, so `ret.Ok == 8` is refutable. A model that
 /// bound the payload to a fresh unconstrained variable would prove this, and one
 /// that bound it with no discriminant guard would refute the true entry above.
-/// requires: r.is_ok() && r.Ok == 9
-/// ensures: ret.Ok == 8
 pub fn ret_ok_payload_tripwire(r: Result<u8, u8>) -> Result<u8, u8> {
     r
 }
 
+spec! {
+    requires: x.is_some() && x.Some == 9,
+    ensures: ret.Some == 9,
+}
 /// `ret.Some` on an `Option` pass-through under `x.Some == 9`.
-/// requires: x.is_some() && x.Some == 9
-/// ensures: ret.Some == 9
 pub fn ret_some_payload(x: Option<u8>) -> Option<u8> {
     x
 }
 
+spec! {
+    requires: x.is_some() && x.Some == 9,
+    ensures: ret.Some == 8,
+}
 /// The tripwire for `ret.Some`.
-/// requires: x.is_some() && x.Some == 9
-/// ensures: ret.Some == 8
 pub fn ret_some_payload_tripwire(x: Option<u8>) -> Option<u8> {
     x
 }
 
+spec! {
+    requires: r.is_err() && r.Err == 7,
+    ensures: ret.Err == 7,
+}
 /// `ret.Err`: the failure payload of a `Result`. The guard is on the `Err`
 /// discriminant, so under `r.Err == 7` the clause is checked on the `Err` path.
-/// requires: r.is_err() && r.Err == 7
-/// ensures: ret.Err == 7
 pub fn ret_err_payload(r: Result<u8, u8>) -> Result<u8, u8> {
     r
 }
 
+spec! {
+    requires: r.is_err() && r.Err == 7,
+    ensures: ret.Err == 8,
+}
 /// The tripwire for `ret.Err`: a model that tested the wrong discriminant, or
 /// bound the payload with no guard, would prove this.
-/// requires: r.is_err() && r.Err == 7
-/// ensures: ret.Err == 8
 pub fn ret_err_payload_tripwire(r: Result<u8, u8>) -> Result<u8, u8> {
     r
 }
 
+spec! {
+    requires: true,
+    ensures: ret.Ok == 9,
+}
 /// The guard is *load-bearing* here, and this is the fixture that shows it: the
 /// body reaches `Ok(9)` on one branch and `Err(5)` on the other, so the `Err` path
 /// has no `Ok` payload. The clause `ret.Ok == 9` is checked on the `Ok` path and is
 /// *vacuously* true on the `Err` path -- which is what verifies it. Drop the guard
 /// and the `Ok` payload is compared on the `Err` path too, against a value the
 /// variant does not have, and this is refuted.
-/// requires: true
-/// ensures: ret.Ok == 9
 pub fn ret_payload_guarded_vacuous(c: bool) -> Result<u8, u8> {
     if c { Ok(9) } else { Err(5) }
 }
 
+spec! {
+    requires: true,
+    ensures: ret.Ok == 200,
+}
 /// The tripwire: the `Ok` payload is `9` on the `Ok` path, so `ret.Ok == 200` is
 /// refuted -- a model that bound the payload to a constant, or dropped the guard,
 /// would prove it.
-/// requires: true
-/// ensures: ret.Ok == 200
 pub fn ret_payload_guarded_vacuous_tripwire(c: bool) -> Result<u8, u8> {
     if c { Ok(9) } else { Err(5) }
 }
 
+spec! {
+    requires: m == Msg::Data && m.Data == 9,
+    ensures: ret.Data == 9,
+}
 /// A *user* enum's payload is readable too: `ret.Data` on a `Msg` pass-through.
 /// The binding is gated on the layout, not on a success/failure pair, so an enum
 /// with neither `Ok` nor `Some` still has readable payloads.
-/// requires: m == Msg::Data && m.Data == 9
-/// ensures: ret.Data == 9
 pub fn ret_user_enum_payload(m: Msg) -> Msg {
     m
 }
 
+spec! {
+    requires: m == Msg::Data && m.Data == 9,
+    ensures: ret.Data == 8,
+}
 /// The tripwire for a user enum's payload.
-/// requires: m == Msg::Data && m.Data == 9
-/// ensures: ret.Data == 8
 pub fn ret_user_enum_payload_tripwire(m: Msg) -> Msg {
     m
 }
 
+spec! {
+    requires: true,
+    ensures: ret.Ok == 5,
+}
 /// A payload read on a *non-enum* return must refuse: `ret.Ok` on a `u8` names a
 /// variant the return type does not have. The contract is unreadable, so the
 /// function is skipped rather than checked against a fabricated payload.
-/// requires: true
-/// ensures: ret.Ok == 5
 pub fn ret_payload_on_non_enum(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: ret.None == 5,
+}
 /// A *unit* variant has no payload to read, so `ret.None` is refused rather than
 /// bound to a fabricated value.
-/// requires: true
-/// ensures: ret.None == 5
 pub fn ret_payload_on_unit_variant(x: Option<u8>) -> Option<u8> {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == (x == 1),
+}
 /// A parenthesized comparison as an *operand* is a `bool` value: `ret == (x == 1)`
 /// is the natural spelling of a `bool`-returning function's postcondition. The body
 /// returns `x == 1`, so the two agree on every input.
-/// requires: true
-/// ensures: ret == (x == 1)
 pub fn bool_ret_is_comparison(x: u8) -> bool {
     x == 1
 }
 
+spec! {
+    requires: true,
+    ensures: ret == (x == 2),
+}
 /// The tripwire: the body returns `x == 1`, so `ret == (x == 2)` is false at `x == 1`.
 /// A reader that dropped the group -- or read it as a constant -- would prove this.
-/// requires: true
-/// ensures: ret == (x == 2)
 pub fn bool_ret_is_comparison_tripwire(x: u8) -> bool {
     x == 1
 }
 
+spec! {
+    requires: true,
+    ensures: ret == ((x + 1) == 2),
+}
 /// The group may hold an arithmetic expression: `((x + 1) == 2)` is `x == 1`, which
 /// the body returns.
-/// requires: true
-/// ensures: ret == ((x + 1) == 2)
 pub fn bool_ret_grouped_arithmetic(x: u8) -> bool {
     x == 1
 }
 
+spec! {
+    requires: x == 1,
+    ensures: ret,
+}
 /// A bare `bool` at the predicate position reads as the value itself: under
 /// `x == 1` the body returns `true`, so `ensures: ret` holds.
-/// requires: x == 1
-/// ensures: ret
 pub fn bool_ret_bare(x: u8) -> bool {
     x == 1
 }
 
+spec! {
+    requires: true,
+    ensures: ret,
+}
 /// The tripwire for a bare bool: `ret` is false at `x == 0`, so the unguarded claim
 /// is refuted. A reader that treated a bare one-bit word as always true would prove
 /// it.
-/// requires: true
-/// ensures: ret
 pub fn bool_ret_bare_tripwire(x: u8) -> bool {
     x == 1
 }
 
+spec! {
+    requires: x != 1,
+    ensures: !ret,
+}
 /// A negated bare bool: under `x != 1` the body returns `false`, so `!ret` holds.
-/// requires: x != 1
-/// ensures: !ret
 pub fn bool_ret_negated(x: u8) -> bool {
     x == 1
 }
 
+spec! {
+    requires: r.is_err() && r.Err == 7,
+    ensures: (ret.Ok == 9 && ret.Err == 8),
+}
 /// A parenthesized conjunction of payload clauses must not collapse to a vacuous
 /// guard. `(ret.Ok == 9 && ret.Err == 8)` on a `Result` pass-through: the body
 /// returns `Err(7)`, so `ret.Ok` is unconstrained on the `Err` path and `ret.Err`
 /// is `7` there, making the conjunction false. Before the fix the group re-guarded
 /// both payloads with a combined `tag == 0 && tag == 1` -- unsatisfiable -- and the
 /// claim was *verified* on a body that refutes it.
-/// requires: r.is_err() && r.Err == 7
-/// ensures: (ret.Ok == 9 && ret.Err == 8)
 pub fn grouped_payload_conjunction_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
     r
 }
 
+spec! {
+    requires: r.is_err() && r.Err == 7,
+    ensures: (ret.Ok == 0 && ret.Err == 7),
+}
 /// The true companion: a genuine *mixed-variant* conjunction that holds. The body
 /// passes `r` through under `requires: r.is_err() && r.Err == 7`, so on the `Err`
 /// path `ret.Err == 7` holds and `ret.Ok == 0` is vacuous (its variant is not
@@ -3301,20 +3848,24 @@ pub fn grouped_payload_conjunction_cannot_prove_this(r: Result<u8, u8>) -> Resul
 /// mixed-variant group would *skip* it -- which is how this distinguishes
 /// preserved support from blanket rejection, where a single-variant control could
 /// not.
-/// requires: r.is_err() && r.Err == 7
-/// ensures: (ret.Ok == 0 && ret.Err == 7)
 pub fn grouped_payload_conjunction_ok(r: Result<u8, u8>) -> Result<u8, u8> {
     r
 }
 
+spec! {
+    requires: r.is_err() && r.Err == 7,
+    ensures: ret.Ok == 9 && ret.Err == 8,
+}
 /// The ungrouped spelling of the same claim, which must agree with the grouped
 /// one: both refuted, so the fix cannot have changed only one reading.
-/// requires: r.is_err() && r.Err == 7
-/// ensures: ret.Ok == 9 && ret.Err == 8
 pub fn ungrouped_payload_conjunction_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
     r
 }
 
+spec! {
+    requires: r.is_err() && r.Err == 7,
+    ensures: !(ret.Ok == 9),
+}
 /// A *negated* payload comparison must read the discriminant guard from
 /// *outside* the negation. `!(ret.Ok == 9)` on a pass-through under
 /// `requires: r.is_err() && r.Err == 7` holds: `ret.Ok` has no value on the `Err`
@@ -3322,107 +3873,127 @@ pub fn ungrouped_payload_conjunction_cannot_prove_this(r: Result<u8, u8>) -> Res
 /// applied inside the `!` (`!(tag == 0 => payload == 9)`), which is *false* on the
 /// `Err` path, so this valid contract was refuted while the equivalent
 /// `ret.Ok != 9` verified.
-/// requires: r.is_err() && r.Err == 7
-/// ensures: !(ret.Ok == 9)
 pub fn negated_payload_comparison(r: Result<u8, u8>) -> Result<u8, u8> {
     r
 }
 
+spec! {
+    requires: r.is_err() && r.Err == 7,
+    ensures: ret.Ok != 9,
+}
 /// The `!=` spelling of the same claim, which must agree with the negated `==`
 /// spelling: both verify.
-/// requires: r.is_err() && r.Err == 7
-/// ensures: ret.Ok != 9
 pub fn negated_payload_comparison_inequality(r: Result<u8, u8>) -> Result<u8, u8> {
     r
 }
 
+spec! {
+    requires: true,
+    ensures: !(ret.Ok == 9),
+}
 /// The tripwire: on an `Ok(9)` return `ret.Ok` *is* `9`, so both spellings of the
 /// negation are false. A fix that made every negated payload clause vacuous would
 /// pass the true pair above but fail this.
-/// requires: true
-/// ensures: !(ret.Ok == 9)
 pub fn negated_payload_comparison_cannot_prove_this() -> Result<u8, u8> {
     Ok(9)
 }
 
+spec! {
+    requires: true,
+    ensures: !(ret.Ok == 9 && ret.Err == 8),
+}
 /// A negation spanning *two* variants has no single scope, so it is refused
 /// rather than given a contradictory guard. A skip, not a verdict.
-/// requires: true
-/// ensures: !(ret.Ok == 9 && ret.Err == 8)
 pub fn negated_payload_mixed_variant_is_refused() -> Result<u8, u8> {
     Ok(9)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.Pair == 1,
+}
 /// `ret.Pair` denotes the payload variant's *first* field: `Duo::Pair(1, 2)` makes
 /// it `1`. Before the fix the construction wrote every operand to the
 /// single-valued payload store, so the last field (`2`) won and this was refuted
 /// while `ret.Pair == 2` was *verified*.
-/// requires: true
-/// ensures: ret.Pair == 1
 pub fn duo_pair_first_field() -> Duo {
     Duo::Pair(1, 2)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.Pair == 2,
+}
 /// The tripwire: the second field is `2`, which is *not* what `ret.Pair` denotes,
 /// so this must be refuted. A model that left the last field in the payload store
 /// would prove it.
-/// requires: true
-/// ensures: ret.Pair == 2
 pub fn duo_pair_second_field_cannot_prove_this() -> Duo {
     Duo::Pair(1, 2)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.Ok == ret__v_Ok,
+}
 /// An argument named like the generated payload binding (`ret__v_Ok`) must not be
 /// shadowed by it: the contract compares `ret.Ok` with the *argument*, which is a
 /// real input, so it is refuted (the body returns `Ok(9)`, and the argument is
 /// unconstrained). Before the fix the binding overwrote the argument and the
 /// clause compared the payload with itself, so it was *verified*.
-/// requires: true
-/// ensures: ret.Ok == ret__v_Ok
 pub fn payload_binding_shadow_tripwire(ret__v_Ok: u8) -> Result<u8, u8> {
     Ok(9)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_ok(),
+}
 /// A *non-enum* return must refuse the methods: `ret.is_ok()` on a `u8` names a
 /// tag that does not exist. This is the refusal, not a verdict -- the contract is
 /// unreadable, so the function is skipped rather than checked against a
 /// fabricated tag.
-/// requires: true
-/// ensures: ret.is_ok()
 pub fn enum_ret_method_on_non_enum(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: r.is_ok(),
+    ensures: ret == true,
+}
 /// The same methods on an enum-typed *argument*: `r.is_ok()` in a `requires` reads
 /// the argument's tag, which the executor seeds. A precondition that names the tag
 /// is the shape a real function has when it dispatches on a `Result` before
 /// returning a value.
-/// requires: r.is_ok()
-/// ensures: ret == true
 pub fn enum_arg_is_ok_guarded(r: Result<u8, u8>) -> bool {
     r.is_ok()
 }
 
+spec! {
+    requires: r.is_ok(),
+    ensures: ret == false,
+}
 /// The tripwire: the precondition admits only `Ok`, so `r.is_ok()` is `true` and
 /// `ret == false` is refutable. A model that read the argument's tag as a constant,
 /// or tested the wrong discriminant, would prove this.
-/// requires: r.is_ok()
-/// ensures: ret == false
 pub fn enum_arg_is_ok_guarded_tripwire(r: Result<u8, u8>) -> bool {
     r.is_ok()
 }
 
+spec! {
+    requires: true,
+    ensures: r.is_ok() || r.is_err(),
+}
 /// `is_ok`/`is_err` on an argument read the two discriminants, so their disjunction
 /// is a tautology and must verify.
-/// requires: true
-/// ensures: r.is_ok() || r.is_err()
 pub fn enum_arg_is_ok_or_err(r: Result<u8, u8>) -> bool {
     r.is_ok()
 }
 
+spec! {
+    requires: true,
+    ensures: r.is_ok() && r.is_err(),
+}
 /// The tripwire: the conjunction is refutable, so the two read *different* tags.
-/// requires: true
-/// ensures: r.is_ok() && r.is_err()
 pub fn enum_arg_is_ok_and_err_tripwire(r: Result<u8, u8>) -> bool {
     r.is_ok()
 }
@@ -3436,138 +4007,174 @@ pub fn enum_arg_is_ok_and_err_tripwire(r: Result<u8, u8>) -> bool {
 // (`Option::<u8>::ok_or::<i32>`), so it also pins that the classifier finds the
 // method name past a `<…>` segment.
 
+spec! {
+    requires: x.is_some(),
+    ensures: ret.is_ok(),
+}
 /// `Option::ok_or`: `Some` becomes `Ok`, so the result is `Ok` exactly on the
 /// receiver's `Some`.
-/// requires: x.is_some()
-/// ensures: ret.is_ok()
 pub fn ok_or_some_is_ok(x: Option<u8>) -> Result<u8, u8> {
     x.ok_or(0)
 }
 
+spec! {
+    requires: x.is_some(),
+    ensures: ret.is_err(),
+}
 /// The tripwire: under `x.is_some()` the result is `Ok`, so `ret.is_err()` is
 /// refutable. A model that read the result tag as a constant, or tested the wrong
 /// discriminant, would prove it.
-/// requires: x.is_some()
-/// ensures: ret.is_err()
 pub fn ok_or_some_is_ok_tripwire(x: Option<u8>) -> Result<u8, u8> {
     x.ok_or(0)
 }
 
+spec! {
+    requires: x.is_none(),
+    ensures: ret.is_err(),
+}
 /// The other tag: under `x.is_none()` the result is `Err`.
-/// requires: x.is_none()
-/// ensures: ret.is_err()
 pub fn ok_or_none_is_err(x: Option<u8>) -> Result<u8, u8> {
     x.ok_or(0)
 }
 
+spec! {
+    requires: x.is_none(),
+    ensures: ret.is_ok(),
+}
 /// The tripwire for the `None` branch.
-/// requires: x.is_none()
-/// ensures: ret.is_ok()
 pub fn ok_or_none_is_err_tripwire(x: Option<u8>) -> Result<u8, u8> {
     x.ok_or(0)
 }
 
+spec! {
+    requires: x.is_some() && x.Some == 9,
+    ensures: ret == 9,
+}
 /// `ok_or` *moves the payload*: under `x.Some == 9` the result's `Ok` payload is
 /// `9`. Reading it back through `unwrap` is the evidence the payload crossed the
 /// conversion, not just the tag.
-/// requires: x.is_some() && x.Some == 9
-/// ensures: ret == 9
 pub fn ok_or_moves_the_payload(x: Option<u8>) -> u8 {
     x.ok_or(0).unwrap()
 }
 
+spec! {
+    requires: x.is_some() && x.Some == 9,
+    ensures: ret == 8,
+}
 /// The tripwire: the payload is `9`, so a claim of `8` is refutable. A model that
 /// dropped the payload (leaving it unconstrained, or `0`) would prove this.
-/// requires: x.is_some() && x.Some == 9
-/// ensures: ret == 8
 pub fn ok_or_moves_the_payload_tripwire(x: Option<u8>) -> u8 {
     x.ok_or(0).unwrap()
 }
 
+spec! {
+    requires: r.is_ok(),
+    ensures: ret.is_some(),
+}
 /// `Result::ok`: `Ok` becomes `Some`, so the result is `Some` exactly on the
 /// receiver's `Ok`.
-/// requires: r.is_ok()
-/// ensures: ret.is_some()
 pub fn ok_ok_is_some(r: Result<u8, u8>) -> Option<u8> {
     r.ok()
 }
 
+spec! {
+    requires: r.is_ok(),
+    ensures: ret.is_none(),
+}
 /// The tripwire for the `Ok` branch.
-/// requires: r.is_ok()
-/// ensures: ret.is_none()
 pub fn ok_ok_is_some_tripwire(r: Result<u8, u8>) -> Option<u8> {
     r.ok()
 }
 
+spec! {
+    requires: r.is_err(),
+    ensures: ret.is_none(),
+}
 /// The other tag: under `r.is_err()` the result is `None`.
-/// requires: r.is_err()
-/// ensures: ret.is_none()
 pub fn ok_err_is_none(r: Result<u8, u8>) -> Option<u8> {
     r.ok()
 }
 
+spec! {
+    requires: r.is_err(),
+    ensures: ret.is_some(),
+}
 /// The tripwire for the `Err` branch.
-/// requires: r.is_err()
-/// ensures: ret.is_some()
 pub fn ok_err_is_none_tripwire(r: Result<u8, u8>) -> Option<u8> {
     r.ok()
 }
 
+spec! {
+    requires: r.is_ok() && r.Ok == 9,
+    ensures: ret == 9,
+}
 /// `ok` moves the `Ok` payload onto `Some`.
-/// requires: r.is_ok() && r.Ok == 9
-/// ensures: ret == 9
 pub fn ok_moves_the_payload(r: Result<u8, u8>) -> u8 {
     r.ok().unwrap()
 }
 
+spec! {
+    requires: r.is_ok() && r.Ok == 9,
+    ensures: ret == 8,
+}
 /// The tripwire: a model that dropped the payload would prove `8`.
-/// requires: r.is_ok() && r.Ok == 9
-/// ensures: ret == 8
 pub fn ok_moves_the_payload_tripwire(r: Result<u8, u8>) -> u8 {
     r.ok().unwrap()
 }
 
+spec! {
+    requires: r.is_err(),
+    ensures: ret.is_some(),
+}
 /// `Result::err`: `Err` becomes `Some`, so the result is `Some` exactly on the
 /// receiver's `Err` (the tag is *kept*, not inverted -- `err` is the mirror of
 /// `ok`, which inverts).
-/// requires: r.is_err()
-/// ensures: ret.is_some()
 pub fn err_err_is_some(r: Result<u8, u8>) -> Option<u8> {
     r.err()
 }
 
+spec! {
+    requires: r.is_err(),
+    ensures: ret.is_none(),
+}
 /// The tripwire for the `Err` branch of `err`: a model that inverted the tag (as
 /// `ok` does) would call `Err` `None` and prove this.
-/// requires: r.is_err()
-/// ensures: ret.is_none()
 pub fn err_err_is_some_tripwire(r: Result<u8, u8>) -> Option<u8> {
     r.err()
 }
 
+spec! {
+    requires: r.is_ok(),
+    ensures: ret.is_none(),
+}
 /// The other tag: under `r.is_ok()` the result is `None`.
-/// requires: r.is_ok()
-/// ensures: ret.is_none()
 pub fn err_ok_is_none(r: Result<u8, u8>) -> Option<u8> {
     r.err()
 }
 
+spec! {
+    requires: r.is_ok(),
+    ensures: ret.is_some(),
+}
 /// The tripwire for the `Ok` branch of `err`.
-/// requires: r.is_ok()
-/// ensures: ret.is_some()
 pub fn err_ok_is_none_tripwire(r: Result<u8, u8>) -> Option<u8> {
     r.err()
 }
 
+spec! {
+    requires: r.is_err() && r.Err == 7,
+    ensures: ret == 7,
+}
 /// `err` moves the `Err` payload onto `Some`.
-/// requires: r.is_err() && r.Err == 7
-/// ensures: ret == 7
 pub fn err_moves_the_payload(r: Result<u8, u8>) -> u8 {
     r.err().unwrap()
 }
 
+spec! {
+    requires: r.is_err() && r.Err == 7,
+    ensures: ret == 8,
+}
 /// The tripwire: the payload is `7`, so a claim of `8` is refutable.
-/// requires: r.is_err() && r.Err == 7
-/// ensures: ret == 8
 pub fn err_moves_the_payload_tripwire(r: Result<u8, u8>) -> u8 {
     r.err().unwrap()
 }
@@ -3580,62 +4187,78 @@ pub fn err_moves_the_payload_tripwire(r: Result<u8, u8>) -> u8 {
 // `Some` and the argument on `None`; `and` is the mirror. A model that fixed the
 // result tag to a constant, or swapped the two payloads, proves a tripwire.
 
+spec! {
+    requires: x.is_some() && x.Some == 7,
+    ensures: ret == 7,
+}
 /// `Some(x).or(y)` is the receiver, so the result's payload is `x`'s -- pinned by
 /// reading the result back through `unwrap` with the receiver's payload fixed.
-/// requires: x.is_some() && x.Some == 7
-/// ensures: ret == 7
 pub fn or_some_is_the_receiver(x: Option<u8>, y: Option<u8>) -> u8 {
     x.or(y).unwrap()
 }
 
+spec! {
+    requires: x.is_some() && x.Some == 7 && y.Some == 8,
+    ensures: ret == 8,
+}
 /// The false twin: `or` on a `Some` receiver must not yield the *argument*'s
 /// payload.
-/// requires: x.is_some() && x.Some == 7 && y.Some == 8
-/// ensures: ret == 8
 pub fn or_some_is_the_receiver_tripwire(x: Option<u8>, y: Option<u8>) -> u8 {
     x.or(y).unwrap()
 }
 
+spec! {
+    requires: x.is_none() && y.is_some() && y.Some == 9,
+    ensures: ret == 9,
+}
 /// `None.or(y)` is `y`: the result's payload is the argument's.
-/// requires: x.is_none() && y.is_some() && y.Some == 9
-/// ensures: ret == 9
 pub fn or_none_is_the_argument(x: Option<u8>, y: Option<u8>) -> u8 {
     x.or(y).unwrap()
 }
 
+spec! {
+    requires: x.is_none() && y.is_some() && y.Some == 9,
+    ensures: ret == 8,
+}
 /// The false twin: `or` on a `None` receiver must not keep the receiver's tag
 /// (`None`), which would leave `unwrap` a value it does not have.
-/// requires: x.is_none() && y.is_some() && y.Some == 9
-/// ensures: ret == 8
 pub fn or_none_is_the_argument_tripwire(x: Option<u8>, y: Option<u8>) -> u8 {
     x.or(y).unwrap()
 }
 
+spec! {
+    requires: x.is_some() && y.is_some() && y.Some == 9,
+    ensures: ret == 9,
+}
 /// `Some(x).and(y)` is `y`: the receiver's payload is dropped, the argument's
 /// returned.
-/// requires: x.is_some() && y.is_some() && y.Some == 9
-/// ensures: ret == 9
 pub fn and_some_is_the_argument(x: Option<u8>, y: Option<u8>) -> u8 {
     x.and(y).unwrap()
 }
 
+spec! {
+    requires: x.is_some() && x.Some == 7 && y.is_some() && y.Some == 9,
+    ensures: ret == 7,
+}
 /// The false twin: `and` on a `Some` receiver must not keep the receiver's value.
-/// requires: x.is_some() && x.Some == 7 && y.is_some() && y.Some == 9
-/// ensures: ret == 7
 pub fn and_some_is_the_argument_tripwire(x: Option<u8>, y: Option<u8>) -> u8 {
     x.and(y).unwrap()
 }
 
+spec! {
+    requires: x.is_none(),
+    ensures: ret == false,
+}
 /// `None.and(y)` is `None` (the receiver), so the result is never `Some`.
-/// requires: x.is_none()
-/// ensures: ret == false
 pub fn and_none_is_the_receiver(x: Option<u8>, y: Option<u8>) -> bool {
     x.and(y).is_some()
 }
 
+spec! {
+    requires: x.is_none(),
+    ensures: ret == true,
+}
 /// The false twin: `None.and(y)` must not become `y`.
-/// requires: x.is_none()
-/// ensures: ret == true
 pub fn and_none_is_the_receiver_tripwire(x: Option<u8>, y: Option<u8>) -> bool {
     x.and(y).is_some()
 }
@@ -3645,143 +4268,177 @@ pub fn and_none_is_the_receiver_tripwire(x: Option<u8>, y: Option<u8>) -> bool {
 // whose tags or payloads come from different origins, so the model must
 // normalise rather than demand identical widths.
 
+spec! {
+    requires: n < 255,
+    ensures: ret == false,
+}
 /// A `checked_*` receiver's tag is the arithmetic operand's width (`u8` -> eight
 /// bits), while a seeded `Option` argument's tag is one bit. The two must be
 /// normalised to a common width before the `ite`, or the query is ill-formed.
-/// requires: n < 255
-/// ensures: ret == false
 pub fn or_mixed_tag_widths_is_none(n: u8, y: Option<u8>) -> bool {
     n.checked_add(1).or(y).is_none()
 }
 
+spec! {
+    requires: n < 255,
+    ensures: ret == true,
+}
 /// The false twin: `n < 255` makes `checked_add` `Some`, so `or` is the receiver
 /// and `is_none()` is false -- a model that read the argument's tag would prove
 /// this.
-/// requires: n < 255
-/// ensures: ret == true
 pub fn or_mixed_tag_widths_tripwire(n: u8, y: Option<u8>) -> bool {
     n.checked_add(1).or(y).is_none()
 }
 
+spec! {
+    requires: n == 255 && y.is_some(),
+    ensures: ret == true,
+}
 /// The other side of the mixed-tag pair: `n == 255` overflows `checked_add` to
 /// `None`, so `or` is the argument (`Some`).
-/// requires: n == 255 && y.is_some()
-/// ensures: ret == true
 pub fn or_mixed_tag_widths_none_is_argument(n: u8, y: Option<u8>) -> bool {
     n.checked_add(1).or(y).is_some()
 }
 
+spec! {
+    requires: x.is_some() && y.is_some(),
+    ensures: ret == true,
+}
 /// `Option<T>::and<U>` returns `Option<U>`: `Some(x).and(y)` is `y`, so the
 /// receiver's 8-bit payload never becomes the result. An `ite` over the two would
 /// demand equal widths for unrelated types.
-/// requires: x.is_some() && y.is_some()
-/// ensures: ret == true
 pub fn and_different_payload_widths(x: Option<u8>, y: Option<u16>) -> bool {
     x.and(y).is_some()
 }
 
+spec! {
+    requires: x.is_some() && y.is_some(),
+    ensures: ret == false,
+}
 /// The false twin: `x` and `y` both `Some`, so `and` is `Some` -- a model that
 /// read the receiver's payload or refused the width mismatch would prove this.
-/// requires: x.is_some() && y.is_some()
-/// ensures: ret == false
 pub fn and_different_payload_widths_tripwire(x: Option<u8>, y: Option<u16>) -> bool {
     x.and(y).is_some()
 }
 
+spec! {
+    requires: x.is_none() && y.is_some(),
+    ensures: ret == false,
+}
 /// The receiver's `None` decides `and`: `None.and(y)` is `None` whatever `y` is.
-/// requires: x.is_none() && y.is_some()
-/// ensures: ret == false
 pub fn and_none_receiver_decides(x: Option<u8>, y: Option<u16>) -> bool {
     x.and(y).is_some()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == true,
+}
 /// A *constructed* `None` records no payload, and its absence is not a failure:
 /// `None::<u8>.or(Some(9))` is the argument.
-/// requires: true
-/// ensures: ret == true
 pub fn constructed_none_or_some() -> bool {
     None::<u8>.or(Some(9)).is_some()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == true,
+}
 /// The mirror: `Some(7).or(None)` is the receiver.
-/// requires: true
-/// ensures: ret == true
 pub fn constructed_some_or_none() -> bool {
     Some(7u8).or(None).is_some()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == true,
+}
 /// The false twin of `constructed_none_or_some`: a `None` receiver with no
 /// payload must still select the argument, so `is_none()` is false.
-/// requires: true
-/// ensures: ret == true
 pub fn constructed_none_or_some_tripwire() -> bool {
     None::<u8>.or(Some(9)).is_none()
 }
 
+spec! {
+    requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9,
+    ensures: ret == 5,
+}
 /// `a.first().or(b.first())` selects between two *slice elements*, so the
 /// reference identity is conditional: `a`'s element on `Some`, `b`'s on `None`.
 /// The deref must read the selected element, which needs the conditional
 /// identity carried through the combinator.
-/// requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9
-/// ensures: ret == 5
 pub fn or_slices_selects_the_receiver(a: &[u8], b: &[u8]) -> u8 {
     *a.first().or(b.first()).unwrap()
 }
 
+spec! {
+    requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9,
+    ensures: ret == 9,
+}
 /// The false twin: the selected element is `a[0] == 5`, not `b[0] == 9`.
-/// requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9
-/// ensures: ret == 9
 pub fn or_slices_selects_the_receiver_tripwire(a: &[u8], b: &[u8]) -> u8 {
     *a.first().or(b.first()).unwrap()
 }
 
+spec! {
+    requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9,
+    ensures: ret == 9,
+}
 /// `and` returns the argument on `Some`, so the deref is `b`'s element.
-/// requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9
-/// ensures: ret == 9
 pub fn and_slices_selects_the_argument(a: &[u8], b: &[u8]) -> u8 {
     *a.first().and(b.first()).unwrap()
 }
 
+spec! {
+    requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9,
+    ensures: ret == 5,
+}
 /// The false twin: `and` is not the receiver's element.
-/// requires: a.len() > 0 && b.len() > 0 && a[0] == 5 && b[0] == 9
-/// ensures: ret == 5
 pub fn and_slices_selects_the_argument_tripwire(a: &[u8], b: &[u8]) -> u8 {
     *a.first().and(b.first()).unwrap()
 }
 
+spec! {
+    requires: a.len() > 0 && b.len() > 0 && b[0] == 9,
+    ensures: ret == 9,
+}
 /// `Option<T>::and<U>` permits a *different* payload type, and the result's
 /// element is always the argument's. Building a `Select` over the receiver's
 /// (`u8`) and the argument's (`u16`) elements demanded equal widths for unrelated
 /// types and marked the query ill-formed, so the deref was `incomplete` even with
 /// both slices nonempty. Carrying the argument identity alone is both exact and
 /// width-safe.
-/// requires: a.len() > 0 && b.len() > 0 && b[0] == 9
-/// ensures: ret == 9
 pub fn and_different_width_deref(a: &[u8], b: &[u16]) -> u16 {
     *a.first().and(b.first()).unwrap()
 }
 
+spec! {
+    requires: a.len() > 0 && b.len() > 0 && a[0] == 3 && b[0] == 9,
+    ensures: ret == 3,
+}
 /// The false twin: the deref is `b[0] == 9`, never the receiver's `a[0]`.
-/// requires: a.len() > 0 && b.len() > 0 && a[0] == 3 && b[0] == 9
-/// ensures: ret == 3
 pub fn and_different_width_deref_tripwire(a: &[u8], b: &[u16]) -> u16 {
     *a.first().and(b.first()).unwrap()
 }
 
+spec! {
+    requires: x.is_some() && b.len() > 0 && b[0] == 9,
+    ensures: ret == 9,
+}
 /// A scalar `Option` receiver with a slice-reference argument: the receiver
 /// carries no element identity at all, so the result identity is the argument's.
 /// The old code's `(None, Some(a))` arm only took the argument when the receiver
 /// tag proved it was not selected, which is `or`'s rule; `and` selects the
 /// *argument* on a `Some` receiver, so it must take it unconditionally.
-/// requires: x.is_some() && b.len() > 0 && b[0] == 9
-/// ensures: ret == 9
 pub fn and_scalar_receiver_ref_argument(x: Option<u8>, b: &[u8]) -> u8 {
     *x.and(b.first()).unwrap()
 }
 
+spec! {
+    requires: x.is_some() && b.len() > 0 && b[0] == 9,
+    ensures: ret == 5,
+}
 /// The false twin: the receiver is a scalar, so the deref is always `b[0] == 9`.
-/// requires: x.is_some() && b.len() > 0 && b[0] == 9
-/// ensures: ret == 5
 pub fn and_scalar_receiver_ref_argument_tripwire(x: Option<u8>, b: &[u8]) -> u8 {
     *x.and(b.first()).unwrap()
 }
@@ -3797,8 +4454,10 @@ impl Drop for Boom {
     }
 }
 
-/// requires: true
-/// ensures: ret <= 255
+spec! {
+    requires: true,
+    ensures: ret <= 255,
+}
 pub fn unwrap_or_default_boom(r: Result<u8, Boom>) -> u8 {
     r.unwrap_or_default()
 }
@@ -3812,59 +4471,75 @@ pub fn unwrap_or_default_boom(r: Result<u8, Boom>) -> u8 {
 // what these fixtures pin -- a `None::<u8>.ok_or(e)` is a known `Err`, and a
 // model that refused it (or invented an `Ok` payload) would not decide.
 
+spec! {
+    requires: true,
+    ensures: ret.is_err(),
+}
 /// `None::<u8>.ok_or(7)` is an `Err` -- a known tag, no `Some` payload needed.
-/// requires: true
-/// ensures: ret.is_err()
 pub fn constructed_none_ok_or_is_err() -> Result<u8, u8> {
     None::<u8>.ok_or(7u8)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_ok(),
+}
 /// The tripwire: `None.ok_or` never produces an `Ok`, so claiming one refutes.
-/// requires: true
-/// ensures: ret.is_ok()
 pub fn constructed_none_ok_or_is_err_tripwire() -> Result<u8, u8> {
     None::<u8>.ok_or(7u8)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_none(),
+}
 /// `Err(e).ok()` is a `None` -- a known tag, no `Ok` payload needed.
-/// requires: true
-/// ensures: ret.is_none()
 pub fn constructed_err_ok_is_none(e: u8) -> Option<u8> {
     Err::<u8, u8>(e).ok()
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_some(),
+}
 /// The tripwire for the constructed `Err`.
-/// requires: true
-/// ensures: ret.is_some()
 pub fn constructed_err_ok_is_none_tripwire(e: u8) -> Option<u8> {
     Err::<u8, u8>(e).ok()
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_none(),
+}
 /// `Ok(x).err()` is a `None` -- the other constructed direction.
-/// requires: true
-/// ensures: ret.is_none()
 pub fn constructed_ok_err_is_none(x: u8) -> Option<u8> {
     Ok::<u8, u8>(x).err()
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_some(),
+}
 /// The tripwire for the constructed `Ok`.
-/// requires: true
-/// ensures: ret.is_some()
 pub fn constructed_ok_err_is_none_tripwire(x: u8) -> Option<u8> {
     Ok::<u8, u8>(x).err()
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_some(),
+}
 /// The constructed *payload-carrying* variant still moves its payload: a known
 /// `Ok` needs no `Err` payload, and its `Ok` payload survives onto `Some`.
-/// requires: true
-/// ensures: ret.is_some()
 pub fn constructed_ok_ok_is_some(x: u8) -> Option<u8> {
     Ok::<u8, u8>(x).ok()
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_none(),
+}
 /// The tripwire for the constructed `Ok` payload-carrying direction.
-/// requires: true
-/// ensures: ret.is_none()
 pub fn constructed_ok_ok_is_some_tripwire(x: u8) -> Option<u8> {
     Ok::<u8, u8>(x).ok()
 }
@@ -3877,60 +4552,76 @@ pub fn constructed_ok_ok_is_some_tripwire(x: u8) -> Option<u8> {
 // lookaheads now know the `base.method()` shape; whether the base really names
 // an enum is still decided when the predicate is parsed.
 
+spec! {
+    requires: true,
+    ensures: (ret.is_some()),
+}
 /// A parenthesised enum predicate reads.
-/// requires: true
-/// ensures: (ret.is_some())
 pub fn grouped_enum_predicate(x: u8) -> Option<u8> {
     Some(x)
 }
 
+spec! {
+    requires: true,
+    ensures: (ret.is_none()),
+}
 /// The tripwire: a parenthesised claim that the result is `None` is refutable
 /// (the body always returns `Some`).
-/// requires: true
-/// ensures: (ret.is_none())
 pub fn grouped_enum_predicate_tripwire(x: u8) -> Option<u8> {
     Some(x)
 }
 
+spec! {
+    requires: !(x.is_none()),
+    ensures: true,
+}
 /// A negated enum predicate on the *argument* reads.
-/// requires: !(x.is_none())
-/// ensures: true
 pub fn negated_enum_predicate(x: Option<u8>) -> u8 {
     x.unwrap_or(0)
 }
 
+spec! {
+    requires: !(x.is_none()),
+    ensures: x.is_some() && x.Some == 0,
+}
 /// The tripwire: `!(x.is_none())` is `x.is_some()`, so it does not say the
 /// payload is `0` (a `Some(1)` argument refutes it).
-/// requires: !(x.is_none())
-/// ensures: x.is_some() && x.Some == 0
 pub fn negated_enum_predicate_tripwire(x: Option<u8>) -> u8 {
     x.unwrap_or(0)
 }
 
+spec! {
+    requires: true,
+    ensures: (ret.is_ok()) && ret.is_ok(),
+}
 /// A parenthesised enum predicate combines with `&&`.
-/// requires: true
-/// ensures: (ret.is_ok()) && ret.is_ok()
 pub fn grouped_enum_predicate_conjunction(x: u8) -> Result<u8, u8> {
     Ok(x)
 }
 
+spec! {
+    requires: true,
+    ensures: (ret.is_ok()) && ret.is_err(),
+}
 /// The tripwire for the conjunction: no result is both `Ok` and `Err`.
-/// requires: true
-/// ensures: (ret.is_ok()) && ret.is_err()
 pub fn grouped_enum_predicate_conjunction_tripwire(x: u8) -> Result<u8, u8> {
     Ok(x)
 }
 
+spec! {
+    requires: !x.is_none(),
+    ensures: true,
+}
 /// A negated enum predicate on the *argument*, without parentheses.
-/// requires: !x.is_none()
-/// ensures: true
 pub fn bare_negated_enum_predicate(x: Option<u8>) -> u8 {
     x.unwrap_or(0)
 }
 
+spec! {
+    requires: !x.is_none(),
+    ensures: x.Some == 0,
+}
 /// The tripwire for the bare negation.
-/// requires: !x.is_none()
-/// ensures: x.Some == 0
 pub fn bare_negated_enum_predicate_tripwire(x: Option<u8>) -> u8 {
     x.unwrap_or(0)
 }
@@ -3944,230 +4635,280 @@ pub fn bare_negated_enum_predicate_tripwire(x: Option<u8>) -> u8 {
 // An unknown source sign is a refusal, the same call the body makes, because
 // guessing it is how `-1i8 as i16 == 255` becomes a reachable false proof.
 
+spec! {
+    requires: true,
+    ensures: ret == x as u32,
+}
 /// A widening cast of an *unsigned* source zero-fills, so `x as u32` is `x`.
-/// requires: true
-/// ensures: ret == x as u32
 pub fn contract_cast_widens_unsigned(x: u8) -> u32 {
     x as u32
 }
 
+spec! {
+    requires: true,
+    ensures: ret == (x as u32) + 1,
+}
 /// The tripwire: the same widening, but the contract names a value one too high,
 /// so it is false for every input -- the cast is read, not a free variable.
-/// requires: true
-/// ensures: ret == (x as u32) + 1
 pub fn contract_cast_widens_unsigned_tripwire(x: u8) -> u32 {
     x as u32
 }
 
+spec! {
+    requires: x == -1,
+    ensures: ret == -1,
+}
 /// A widening cast of a *signed* source sign-extends, so `x as i32` is the same
 /// signed value. The contract's `x as i32` and the body's `x as i32` must both
 /// sign-extend; if either zero-filled, `requires: x == -1; ensures: ret == -1`
 /// would be refuted at `-1` (the body would return `255`).
-/// requires: x == -1
-/// ensures: ret == -1
 pub fn contract_cast_widens_signed(x: i8) -> i32 {
     x as i32
 }
 
+spec! {
+    requires: x == -1,
+    ensures: ret == 255,
+}
 /// The tripwire that separates sign-extension from zero-filling. Rust sign-extends
 /// through a widening cast even when the *target* is unsigned: `-1i8 as u16` is
 /// `65535`, not the zero-extended `255`. A contract cast that zero-filled would
 /// name `255`, and the true entry below (`ret == 65535`) would be refuted instead
 /// of proved -- so this pair pins the direction.
-/// requires: x == -1
-/// ensures: ret == 255
 pub fn contract_cast_signed_to_unsigned_tripwire(x: i8) -> u16 {
     x as u16
 }
 
+spec! {
+    requires: x == -1,
+    ensures: ret == 65535,
+}
 /// The true half of the pair above: `-1i8 as u16` sign-extends to `65535`.
-/// requires: x == -1
-/// ensures: ret == 65535
 pub fn contract_cast_signed_to_unsigned(x: i8) -> u16 {
     x as u16
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x as u8,
+}
 /// A narrowing cast keeps the low bits: `x as u8` drops the high byte. The body
 /// and the contract must agree, so `ret == x as u8` is the identity here.
-/// requires: true
-/// ensures: ret == x as u8
 pub fn contract_cast_narrows(x: u16) -> u8 {
     x as u8
 }
 
+spec! {
+    requires: x == 256,
+    ensures: ret == 1,
+}
 /// The tripwire for narrowing pins *which* bits are kept: `256` is `0x100`, so
 /// `256 as u8` is `0` (the low byte), not `1`. A model that kept the wrong byte,
 /// or read the cast as a free variable, could make `ret == 1` true.
-/// requires: x == 256
-/// ensures: ret == 1
 pub fn contract_cast_narrows_tripwire(x: u16) -> u8 {
     x as u8
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x as u16 as u32,
+}
 /// A cast chain applies left to right, and each step's source sign is the
 /// previous step's target sign. `x as u16 as u32` is two zero-fills, which is `x`.
-/// requires: true
-/// ensures: ret == x as u16 as u32
 pub fn contract_cast_chain(x: u8) -> u32 {
     x as u16 as u32
 }
 
+spec! {
+    requires: true,
+    ensures: ret == (x as u16 as u32) + 1,
+}
 /// The tripwire: the chain is a value, not a free variable, so naming it one too
 /// high is false for every input.
-/// requires: true
-/// ensures: ret == (x as u16 as u32) + 1
 pub fn contract_cast_chain_tripwire(x: u8) -> u32 {
     x as u16 as u32
 }
 
+spec! {
+    requires: true,
+    ensures: (x as i16) >= 0,
+}
 /// A cast in a contract is a *value* the order can be asked about, not only a
 /// spelling that can be equated with the return. `x as i16` for a `u8` `x` is
 /// non-negative, because zero-filling a `u8` into a wider signed type cannot set
 /// the sign bit. The comparison is therefore decided on the cast's value rather
 /// than refused as an unknown sign, which is what the equality entries above do
 /// not show: they only ever meet the cast with `==`.
-/// requires: true
-/// ensures: (x as i16) >= 0
 pub fn contract_cast_relational_nonneg(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: (x as i16) < 256,
+}
 /// The same cast against the upper bound: a `u8` zero-fills into `i16` in
 /// `[0, 255]`, so `(x as i16) < 256` holds for every input. Pinned with the
 /// entry above so both ends of the widened range are exercised, and neither is a
 /// constant the reader could have folded to the answer.
-/// requires: true
-/// ensures: (x as i16) < 256
 pub fn contract_cast_relational_lt_width(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: (y as i16) <= 127,
+}
 /// A *signed* source sign-extends into the wider signed target, so `y as i16` for
 /// an `i8` `y` is `<= 127` -- the top of the source's range, sign-extended. A
 /// model that zero-filled would place `-1i8 as i16` at `255`, and this contract
 /// would be refuted at `y == -1`.
-/// requires: true
-/// ensures: (y as i16) <= 127
 pub fn contract_cast_relational_signed_bound(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: (y as i16) >= 0,
+}
 /// The tripwire for the two `>= 0` claims above: the *signed* source is not
 /// non-negative, so `(y as i16) >= 0` is false at every negative `y` and the
 /// function must be refuted. A reader that dropped the sign of the source and
 /// treated the cast as unsigned would prove this, which is the false proof the
 /// pair exists to forbid.
-/// requires: true
-/// ensures: (y as i16) >= 0
 pub fn contract_cast_relational_signed_nonneg_tripwire(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: (x as i16) > 0,
+}
 /// The tripwire for the widened upper bound: an `unsigned` source is *not* always
 /// positive, so `(x as i16) > 0` is false at `x == 0` and the function must be
 /// refuted. Together with `..._lt_width` this pins that the reader knows the
 /// widened value's true range rather than accepting any comparison about it.
-/// requires: true
-/// ensures: (x as i16) > 0
 pub fn contract_cast_relational_positive_tripwire(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x < y,
+    ensures: ret == x.wrapping_add(y),
+}
 /// `a.wrapping_add(b)` is the method-call spelling of the wrapping add the
 /// contract language already models as `a + b`, so the two must denote one term.
 /// The precondition is a *relation* between the two inputs, which is the shape the
 /// reader has to reason about rather than fold, and the body computes exactly the
 /// term the postcondition names.
-/// requires: x < y
-/// ensures: ret == x.wrapping_add(y)
 pub fn contract_wrapping_add_reads(x: u8, y: u8) -> u8 {
     x.wrapping_add(y)
 }
 
+spec! {
+    requires: x < y,
+    ensures: ret == x.wrapping_add(y).wrapping_add(1),
+}
 /// The tripwire: the wrapping add is a *value*, not a free variable, so naming it
 /// one too high is false for every input. Without this, a reader that treated
 /// `x.wrapping_add(y)` as an uninterpreted call would prove the true entry above
 /// and this one too.
-/// requires: x < y
-/// ensures: ret == x.wrapping_add(y).wrapping_add(1)
 pub fn contract_wrapping_add_is_a_value_tripwire(x: u8, y: u8) -> u8 {
     x.wrapping_add(y)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x.wrapping_sub(1).wrapping_mul(2),
+}
 /// The same sugar for `-` and `*`, and the chained form: the postfix applies left
 /// to right, so `x.wrapping_sub(1).wrapping_mul(2)` is `(x - 1) * 2` computed with
 /// wrapping at eight bits. The body writes the same wrapping operations, which
 /// pins that the two spellings denote one term on every input -- including the
 /// `x == 0` case, where the plain operators would instead panic on overflow.
-/// requires: true
-/// ensures: ret == x.wrapping_sub(1).wrapping_mul(2)
 pub fn contract_wrapping_sub_mul_chain_reads(x: u8) -> u8 {
     x.wrapping_sub(1).wrapping_mul(2)
 }
 
+spec! {
+    requires: x >= 1 && x <= 100,
+    ensures: ret == x.wrapping_sub(1).wrapping_mul(2),
+}
 /// And the agreement with the *plain* operators where no overflow can occur: in
 /// `1..=100` the wrapping and the checked operations coincide, so the body may
 /// write `(x - 1) * 2` and the contract's sugar must denote the same value. This
 /// is the entry that separates "the sugar is the operator" from "the sugar is an
 /// uninterpreted call", which the entry above cannot: there the body is wrapping
 /// too, so a reader that modelled both as a fresh variable would still agree.
-/// requires: x >= 1 && x <= 100
-/// ensures: ret == x.wrapping_sub(1).wrapping_mul(2)
 pub fn contract_wrapping_agrees_with_the_plain_operators(x: u8) -> u8 {
     (x - 1) * 2
 }
 
+spec! {
+    requires: true,
+    ensures: ret == (1u8).wrapping_neg(),
+}
 /// `wrapping_neg` is `0 - x` at the operand's width, and it is legal for an
 /// *unsigned* receiver where the unary `-` is not: `(1u8).wrapping_neg()` is
 /// `255`. A reader that reused the unary negation's signed-only rule would refuse
 /// this, so the entry pins that the sugar is read as the wrapping operator it is.
-/// requires: true
-/// ensures: ret == (1u8).wrapping_neg()
 pub fn contract_wrapping_neg_on_unsigned_reads() -> u8 {
     255
 }
 
+spec! {
+    requires: true,
+    ensures: ret == y.wrapping_neg(),
+}
 /// And on a signed receiver: `y.wrapping_neg()` for an `i8` is `0 - y`, which at
 /// `y == i8::MIN` is `i8::MIN` again rather than an overflow, so the body's
 /// `wrapping_neg` and the contract's are one value.
-/// requires: true
-/// ensures: ret == y.wrapping_neg()
 pub fn contract_wrapping_neg_on_signed_reads(y: i8) -> i8 {
     y.wrapping_neg()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 200u8.wrapping_add(100u8),
+}
 /// The deliberate difference from `+`: a *constant* `+` that overflows its type is
 /// refused (`200u8 + 100u8` is a rustc error), but `200u8.wrapping_add(100u8)` is
 /// a legal program whose value is `44`. So the sugar must not run the overflow
 /// fold -- it takes the engine's wrapping value, which is what Rust computes. This
 /// entry fails if the reader refuses the shape, and is refuted if it computes
 /// `300`.
-/// requires: true
-/// ensures: ret == 200u8.wrapping_add(100u8)
 pub fn contract_wrapping_add_of_constants_wraps() -> u8 {
     44
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x.wrapping_add(300),
+}
 /// The operands' literals are still range-checked against the type they meet:
 /// `x.wrapping_add(300)` is a rustc error for its `300`, so the shape is refused
 /// rather than decided, even though the *method* is a wrapping one. The wrapping
 /// semantics excuse the overflow of the *result*, not an out-of-range literal.
-/// requires: true
-/// ensures: ret == x.wrapping_add(300)
 pub fn contract_wrapping_add_of_an_out_of_range_literal_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1.wrapping_add(2),
+}
 /// A receiver whose type is not known is refused: Rust rejects
 /// `1.wrapping_add(2)` with `E0689` ("can't call method on ambiguous numeric type
 /// `{integer}`"), so the reader must not silently give the bare literal the
 /// scope's width and decide the shape.
-/// requires: true
-/// ensures: ret == 1.wrapping_add(2)
 pub fn contract_wrapping_add_on_an_untyped_receiver_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 1 && n == 8,
+    ensures: ret == 1,
+}
 /// `wrapping_shl`/`wrapping_shr` reduce the amount modulo the width, the same
 /// reduction a rotation does, so `1u8.wrapping_shl(8)` is `1` (`wrapping_shl(0)`)
 /// rather than the `0` a saturating shift would give. The amount is pinned to the
@@ -4175,49 +4916,59 @@ pub fn contract_wrapping_add_on_an_untyped_receiver_is_refused(x: u8) -> u8 {
 /// saturated the amount (the engine's plain variable shift) would compute `0` and
 /// refute it. The twin below is the mirror -- it claims the saturated `0`, which
 /// only an unreduced model would prove.
-/// requires: x == 1 && n == 8
-/// ensures: ret == 1
 pub fn wrapping_shl_reduces_its_amount(x: u8, n: u32) -> u8 {
     x.wrapping_shl(n)
 }
 
+spec! {
+    requires: x == 1 && n == 8,
+    ensures: ret == 0,
+}
 /// The false twin: `1u8.wrapping_shl(8)` is `1`, not `0`. A model that did *not*
 /// reduce the amount -- the engine's own variable shift saturates `n >= w` to `0`
 /// -- would prove this, so the pair separates "the amount reduces" from "the
 /// amount saturates", which a `ret <= 255` bound could not.
-/// requires: x == 1 && n == 8
-/// ensures: ret == 0
 pub fn wrapping_shl_amount_is_not_saturated_tripwire(x: u8, n: u32) -> u8 {
     x.wrapping_shl(n)
 }
 
+spec! {
+    requires: x == -8 && n == 1,
+    ensures: ret == -4,
+}
 /// `wrapping_shr` is *arithmetic* on a signed receiver: `-8i8.wrapping_shr(1)` is
 /// `-4`, so a model that took the logical shift would refute this. This pins the
 /// *shift kind* (the amount `1` is below the width, so reduction is not involved).
-/// requires: x == -8 && n == 1
-/// ensures: ret == -4
 pub fn wrapping_shr_signed_is_arithmetic(x: i8, n: u32) -> i8 {
     x.wrapping_shr(n)
 }
 
+spec! {
+    requires: x == -8 && n == 1,
+    ensures: ret == 124,
+}
 /// The logical reading of the same call, which is the wrong one for a signed
 /// receiver: `-8i8.wrapping_shr(1)` is `-4` (`0xfc`), never `124` (`0x7c`).
-/// requires: x == -8 && n == 1
-/// ensures: ret == 124
 pub fn wrapping_shr_signed_is_not_logical_tripwire(x: i8, n: u32) -> i8 {
     x.wrapping_shr(n)
 }
 
+spec! {
+    requires: x == 128 && n == 9,
+    ensures: ret == 64,
+}
 /// The unsigned receiver is the logical shift: `128u8.wrapping_shr(9)` is `64`
 /// (`9` reduces to `1`), not a sign fill. This pins *both* the shift kind (a sign
 /// fill would give `192`) and the amount reduction (a saturating shift would give
 /// `0`), so a model that got either wrong fails it.
-/// requires: x == 128 && n == 9
-/// ensures: ret == 64
 pub fn wrapping_shr_unsigned_is_logical(x: u8, n: u32) -> u8 {
     x.wrapping_shr(n)
 }
 
+spec! {
+    requires: -x as u8 > 127,
+    ensures: ret == 1,
+}
 /// Unary `-` binds *tighter* than `as` in Rust, so `-x as u8` is `(-x) as u8`,
 /// not `-(x as u8)`. The two readings agree on the value here — negation and
 /// truncation commute — but not on the *type*: Rust's is `u8`, the other is
@@ -4226,44 +4977,52 @@ pub fn wrapping_shr_unsigned_is_logical(x: u8, n: u32) -> u8 {
 /// reading the negation outside the cast makes the function *vacuous*. The body
 /// returns `1` unconditionally, so it verifies exactly when the precondition is
 /// satisfiable.
-/// requires: -x as u8 > 127
-/// ensures: ret == 1
 pub fn contract_neg_binds_tighter_than_cast(x: i8) -> u8 {
     1
 }
 
+spec! {
+    requires: x == -5,
+    ensures: ret == -x as u8,
+}
 /// The value reading, which both parses agree on (negation and truncation
 /// commute), so this guards against a fix that broke the *value* while fixing the
 /// type: at `x == -5`, `-x` is `5`, and `5 as u8` is `5`.
-/// requires: x == -5
-/// ensures: ret == -x as u8
 pub fn contract_neg_cast_value(x: i8) -> u8 {
     -x as u8
 }
 
+spec! {
+    requires: x == 1,
+    ensures: (-x as u8) < 127,
+}
 /// The tripwire, and the direction that matters: `255 < 127` is *false* on the
 /// unsigned `u8` that Rust produces, so the tool must refute this. Under the
 /// signed reading (`-1 < 127`) it would be *true* and the function would verify —
 /// a false proof. That is the failure the precedence bug produced, so this entry
 /// failing to refute is the alarm.
-/// requires: x == 1
-/// ensures: -x as u8 < 127
 pub fn contract_neg_binds_tighter_than_cast_tripwire(x: i8) -> u8 {
     1
 }
 
+spec! {
+    requires: !x == 5,
+    ensures: ret == 250,
+}
 /// Unary `!` on a *value* is bitwise NOT, and binds *tighter* than `==`, so
 /// `!x == 5` is `(!x) == 5` (`x == 250`), not `!(x == 5)` (`x != 5`). The two are
 /// different predicates, so reading it the second way is a wrong verdict, not a
 /// refusal. The body returns `x`, so with Rust's reading the postcondition holds
 /// and the function verifies; with the predicate reading the tool would refute it
 /// at `x == 0`.
-/// requires: !x == 5
-/// ensures: ret == 250
 pub fn contract_bang_binds_tighter_than_eq(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: !x == 5,
+    ensures: ret == 249,
+}
 /// A control for the entry above, not a reverse discriminator. The two readings of
 /// `!x == 5` are `x == 250` (Rust) and `x != 5` (the bug); the second is *broader*,
 /// so it can only refute things the first verifies, never verify something the
@@ -4271,50 +5030,60 @@ pub fn contract_bang_binds_tighter_than_eq(x: u8) -> u8 {
 /// prove the tool is not simply verifying everything under that precondition: the
 /// body returns `x`, so `ret == 249` is false at the only input Rust admits
 /// (`x == 250`) and the tool must refute it under *both* readings.
-/// requires: !x == 5
-/// ensures: ret == 249
 pub fn contract_bang_binds_tighter_than_eq_control(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == !x,
+}
 /// A bare `!x` on an integer is bitwise NOT: for `u8`, `!0` is `255`. It used to
 /// be unreadable, which dropped the obligation rather than checking it.
-/// requires: x == 0
-/// ensures: ret == !x
 pub fn contract_bang_is_bitwise_not(x: u8) -> u8 {
     !x
 }
 
+spec! {
+    requires: x == 7 && !(x == 8),
+    ensures: ret == 1,
+}
 /// A predicate `!` still negates: `!(x == 8)` is `x != 8`, so the guard holds at
 /// `x == 7` and the function verifies. This is the shape that must *not* break
 /// when value-level `!` is added.
-/// requires: x == 7 && !(x == 8)
-/// ensures: ret == 1
 pub fn contract_bang_still_negates_a_predicate(x: u8) -> u8 {
     1
 }
 
+spec! {
+    requires: true,
+    ensures: !0 == 255,
+}
 /// The false-proof tripwire for an *untyped* constant in an equality.
 ///
 /// `!0` has no type of its own. Rust types an untyped constant as `i32`, so `!0`
 /// is `-1` and `!0 == 255` is `false` -- the postcondition holds for no input.
 /// The reader used to carry the complement as a bit pattern at the scope's width,
 /// build `255u8 == 255`, and *verify* this. With the refusal it is `skipped`.
-/// requires: true
-/// ensures: !0 == 255
 pub fn contract_untyped_complement_equality_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == !0,
+    ensures: ret == 255,
+}
 /// The control: a typed operand fixes the reading, so `!0` becomes a `u8` and
 /// `x == !0` is exactly `x == 255` -- what Rust means. This must still read and
 /// verify, so the refusal above is not a blanket ban on `!` in a comparison.
-/// requires: x == !0
-/// ensures: ret == 255
 pub fn contract_complement_of_literal_with_typed_partner_reads(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: y <= (!128),
+}
 /// The false-proof tripwire for a complement of an *out-of-range* literal.
 ///
 /// `!128` for an `i8` is a rustc `literal out of range for i8` error: `128` does
@@ -4323,44 +5092,50 @@ pub fn contract_complement_of_literal_with_typed_partner_reads(x: u8) -> u8 {
 /// let the resize truncate it with no check, so `y <= !128` read as `y <= 127`
 /// (`i8::MAX`) and *verified* -- a false proof on a program rustc rejects. It must
 /// be refused, not decided.
-/// requires: true
-/// ensures: y <= (!128)
 pub fn contract_complement_of_out_of_range_literal_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: y <= (!127),
+}
 /// The control: `!127` fits an `i8` (`127` is `i8::MAX`), so the complement is a
 /// legal `i8` and the comparison must still read. This keeps the refusal above
 /// drawn at the range, not at `!`.
-/// requires: true
-/// ensures: y <= (!127)
 pub fn contract_fitting_complement_still_reads(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: b <= (!128),
+}
 /// The control for the *width*: `!128` against an `i16` is legal (`128` fits an
 /// `i16`), so the same complement that is refused for an `i8` must read here. A
 /// fix that refused every `!`-of-`128` regardless of the partner width would fail
 /// this.
-/// requires: true
-/// ensures: b <= (!128)
 pub fn contract_complement_reads_at_a_wider_operand(b: i16) -> i16 {
     b
 }
 
+spec! {
+    requires: -x >= 0,
+    ensures: ret == 0,
+}
 /// Unary `-` on an *unsigned* name is a rustc error (`E0600: cannot apply unary
 /// operator `-` to type `u8``). The reader modelled it as `0 - x`, a value Rust
 /// never produces, so the shape is refused rather than decided.
-/// requires: -x >= 0
-/// ensures: ret == 0
 pub fn contract_unsigned_negation_is_refused(x: u8) -> u8 {
     0
 }
 
+spec! {
+    requires: x == -5,
+    ensures: ret == -x as u8,
+}
 /// The control: a negation of a *signed* name is legal and must still read, so the
 /// refusal above is not a blanket ban on unary `-`.
-/// requires: x == -5
-/// ensures: ret == -x as u8
 pub fn contract_signed_negation_still_reads(x: i8) -> u8 {
     -x as u8
 }
@@ -4378,91 +5153,111 @@ pub fn contract_signed_negation_still_reads(x: i8) -> u8 {
 // because there the negation is what makes the magnitude legal (`-128i8` reads).
 //
 // These are `skipped`, not `verified` and not `failed`.
-/// requires: true
-/// ensures: y == -(i8::MIN)
+spec! {
+    requires: true,
+    ensures: y == -(i8::MIN),
+}
 pub fn contract_negation_of_min_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: y == -(3 << 7),
+}
 /// The same overflow reached through a shift that wraps to `i8::MIN`'s pattern,
 /// so the check is on the *value* and not on the `i8::MIN` spelling.
-/// requires: true
-/// ensures: y == -(3 << 7)
 pub fn contract_negation_of_wrapping_shift_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: y == -127,
+    ensures: ret == -y as i8,
+}
 /// The control: negating `i8::MAX` is in range and must still read, so the
 /// refusal above is pinned to the overflow and not to a negation of a bound.
-/// requires: y == -127
-/// ensures: ret == -y as i8
 pub fn contract_negation_of_max_still_reads(y: i8) -> i8 {
     -y
 }
 
+spec! {
+    requires: x == 8,
+    ensures: ret == x >> 1 + 1,
+}
 /// A shift *amount* may be a constant expression, not only a bare literal:
 /// `x >> 1 + 1` is `x >> 2` in Rust. The reader accepted only a raw literal, so
 /// this shape was unreadable -- a dropped obligation on something rustc compiles.
 /// The body shifts by `2`, so this verifies exactly when the amount folds.
-/// requires: x == 8
-/// ensures: ret == x >> 1 + 1
 pub fn contract_shift_amount_is_folded(x: u8) -> u8 {
     x >> 2
 }
 
+spec! {
+    requires: x == 8,
+    ensures: ret == 2,
+}
 /// The same folding on the *body* side: the amount `1 + 1` is constant, so the
 /// body must lower it to a constant shift rather than a barrel shifter. It was
 /// classified symbolic, which left the query undecided; folding it makes the
 /// function prove.
-/// requires: x == 8
-/// ensures: ret == 2
 pub fn body_shift_amount_is_folded(x: u8) -> u8 {
     x >> 1 + 1
 }
 
+spec! {
+    requires: x == 3,
+    ensures: ret == x % (1 - 1),
+}
 /// A divisor of *zero* must be refused however it is spelled. `1 - 1` folds to
 /// `0`, and checking only for a bare `0` literal let it through, so the reader
 /// built `srem(x, 0)` -- an undefined operation -- and returned a definite verdict
 /// from it. Refusing the folded zero turns that into a visible skip.
-/// requires: x == 3
-/// ensures: ret == x % (1 - 1)
 pub fn contract_divisor_zero_is_folded(x: u8) -> u8 {
     x % 3
 }
 
+spec! {
+    requires: x == 4,
+    ensures: ret == x / (1 + 1),
+}
 /// A *constant, non-zero* divisor in folded form still reads and models exactly:
 /// `4 / (1 + 1)` is `4 / 2` is `2`, the same as the body.
-/// requires: x == 4
-/// ensures: ret == x / (1 + 1)
 pub fn contract_divisor_folded_is_read(x: u8) -> u8 {
     x / 2
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == !x as u8,
+}
 /// Value-level `!` binds tighter than a cast, so `!x as u8` is `(!x) as u8`: at
 /// `x == 0` that is `255`. Reading it as `!(x as u8)` would make the `!` a predicate
 /// negation and this would not parse at all, so the entry pins the binding.
-/// requires: x == 0
-/// ensures: ret == !x as u8
 pub fn contract_bang_binds_tighter_than_a_cast(x: u8) -> u8 {
     !x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == !x & 1,
+}
 /// Value-level `!` binds tighter than `&`, so `!x & 1` is `(!x) & 1`: at `x == 0`
 /// that is `255 & 1 == 1`. A reading that let `&` bind first would compute
 /// `!(x & 1)`, which is `254` here.
-/// requires: x == 0
-/// ensures: ret == !x & 1
 pub fn contract_bang_binds_tighter_than_and(x: u8) -> u8 {
     !x & 1
 }
 
+spec! {
+    requires: x == 249,
+    ensures: !(x + 1) == 5,
+}
 /// A parenthesis does not turn `!` into a predicate negation: `!(x + 1)` holds
 /// *arithmetic*, so `!(x + 1) == 5` is `(!(x + 1)) == 5`, i.e. `x == 249`, not the
 /// negation of `(x + 1) == 5` (which is not even well-typed). Contrast
 /// `contract_bang_still_negates_a_predicate`, where the parenthesis holds a
 /// *comparison* and the `!` does negate.
-/// requires: x == 249
-/// ensures: !(x + 1) == 5
 pub fn contract_bang_paren_arithmetic_is_a_value(x: u8) -> u8 {
     0
 }
@@ -4477,88 +5272,110 @@ pub fn contract_bang_paren_arithmetic_is_a_value(x: u8) -> u8 {
 // function returning `255`. These entries pin the value each radix reads, and the
 // control pins that the fixed value is *not* the truncated one.
 
+spec! {
+    requires: x == 0xFF,
+    ensures: ret == 255,
+}
 /// A hex literal reads at radix 16: `0xFF` is `255`. The body returns the argument
 /// unchanged, so `ret == 255` holds only under the correct reading; the truncated
 /// `x == 0` reading refutes it.
-/// requires: x == 0xFF
-/// ensures: ret == 255
 pub fn contract_hex_literal_is_255(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 0b1010,
+    ensures: ret == 10,
+}
 /// A binary literal reads at radix 2: `0b1010` is `10`, not `0`.
-/// requires: x == 0b1010
-/// ensures: ret == 10
 pub fn contract_binary_literal_is_ten(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 0o17,
+    ensures: ret == 15,
+}
 /// An octal literal reads at radix 8: `0o17` is `15`, not `0`.
-/// requires: x == 0o17
-/// ensures: ret == 15
 pub fn contract_octal_literal_is_fifteen(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 0xFF_FF,
+    ensures: ret == 65535,
+}
 /// Underscores separate digits in any radix: `0xFF_FF` is `65535`.
-/// requires: x == 0xFF_FF
-/// ensures: ret == 65535
 pub fn contract_hex_underscore_is_65535(x: u16) -> u16 {
     x
 }
 
+spec! {
+    requires: x == 0xFFu8,
+    ensures: ret == 255,
+}
 /// A hex literal with a type suffix is still that value: `0xFFu8` is `255`.
-/// requires: x == 0xFFu8
-/// ensures: ret == 255
 pub fn contract_hex_with_suffix_is_255(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 0xFF,
+    ensures: ret == 0,
+}
 /// The control: the *truncated* reading is `0`, so `ret == 0` is false for a body
 /// that returns `x` under `x == 0xFF`. This must be **refuted**; if the literal is
 /// mis-read as `0`, the precondition becomes `x == 0` and this is "proved" -- the
 /// false proof the fix removes.
-/// requires: x == 0xFF
-/// ensures: ret == 0
 pub fn contract_hex_literal_is_not_zero_control(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 0x10 + 0x01,
+    ensures: ret == 17,
+}
 /// A radix literal is a *value* in arithmetic too, not only a bare atom: `0x10 + 1`
 /// is `17`, and the reader must fold it the same way it folds a decimal.
-/// requires: x == 0x10 + 0x01
-/// ensures: ret == 17
 pub fn contract_hex_arithmetic_is_folded(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 4,
+    ensures: ret == x >> 0x1,
+}
 /// A radix literal as a *shift amount*: `x >> 0x1` is `x >> 1`. The shift-amount
 /// path folds the operand, so the literal has to be a constant there too.
-/// requires: x == 4
-/// ensures: ret == x >> 0x1
 pub fn contract_hex_shift_amount(x: u8) -> u8 {
     x >> 1
 }
 
+spec! {
+    requires: x == 0xAB,
+    ensures: ret == x & 0x0F,
+}
 /// A radix literal in a mask: `x & 0x0F` keeps the low nibble. At `x == 0xAB`
 /// that is `0x0B == 11`.
-/// requires: x == 0xAB
-/// ensures: ret == x & 0x0F
 pub fn contract_hex_mask_keeps_low_nibble(x: u8) -> u8 {
     x & 0x0F
 }
 
+spec! {
+    requires: x == -0xFF,
+    ensures: ret == -255,
+}
 /// A *negative* radix literal: `-0xFF` is `-255`, so the prefix binds before the
 /// value is negated. The body returns `x` at `x == -255`.
-/// requires: x == -0xFF
-/// ensures: ret == -255
 pub fn contract_negative_hex_literal(x: i16) -> i16 {
     x
 }
 
+spec! {
+    requires: x == 0XFF,
+    ensures: ret == 255,
+}
 /// An uppercase prefix is the same radix: `0XFF` is `255`.
-/// requires: x == 0XFF
-/// ensures: ret == 255
 pub fn contract_uppercase_hex_prefix(x: u8) -> u8 {
     x
 }
@@ -4573,114 +5390,142 @@ pub fn contract_uppercase_hex_prefix(x: u8) -> u8 {
 // 127` held, because `-128..=127` excludes nothing that `<= -128` admits. The same
 // holds for a negation: `-129` for an `i8` wraps to `127` at eight bits.
 
+spec! {
+    requires: x <= 128,
+    ensures: ret <= 127,
+}
 /// `128` does not fit an `i8` (it is `i8::MAX + 1`), so `x <= 128` is a Rust error
 /// and the reader must refuse it. The body returns `x`, so if the literal were
 /// wrapped to `-128` this would *verify* (`x <= -128` implies `x <= 127`); the
 /// honest outcome is a skip.
-/// requires: x <= 128
-/// ensures: ret <= 127
 pub fn contract_out_of_range_literal_is_refused(x: i8) -> i8 {
     x
 }
 
+spec! {
+    requires: x >= -128,
+    ensures: ret >= -128,
+}
 /// The `i8::MIN` boundary shares the bit pattern `0x80` with `128` and must still
 /// read: `x >= -128` is true for every `i8`.
-/// requires: x >= -128
-/// ensures: ret >= -128
 pub fn contract_min_bound_still_reads(x: i8) -> i8 {
     x
 }
 
+spec! {
+    requires: x >= -129,
+    ensures: ret >= 0,
+}
 /// `-129` does not fit an `i8` either, so `x >= -129` is refused. Wrapping it to
 /// `127` would make `x >= 0` hold for the whole (empty) precondition set, a false
 /// proof; the refusal keeps it visible.
-/// requires: x >= -129
-/// ensures: ret >= 0
 pub fn contract_out_of_range_negation_is_refused(x: i8) -> i8 {
     x
 }
 
+spec! {
+    requires: x >= -129,
+    ensures: ret >= -129,
+}
 /// The `i16` case is legal and must still read: `-129` fits an `i16`, so
 /// `x >= -129` is a real (non-vacuous) precondition.
-/// requires: x >= -129
-/// ensures: ret >= -129
 pub fn contract_negative_bound_reads_at_i16(x: i16) -> i16 {
     x
 }
 
+spec! {
+    requires: 128 <= i8::MAX && x == 7,
+    ensures: ret == 0,
+}
 /// A comparison between two *constants* has no typed name to take its width from,
 /// but it still has to be one rustc would accept. `128 <= i8::MAX` is a `literal
 /// out of range for i8` error, and reading `128` as the bit pattern `0x80` made it
 /// `-128 <= 127` -- always true -- so the shape is refused, not decided.
-/// requires: 128 <= i8::MAX && x == 7
-/// ensures: ret == 0
 pub fn contract_constant_vs_constant_out_of_range(x: i8) -> i8 {
     x
 }
 
+spec! {
+    requires: 127 <= i8::MAX && x == 7,
+    ensures: ret == 7,
+}
 /// The in-range counterpart, so the refusal above is pinned to the value and not
 /// to the shape: `127 <= i8::MAX` is well-typed and must read.
-/// requires: 127 <= i8::MAX && x == 7
-/// ensures: ret == 7
 pub fn contract_constant_vs_constant_in_range(x: i8) -> i8 {
     x
 }
 
+spec! {
+    requires: x <= 200 + 100,
+    ensures: ret <= 44,
+}
 /// A constant *arithmetic* expression that overflows its operand width is a rustc
 /// const-eval error (`200u8 + 100u8`), so it must be refused rather than folded
 /// mod 256. Folding made `x <= 200 + 100` read as `x <= 44` -- a *stronger*
 /// precondition than the author wrote (`x <= 300`, which admits every `u8`), and
 /// `ensures: ret <= 44` was then proved for a body that fails at `x == 100`: a
 /// false proof.
-/// requires: x <= 200 + 100
-/// ensures: ret <= 44
 pub fn contract_constant_sum_overflow_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x >= 0 - 1,
+    ensures: ret >= 0,
+}
 /// An unsigned constant expression that goes negative is a rustc error too
 /// (`0u8 - 1u8`), and the reader refuses it rather than wrapping to `255`.
-/// requires: x >= 0 - 1
-/// ensures: ret >= 0
 pub fn contract_constant_underflow_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == i8::MIN / -1,
+}
 /// `i8::MIN / -1` and `i8::MIN % -1` overflow the signed operand, which rustc
 /// rejects; the engine's divider would wrap them to `MIN` and `0`.
-/// requires: true
-/// ensures: ret == i8::MIN / -1
 pub fn contract_constant_div_overflow_is_refused() -> i8 {
     -128
 }
 
+spec! {
+    requires: x <= 100 + 44,
+    ensures: ret <= 144,
+}
 /// The in-range counterpart: a constant sum that *does* fit reads as written, so
 /// the refusal above is pinned to the overflow and not to constant arithmetic.
-/// requires: x <= 100 + 44
-/// ensures: ret <= 144
 pub fn contract_constant_sum_in_range_reads(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x as u16 <= 200 + 100,
+    ensures: ret == x,
+}
 /// A constant sum that overflows its *narrow* operand but fits a wider one is
 /// legal in rustc (`200 + 100` is `300` for a `u16`), so it must still read.
-/// requires: x as u16 <= 200 + 100
-/// ensures: ret == x
 pub fn contract_constant_sum_wider_operand_reads(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x <= i8::MAX + 1,
+    ensures: ret <= 0,
+}
 /// The signed trap: `i8::MAX + 1` is `128`, which fits an *unsigned* byte but not
 /// a signed one, and rustc rejects it. Widening the exact result at the
 /// expression's own signedness is what refuses it; an unsigned widening left it at
 /// eight bits where it read as `-128` -- a false proof of the same kind the fold
 /// exists to prevent.
-/// requires: x <= i8::MAX + 1
-/// ensures: ret <= 0
 pub fn contract_constant_signed_sum_overflow_is_refused(x: i8) -> i8 {
     x
 }
 
+spec! {
+    requires: x == -1,
+    ensures: ret == 255,
+}
 /// A *signed* constant compared with an *unsigned* operand is refused.
 ///
 /// Rust infers a literal's type from the operand it meets, and `x == -1` for a
@@ -4689,52 +5534,60 @@ pub fn contract_constant_signed_sum_overflow_is_refused(x: i8) -> i8 {
 /// `x == -1` as `x == 255` -- a wrong *value*, and `ensures: ret == 255` was
 /// *proved* for a body returning `x`, which is a false proof. Refusing the shape is
 /// the only sound answer; the wrong reading is a proof, so it cannot be a warning.
-/// requires: x == -1
-/// ensures: ret == 255
 pub fn contract_signed_literal_vs_unsigned_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x <= 0xFF,
+    ensures: ret == x,
+}
 /// The legal counterpart: a bare literal is unsigned, so `0xFF` against a `u8`
 /// must still read as `255`. Refusing every literal would be as wrong as refusing
 /// none, and this is the case that keeps the check from being a blanket ban.
-/// requires: x <= 0xFF
-/// ensures: ret == x
 pub fn contract_unsigned_literal_still_reads(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x + -1 >= 0,
+    ensures: ret != 0,
+}
 /// The same mixed-sign shape at the *arithmetic* level, where it is equally a
 /// rustc error and equally a false proof if read. `x + -1 >= 0` for a `u8` is
 /// trivially true when the negation is read as `255`, so this postcondition was
 /// *proved* for a body returning `x` -- a false proof the comparison-level check
 /// alone did not close.
-/// requires: x + -1 >= 0
-/// ensures: ret != 0
 pub fn contract_signed_constant_sum_vs_unsigned_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x + 255 >= 0,
+    ensures: ret == x,
+}
 /// The legal counterpart at the arithmetic level: an *unsigned* constant still
 /// adds and reads, so the refusal is not a blanket ban on constants in sums.
-/// requires: x + 255 >= 0
-/// ensures: ret == x
 pub fn contract_unsigned_constant_sum_still_reads(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x ^ -1 <= 255,
+    ensures: ret != 0,
+}
 /// And at the *bitwise* level, where the same negation is the same rustc error and
 /// the same wrong reading: `x ^ -1 <= 255` read as `x ^ 255 <= 255`, always true,
 /// so it was *proved* for a body returning `x`.
-/// requires: x ^ -1 <= 255
-/// ensures: ret != 0
 pub fn contract_signed_constant_mask_vs_unsigned_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x & 255 == x,
+    ensures: ret == x,
+}
 /// The legal counterpart at the bitwise level: an unsigned mask still reads.
-/// requires: x & 255 == x
-/// ensures: ret == x
 pub fn contract_unsigned_mask_still_reads(x: u8) -> u8 {
     x
 }
@@ -4756,91 +5609,117 @@ pub fn contract_unsigned_mask_still_reads(x: u8) -> u8 {
 // the ladder below is now Rust's own, `| ^ & << >> + - * / %` from loosest to
 // tightest.
 
+spec! {
+    requires: true,
+    ensures: ret == x >> 1,
+}
 /// A logical right shift of an unsigned value: `x >> 1` is `x / 2`.
-/// requires: true
-/// ensures: ret == x >> 1
 pub fn contract_shr_unsigned(x: u8) -> u8 {
     x >> 1
 }
 
+spec! {
+    requires: true,
+    ensures: ret == (x >> 1) + 1,
+}
 /// The tripwire: `>>` is a value, not a free variable, so naming it one too high
 /// is false for every input.
-/// requires: true
-/// ensures: ret == (x >> 1) + 1
 pub fn contract_shr_unsigned_tripwire(x: u8) -> u8 {
     x >> 1
 }
 
+spec! {
+    requires: x <= 63,
+    ensures: ret == x << 2,
+}
 /// A left shift: `x << 2` is `x * 4` for the values that do not overflow.
-/// requires: x <= 63
-/// ensures: ret == x << 2
 pub fn contract_shl(x: u8) -> u8 {
     x << 2
 }
 
+spec! {
+    requires: x == -8,
+    ensures: ret == -4,
+}
 /// A *signed* right shift is arithmetic, not logical: `-8 >> 1` is `-4`, where a
 /// logical shift would give a large positive. This is the entry that separates
 /// the two, and the reason the parser reads the left operand's sign.
-/// requires: x == -8
-/// ensures: ret == -4
 pub fn contract_shr_signed_is_arithmetic(x: i8) -> i8 {
     x >> 1
 }
 
+spec! {
+    requires: x == -8,
+    ensures: ret == -1,
+}
 /// The tripwire: `-8 >> 1` is never `-1`, so a logical reading (which would give
 /// a large positive) or a wrong amount cannot make this true.
-/// requires: x == -8
-/// ensures: ret == -1
 pub fn contract_shr_signed_is_arithmetic_tripwire(x: i8) -> i8 {
     x >> 1
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x / 3,
+}
 /// An unsigned quotient: `x / 3`.
-/// requires: true
-/// ensures: ret == x / 3
 pub fn contract_udiv(x: u32) -> u32 {
     x / 3
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x % 10,
+}
 /// An unsigned remainder: `x % 10`.
-/// requires: true
-/// ensures: ret == x % 10
 pub fn contract_urem(x: u32) -> u32 {
     x % 10
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x,
+}
 /// The tripwire for division: the quotient is not the dividend, so `ret == x`
 /// is false whenever `x >= 3`.
-/// requires: true
-/// ensures: ret == x
 pub fn contract_udiv_tripwire(x: u32) -> u32 {
     x / 3
 }
 
+spec! {
+    requires: x == -7,
+    ensures: ret == -3,
+}
 /// A *signed* division must use the signed engine: `-7 / 2` is `-3`, where the
 /// unsigned one would give a huge positive. The witness is `-7` and the true
 /// value `-3`, so a wrong engine is caught.
-/// requires: x == -7
-/// ensures: ret == -3
 pub fn contract_sdiv(x: i32) -> i32 {
     x / 2
 }
 
+spec! {
+    requires: x == -7,
+    ensures: ret == -1,
+}
 /// A signed remainder: `-7 % 2` is `-1` in Rust (the sign follows the dividend).
-/// requires: x == -7
-/// ensures: ret == -1
 pub fn contract_srem(x: i32) -> i32 {
     x % 2
 }
 
+spec! {
+    requires: x == -7,
+    ensures: ret == 3,
+}
 /// The tripwire for signed division: `-7 / 2` is never `3` (the truncation is
 /// toward zero, so the sign is negative).
-/// requires: x == -7
-/// ensures: ret == 3
 pub fn contract_sdiv_tripwire(x: i32) -> i32 {
     x / 2
 }
 
+spec! {
+    requires: true,
+    ensures: ret == -7 % 3,
+}
 /// A *constant* signed expression, with no symbolic operand at all. The existing
 /// `contract_srem`/`contract_sdiv` entries pin a symbolic argument (`x == -7`),
 /// and signedness is read from the names in an expression — so they never
@@ -4848,128 +5727,156 @@ pub fn contract_sdiv_tripwire(x: i32) -> i32 {
 /// is folded by rustc to `-1`, and the contract is the literal `-7 % 3`. Rust says
 /// `-1` (the sign follows the dividend); the unsigned engine would say
 /// `4294967289 % 3`, i.e. `0`, and refute this.
-/// requires: true
-/// ensures: ret == -7 % 3
 pub fn contract_const_srem_negative() -> i32 {
     -7i32 % 3i32
 }
 
+spec! {
+    requires: true,
+    ensures: ret == -7 / 2,
+}
 /// The companion for division: `-7 / 2` is `-3`, truncated toward zero. The
 /// unsigned engine would give `2147483641`, a huge positive.
-/// requires: true
-/// ensures: ret == -7 / 2
 pub fn contract_const_sdiv_negative() -> i32 {
     -7i32 / 2i32
 }
 
+spec! {
+    requires: true,
+    ensures: ret == -8 >> 1,
+}
 /// The companion for an arithmetic shift: `-8 >> 1` is `-4` on a signed operand.
 /// A logical reading would give `2147483644`.
-/// requires: true
-/// ensures: ret == -8 >> 1
 pub fn contract_const_ashr_negative() -> i32 {
     -8i32 >> 1
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
 /// The tripwire: `-7 % 3` is `-1`, never `2` (which is what a remainder that
 /// followed the *divisor's* sign would give). The body is `-1`, so `2` is
 /// refuted.
-/// requires: true
-/// ensures: ret == 2
 pub fn contract_const_srem_negative_tripwire() -> i32 {
     -7i32 % 3i32
 }
 
+spec! {
+    requires: true,
+    ensures: ret == -1,
+}
 /// The tripwire for the shift: `-8 >> 1` is `-4`, never `-1`.
-/// requires: true
-/// ensures: ret == -1
 pub fn contract_const_ashr_negative_tripwire() -> i32 {
     -8i32 >> 1
 }
 
+spec! {
+    requires: -7 < 3,
+    ensures: ret == 1,
+}
 /// The same unsigned flag decides a *comparison*, not only `/ % >>`. `-7 < 3` is
 /// true on a signed reading and false on an unsigned one (`4294967289 < 3`), so a
 /// literal that reports itself unsigned made this precondition unsatisfiable —
 /// the safe direction, but wrong. The body returns `1`, so the postcondition is
 /// true whenever the precondition is.
-/// requires: -7 < 3
-/// ensures: ret == 1
 pub fn contract_const_cmp_negative() -> u8 {
     1
 }
 
+spec! {
+    requires: -7 > 0,
+    ensures: ret == 1,
+}
 /// The tripwire: `-7 > 0` is false, so a *signed* reading makes the precondition
 /// unsatisfiable and the function vacuous. An unsigned reading (`4294967289 > 0`)
 /// would make it true and the function verify — so a regression here shows up as
 /// this entry *passing*, which is the direction to watch.
-/// requires: -7 > 0
-/// ensures: ret == 1
 pub fn contract_const_cmp_negative_tripwire() -> u8 {
     1
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x & 1 + 1,
+}
 /// Precedence: Rust reads `x & 1 + 1` as `x & (1 + 1)`, i.e. `x & 2`. The body
 /// computes `x & 2`, so a parser that read `(x & 1) + 1` would refute this.
-/// requires: true
-/// ensures: ret == x & 1 + 1
 pub fn contract_precedence_and_over_add(x: u8) -> u8 {
     x & 2
 }
 
+spec! {
+    requires: x == 1,
+    ensures: ret == 2,
+}
 /// The tripwire that separates the two readings. At `x == 1`, `1 & 2` is `0`
 /// while `(1 & 1) + 1` is `2`; the body computes `0`, so the `2` reading is
 /// refuted with witness `x == 1`.
-/// requires: x == 1
-/// ensures: ret == 2
 pub fn contract_precedence_and_over_add_tripwire(x: u8) -> u8 {
     x & 2
 }
 
+spec! {
+    requires: x <= 126,
+    ensures: ret == x + 1 << 1,
+}
 /// Precedence between `+` and `<<`: `x + 1 << 1` is `(x + 1) << 1` in Rust,
 /// because `+` binds tighter than `<<`. The body computes `(x + 1) << 1`. The
 /// bound keeps both the `x + 1` and the `<< 1` in range, so the body does not
 /// panic -- an unbounded `u8` would make the function *panic* rather than verify,
 /// which is a true result but not the one this entry is about.
-/// requires: x <= 126
-/// ensures: ret == x + 1 << 1
 pub fn contract_precedence_add_over_shl(x: u8) -> u8 {
     (x + 1) << 1
 }
 
+spec! {
+    requires: x <= 126,
+    ensures: ret == x * 2 + 1,
+}
 /// The tripwire: `(x + 1) << 1` is `2x + 2`, never `2x + 1`, so a reading that
 /// shifted the wrong side is refuted.
-/// requires: x <= 126
-/// ensures: ret == x * 2 + 1
 pub fn contract_precedence_add_over_shl_tripwire(x: u8) -> u8 {
     (x + 1) << 1
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == x & 3 | 4,
+}
 /// Precedence between `&` and `|`: `x & 3 | 4` is `(x & 3) | 4`, because `&` binds
 /// tighter. The two readings differ at `x == 0`, where the correct one is `4` and
 /// `x & (3 | 4)` is `0`. The body computes the correct `4`.
-/// requires: x == 0
-/// ensures: ret == x & 3 | 4
 pub fn contract_precedence_and_over_or(x: u8) -> u8 {
     (x & 3) | 4
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == 0,
+}
 /// The tripwire: at `x == 0` the `|`-binds-first reading gives `0`, which the body
 /// does not, so it is refuted -- unless the parser took that reading, in which case
 /// this would verify.
-/// requires: x == 0
-/// ensures: ret == 0
 pub fn contract_precedence_and_over_or_tripwire(x: u8) -> u8 {
     (x & 3) | 4
 }
 
+spec! {
+    requires: x == 4,
+    ensures: x >> 1 == 2,
+}
 /// Precedence between a shift and a comparison: `x >> 1 == 2` is `(x >> 1) == 2`,
 /// because `<<`/`>>` bind tighter than `==`. The body returns `1` iff the comparison
 /// holds, so the contract is the comparison itself at a pinned point.
-/// requires: x == 4
-/// ensures: x >> 1 == 2
 pub fn contract_precedence_shift_over_eq(x: u8) -> u8 {
     0
 }
 
+spec! {
+    requires: x == 8,
+    ensures: x >> 1 == 2,
+}
 /// The false direction of the same shape: `x >> 1 == 2` at `x == 8` is `4 == 2`,
 /// which is false, so the body returning `1` is refuted. Together with the entry
 /// above this pins that the comparison is *decided*, not merely read: a reader that
@@ -4977,41 +5884,47 @@ pub fn contract_precedence_shift_over_eq(x: u8) -> u8 {
 /// read the shift as `x >> (1 == 2)` = `x >> 0` = `x` and then proved the equality
 /// would have proved a false thing. The verifying entry is the one that separates
 /// those, because only the correct reading is true there.
-/// requires: x == 8
-/// ensures: x >> 1 == 2
 pub fn contract_precedence_shift_over_eq_tripwire(x: u8) -> u8 {
     1
 }
 
+spec! {
+    requires: x == 5,
+    ensures: ret == x as i16 + 1,
+}
 /// Precedence between a cast and `+`: `x as i16 + 1` is `(x as i16) + 1`, because a
 /// cast binds tighter than arithmetic. The body computes `(x as i16) + 1`.
-/// requires: x == 5
-/// ensures: ret == x as i16 + 1
 pub fn contract_precedence_cast_over_add(x: i8) -> i16 {
     x as i16 + 1
 }
 
+spec! {
+    requires: x == 1,
+    ensures: ret == -x as i16,
+}
 /// Precedence between unary `-` and a cast: `-x as i16` is `(-x) as i16`, because
 /// unary operators bind tighter than `as`. The body computes `(-x) as i16`.
-/// requires: x == 1
-/// ensures: ret == -x as i16
 pub fn contract_precedence_neg_over_cast(x: i8) -> i16 {
     -x as i16
 }
 
+spec! {
+    requires: x == 3,
+    ensures: ret == -x % 2,
+}
 /// Precedence between unary `-` and `%`, and the *sign* of a remainder: `-x % 2` is
 /// `(-x) % 2`, and Rust truncates toward zero, so at `x == 3` it is `-1`. The body
 /// computes `-3 % 2`.
-/// requires: x == 3
-/// ensures: ret == -x % 2
 pub fn contract_precedence_neg_over_rem(x: i8) -> i8 {
     -3 % 2
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 2 * 3 % 4,
+}
 /// Left associativity at equal precedence: `2 * 3 % 4` is `(2 * 3) % 4`, i.e. `2`,
 /// not `2 * (3 % 4)` which is `6`. A constant, so there is no input to vary.
-/// requires: true
-/// ensures: ret == 2 * 3 % 4
 pub fn contract_precedence_mul_rem_left_assoc() -> u8 {
     2
 }
@@ -5028,25 +5941,31 @@ pub fn contract_precedence_mul_rem_left_assoc() -> u8 {
 // the whole run down with it. These entries pin that the *tool survives* a
 // 128-bit function and reports it, which is the property a crash would break.
 
+spec! {
+    requires: true,
+    ensures: ret == x,
+}
 /// A `u128` argument: refused, not panicked.
-/// requires: true
-/// ensures: ret == x
 pub fn wide_arg(x: u128) -> u128 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// A `u128` return with an ordinary argument: refused on the return type alone.
-/// requires: true
-/// ensures: true
 pub fn wide_return(x: u8) -> u128 {
     x as u128
 }
 
+spec! {
+    requires: true,
+    invariant: x == 0,
+    ensures: ret == 0,
+}
 /// A `u128` *local* inside a loop: the loop havoc consults the type's width, so
 /// this is the path that would panic without the guard.
-/// requires: true
-/// invariant: x == 0
-/// ensures: ret == 0
 pub fn wide_local_in_loop() -> u8 {
     let mut x: u128 = 0;
     let mut i = 0u8;
@@ -5057,18 +5976,22 @@ pub fn wide_local_in_loop() -> u8 {
     0
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x as u128,
+}
 /// A contract casting to `u128`, with no 128-bit local at all: the refusal has to
 /// come from the *parser*, since the function's own types are all 64-bit.
-/// requires: true
-/// ensures: ret == x as u128
 pub fn wide_cast_in_contract(x: u8) -> u64 {
     x as u64
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x as u64,
+}
 /// A `u64` function next to the 128-bit ones, to show the guard does not spill:
 /// this one still verifies.
-/// requires: true
-/// ensures: ret == x as u64
 pub fn narrow_64_still_works(x: u8) -> u64 {
     x as u64
 }
@@ -5085,48 +6008,60 @@ pub fn narrow_64_still_works(x: u8) -> u64 {
 // never been contradicted.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: x != 0,
+    ensures: ret >= 1,
+}
 /// A zero operand has no set bits and every other value has at least one, so the
 /// count is at least 1. This is the shape `checked_*` cannot express: the result
 /// type is `u32` while the operand is `u8`.
-/// requires: x != 0
-/// ensures: ret >= 1
 pub fn popcount_of_nonzero(x: u8) -> u32 {
     x.count_ones()
 }
 
+spec! {
+    requires: x != 0,
+    ensures: ret >= 2,
+}
 /// The tripwire: a `u8` has eight bits, so the count is at least 2 for every
 /// nonzero operand -- which is false at `x == 1`, whose count is 1.
-/// requires: x != 0
-/// ensures: ret >= 2
 pub fn popcount_of_nonzero_tripwire(x: u8) -> u32 {
     x.count_ones()
 }
 
+spec! {
+    ensures: ret <= 8,
+}
 /// The count cannot exceed the operand's width. Stated at the top of the range,
 /// where the *widened* result would be wrong if the model left it 8-bit.
-/// ensures: ret <= 8
 pub fn popcount_bounded_by_width(x: u8) -> u32 {
     x.count_ones()
 }
 
+spec! {
+    ensures: ret <= 7,
+}
 /// The tripwire: `x == 0xFF` has eight set bits, so a bound of 7 is false.
-/// ensures: ret <= 7
 pub fn popcount_bounded_by_width_tripwire(x: u8) -> u32 {
     x.count_ones()
 }
 
+spec! {
+    ensures: ret >= x,
+}
 /// `wrapping_abs` never returns a value below its operand: it is the identity on
 /// non-negative inputs and the negation on negative ones, and at `MIN` it wraps
 /// back to `MIN` itself. All three cases are `ret >= x`, which is why this is
 /// true including at the `MIN` point where the magnitude is unrepresentable.
-/// ensures: ret >= x
 pub fn abs_never_below_operand(x: i8) -> i8 {
     x.wrapping_abs()
 }
 
+spec! {
+    ensures: ret > x,
+}
 /// The tripwire: strict inequality fails at `x == 0`, where `abs` is the identity
 /// and the result equals the operand.
-/// ensures: ret > x
 pub fn abs_never_below_operand_tripwire(x: i8) -> i8 {
     x.wrapping_abs()
 }
@@ -5142,120 +6077,150 @@ pub fn abs_never_below_operand_tripwire(x: i8) -> i8 {
 // is one verifying contract and one tripwire.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: x < 128,
+    ensures: ret >= 1,
+}
 /// `leading_zeros` counts the zero bits above the highest set bit, so an operand
 /// below `0x80` has at least one -- and the count is on the widened `u32` result.
-/// requires: x < 128
-/// ensures: ret >= 1
 pub fn leading_zeros_of_a_small_value(x: u8) -> u32 {
     x.leading_zeros()
 }
 
+spec! {
+    requires: x < 128,
+    ensures: ret >= 9,
+}
 /// The tripwire: `x == 0` has eight leading zeros, so a bound of *nine* is false
 /// even though it looks safe for every non-zero operand.
-/// requires: x < 128
-/// ensures: ret >= 9
 pub fn leading_zeros_of_a_small_value_tripwire(x: u8) -> u32 {
     x.leading_zeros()
 }
 
+spec! {
+    requires: x >= 128,
+    ensures: ret <= 7,
+}
 /// `trailing_zeros` counts the zero bits below the lowest set bit, so a value
 /// with the top bit set has at most seven of them.
-/// requires: x >= 128
-/// ensures: ret <= 7
 pub fn trailing_zeros_of_a_top_bit_value(x: u8) -> u32 {
     x.trailing_zeros()
 }
 
+spec! {
+    requires: x >= 128,
+    ensures: ret <= 6,
+}
 /// The tripwire: `x == 0x80` has exactly seven trailing zeros, so a bound of six
 /// is false -- and the witness is the smallest operand the precondition allows.
-/// requires: x >= 128
-/// ensures: ret <= 6
 pub fn trailing_zeros_of_a_top_bit_value_tripwire(x: u8) -> u32 {
     x.trailing_zeros()
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == 8,
+}
 /// `count_zeros` counts the clear bits, so a `u8` of zero has all eight of them.
 /// This is the exactness pin: a model that summed the *set* bits (the polarity
 /// confusion) would answer `0` here and fail, and one that stopped at seven
 /// would fail too.
-/// requires: x == 0
-/// ensures: ret == 8
 pub fn count_zeros_of_zero_is_the_width(x: u8) -> u32 {
     x.count_zeros()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The tripwire: `count_zeros` is not identically zero. `x == 0` has eight clear
 /// bits, so a bound of zero is false -- and a stub that returned a constant `0`
 /// would *prove* this false contract, which is what makes it the pin that the
 /// count is read rather than assumed.
-/// requires: true
-/// ensures: ret == 0
 pub fn count_zeros_of_zero_is_the_width_tripwire(x: u8) -> u32 {
     x.count_zeros()
 }
 
+spec! {
+    requires: x >= 128,
+    ensures: ret >= 1,
+}
 /// `leading_ones` counts the set bits above the highest clear bit, so a value
 /// with the top bit set has at least one -- and the count is on the widened
 /// `u32` result.
-/// requires: x >= 128
-/// ensures: ret >= 1
 pub fn leading_ones_of_a_top_bit_value(x: u8) -> u32 {
     x.leading_ones()
 }
 
+spec! {
+    requires: x >= 128,
+    ensures: ret >= 9,
+}
 /// The tripwire: `x == 0xff` has eight leading ones, so a bound of nine is false
 /// even though it looks safe for every operand with the top bit set.
-/// requires: x >= 128
-/// ensures: ret >= 9
 pub fn leading_ones_of_a_top_bit_value_tripwire(x: u8) -> u32 {
     x.leading_ones()
 }
 
+spec! {
+    requires: x < 128,
+    ensures: ret <= 7,
+}
 /// `trailing_ones` counts the set bits below the lowest clear bit, so a value
 /// below `0x80` has at most seven of them.
-/// requires: x < 128
-/// ensures: ret <= 7
 pub fn trailing_ones_of_a_small_value(x: u8) -> u32 {
     x.trailing_ones()
 }
 
+spec! {
+    requires: x < 128,
+    ensures: ret <= 6,
+}
 /// The tripwire: `x == 0x7f` has exactly seven trailing ones, so a bound of six
 /// is false -- and the witness is the largest operand the precondition allows.
-/// requires: x < 128
-/// ensures: ret <= 6
 pub fn trailing_ones_of_a_small_value_tripwire(x: u8) -> u32 {
     x.trailing_ones()
 }
 
+spec! {
+    requires: x == 128,
+    ensures: ret == true,
+}
 /// `is_power_of_two` is true for the top bit of a `u8`, so the postcondition
 /// holds for `x == 128`. This is the channel pin: the result is a `bool` the
 /// `if` branches on, and a model that wrote a one-bit *word* into the local
 /// would leave it unreadable as a predicate, so this would fail rather than pass.
-/// requires: x == 128
-/// ensures: ret == true
 pub fn is_power_of_two_of_the_top_bit(x: u8) -> bool {
     x.is_power_of_two()
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == true,
+}
 /// The tripwire: `x == 0` is the one value the bare `x & (x - 1) == 0` mask test
 /// would accept, so a model that dropped the `x != 0` conjunct would *prove* this
 /// false contract. It is false because zero is not a power of two.
-/// requires: x == 0
-/// ensures: ret == true
 pub fn is_power_of_two_of_zero_tripwire(x: u8) -> bool {
     x.is_power_of_two()
 }
 
+spec! {
+    requires: x == 3,
+    ensures: ret == false,
+}
 /// The complement pin, and the one the zero tripwire cannot make: three has two
 /// bits set, so the mask test has to be applied at all. A model that answered
 /// "non-zero means a power of two" would *refute* this true contract, where `0`
 /// only catches the opposite mistake -- a missing mask wrongly accepting zero.
-/// requires: x == 3
-/// ensures: ret == false
 pub fn is_power_of_two_of_three(x: u8) -> bool {
     x.is_power_of_two()
 }
 
+spec! {
+    requires: x == 128,
+    ensures: ret == 7,
+}
 /// The predicate is *consumed by a branch*, not only read in a postcondition.
 ///
 /// Every other `is_power_of_two` fixture returns the predicate directly, so the
@@ -5264,8 +6229,6 @@ pub fn is_power_of_two_of_three(x: u8) -> bool {
 /// executor could not branch on -- or a `Val::Bool` the `if` could not read --
 /// would leave the path unknown rather than take the right arm. The two arms
 /// return different constants, so the postcondition fixes which arm was taken.
-/// requires: x == 128
-/// ensures: ret == 7
 pub fn is_power_of_two_branching_takes_the_true_arm(x: u8) -> u8 {
     if x.is_power_of_two() {
         7
@@ -5274,11 +6237,13 @@ pub fn is_power_of_two_branching_takes_the_true_arm(x: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: x == 3,
+    ensures: ret == 9,
+}
 /// The other arm of the same branch: `3` is not a power of two, so the `else`
 /// runs and the postcondition is `9`. Together with the pin above it fixes both
 /// arms, which a model that took a constant arm could not do.
-/// requires: x == 3
-/// ensures: ret == 9
 pub fn is_power_of_two_branching_takes_the_false_arm(x: u8) -> u8 {
     if x.is_power_of_two() {
         7
@@ -5287,12 +6252,14 @@ pub fn is_power_of_two_branching_takes_the_false_arm(x: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == 7,
+}
 /// The branching tripwire: `0` is not a power of two, so the `else` arm runs and
 /// the result is `9`. A model that dropped the `x != 0` conjunct would take the
 /// `then` arm and *prove* this false `ret == 7` -- so the branch, not just the
 /// predicate, is what this pins.
-/// requires: x == 0
-/// ensures: ret == 7
 pub fn is_power_of_two_branching_of_zero_tripwire(x: u8) -> u8 {
     if x.is_power_of_two() {
         7
@@ -5301,54 +6268,66 @@ pub fn is_power_of_two_branching_of_zero_tripwire(x: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: x == i8::MIN,
+    ensures: ret == true,
+}
 /// `is_negative` is true for `i8::MIN`, whose bits (`0x80`) are the *largest*
 /// unsigned byte -- so an unsigned reading of the top bit would call it positive.
 /// This is the signedness pin: the model must compare signed, which is why the
 /// contract is satisfiable only under the signed reading.
-/// requires: x == i8::MIN
-/// ensures: ret == true
 pub fn is_negative_of_min(x: i8) -> bool {
     x.is_negative()
 }
 
+spec! {
+    requires: x == i8::MAX,
+    ensures: ret == false,
+}
 /// The complement pin: `i8::MAX` is positive, so a model that read the top bit
 /// (clear here) as "not negative" and stopped would refute this. It is the pair
 /// to the `MIN` pin above, which alone could be passed by an unsigned `x != 0`.
-/// requires: x == i8::MAX
-/// ensures: ret == false
 pub fn is_negative_of_max(x: i8) -> bool {
     x.is_negative()
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == true,
+}
 /// The tripwire: zero is neither negative nor positive, so this false contract
 /// must be refuted. A model that used the *top bit* rather than a signed compare
 /// would prove it (bit 7 of `0` is clear).
-/// requires: x == 0
-/// ensures: ret == true
 pub fn is_negative_of_zero_tripwire(x: i8) -> bool {
     x.is_negative()
 }
 
+spec! {
+    requires: x == i8::MAX,
+    ensures: ret == true,
+}
 /// `is_positive` is the strict `> 0`, so `i8::MAX` is positive.
-/// requires: x == i8::MAX
-/// ensures: ret == true
 pub fn is_positive_of_max(x: i8) -> bool {
     x.is_positive()
 }
 
+spec! {
+    requires: x == -1,
+    ensures: ret == true,
+}
 /// The tripwire for `is_positive`: `-1` is negative, so this must be refuted. A
 /// model that answered `x != 0` would *prove* it.
-/// requires: x == -1
-/// ensures: ret == true
 pub fn is_positive_of_minus_one_tripwire(x: i8) -> bool {
     x.is_positive()
 }
 
+spec! {
+    requires: x == -1,
+    ensures: ret == 7,
+}
 /// The predicate is consumed by a branch, not only read in a postcondition, so a
 /// `Val::Bool` the `switchInt` could not read would leave the path unknown rather
 /// than take the right arm.
-/// requires: x == -1
-/// ensures: ret == 7
 pub fn is_negative_branching_takes_the_true_arm(x: i8) -> u8 {
     if x.is_negative() {
         7
@@ -5357,29 +6336,38 @@ pub fn is_negative_branching_takes_the_true_arm(x: i8) -> u8 {
     }
 }
 
+spec! {
+    requires: x == 0,
+    requires: r == -1,
+    ensures: ret == 255,
+}
 /// `wrapping_add_signed` adds a signed addend to an unsigned self, and the result
 /// is the plain wrapped sum: `0u8 + (-1i8)` is `255`. This is the *value* pin --
 /// a model that refused the mixed shape, or read the addend as unsigned, would
 /// not produce `255`.
-/// requires: x == 0
-/// requires: r == -1
-/// ensures: ret == 255
 pub fn wrapping_add_signed_of_a_negative(x: u8, r: i8) -> u8 {
     x.wrapping_add_signed(r)
 }
 
+spec! {
+    requires: x == 0,
+    requires: r == -1,
+    ensures: ret == 0,
+}
 /// `saturating_add_signed` clamps at the *addend's* end, not the self type's: an
 /// unsigned self with a negative addend that borrows below zero clamps to `0`,
 /// where the ordinary unsigned `saturating_add` would wrap instead. The
 /// postcondition is the clamp value, so a model that forgot the clamp -- or took
 /// the addend as unsigned -- would not produce `0`.
-/// requires: x == 0
-/// requires: r == -1
-/// ensures: ret == 0
 pub fn saturating_add_signed_clamps_to_zero(x: u8, r: i8) -> u8 {
     x.saturating_add_signed(r)
 }
 
+spec! {
+    requires: x == 0,
+    requires: r == -1,
+    ensures: ret == true,
+}
 /// The flag of a mixed-signedness addition, where the *mathematical* result runs
 /// off the bottom: `0u8 + (-1i8)` is `-1`, which `u8` cannot hold, so the flag is
 /// `true` and the value is the wrapped `255`. The flag is set by the *addend's
@@ -5388,78 +6376,87 @@ pub fn saturating_add_signed_clamps_to_zero(x: u8, r: i8) -> u8 {
 /// `false ^ true`. That is what makes the pin below, where the carry *does* fire
 /// and the flag is nevertheless *clear*, the one that separates this model from
 /// the naive one.
-/// requires: x == 0
-/// requires: r == -1
-/// ensures: ret == true
 pub fn overflowing_add_signed_below_zero_is_overflow(x: u8, r: i8) -> bool {
     x.overflowing_add_signed(r).1
 }
 
+spec! {
+    requires: x == 250,
+    requires: r == -1,
+    ensures: ret == false,
+}
 /// The pin the carry alone cannot make: `250u8 + (-1i8)` is `249`, which `u8`
 /// holds, so the flag is `false` -- even though the addition *carries*, because
 /// the addend reads as `255u8` and `250 + 255` wraps to `249`. A model that took
 /// the bare top-bit carry as the flag would report `true` here and *refute* this
 /// true contract; the addend's sign is what cancels that carry.
-/// requires: x == 250
-/// requires: r == -1
-/// ensures: ret == false
 pub fn overflowing_add_signed_within_range_is_not_overflow(x: u8, r: i8) -> bool {
     x.overflowing_add_signed(r).1
 }
 
+spec! {
+    requires: x == 250,
+    requires: r == 10,
+    ensures: ret == true,
+}
 /// The flag from the other side: `250u8 + 10i8` is `260`, past `u8::MAX`, so the
 /// flag is `true`. Together with the pin above it fixes the flag in both
 /// directions, which is what a model that returned a constant could not do.
-/// requires: x == 250
-/// requires: r == 10
-/// ensures: ret == true
 pub fn overflowing_add_signed_past_the_top_tripwire(x: u8, r: i8) -> bool {
     x.overflowing_add_signed(r).1
 }
 
+spec! {
+    requires: x == 0,
+    requires: r == 128,
+    ensures: ret == -128,
+}
 /// The `_unsigned` direction, where the self operand is signed: `0i8 + 128u8` is
 /// `-128`, the value `wrapping_add_unsigned` produces by reinterpreting the
 /// addend. A model that read the addend as signed (`128u8` as `i8` is `-128`)
 /// would compute `0 + -128` and agree here by accident, so the pin below is the
 /// one that separates the two readings.
-/// requires: x == 0
-/// requires: r == 128
-/// ensures: ret == -128
 pub fn wrapping_add_unsigned_of_the_top_bit(x: i8, r: u8) -> i8 {
     x.wrapping_add_unsigned(r)
 }
 
+spec! {
+    requires: x == 0,
+    requires: r == 128,
+    ensures: ret == 127,
+}
 /// `saturating_add_unsigned` on a signed self clamps to the *signed* maximum
 /// `127`, because the addend is unsigned and can only run off the top. `0i8 +
 /// 128u8` overflows and clamps to `127`. A model that took the unsigned maximum
 /// would return `255`, which reads back as `-1`.
-/// requires: x == 0
-/// requires: r == 128
-/// ensures: ret == 127
 pub fn saturating_add_unsigned_clamps_to_signed_max(x: i8, r: u8) -> i8 {
     x.saturating_add_unsigned(r)
 }
 
+spec! {
+    requires: x == 1,
+    requires: r == 128,
+    ensures: ret == 127,
+}
 /// The tripwire that separates the two readings of the addend: `1i8 + 128u8` is
 /// `129`, past `i8::MAX`, so it clamps to `127`. Reading the addend as signed
 /// gives `1 + (-128)` = `-127`, which is in range and would *refute* this true
 /// contract -- so a model that got the addend's signedness wrong is caught here
 /// and not by the `x == 0` pin, where both readings agree on `-128`.
-/// requires: x == 1
-/// requires: r == 128
-/// ensures: ret == 127
 pub fn saturating_add_unsigned_top_bit_tripwire(x: i8, r: u8) -> i8 {
     x.saturating_add_unsigned(r)
 }
 
+spec! {
+    requires: x == 250,
+    requires: r == -1,
+    ensures: ret == 249,
+}
 /// `checked_add_signed` in range: `250u8 + (-1i8)` is `249`, which `u8` holds, so
 /// the `Some` arm runs and the value is the plain sum. This is the `Some`-value
 /// pin the tripwires below need: without it a model that returned the `None` arm
 /// everywhere would still pass a false contract that happened to name the arm's
 /// constant.
-/// requires: x == 250
-/// requires: r == -1
-/// ensures: ret == 249
 pub fn checked_add_signed_in_range_is_the_sum(x: u8, r: i8) -> u8 {
     match x.checked_add_signed(r) {
         Some(v) => v,
@@ -5467,12 +6464,14 @@ pub fn checked_add_signed_in_range_is_the_sum(x: u8, r: i8) -> u8 {
     }
 }
 
+spec! {
+    requires: x == 1,
+    requires: r == 1,
+    ensures: ret == 2,
+}
 /// `checked_add_unsigned` in range: `1i8 + 1u8` is `2`, so the `Some` arm runs.
 /// The `_unsigned` direction's `Some` value, which the false tripwire below is
 /// the complement of.
-/// requires: x == 1
-/// requires: r == 1
-/// ensures: ret == 2
 pub fn checked_add_unsigned_in_range_is_the_sum(x: i8, r: u8) -> i8 {
     match x.checked_add_unsigned(r) {
         Some(v) => v,
@@ -5480,24 +6479,28 @@ pub fn checked_add_unsigned_in_range_is_the_sum(x: i8, r: u8) -> i8 {
     }
 }
 
+spec! {
+    requires: x == 1,
+    requires: r == 1,
+    ensures: ret == false,
+}
 /// `overflowing_add_unsigned` in range: `1i8 + 1u8` is `2`, in range, so the flag
 /// is `false`. The `_unsigned` flag's clear direction, which the signed self's
 /// carry alone would report as `true` (the addend's non-negative sign does not
 /// cancel it).
-/// requires: x == 1
-/// requires: r == 1
-/// ensures: ret == false
 pub fn overflowing_add_unsigned_within_range_is_not_overflow(x: i8, r: u8) -> bool {
     x.overflowing_add_unsigned(r).1
 }
 
+spec! {
+    requires: x == 0,
+    requires: r == 128,
+    ensures: ret == true,
+}
 /// `overflowing_add_unsigned` off the top: `0i8 + 128u8` is `-128`, past `i8`, so
 /// the flag is `true`. Here the carry alone reports the overflow correctly, so
 /// this pin alone does not separate the two flag models -- the in-range pin above
 /// is the one that does.
-/// requires: x == 0
-/// requires: r == 128
-/// ensures: ret == true
 pub fn overflowing_add_unsigned_past_the_top_is_overflow(x: i8, r: u8) -> bool {
     x.overflowing_add_unsigned(r).1
 }
@@ -5507,44 +6510,52 @@ pub fn overflowing_add_unsigned_past_the_top_is_overflow(x: i8, r: u8) -> bool {
 // rule requires: a model that proves one of these cannot pass the suite. They are
 // kept beside the true pins so the two readings of every shape are pinned at once.
 
+spec! {
+    requires: x == 250,
+    requires: r == -1,
+    ensures: ret == 250,
+}
 /// The `wrapping` value tripwire: `250u8 + (-1i8)` is `249`, so `ret == 250` is
 /// false. The witness is `x == 250, r == -1`.
-/// requires: x == 250
-/// requires: r == -1
-/// ensures: ret == 250
 pub fn wrapping_add_signed_wrong_value_tripwire(x: u8, r: i8) -> u8 {
     x.wrapping_add_signed(r)
 }
 
+spec! {
+    requires: x == 0,
+    requires: r == -1,
+    ensures: ret == 1,
+}
 /// The `saturating` clamp tripwire: `0u8 + (-1i8)` borrows below zero and clamps
 /// to `0`, so `ret == 1` is false. A model that forgot the clamp would wrap to
 /// `255` and also fail this, but a model that clamps to the wrong end would pass
 /// the true pin and fail here.
-/// requires: x == 0
-/// requires: r == -1
-/// ensures: ret == 1
 pub fn saturating_add_signed_wrong_value_tripwire(x: u8, r: i8) -> u8 {
     x.saturating_add_signed(r)
 }
 
+spec! {
+    requires: x == 250,
+    requires: r == -1,
+    ensures: ret == true,
+}
 /// The `overflowing` flag tripwire, in the direction the carry alone gets wrong:
 /// `250u8 + (-1i8)` is `249`, in range, so the flag is `false` and `ret == true`
 /// is false. This is the false contract the *bare-carry* model would prove, since
 /// that model reports the carry (which fires here) as the flag.
-/// requires: x == 250
-/// requires: r == -1
-/// ensures: ret == true
 pub fn overflowing_add_signed_wrong_flag_tripwire(x: u8, r: i8) -> bool {
     x.overflowing_add_signed(r).1
 }
 
+spec! {
+    requires: x == 250,
+    requires: r == 10,
+    ensures: ret == 255,
+}
 /// The `checked` `None` tripwire: `250u8 + 10i8` is `260`, past `u8::MAX`, so the
 /// result is `None` and the match takes the `None` arm returning `0`. Claiming
 /// `ret == 255` -- the wrapped value -- is false, and it is the false contract a
 /// model that treated `checked` as `wrapping` would prove.
-/// requires: x == 250
-/// requires: r == 10
-/// ensures: ret == 255
 pub fn checked_add_signed_none_tripwire(x: u8, r: i8) -> u8 {
     match x.checked_add_signed(r) {
         Some(v) => v,
@@ -5552,45 +6563,53 @@ pub fn checked_add_signed_none_tripwire(x: u8, r: i8) -> u8 {
     }
 }
 
+spec! {
+    requires: x == 0,
+    requires: r == 128,
+    ensures: ret == 127,
+}
 /// The `wrapping` `_unsigned` value tripwire: `0i8 + 128u8` is `-128`, so
 /// `ret == 127` is false -- it is the *saturating* answer, which pins that the
 /// two families are not the same shape.
-/// requires: x == 0
-/// requires: r == 128
-/// ensures: ret == 127
 pub fn wrapping_add_unsigned_wrong_value_tripwire(x: i8, r: u8) -> i8 {
     x.wrapping_add_unsigned(r)
 }
 
+spec! {
+    requires: x == 0,
+    requires: r == 128,
+    ensures: ret == -128,
+}
 /// The `saturating` `_unsigned` value tripwire, the mirror of the pin above:
 /// `0i8 + 128u8` clamps to `127`, so `ret == -128` -- the *wrapping* answer -- is
 /// false. A model that clamped to the unsigned maximum (`255`, read back as `-1`)
 /// or that wrapped would fail the true pin and pass this one.
-/// requires: x == 0
-/// requires: r == 128
-/// ensures: ret == -128
 pub fn saturating_add_unsigned_wrong_value_tripwire(x: i8, r: u8) -> i8 {
     x.saturating_add_unsigned(r)
 }
 
+spec! {
+    requires: x == 1,
+    requires: r == 1,
+    ensures: ret == true,
+}
 /// The `overflowing` `_unsigned` flag tripwire: `1i8 + 1u8` is `2`, in range, so
 /// the flag is `false` and `ret == true` is false. This is the direction the
 /// signed carry gets wrong, because `1i8 + 1u8` read as a signed addition is
 /// `1 + 1`, no overflow -- and read at the addend's sign it is still clear -- so
 /// a model that used either the bare carry or the self sign proves this.
-/// requires: x == 1
-/// requires: r == 1
-/// ensures: ret == true
 pub fn overflowing_add_unsigned_wrong_flag_tripwire(x: i8, r: u8) -> bool {
     x.overflowing_add_unsigned(r).1
 }
 
+spec! {
+    requires: x == 1,
+    requires: r == 1,
+    ensures: ret == 0,
+}
 /// The `checked` `_unsigned` tripwire: `1i8 + 1u8` is `2`, so the `Some` arm runs
 /// and `ret == 0` is false. Together with `checked_add_unsigned_in_range_is_the_sum`
 /// it pins both the value and the arm.
-/// requires: x == 1
-/// requires: r == 1
-/// ensures: ret == 0
 pub fn checked_add_unsigned_wrong_value_tripwire(x: i8, r: u8) -> i8 {
     match x.checked_add_unsigned(r) {
         Some(v) => v,
@@ -5625,84 +6644,104 @@ impl NotPowerOfTwo for u8 {
     }
 }
 
+spec! {
+    requires: x == 1,
+    ensures: ret == false,
+}
 /// `1u8` *is* a power of two under `core`, but the trait above says otherwise, so
 /// the call must read the trait body and the result is `false`. A model that
 /// answered from `core`'s predicate would *refute* this true contract.
-/// requires: x == 1
-/// ensures: ret == false
 pub fn trait_is_power_of_two_disagrees_with_core(x: u8) -> bool {
     NotPowerOfTwo::is_power_of_two(x)
 }
 
+spec! {
+    requires: x == 1,
+    ensures: ret == true,
+}
 /// The false direction: the same call claims `core`'s answer, which the trait body
 /// does not produce, so it must be refuted. This is exactly the contract the
 /// suffix-classification bug *proved*.
-/// requires: x == 1
-/// ensures: ret == true
 pub fn trait_is_power_of_two_disagrees_with_core_tripwire(x: u8) -> bool {
     NotPowerOfTwo::is_power_of_two(x)
 }
 
+spec! {
+    requires: x > 0,
+    ensures: ret < 0,
+}
 /// `saturating_neg` of a positive value is negative: the negation is in range, so
 /// no clamp happens, and the result is `-x`.
-/// requires: x > 0
-/// ensures: ret < 0
 pub fn saturating_neg_of_positive_is_negative(x: i8) -> i8 {
     x.saturating_neg()
 }
 
+spec! {
+    requires: true,
+    ensures: ret < 0,
+}
 /// The tripwire: the *wrapping* negation of `x == 0` is `0`, which is not
 /// negative, so the same claim without the positivity precondition is false.
-/// requires: true
-/// ensures: ret < 0
 pub fn wrapping_neg_is_negative_tripwire(x: i8) -> i8 {
     x.wrapping_neg()
 }
 
+spec! {
+    requires: true,
+    ensures: ret >= 0,
+}
 /// `saturating_abs` is the magnitude, and at `MIN` -- where the magnitude is not
 /// representable -- it clamps to `MAX` rather than wrapping back to `MIN`. So the
 /// result is never negative, for any operand.
-/// requires: true
-/// ensures: ret >= 0
 pub fn saturating_abs_is_never_negative(x: i8) -> i8 {
     x.saturating_abs()
 }
 
+spec! {
+    requires: true,
+    ensures: ret >= 0,
+}
 /// The tripwire: the *wrapping* absolute value of `MIN` is `MIN`, which is
 /// negative, so the same claim about the wrapping family is false.
-/// requires: true
-/// ensures: ret >= 0
 pub fn wrapping_abs_is_never_negative_tripwire(x: i8) -> i8 {
     x.wrapping_abs()
 }
 
+spec! {
+    requires: x <= 0,
+    ensures: ret >= 0,
+}
 /// `saturating_neg` of a non-positive value clamps to zero rather than wrapping,
 /// which is what distinguishes it from `wrapping_neg` at `MIN`.
-/// requires: x <= 0
-/// ensures: ret >= 0
 pub fn saturating_neg_of_non_positive_is_non_negative(x: i8) -> i8 {
     x.saturating_neg()
 }
 
+spec! {
+    requires: x <= 0,
+    ensures: ret >= 0,
+}
 /// The tripwire: `wrapping_neg` at `MIN` is `MIN`, which is negative.
-/// requires: x <= 0
-/// ensures: ret >= 0
 pub fn wrapping_neg_of_non_positive_is_non_negative_tripwire(x: i8) -> i8 {
     x.wrapping_neg()
 }
 
+spec! {
+    requires: x >= 0,
+    ensures: ret == x,
+}
 /// `saturating_abs` is monotone in the sense that its result is at least the
 /// operand when the operand is non-negative -- where it is the identity.
-/// requires: x >= 0
-/// ensures: ret == x
 pub fn saturating_abs_of_non_negative_is_identity(x: i8) -> i8 {
     x.saturating_abs()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x,
+}
 /// The tripwire: for a *negative* operand the identity claim fails, and the
 /// witness is the negation.
-/// requires: true
-/// ensures: ret == x
 pub fn saturating_abs_is_identity_tripwire(x: i8) -> i8 {
     x.saturating_abs()
 }
@@ -5722,58 +6761,70 @@ pub fn saturating_abs_is_identity_tripwire(x: i8) -> i8 {
 // As always, each shape carries one verifying contract and one tripwire.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: true,
+    ensures: ret.1 == true || ret.0 == x + y,
+}
 /// The flag is set exactly when the addition overflowed, so either it did
 /// (the flag is `true`) or the wrapped value is the exact sum. This is the whole
 /// meaning of `overflowing_add` in one contract, and it reads *both* components
 /// of the return through `ret.0` and `ret.1`.
-/// requires: true
-/// ensures: ret.1 == true || ret.0 == x + y
 pub fn overflowing_add_flag_or_exact_sum(x: u8, y: u8) -> (u8, bool) {
     x.overflowing_add(y)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.1 == false,
+}
 /// The tripwire: the flag is *not* always clear -- `0xFF + 1` overflows -- so a
 /// contract that reads `ret.1` and claims it is false must fail.
-/// requires: true
-/// ensures: ret.1 == false
 pub fn overflowing_add_flag_never_set_tripwire(x: u8, y: u8) -> (u8, bool) {
     x.overflowing_add(y)
 }
 
+spec! {
+    requires: x < 16,
+    requires: y < 16,
+    ensures: ret.1 == false,
+}
 /// A guarded addition: with `x < 16` and `y < 16` the sum fits in a `u8`, so the
 /// flag is clear -- and this reads the flag, not just the value.
-/// requires: x < 16
-/// requires: y < 16
-/// ensures: ret.1 == false
 pub fn overflowing_add_small_operands_never_flag(x: u8, y: u8) -> (u8, bool) {
     x.overflowing_add(y)
 }
 
+spec! {
+    requires: x < 16,
+    ensures: ret.1 == false,
+}
 /// The tripwire: dropping the second bound lets `y == 0xFF` through, and
 /// `16 + 0xFF` overflows, so the flag is not always clear.
-/// requires: x < 16
-/// ensures: ret.1 == false
 pub fn overflowing_add_one_bound_only_tripwire(x: u8, y: u8) -> (u8, bool) {
     x.overflowing_add(y)
 }
 
+spec! {
+    requires: x < 16,
+    requires: y < 16,
+    ensures: ret.0 == x + y,
+}
 /// When the addition does not overflow the wrapped value *is* the sum, so a
 /// contract on `ret.0` alone is checkable and must agree with the body's own
 /// arithmetic. The precondition is what makes it true, and it is the value
 /// component this time rather than the flag.
-/// requires: x < 16
-/// requires: y < 16
-/// ensures: ret.0 == x + y
 pub fn overflowing_add_value_is_exact_when_no_overflow(x: u8, y: u8) -> (u8, bool) {
     x.overflowing_add(y)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.0 >= x,
+}
 /// The tripwire: the wrapped value is *not* always at least the left operand.
 /// The contract's own `+` wraps at `u8` exactly as the method does, so an
 /// "exact sum" claim cannot distinguish the two -- the place the wrapping shows
 /// is the order. `0xFF + 1` wraps to `0`, below `x`, and the witness finds it.
-/// requires: true
-/// ensures: ret.0 >= x
 pub fn overflowing_add_wrapped_value_below_operand_tripwire(x: u8, y: u8) -> (u8, bool) {
     x.overflowing_add(y)
 }
@@ -5801,30 +6852,36 @@ pub fn overflowing_add_wrapped_value_below_operand_tripwire(x: u8, y: u8) -> (u8
 // rule.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: true,
+    ensures: ret == 128,
+}
 /// `wrapping_pow(2, 7)` is `128`, which fits in a `u8`; the same base at exponent
 /// `8` wraps to `0`. Stated on the wrapped value, where a wrong fold shows as a
 /// wrong number.
-/// requires: true
-/// ensures: ret == 128
 pub fn wrapping_pow_two_to_seven_is_128() -> u8 {
     2u8.wrapping_pow(7)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 128,
+}
 /// The tripwire: `2^8` wraps to `0` at a `u8`. `256` cannot be written here --
 /// the frontend refuses a literal that does not fit the operand's width, which is
 /// the right refusal, so the claim names the *neighbouring* value instead: a
 /// model that stopped one step early, or folded at the wrong width and truncated
 /// only at the end, agrees on `2^7 == 128` and fails here.
-/// requires: true
-/// ensures: ret == 128
 pub fn wrapping_pow_two_to_eight_is_256_tripwire() -> u8 {
     2u8.wrapping_pow(8)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 128,
+}
 /// `checked_pow` returns `None` exactly where `wrapping_pow` overflowed, so the
 /// match arms meet the `Some` case at `2^7`.
-/// requires: true
-/// ensures: ret == 128
 pub fn checked_pow_two_to_seven_is_some_128() -> u8 {
     match 2u8.checked_pow(7) {
         Some(v) => v,
@@ -5832,10 +6889,12 @@ pub fn checked_pow_two_to_seven_is_some_128() -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 255,
+}
 /// The tripwire: `checked_pow(2, 8)` is `None`, so the `None` arm runs and the
 /// result is `0`, not `255`.
-/// requires: true
-/// ensures: ret == 255
 pub fn checked_pow_two_to_eight_is_none_tripwire() -> u8 {
     match 2u8.checked_pow(8) {
         Some(v) => v,
@@ -5843,123 +6902,151 @@ pub fn checked_pow_two_to_eight_is_none_tripwire() -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 243,
+}
 /// `saturating_pow(3, 5)` is `243`, in range, so no clamp happens.
-/// requires: true
-/// ensures: ret == 243
 pub fn saturating_pow_three_to_five_is_243() -> u8 {
     3u8.saturating_pow(5)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 217,
+}
 /// The tripwire: `3^6` is `729`, past `u8::MAX`, so `saturating_pow` clamps to
 /// `255` rather than wrapping to `217`.
-/// requires: true
-/// ensures: ret == 217
 pub fn saturating_pow_three_to_six_clamps_tripwire() -> u8 {
     3u8.saturating_pow(6)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.1 == false,
+}
 /// The overflow flag is set exactly where the product overflowed, so either it
 /// fired or the value is the exact power -- and `2^7` does not overflow.
-/// requires: true
-/// ensures: ret.1 == false
 pub fn overflowing_pow_two_to_seven_did_not_overflow() -> (u8, bool) {
     2u8.overflowing_pow(7)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.1 == false,
+}
 /// The tripwire: `2^8` *does* overflow a `u8`, so the flag is `true` and the
 /// claim that it did not is false.
-/// requires: true
-/// ensures: ret.1 == false
 pub fn overflowing_pow_two_to_eight_flag_tripwire() -> (u8, bool) {
     2u8.overflowing_pow(8)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == -128,
+}
 /// A signed base: `(-2)^7` is `-128`, the one value in range at this magnitude,
 /// so the wrap does not happen and the result is exactly `MIN`.
-/// requires: true
-/// ensures: ret == -128
 pub fn wrapping_pow_negative_two_to_seven_is_min() -> i8 {
     (-2i8).wrapping_pow(7)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 127,
+}
 /// The tripwire: `(-2)^8` is `256`, past `i8::MAX`, and wraps to `0`. The true
 /// value is not writable as an `i8` literal, so the claim names `i8::MAX`: a
 /// model that read the exponent's bits as signed, or that clamped the signed case
 /// to `MAX` instead of wrapping it, lands there and refutes the claim.
-/// requires: true
-/// ensures: ret == 127
 pub fn wrapping_pow_negative_two_to_eight_wraps_tripwire() -> i8 {
     (-2i8).wrapping_pow(8)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == -128,
+}
 /// `saturating_pow` of a negative base with an *odd* exponent is negative and
 /// past the range, so it clamps to `MIN` rather than `MAX`. This is the signed
 /// clamp direction, and it is the one a "clamp everything to `MAX`" model gets
 /// wrong.
-/// requires: true
-/// ensures: ret == -128
 pub fn saturating_pow_negative_base_clamps_to_min() -> i8 {
     (-3i8).saturating_pow(5)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 127,
+}
 /// The tripwire: the same claim pinned to `MAX` is false, because the true result
 /// is negative.
-/// requires: true
-/// ensures: ret == 127
 pub fn saturating_pow_negative_base_to_max_tripwire() -> i8 {
     (-3i8).saturating_pow(5)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// `pow(x, 0)` is `1` for every base, including `0`. This is the fold's base
 /// case, and it is the one exponent every family agrees on.
-/// requires: true
-/// ensures: ret == 1
 pub fn wrapping_pow_zero_exponent_is_one(x: u8) -> u8 {
     x.wrapping_pow(0)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// The tripwire: `pow(x, 1)` is `x`, not `1`, for every base -- so the claim is
 /// false at every base other than `1`.
-/// requires: true
-/// ensures: ret == 1
 pub fn wrapping_pow_one_exponent_is_one_tripwire(x: u8) -> u8 {
     x.wrapping_pow(1)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 243,
+}
 /// The plain `pow`: `3^5` is `243`, in range, so no panic. The contract names the
 /// exact power, so a model that read the wrong number of exponent bits shows as a
 /// wrong value rather than a wrong panic.
-/// requires: true
-/// ensures: ret == 243
 pub fn plain_pow_three_to_five_is_243() -> u8 {
     3u8.pow(5)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The tripwire: `2^8` overflows a `u8`, so the plain `pow` *panics* rather than
 /// wrapping to `0`. The claim that the value is `0` is false on every path -- the
 /// only live path panics -- so it must be refuted (by the panic, not by a wrapped
 /// value).
-/// requires: true
-/// ensures: ret == 0
 pub fn plain_pow_two_to_eight_would_panic_tripwire() -> u8 {
     2u8.pow(8)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 128,
+}
 /// The panic-freedom control: `2^7` is `128`, exactly in range, so `2u8.pow(7)`
 /// cannot panic and the panic obligation must be discharged.
-/// requires: true
-/// ensures: ret == 128
 pub fn plain_pow_two_to_seven_does_not_panic() -> u8 {
     2u8.pow(7)
 }
 
+spec! {
+    requires: a >= 2,
+    ensures: true,
+}
 /// The panic is *reachable*, not vacuous: a symbolic base in a range that admits
 /// overflow, with the constant exponent `8` that a `u8` cannot hold for any base
 /// `>= 2`. This is the fixture that pins the panic polarity -- a model that
 /// treated the plain `pow` as total would prove this panic-free, which is the
 /// false proof the shape exists to prevent. It must FAIL on the panic obligation.
-/// requires: a >= 2
-/// ensures: true
 pub fn plain_pow_panic_is_reachable(a: u8) -> u8 {
     a.pow(8)
 }
@@ -5978,44 +7065,54 @@ pub fn plain_pow_panic_is_reachable(a: u8) -> u8 {
 // contradicted" gap the standing tripwire rule exists to close.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: x == 0,
+    ensures: ret == 255,
+}
 /// The complement of zero is all ones: `255` at a `u8`. Stated on the operand's
 /// width, so a model that masked at the destination's width would agree here and
 /// disagree at a narrower operand.
-/// requires: x == 0
-/// ensures: ret == 255
 pub fn not_of_zero_is_all_ones(x: u8) -> u8 {
     !x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 255 - x,
+}
 /// `!x == 255 - x` at a `u8`, the identity the mask at the operand's width gives.
 /// An operand is named so the claim is symbolic rather than one input.
-/// requires: true
-/// ensures: ret == 255 - x
 pub fn not_is_255_minus_x(x: u8) -> u8 {
     !x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 255,
+}
 /// The tripwire: `!x` is `255` only at `x == 0`, so claiming it always is false
 /// at every other input. A model that ignored the operand -- `all_ones ^ 0`, or a
 /// constant `255` -- would prove this.
-/// requires: true
-/// ensures: ret == 255
 pub fn not_is_always_255_tripwire(x: u8) -> u8 {
     !x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == -1,
+}
 /// The complement keeps the operand's sign, so at an `i8` the complement of zero
 /// is `-1`, not `255` -- the same bit pattern read as the operand's type.
-/// requires: x == 0
-/// ensures: ret == -1
 pub fn not_of_zero_is_minus_one(x: i8) -> i8 {
     !x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == 4294967295,
+}
 /// The width is the operand's, so a `u32` complement of zero is `4294967295`
 /// rather than the `u8` value. This is the width the mask must be derived from.
-/// requires: x == 0
-/// ensures: ret == 4294967295
 pub fn not_of_zero_u32_is_all_ones(x: u32) -> u32 {
     !x
 }
@@ -6032,23 +7129,29 @@ pub fn not_of_zero_u32_is_all_ones(x: u32) -> u32 {
 // `leaked_requires_is_dropped` is the same function with the struct removed -- the
 // two must agree, which is what makes the tripwire evidence rather than a reading
 // of one file.
-/// requires: x == 0
+spec! {
+    requires: x == 0,
+}
 pub struct LeakSource {
     pub v: u8,
 }
 
+spec! {
+    ensures: ret == 0,
+}
 /// The tripwire: `x` is arbitrary, so `ret == 0` is false at `x != 0`. If the
 /// struct's `requires: x == 0` leaked in, the check would be made only at `x == 0`
 /// and this would *verify* -- the false proof.
-/// ensures: ret == 0
 pub fn leaked_requires_tripwire(x: u8) -> u8 {
     x
 }
 
+spec! {
+    ensures: ret == 0,
+}
 /// The control: the identical function and contract with no struct above it. It
 /// must be refuted for the same reason, so the tripwire's refutation is the
 /// reader dropping the leak and not some other reading.
-/// ensures: ret == 0
 pub fn leaked_requires_is_dropped(x: u8) -> u8 {
     x
 }
@@ -6062,23 +7165,29 @@ pub fn leaked_requires_is_dropped(x: u8) -> u8 {
 //
 // These are `skipped`, not `verified` and not `failed`: a program rustc rejects
 // gets no verdict.
-/// requires: a > b
-/// ensures: ret != 0
+spec! {
+    requires: a > b,
+    ensures: ret != 0,
+}
 pub fn contract_mixed_signedness_compare_is_refused(a: i8, b: u8) -> u8 {
     b
 }
 
+spec! {
+    requires: a + b == 0,
+    ensures: ret != 0,
+}
 /// The same at an arithmetic level, where the reader also picks a sign.
-/// requires: a + b == 0
-/// ensures: ret != 0
 pub fn contract_mixed_signedness_add_is_refused(a: i8, b: u8) -> u8 {
     b
 }
 
+spec! {
+    requires: a < b,
+    ensures: ret == a,
+}
 /// The legal counterpart: two names of the *same* signedness compare and read, so
 /// the refusal is not a blanket ban on two-name comparisons.
-/// requires: a < b
-/// ensures: ret == a
 pub fn contract_same_signedness_compare_still_reads(a: i8, b: i8) -> i8 {
     a
 }
@@ -6095,39 +7204,49 @@ pub fn contract_same_signedness_compare_still_reads(a: i8, b: i8) -> i8 {
 // refused -- a skipped function, not a wrong verdict.
 //
 // These are `skipped`, not `verified` and not `failed`.
-/// requires: true
-/// ensures: (255 >> 8) <= x
+spec! {
+    requires: true,
+    ensures: (255 >> 8) <= x,
+}
 pub fn contract_untyped_shift_amount_over_narrow_width_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: (!0 << 8) <= x,
+}
 /// The left-shift form, and an amount over the narrowest width again.
-/// requires: true
-/// ensures: (!0 << 8) <= x
 pub fn contract_untyped_left_shift_amount_over_narrow_width_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: (255 >> 1) >= y,
+}
 /// The same shape where the operand, not the amount, is what the narrow partner
 /// rejects: `255` is a rustc `literal out of range` for an `i8`.
-/// requires: true
-/// ensures: (255 >> 1) >= y
 pub fn contract_untyped_shift_operand_out_of_narrow_range_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: x == 32,
+    ensures: (1 << 4) <= x,
+}
 /// The control: a shift whose amount is below the narrowest width and whose
 /// operand fits an 8-bit signed value is valid at every width, so it reads.
-/// requires: x == 32
-/// ensures: (1 << 4) <= x
 pub fn contract_fitting_untyped_shift_still_reads(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: a == 8,
+    ensures: (a >> 3) == 1,
+}
 /// The control: a shift of a *typed* name has a known width, so a larger amount is
 /// fine as long as it is below that width.
-/// requires: a == 8
-/// ensures: (a >> 3) == 1
 pub fn contract_typed_shift_still_reads(a: u16) -> u16 {
     a
 }
@@ -6145,23 +7264,29 @@ pub fn contract_typed_shift_still_reads(a: u16) -> u16 {
 // amount never appears and the shift is refused for the amount it really is.
 //
 // These are `skipped`, not `verified` and not `failed`.
-/// requires: true
-/// ensures: (x >> (2 << 7)) == 0
+spec! {
+    requires: true,
+    ensures: (x >> (2 << 7)) == 0,
+}
 pub fn contract_nested_shift_amount_overflow_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: (x >> ((2 << 7) + 1)) == 0,
+}
 /// The same wrapped amount reached through a `+`, so the floor is on the amount
 /// expression as a whole and not only on a bare nested shift.
-/// requires: true
-/// ensures: (x >> ((2 << 7) + 1)) == 0
 pub fn contract_nested_shift_amount_sum_overflow_is_refused(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: (x >> (1 + 1)) <= x,
+}
 /// The control: an amount that fits `i32` and is below the operand width reads.
-/// requires: true
-/// ensures: (x >> (1 + 1)) <= x
 pub fn contract_fitting_shift_amount_still_reads(x: u8) -> u8 {
     x
 }
@@ -6173,25 +7298,31 @@ pub fn contract_fitting_shift_amount_still_reads(x: u8) -> u8 {
 // and *refused* the shift -- a false refusal on a program rustc accepts.
 //
 // The first is `verified`; the two negative controls after it are `skipped`.
-/// requires: true
-/// ensures: (x >> (1u8 + (2 << 7))) <= x
+spec! {
+    requires: true,
+    ensures: (x >> (1u8 + (2 << 7))) <= x,
+}
 pub fn contract_typed_amount_operand_fixes_the_width(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: (x >> (2 << 7u8)) == 0,
+}
 /// The negative control: the `u8` suffix sits in the *nested* shift's amount, not
 /// among the outer amount's operands, so the outer amount stays the `i32`
 /// `2 << 7u8` = `256` -- a shift overflow, and a rustc error.
-/// requires: true
-/// ensures: (x >> (2 << 7u8)) == 0
 pub fn contract_nested_amount_suffix_does_not_fix_the_outer_width(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: (x >> ((1u8) as u16 + (2 << 7))) == 0,
+}
 /// A cast fixes the amount's type and overrides what it casts: `(1u8) as u16` is a
 /// `u16`, so `(1u8) as u16 + (2 << 7)` is `257u16` -- a shift overflow.
-/// requires: true
-/// ensures: (x >> ((1u8) as u16 + (2 << 7))) == 0
 pub fn contract_cast_amount_operand_fixes_the_width(x: u8) -> u8 {
     x
 }
@@ -6209,63 +7340,79 @@ pub fn contract_cast_amount_operand_fixes_the_width(x: u8) -> u8 {
 // fold is what refuses them.
 //
 // These are `skipped`, not `verified` and not `failed`.
-/// requires: true
-/// ensures: y == (200 & 200)
+spec! {
+    requires: true,
+    ensures: y == (200 & 200),
+}
 pub fn contract_literal_in_fold_out_of_range_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: y == (2 & 128),
+}
 /// The masking form: the fold's value `0` fits, but the `128` underneath does not.
-/// requires: true
-/// ensures: y == (2 & 128)
 pub fn contract_masked_literal_out_of_range_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: y == (100 + 100),
+}
 /// A sum whose value `200` is out of range for the `i8` it meets.
-/// requires: true
-/// ensures: y == (100 + 100)
 pub fn contract_constant_sum_value_out_of_range_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: y == (128 - 63),
+}
 /// A difference whose value `65` *fits*, but whose `128` literal does not -- the
 /// case a value-only check cannot see.
-/// requires: true
-/// ensures: y == (128 - 63)
 pub fn contract_literal_in_difference_out_of_range_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: x == 200,
+    ensures: x == (200 & 200),
+}
 /// The control: the same literals under a `u8` partner fit, so the comparison
 /// reads. This keeps the refusal drawn at the range, not at the fold.
-/// requires: x == 200
-/// ensures: x == (200 & 200)
 pub fn contract_fold_literals_in_range_still_read(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: y == -128,
+    ensures: ret == y,
+}
 /// The control: `-128` is the one bare literal a unary `-` rescues for an `i8`,
 /// because the negated value, not the magnitude, is what meets the type.
-/// requires: y == -128
-/// ensures: ret == y
 pub fn contract_bare_negated_bound_still_reads(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: y == -(128 - 63),
+}
 /// A literal *inside* a fold is not rescued by a surrounding `-`: `-(128 - 63)` is
 /// rejected for its inner `128`, unlike `-(128)`.
-/// requires: true
-/// ensures: y == -(128 - 63)
 pub fn contract_literal_in_negated_fold_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: y < (100 >> (!254)),
+}
 /// A shift amount that is an untyped complement has no width of its own: `!254` is
 /// `-255` at the `i32` Rust infers (a shift overflow) but `1` at eight bits, so
 /// the shape is refused rather than read at the scope's width.
-/// requires: true
-/// ensures: y < (100 >> (!254))
 pub fn contract_complement_shift_amount_is_refused(y: i8) -> i8 {
     y
 }
@@ -6283,44 +7430,54 @@ pub fn contract_complement_shift_amount_is_refused(y: i8) -> i8 {
 // refused when the two readings disagree on the overflow.
 //
 // These are `skipped`, not `verified` and not `failed`.
-/// requires: true
-/// ensures: y == ((!127) - 63)
+spec! {
+    requires: true,
+    ensures: y == ((!127) - 63),
+}
 pub fn contract_sign_ambiguous_fold_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: y == ((!127) * 2),
+}
 /// The multiplication form, where the signed reading overflows and the unsigned one
 /// does not: `!127 * 2` is `i8::MIN * 2` (a rustc overflow) but `128 * 2 = 256`
 /// unsigned.
-/// requires: true
-/// ensures: y == ((!127) * 2)
 pub fn contract_sign_ambiguous_mul_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: a == ((!100) * (-0)),
+}
 /// A negated bare literal beside an untyped complement is legal only at a signed
 /// type (`!100 * -0` is `E0277` for a `u16`), so the shape is refused rather than
 /// decided on the wrong reading.
-/// requires: true
-/// ensures: a == ((!100) * (-0))
 pub fn contract_complement_with_negated_literal_is_refused(a: u16) -> u16 {
     a
 }
 
+spec! {
+    requires: a == 65345,
+    ensures: a == ((!127) - 63),
+}
 /// The control: the same fold under a *wider* partner is accepted by rustc and must
 /// still be decided. `(!127) - 63` at sixteen bits is `65408 - 63 = 65345`, in
 /// range, so the two readings agree and the shape reads.
-/// requires: a == 65345
-/// ensures: a == ((!127) - 63)
 pub fn contract_sign_ambiguous_fold_at_wider_width_reads(a: u16) -> u16 {
     a
 }
 
+spec! {
+    requires: x == 254,
+    ensures: x == ((!0) - 1),
+}
 /// The control: a fold of untyped operands that agrees under both readings still
 /// reads. `(!0) - 1` is `255 - 1 = 254` unsigned and `-1 - 1 = -2` signed, and
 /// *neither* overflows at eight bits, so the reader may decide it.
-/// requires: x == 254
-/// ensures: x == ((!0) - 1)
 pub fn contract_agreeing_untyped_fold_still_reads(x: u8) -> u8 {
     x
 }
@@ -6343,94 +7500,116 @@ pub fn contract_agreeing_untyped_fold_still_reads(x: u8) -> u8 {
 // skipped. The envelope now travels in the operand's own payload.
 //
 // These first two are `skipped`: the shapes are rustc range errors.
-/// requires: true
-/// ensures: y == 128i8
+spec! {
+    requires: true,
+    ensures: y == 128i8,
+}
 pub fn contract_suffixed_positive_min_magnitude_is_refused(y: i8) -> i8 {
     y
 }
 
-/// requires: true
-/// ensures: y == -(-128i8)
+spec! {
+    requires: true,
+    ensures: y == -(-128i8),
+}
 pub fn contract_double_negated_min_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: y == -128i8,
+    ensures: ret == y,
+}
 /// The control: `-128i8` is the one suffixed literal a unary `-` rescues, because
 /// the negated value, not the magnitude, is what meets the type. It must read.
-/// requires: y == -128i8
-/// ensures: ret == y
 pub fn contract_suffixed_min_literal_still_reads(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: b == 128i16,
+    ensures: ret == b,
+}
 /// The control: a plain positive suffixed literal well inside range reads.
-/// requires: b == 128i16
-/// ensures: ret == b
 pub fn contract_suffixed_positive_literal_still_reads(b: i16) -> i16 {
     b
 }
 
+spec! {
+    requires: x == !128 && y == 127,
+    ensures: ret == 0,
+}
 /// The two-conjunct case: `x == !128` is a legal `u8` complement and `y == 127` is
 /// a legal `i8` comparison. The complement's operand (`128`) must not be charged to
 /// the unrelated `127`, so the whole contract reads.
-/// requires: x == !128 && y == 127
-/// ensures: ret == 0
 pub fn contract_complement_does_not_pollute_a_bare_literal(x: u8, y: i8) -> u8 {
     let _ = (x, y);
     0
 }
 
+spec! {
+    requires: true,
+    ensures: y <= (!128),
+}
 /// The refusal the complement still owes: `!128` against an `i8` is a `literal out
 /// of range for i8` error, because Rust checks the operand `128`.
-/// requires: true
-/// ensures: y <= (!128)
 pub fn contract_complement_operand_out_of_range_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: (-(!128)) <= y,
+}
 /// The refusal survives a unary `-` around the complement: `-!128` for an `i8` is a
 /// rustc error for the same operand `128`, so the envelope must travel through the
 /// negation, which is a *value* and cannot carry it in the sign.
-/// requires: true
-/// ensures: (-(!128)) <= y
 pub fn contract_negated_complement_operand_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: true,
+    ensures: y == !(!1 - 200),
+}
 /// A nested complement whose operand is a *fold*: `!(!1 - 200)` for an `i8` is a
 /// rustc error for the `200`, and the reader must keep it. The inner complement
 /// `!1` carries `(1, 1)` in its sign, and the fold `!1 - 200` records `200` on its
 /// own term; the outer complement has to union both, or taking the inherited
 /// envelope alone drops the `200` and the reader decides a contract rustc rejects.
-/// requires: true
-/// ensures: y == !(!1 - 200)
 pub fn contract_nested_complement_fold_operand_is_refused(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: y == -128i8 && y == i8::MIN,
+    ensures: ret == y,
+}
 /// A named bound after a suffixed literal of the same bit pattern: `-128i8` records
 /// the written magnitude `128`, and `i8::MIN` is the *same* eight-bit constant, so a
 /// term-keyed envelope charged the literal's `128` to the bound and skipped this
 /// valid contract. Both conjunct orders must read.
-/// requires: y == -128i8 && y == i8::MIN
-/// ensures: ret == y
 pub fn contract_named_min_after_suffixed_min_reads(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: y == i8::MIN && y == -128i8,
+    ensures: ret == y,
+}
 /// The reverse conjunct order, so neither the literal nor the bound is recorded
 /// first in a way that hides the collision.
-/// requires: y == i8::MIN && y == -128i8
-/// ensures: ret == y
 pub fn contract_suffixed_min_after_named_min_reads(y: i8) -> i8 {
     y
 }
 
+spec! {
+    requires: x == 128 && y == i8::MIN,
+    ensures: ret == 0,
+}
 /// The bare-literal form of the same collision: `128` is in range for a `u8` and
 /// `i8::MIN` is valid, but both are the eight-bit constant `0x80`. The bound must
 /// not inherit the literal's envelope in either order.
-/// requires: x == 128 && y == i8::MIN
-/// ensures: ret == 0
 pub fn contract_named_min_after_bare_128_reads(x: u8, y: i8) -> u8 {
     let _ = (x, y);
     0
@@ -6454,29 +7633,35 @@ pub struct Pair(pub u8, pub u8);
 /// whose `.0` is negative, so `d.0 > -100` is a signed comparison.
 pub struct Delta(pub i8);
 
+spec! {
+    requires: p.0 <= p.1,
+    ensures: ret >= p.0,
+}
 /// The positional form of [`struct_reassign_then_field_read`]: a tuple struct's
 /// field read through a reference.
-/// requires: p.0 <= p.1
-/// ensures: ret >= p.0
 pub fn tuple_struct_reads_its_field(p: &Pair) -> u8 {
     if p.0 > p.1 { p.0 } else { p.1 }
 }
 
+spec! {
+    requires: p.0 <= p.1,
+    ensures: ret <= p.1,
+}
 /// The same contract on a *by-value* tuple struct, so the binding does not depend
 /// on reading through the reference.
-/// requires: p.0 <= p.1
-/// ensures: ret <= p.1
 pub fn tuple_struct_by_value_reads_its_field(p: Pair) -> u8 {
     if p.0 > p.1 { p.0 } else { p.1 }
 }
 
+spec! {
+    requires: d.0 < 0,
+    ensures: ret < 0,
+}
 /// A signed tuple field. `d.0 < 0` is satisfiable only under the *signed*
 /// reading of the field, so a reader that took `d.0` as unsigned would find the
 /// precondition unsatisfiable and refuse the contract as vacuous rather than
 /// verify it. `verified` is therefore the evidence that the declared `i8` was
 /// read, not the dump's unsigned default.
-/// requires: d.0 < 0
-/// ensures: ret < 0
 pub fn tuple_struct_signed_field_reads(d: &Delta) -> i8 {
     d.0
 }
@@ -6534,78 +7719,96 @@ impl Couple {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A generic method, monomorphised to `Wrapper<u8>`.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_generic_method(mut w: Wrapper<u8>) -> u8 {
     w.stow(5);
     w.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// An associated function, a `&mut self` builder and a `&self` read in one body.
-/// requires: true
-/// ensures: ret == 5
 pub fn an_associated_fn_and_builder_chain() -> u8 {
     let mut w = Wrapper::seed(0);
     w.stow(5);
     w.peek()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A trait method call on a concrete receiver.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_trait_method(mut s: Slot) -> u8 {
     s.stash(5);
     s.v
 }
 
+spec! {
+    requires: t.0 == 9,
+    ensures: ret == 9,
+}
 /// A `&self` method on a tuple struct, naming a positional field.
-/// requires: t.0 == 9
-/// ensures: ret == 9
 pub fn a_tuple_struct_read_method(t: Couple) -> u8 {
     t.prim()
 }
 
+spec! {
+    requires: t.0 == 3,
+    ensures: ret == 7,
+}
 /// A `&self` method taking an argument.
-/// requires: t.0 == 3
-/// ensures: ret == 7
 pub fn a_method_with_an_argument(t: Couple) -> u8 {
     t.shift_by(4)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A *reborrow* target: `set_five(&mut *r)` where `r: &mut u8`.
 ///
 /// The `&mut *r` names the place `r` already addresses, so the write belongs to the
 /// caller's `x`, not to the local `r`. `resolve` collapses the deref, which is what
 /// makes this one store.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_reborrow_target_reaches_the_caller(mut x: u8) -> u8 {
     let r = &mut x;
     set_five(&mut *r);
     x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_reborrow_target_reaches_the_caller`].
-/// requires: x == 0
-/// ensures: ret == 0
 pub fn a_stale_reborrow_cannot_prove_this(mut x: u8) -> u8 {
     let r = &mut x;
     set_five(&mut *r);
     x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A write through a `&mut` to a *tuple component* target (`&mut t.0`).
-/// requires: true
-/// ensures: ret == 5
 pub fn a_tuple_component_target_reaches_the_caller(mut t: Pair) -> u8 {
     set_five(&mut t.0);
     t.0
 }
 
+spec! {
+    requires: t.0 == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_tuple_component_target_reaches_the_caller`].
-/// requires: t.0 == 0
-/// ensures: ret == 0
 pub fn a_stale_tuple_component_cannot_prove_this(mut t: Pair) -> u8 {
     set_five(&mut t.0);
     t.0
@@ -6647,115 +7850,143 @@ pub fn read_nested(i: &InnerBox) -> u8 {
     i.v
 }
 
+spec! {
+    requires: x == 3,
+    ensures: ret == 3,
+}
 /// A read through a helper's `&u8`.
-/// requires: x == 3
-/// ensures: ret == 3
 pub fn a_read_through_a_helper(x: u8) -> u8 {
     read_through(&x)
 }
 
+spec! {
+    requires: x == 3,
+    ensures: ret == 4,
+}
 /// The false direction of [`a_read_through_a_helper`].
-/// requires: x == 3
-/// ensures: ret == 4
 pub fn a_stale_read_through_a_helper_cannot_prove_this(x: u8) -> u8 {
     read_through(&x)
 }
 
+spec! {
+    requires: x == 3,
+    ensures: ret == 4,
+}
 /// A read-modify-write through a helper's `&mut u8`.
-/// requires: x == 3
-/// ensures: ret == 4
 pub fn a_bump_through_a_helper(mut x: u8) -> u8 {
     bump_through(&mut x);
     x
 }
 
+spec! {
+    requires: x == 3,
+    ensures: ret == 3,
+}
 /// The false direction of [`a_bump_through_a_helper`]: the bump must be visible.
-/// requires: x == 3
-/// ensures: ret == 3
 pub fn a_stale_bump_cannot_prove_this(mut x: u8) -> u8 {
     bump_through(&mut x);
     x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// Two `&mut` to different fields in one call, and the first field read back.
-/// requires: true
-/// ensures: ret == 5
 pub fn two_reference_arguments(mut c: Config) -> u8 {
     set_two(&mut c.lo, &mut c.hi);
     c.lo
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The *other* field of the same two-reference call.
-/// requires: true
-/// ensures: ret == 7
 pub fn two_reference_arguments_other(mut c: Config) -> u8 {
     set_two(&mut c.lo, &mut c.hi);
     c.hi
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// The false direction: `hi` must not read `lo`'s value.
-/// requires: true
-/// ensures: ret == 5
 pub fn two_reference_arguments_swapped_cannot_prove_this(mut c: Config) -> u8 {
     set_two(&mut c.lo, &mut c.hi);
     c.hi
 }
 
+spec! {
+    requires: c.lo == 1 && c.hi == 2,
+    ensures: ret == 2,
+}
 /// A swap through two references: both fields are *read*, which is the case that
 /// needs the referent's value carried into the callee, not just its parts.
-/// requires: c.lo == 1 && c.hi == 2
-/// ensures: ret == 2
 pub fn a_swap_through_two_references(mut c: Config) -> u8 {
     swap_two(&mut c.lo, &mut c.hi);
     c.lo
 }
 
+spec! {
+    requires: c.lo == 1 && c.hi == 2,
+    ensures: ret == 1,
+}
 /// The other half of the swap.
-/// requires: c.lo == 1 && c.hi == 2
-/// ensures: ret == 1
 pub fn a_swap_through_two_references_other(mut c: Config) -> u8 {
     swap_two(&mut c.lo, &mut c.hi);
     c.hi
 }
 
+spec! {
+    requires: c.lo == 1 && c.hi == 2,
+    ensures: ret == 1,
+}
 /// The false direction of the swap: `lo` must not still be 1.
-/// requires: c.lo == 1 && c.hi == 2
-/// ensures: ret == 1
 pub fn a_stale_swap_cannot_prove_this(mut c: Config) -> u8 {
     swap_two(&mut c.lo, &mut c.hi);
     c.lo
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A helper writing a nested aggregate target (`&mut o.i`) must land on `o.i.v`.
 /// Before the copy-back was re-based on the target's projection, this write was
 /// dropped: the true contract `ret == 5` was refuted and the false `ret == 0` was
 /// **proved**.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_nested_aggregate_target_reaches(mut o: OuterBox) -> u8 {
     write_nested(&mut o.i);
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_nested_aggregate_target_reaches`] -- the one that was
 /// wrongly proved before the re-basing.
-/// requires: o.i.v == 0
-/// ensures: ret == 0
 pub fn a_stale_nested_aggregate_cannot_prove_this(mut o: OuterBox) -> u8 {
     write_nested(&mut o.i);
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 3,
+    ensures: ret == 3,
+}
 /// A *read* of a nested aggregate target (`&o.i`).
-/// requires: o.i.v == 3
-/// ensures: ret == 3
 pub fn a_nested_aggregate_read(o: OuterBox) -> u8 {
     read_nested(&o.i)
 }
 
+spec! {
+    requires: o.i.v == 3,
+    ensures: ret == 4,
+}
 /// The false direction of [`a_nested_aggregate_read`].
-/// requires: o.i.v == 3
-/// ensures: ret == 4
 pub fn a_stale_nested_aggregate_read_cannot_prove_this(o: OuterBox) -> u8 {
     read_nested(&o.i)
 }
@@ -6774,70 +8005,86 @@ impl InnerBox {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A method on a *nested-field* receiver: `o.i.set_leaf(5)`.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_method_on_a_nested_receiver(mut o: OuterBox) -> u8 {
     o.i.set_leaf(5);
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_method_on_a_nested_receiver`].
-/// requires: o.i.v == 0
-/// ensures: ret == 0
 pub fn a_stale_nested_receiver_cannot_prove_this(mut o: OuterBox) -> u8 {
     o.i.set_leaf(5);
     o.i.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// Two method calls in sequence on one receiver: the later write must win.
-/// requires: true
-/// ensures: ret == 7
 pub fn two_methods_in_sequence(mut o: OuterBox) -> u8 {
     o.i.set_leaf(5);
     o.i.set_leaf(7);
     o.i.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// The false direction: the first call's 5 must not survive.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_stale_first_method_cannot_prove_this(mut o: OuterBox) -> u8 {
     o.i.set_leaf(5);
     o.i.set_leaf(7);
     o.i.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A method call through a *reborrowed* receiver (`let r = &mut o; r.i.set_leaf(5)`).
-/// requires: true
-/// ensures: ret == 5
 pub fn a_method_through_a_reborrow(mut o: OuterBox) -> u8 {
     let r = &mut o;
     r.i.set_leaf(5);
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_method_through_a_reborrow`].
-/// requires: o.i.v == 0
-/// ensures: ret == 0
 pub fn a_stale_reborrow_receiver_cannot_prove_this(mut o: OuterBox) -> u8 {
     let r = &mut o;
     r.i.set_leaf(5);
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 9,
+    ensures: ret == 9,
+}
 /// A `&self` method whose result feeds a `&mut` write on the same struct.
-/// requires: o.i.v == 9
-/// ensures: ret == 9
 pub fn a_read_method_feeds_a_write(mut o: OuterBox) -> u8 {
     let t = o.i.get_leaf();
     o.i.set_leaf(t);
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 9,
+    ensures: ret == 8,
+}
 /// The false direction of [`a_read_method_feeds_a_write`].
-/// requires: o.i.v == 9
-/// ensures: ret == 8
 pub fn a_stale_read_method_cannot_prove_this(mut o: OuterBox) -> u8 {
     let t = o.i.get_leaf();
     o.i.set_leaf(t);
@@ -6856,19 +8103,23 @@ pub fn write_duo(d: &mut DuoBox) {
     d.v = 5;
 }
 
+spec! {
+    requires: d.w == 9,
+    ensures: ret == 9,
+}
 /// A leaf write through a `&mut` target leaves the target's *sibling* leaf at the
 /// caller's seed.
-/// requires: d.w == 9
-/// ensures: ret == 9
 pub fn a_leaf_write_leaves_its_sibling(mut d: DuoBox) -> u8 {
     write_duo(&mut d);
     d.w
 }
 
+spec! {
+    requires: d.w == 9,
+    ensures: ret == 5,
+}
 /// The false direction of [`a_leaf_write_leaves_its_sibling`]: the sibling is not
 /// the value that was written.
-/// requires: d.w == 9
-/// ensures: ret == 5
 pub fn a_stale_leaf_sibling_cannot_prove_this(mut d: DuoBox) -> u8 {
     write_duo(&mut d);
     d.w
@@ -6908,51 +8159,63 @@ pub fn borrowed_identity(x: &mut u8) -> &mut u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A two-frame chain: the caller's write goes through `pass_on` into `relay_set`.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_two_frame_chain(mut x: u8) -> u8 {
     pass_on(&mut x, 5);
     x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_two_frame_chain`].
-/// requires: x == 0
-/// ensures: ret == 0
 pub fn a_stale_two_frame_chain_cannot_prove_this(mut x: u8) -> u8 {
     pass_on(&mut x, 5);
     x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A two-frame chain whose inner write is a constant.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_two_frame_constant(mut x: u8) -> u8 {
     pass_on_five(&mut x);
     x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_two_frame_constant`].
-/// requires: x == 0
-/// ensures: ret == 0
 pub fn a_stale_two_frame_constant_cannot_prove_this(mut x: u8) -> u8 {
     pass_on_five(&mut x);
     x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A write through a reference *returned* by a helper.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_write_through_a_returned_reference(mut x: u8) -> u8 {
     let r = borrowed_identity(&mut x);
     *r = 5;
     x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_write_through_a_returned_reference`] -- the one that
 /// was wrongly proved before the returned reference kept its address.
-/// requires: x == 0
-/// ensures: ret == 0
 pub fn a_stale_returned_reference_cannot_prove_this(mut x: u8) -> u8 {
     let r = borrowed_identity(&mut x);
     *r = 5;
@@ -6978,56 +8241,68 @@ impl Config {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A write through a `&mut` to a field *returned by a method*: `*c.lo_mut() = 5`.
 ///
 /// The returned reference names a place in the *callee's* terms (`&mut (*_1).0`),
 /// and `_1` is the caller's `c`, so the write belongs to `c.lo`. Without that
 /// translation the returned reference named nothing, the write was dropped, the true
 /// `ret == 5` was refuted, and the false `ret == 0` was **proved**.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_write_through_a_returned_field_reference(mut c: Config) -> u8 {
     *c.lo_mut() = 5;
     c.lo
 }
 
+spec! {
+    requires: c.lo == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_write_through_a_returned_field_reference`] -- the one
 /// that was wrongly proved.
-/// requires: c.lo == 0
-/// ensures: ret == 0
 pub fn a_stale_returned_field_reference_cannot_prove_this(mut c: Config) -> u8 {
     *c.lo_mut() = 5;
     c.lo
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The same for the *other* field, so the translation cannot be a coincidence of one
 /// index.
-/// requires: true
-/// ensures: ret == 7
 pub fn a_write_through_the_other_returned_reference(mut c: Config) -> u8 {
     *c.hi_mut() = 7;
     c.hi
 }
 
+spec! {
+    requires: c.hi == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_write_through_the_other_returned_reference`].
-/// requires: c.hi == 0
-/// ensures: ret == 0
 pub fn a_stale_other_returned_reference_cannot_prove_this(mut c: Config) -> u8 {
     *c.hi_mut() = 7;
     c.hi
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// A builder whose returned `&mut Self` is read back.
-/// requires: true
-/// ensures: ret == 9
 pub fn a_write_through_a_returned_builder(mut c: Config) -> u8 {
     c.touch(9);
     c.lo
 }
 
+spec! {
+    requires: c.lo == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_write_through_a_returned_builder`].
-/// requires: c.lo == 0
-/// ensures: ret == 0
 pub fn a_stale_returned_builder_cannot_prove_this(mut c: Config) -> u8 {
     c.touch(9);
     c.lo
@@ -7051,84 +8326,104 @@ impl OuterBox {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A write through a `&mut` to a *nested* field returned by a helper: the returned
 /// place is two steps deep in the caller (`o.i.v`), so the translation has to carry
 /// the whole projection, not just the head local.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_write_through_a_returned_nested_reference(mut o: OuterBox) -> u8 {
     *nested_mut(&mut o) = 5;
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_write_through_a_returned_nested_reference`].
-/// requires: o.i.v == 0
-/// ensures: ret == 0
 pub fn a_stale_returned_nested_reference_cannot_prove_this(mut o: OuterBox) -> u8 {
     *nested_mut(&mut o) = 5;
     o.i.v
 }
 
+spec! {
+    requires: o.j.v == 3,
+    ensures: ret == 3,
+}
 /// A write to `o.i.v` must leave `o.j.v` alone.
-/// requires: o.j.v == 3
-/// ensures: ret == 3
 pub fn a_returned_nested_reference_leaves_its_sibling(mut o: OuterBox) -> u8 {
     *nested_mut(&mut o) = 5;
     o.j.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// The same through a *method* returning `&mut self.i.v`.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_write_through_a_method_nested_reference(mut o: OuterBox) -> u8 {
     *o.inner_mut() = 5;
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_write_through_a_method_nested_reference`].
-/// requires: o.i.v == 0
-/// ensures: ret == 0
 pub fn a_stale_method_nested_reference_cannot_prove_this(mut o: OuterBox) -> u8 {
     *o.inner_mut() = 5;
     o.i.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A returned reference to the *second* argument, so the translation must pick the
 /// right argument and not the first.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_write_through_a_second_argument_reference(mut a: OuterBox, mut b: InnerBox) -> u8 {
     *pick_second(&mut a, &mut b) = 5;
     b.v
 }
 
+spec! {
+    requires: b.v == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_write_through_a_second_argument_reference`].
-/// requires: b.v == 0
-/// ensures: ret == 0
 pub fn a_stale_second_argument_reference_cannot_prove_this(mut a: OuterBox, mut b: InnerBox) -> u8 {
     *pick_second(&mut a, &mut b) = 5;
     b.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// A reference returned by one call, passed straight into another.
-/// requires: true
-/// ensures: ret == 1
 pub fn a_reference_returned_into_another_call(mut c: Config) -> u8 {
     write_one(borrowed_identity(&mut c.lo));
     c.lo
 }
 
+spec! {
+    requires: c.lo == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_reference_returned_into_another_call`].
-/// requires: c.lo == 0
-/// ensures: ret == 0
 pub fn a_stale_returned_into_another_call_cannot_prove_this(mut c: Config) -> u8 {
     write_one(borrowed_identity(&mut c.lo));
     c.lo
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A reborrow of a returned reference.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_reborrow_of_a_returned_reference(mut x: u8) -> u8 {
     let r = borrowed_identity(&mut x);
     let s = &mut *r;
@@ -7136,9 +8431,11 @@ pub fn a_reborrow_of_a_returned_reference(mut x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_reborrow_of_a_returned_reference`].
-/// requires: x == 0
-/// ensures: ret == 0
 pub fn a_stale_reborrow_of_a_returned_reference_cannot_prove_this(mut x: u8) -> u8 {
     let r = borrowed_identity(&mut x);
     let s = &mut *r;
@@ -7146,9 +8443,11 @@ pub fn a_stale_reborrow_of_a_returned_reference_cannot_prove_this(mut x: u8) -> 
     x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// Two returned references to *different* fields, both written, and the first read.
-/// requires: true
-/// ensures: ret == 5
 pub fn two_returned_field_references(mut c: Config) -> u8 {
     let r = borrowed_identity(&mut c.lo);
     let s = borrowed_identity(&mut c.hi);
@@ -7157,10 +8456,12 @@ pub fn two_returned_field_references(mut c: Config) -> u8 {
     c.lo
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The false direction of [`two_returned_field_references`]: the *other* field's
 /// write must not land on `lo`.
-/// requires: true
-/// ensures: ret == 7
 pub fn a_stale_two_returned_fields_cannot_prove_this(mut c: Config) -> u8 {
     let r = borrowed_identity(&mut c.lo);
     let s = borrowed_identity(&mut c.hi);
@@ -7169,17 +8470,21 @@ pub fn a_stale_two_returned_fields_cannot_prove_this(mut c: Config) -> u8 {
     c.lo
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A returned reference to a *tuple component*.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_returned_tuple_component_reference(mut t: (u8, u8)) -> u8 {
     *tuple_mut(&mut t) = 5;
     t.0
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_returned_tuple_component_reference`].
-/// requires: true
-/// ensures: ret == 0
 pub fn a_stale_tuple_component_reference_cannot_prove_this(mut t: (u8, u8)) -> u8 {
     *tuple_mut(&mut t) = 5;
     t.0
@@ -7211,81 +8516,101 @@ pub fn swap_two_elements(a: &mut [u8; 2]) {
     a[1] = t;
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// Two `&mut` to different *aggregate* fields in one call, and the first read back.
-/// requires: true
-/// ensures: ret == 5
 pub fn two_aggregate_reference_targets(mut o: OuterBox) -> u8 {
     set_two_parts(&mut o.i, &mut o.j);
     o.i.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The *other* aggregate field of the same call.
-/// requires: true
-/// ensures: ret == 7
 pub fn two_aggregate_reference_targets_other(mut o: OuterBox) -> u8 {
     set_two_parts(&mut o.i, &mut o.j);
     o.j.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The false direction: the two aggregate writes must not collapse onto one.
-/// requires: true
-/// ensures: ret == 7
 pub fn a_stale_two_aggregate_targets_cannot_prove_this(mut o: OuterBox) -> u8 {
     set_two_parts(&mut o.i, &mut o.j);
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 1 && o.j.v == 2,
+    ensures: ret == 2,
+}
 /// A swap of two aggregate fields, so both referents are read.
-/// requires: o.i.v == 1 && o.j.v == 2
-/// ensures: ret == 2
 pub fn a_swap_of_two_aggregate_targets(mut o: OuterBox) -> u8 {
     swap_two_parts(&mut o.i, &mut o.j);
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 1 && o.j.v == 2,
+    ensures: ret == 1,
+}
 /// The false direction of [`a_swap_of_two_aggregate_targets`].
-/// requires: o.i.v == 1 && o.j.v == 2
-/// ensures: ret == 1
 pub fn a_stale_swap_of_aggregate_targets_cannot_prove_this(mut o: OuterBox) -> u8 {
     swap_two_parts(&mut o.i, &mut o.j);
     o.i.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// Two element writes through one `&mut` to the whole array, first element read.
-/// requires: true
-/// ensures: ret == 5
 pub fn two_elements_through_one_reference(mut a: [u8; 2]) -> u8 {
     set_two_elements(&mut a);
     a[0]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The *other* element of the same call.
-/// requires: true
-/// ensures: ret == 7
 pub fn two_elements_through_one_reference_other(mut a: [u8; 2]) -> u8 {
     set_two_elements(&mut a);
     a[1]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The false direction: the two element writes must not collapse onto one.
-/// requires: true
-/// ensures: ret == 7
 pub fn a_stale_two_elements_cannot_prove_this(mut a: [u8; 2]) -> u8 {
     set_two_elements(&mut a);
     a[0]
 }
 
+spec! {
+    requires: a[0] == 1 && a[1] == 2,
+    ensures: ret == 2,
+}
 /// An element swap through a `&mut` to the whole array.
-/// requires: a[0] == 1 && a[1] == 2
-/// ensures: ret == 2
 pub fn a_swap_of_two_elements(mut a: [u8; 2]) -> u8 {
     swap_two_elements(&mut a);
     a[0]
 }
 
+spec! {
+    requires: a[0] == 1 && a[1] == 2,
+    ensures: ret == 1,
+}
 /// The false direction of [`a_swap_of_two_elements`].
-/// requires: a[0] == 1 && a[1] == 2
-/// ensures: ret == 1
 pub fn a_stale_swap_of_elements_cannot_prove_this(mut a: [u8; 2]) -> u8 {
     swap_two_elements(&mut a);
     a[0]
@@ -7301,37 +8626,49 @@ pub fn put_duo_v(d: &mut DuoBox, x: u8) {
     d.v = x;
 }
 
+spec! {
+    requires: d.v == 7,
+    ensures: ret == 7,
+}
 /// A scalar field read through a helper's `&DuoBox`: the referent's parts are
 /// carried in, and the callee's read of `d.v` resolves to the caller's `d.v`.
-/// requires: d.v == 7
-/// ensures: ret == 7
 pub fn a_scalar_field_read_through_a_reference(d: DuoBox) -> u8 {
     take_duo_v(&d)
 }
 
+spec! {
+    requires: d.v == 7,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_scalar_field_read_through_a_reference`].
-/// requires: d.v == 7
-/// ensures: ret == 0
 pub fn a_stale_scalar_field_read_cannot_prove_this(d: DuoBox) -> u8 {
     take_duo_v(&d)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A scalar field written through a helper's `&mut DuoBox`.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_scalar_field_write_through_a_reference(mut d: DuoBox) -> u8 {
     put_duo_v(&mut d, 5);
     d.v
 }
 
+spec! {
+    requires: d.v == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_scalar_field_write_through_a_reference`].
-/// requires: d.v == 0
-/// ensures: ret == 0
 pub fn a_stale_scalar_field_write_cannot_prove_this(mut d: DuoBox) -> u8 {
     put_duo_v(&mut d, 5);
     d.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A write through *two* levels of `&mut`: `**rr = 5` on a `&mut &mut u8`.
 ///
 /// Lowers to `_4 = no_retag copy (*_3); (*_4) = 5`, where `_4` is a `&mut u8`. The
@@ -7339,8 +8676,6 @@ pub fn a_stale_scalar_field_write_cannot_prove_this(mut d: DuoBox) -> u8 {
 /// *through* a deref had no branch, so `_4` got no address and the write was dropped:
 /// the false `ret == 0` was proved against a body that returns 5, and the true
 /// `ret == 5` was refuted.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_write_through_two_levels_of_reference(mut x: u8) -> u8 {
     let mut r = &mut x;
     let rr = &mut r;
@@ -7348,10 +8683,12 @@ pub fn a_write_through_two_levels_of_reference(mut x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_write_through_two_levels_of_reference`]: if the write
 /// were dropped, this would verify.
-/// requires: x == 0
-/// ensures: ret == 0
 pub fn a_stale_two_level_write_cannot_prove_this(mut x: u8) -> u8 {
     let mut r = &mut x;
     let rr = &mut r;
@@ -7359,27 +8696,33 @@ pub fn a_stale_two_level_write_cannot_prove_this(mut x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 3,
+    ensures: ret == 3,
+}
 /// A *read* through two levels of reference: `**rr`.
-/// requires: x == 3
-/// ensures: ret == 3
 pub fn a_read_through_two_levels_of_reference(x: u8) -> u8 {
     let r = &x;
     let rr = &r;
     **rr
 }
 
+spec! {
+    requires: x == 3,
+    ensures: ret == 4,
+}
 /// The false direction of [`a_read_through_two_levels_of_reference`].
-/// requires: x == 3
-/// ensures: ret == 4
 pub fn a_stale_two_level_read_cannot_prove_this(x: u8) -> u8 {
     let r = &x;
     let rr = &r;
     **rr
 }
 
+spec! {
+    requires: x == 3,
+    ensures: ret == 3,
+}
 /// A write through a reference to a *local copy* must not reach the original.
-/// requires: x == 3
-/// ensures: ret == 3
 pub fn a_write_to_a_copy_stays_in_the_copy(x: u8) -> u8 {
     let mut y = x;
     let r = &mut y;
@@ -7387,10 +8730,12 @@ pub fn a_write_to_a_copy_stays_in_the_copy(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: x == 3,
+    ensures: ret == 9,
+}
 /// The false direction of [`a_write_to_a_copy_stays_in_the_copy`]: if the copy
 /// aliased the original, this would verify.
-/// requires: x == 3
-/// ensures: ret == 9
 pub fn a_stale_copy_write_cannot_prove_this(x: u8) -> u8 {
     let mut y = x;
     let r = &mut y;
@@ -7398,10 +8743,12 @@ pub fn a_stale_copy_write_cannot_prove_this(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: c.lo == 1 && c.hi == 2,
+    ensures: ret == 2,
+}
 /// A copy from one reference target to another: `*r = *s` where the two point at
 /// different fields.
-/// requires: c.lo == 1 && c.hi == 2
-/// ensures: ret == 2
 pub fn a_copy_between_two_reference_targets(mut c: Config) -> u8 {
     let r = &mut c.lo;
     let s = &mut c.hi;
@@ -7409,10 +8756,12 @@ pub fn a_copy_between_two_reference_targets(mut c: Config) -> u8 {
     c.lo
 }
 
+spec! {
+    requires: c.lo == 1 && c.hi == 2,
+    ensures: ret == 1,
+}
 /// The false direction of [`a_copy_between_two_reference_targets`]: if the copy
 /// went the wrong way, or `*s` read the stale `lo`, this would verify.
-/// requires: c.lo == 1 && c.hi == 2
-/// ensures: ret == 1
 pub fn a_stale_copy_between_reference_targets_cannot_prove_this(mut c: Config) -> u8 {
     let r = &mut c.lo;
     let s = &mut c.hi;
@@ -7420,13 +8769,15 @@ pub fn a_stale_copy_between_reference_targets_cannot_prove_this(mut c: Config) -
     c.lo
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A field written through a *double* reference to a struct: `(**rr).lo = 5`.
 ///
 /// The `*` chain is local, so both levels resolve inside the frame; it is the
 /// *argument* case (`relay(&mut r)` with `v: &mut &mut u8`) that crosses frames and
 /// is refused.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_write_through_a_double_reference_to_a_struct(mut c: Config) -> u8 {
     let mut r = &mut c;
     let rr = &mut r;
@@ -7434,9 +8785,11 @@ pub fn a_write_through_a_double_reference_to_a_struct(mut c: Config) -> u8 {
     c.lo
 }
 
+spec! {
+    requires: c.lo == 0,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_write_through_a_double_reference_to_a_struct`].
-/// requires: c.lo == 0
-/// ensures: ret == 0
 pub fn a_stale_double_reference_struct_cannot_prove_this(mut c: Config) -> u8 {
     let mut r = &mut c;
     let rr = &mut r;
@@ -7444,14 +8797,16 @@ pub fn a_stale_double_reference_struct_cannot_prove_this(mut c: Config) -> u8 {
     c.lo
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A call through a reference to a reference is *refused*, not modelled.
 ///
 /// `relay(&mut r)` with `relay(v: &mut &mut u8) { **v = 5 }` crosses two frames: the
 /// outer referent lives in the caller and the callee reaches it with its own local
 /// index. The write was dropped, so the false `ret == 0` was **proved**; refusing
 /// leaves the true contract unproved instead.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_call_through_a_reference_to_a_reference_is_refused(mut x: u8) -> u8 {
     let mut r = &mut x;
     relay_two(&mut r);
@@ -7463,40 +8818,52 @@ pub fn relay_two(v: &mut &mut u8) {
     **v = 5;
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A helper whose own `ensures` is false: the body returns 3, not 5.
 ///
 /// Its purpose is the *caller* below. Assuming a callee's `ensures` instead of
 /// inlining its body is the canonical way a verifier proves a false contract, so
 /// this pair pins the property that the frontend never does.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_helper_whose_contract_is_false() -> u8 {
     3
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// The caller of [`a_helper_whose_contract_is_false`]. If the callee's `ensures`
 /// were assumed rather than its body inlined, this false contract would verify.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_caller_of_a_lying_helper_cannot_prove_this() -> u8 {
     a_helper_whose_contract_is_false()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// The same call with the contract the body actually satisfies, so the *shape* is
 /// shown to be decidable and only the false direction fails.
-/// requires: true
-/// ensures: ret == 3
 pub fn a_caller_of_a_lying_helper_knows_the_truth() -> u8 {
     a_helper_whose_contract_is_false()
 }
 
+spec! {
+    requires: x == 99,
+    ensures: ret == x,
+}
 /// A helper with an unsatisfiable precondition.
-/// requires: x == 99
-/// ensures: ret == x
 pub fn a_helper_that_needs_99(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// A call that violates its callee's precondition.
 ///
 /// This one *verifies*, and that is the honest answer rather than a false proof:
@@ -7505,79 +8872,98 @@ pub fn a_helper_that_needs_99(x: u8) -> u8 {
 /// `ret == 7` really does hold. The name says `_is_not_checked` rather than
 /// `_cannot_prove_this` because this entry is *not* a false-direction probe and
 /// must not be counted as one.
-/// requires: true
-/// ensures: ret == 7
 pub fn a_call_that_violates_a_precondition_is_not_checked() -> u8 {
     a_helper_that_needs_99(7)
 }
 
+spec! {
+    requires: x != 0,
+    ensures: ret == 10 / x,
+}
 /// A helper whose precondition rules out zero, so its division is safe.
-/// requires: x != 0
-/// ensures: ret == 10 / x
 pub fn a_helper_that_divides_ten(x: u8) -> u8 {
     10 / x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// The same call-site violation, but where the callee's body *panics* on the
 /// violated input. Inlining the body is what catches this: the division by zero
 /// is an obligation of the inlined path, so the false `ret == 5` fails on a panic
 /// rather than verifying. This is why "the precondition is not checked at the
 /// call site" is sound-incomplete and not unsound.
-/// requires: true
-/// ensures: ret == 5
 pub fn a_call_that_divides_by_zero_cannot_prove_this() -> u8 {
     a_helper_that_divides_ten(0)
 }
 
+spec! {
+    requires: x > 200 && x < 10,
+    ensures: ret == 99,
+}
 /// A helper with an *unsatisfiable* precondition and a postcondition that is false
 /// for its body.
 ///
 /// The dangerous shape: a verifier that reads "the precondition is vacuous, so the
 /// contract holds trivially" may then assume `ret == 99` after any call. The body
 /// returns its argument, so that assumption is a false proof.
-/// requires: x > 200 && x < 10
-/// ensures: ret == 99
 pub fn a_vacuous_helper_whose_postcondition_is_false(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 99,
+}
 /// The caller of [`a_vacuous_helper_whose_postcondition_is_false`]. If the callee's
 /// postcondition were assumed, this false contract would verify.
-/// requires: true
-/// ensures: ret == 99
 pub fn a_caller_inheriting_a_vacuous_lie_cannot_prove_this() -> u8 {
     a_vacuous_helper_whose_postcondition_is_false(0)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The honest direction of the same call: what the body actually returns.
-/// requires: true
-/// ensures: ret == 0
 pub fn a_caller_of_a_vacuous_helper_knows_the_truth() -> u8 {
     a_vacuous_helper_whose_postcondition_is_false(0)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// Recursion whose contract is false. Assuming the recursive call's postcondition
 /// is the inductive step of a false proof.
-/// requires: true
-/// ensures: ret == 0
 pub fn a_recursive_contract_that_is_false_cannot_prove_this(n: u8) -> u8 {
     if n == 0 { 0 } else { a_recursive_contract_that_is_false_cannot_prove_this(n - 1) + 1 }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// One half of a mutually recursive pair whose contracts are false.
-/// requires: true
-/// ensures: ret == 0
 pub fn a_mutual_lie_a_cannot_prove_this(n: u8) -> u8 {
     if n == 0 { 0 } else { a_mutual_lie_b_cannot_prove_this(n - 1) + 1 }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The other half of the mutually recursive pair.
-/// requires: true
-/// ensures: ret == 0
 pub fn a_mutual_lie_b_cannot_prove_this(n: u8) -> u8 {
     if n == 0 { 0 } else { a_mutual_lie_a_cannot_prove_this(n - 1) + 1 }
 }
 
+spec! {
+    requires: true,
+    decreases: n,
+    ensures: ret == n,
+}
 /// A recursive function proved by induction on a `decreases:` measure.
 ///
 /// The self-call is *not* inlined. It is answered by this very contract: the
@@ -7586,13 +8972,15 @@ pub fn a_mutual_lie_b_cannot_prove_this(n: u8) -> u8 {
 /// is proved by the body itself, which is what stops the assumption from being
 /// circular. Before `decreases:` existed this function hit the inline-depth
 /// bound and was reported incomplete.
-/// requires: true
-/// decreases: n
-/// ensures: ret == n
 pub fn a_recursive_identity(n: u8) -> u8 {
     if n == 0 { 0 } else { a_recursive_identity(n - 1) + 1 }
 }
 
+spec! {
+    requires: true,
+    decreases: n,
+    ensures: ret == n,
+}
 /// A recursive function whose *base case* does not establish the postcondition,
 /// so the induction must not save it.
 ///
@@ -7601,26 +8989,30 @@ pub fn a_recursive_identity(n: u8) -> u8 {
 /// assumed at the base case -- only the body is checked there -- so this is the
 /// one place a circular induction would go wrong. It must FAIL on the
 /// postcondition, with a witness (`n == 0`).
-/// requires: true
-/// decreases: n
-/// ensures: ret == n
 pub fn a_recursive_lie_cannot_prove_this(n: u8) -> u8 {
     if n == 0 { 1 } else { a_recursive_lie_cannot_prove_this(n - 1) + 1 }
 }
 
+spec! {
+    requires: true,
+    decreases: n,
+    ensures: ret == 0,
+}
 /// A recursive function whose measure does *not* decrease: the call is on the
 /// same `n`, so the induction has no well-founded basis.
 ///
 /// The precondition and the postcondition are both true of the body, so nothing
 /// but the measure check stops this from being assumed. It must not verify: an
 /// assumption without a decreasing measure is circular.
-/// requires: true
-/// decreases: n
-/// ensures: ret == 0
 pub fn a_recursive_call_that_does_not_decrease_cannot_prove_this(n: u8) -> u8 {
     if n == 0 { 0 } else { a_recursive_call_that_does_not_decrease_cannot_prove_this(n) }
 }
 
+spec! {
+    requires: n <= 3,
+    decreases: n,
+    ensures: ret == 0,
+}
 /// A recursive function whose recursive call violates its own precondition.
 ///
 /// The precondition `n <= 3` is what bounds the recursion, and the call is on
@@ -7628,35 +9020,41 @@ pub fn a_recursive_call_that_does_not_decrease_cannot_prove_this(n: u8) -> u8 {
 /// what makes the induction hypothesis applicable only where it holds; without
 /// that check the postcondition would be assumed for an input the contract never
 /// promised anything about.
-/// requires: n <= 3
-/// decreases: n
-/// ensures: ret == 0
 pub fn a_recursive_call_out_of_range_cannot_prove_this(n: u8) -> u8 {
     if n == 0 { 0 } else { a_recursive_call_out_of_range_cannot_prove_this(n + 1) }
 }
 
+spec! {
+    requires: n <= 3,
+    invariant: i == 5,
+    ensures: ret <= 3,
+}
 /// An invariant that is false where the loop is entered. Checking initiation is
 /// what stops an arbitrary induction hypothesis being taken on faith.
-/// requires: n <= 3
-/// invariant: i == 5
-/// ensures: ret <= 3
 pub fn an_invariant_false_on_entry_cannot_prove_this(n: u8) -> u8 {
     let mut i = 0u8;
     while i < n { i += 1; }
     i
 }
 
+spec! {
+    requires: n <= 3,
+    invariant: i == 0,
+    ensures: ret == 0,
+}
 /// An invariant the body does not preserve. Checking preservation is the other
 /// half of the induction.
-/// requires: n <= 3
-/// invariant: i == 0
-/// ensures: ret == 0
 pub fn an_invariant_not_preserved_cannot_prove_this(n: u8) -> u8 {
     let mut i = 0u8;
     while i < n { i += 1; }
     i
 }
 
+spec! {
+    requires: n <= 100,
+    invariant: i - 1 <= n,
+    ensures: ret <= 101,
+}
 /// A loop counter is a *variable*, so its arithmetic is not a constant
 /// expression.
 ///
@@ -7666,39 +9064,44 @@ pub fn an_invariant_not_preserved_cannot_prove_this(n: u8) -> u8 {
 /// refused it as an unsigned underflow -- even though Rust never range-checks a
 /// variable's arithmetic as a constant expression. The counter's entry value is a
 /// coincidence of the state, not a literal in the source.
-/// requires: n <= 100
-/// invariant: i - 1 <= n
-/// ensures: ret <= 101
 pub fn an_invariant_subtracts_from_a_counter(n: u32) -> u32 {
     let mut i = 1u32;
     while i <= n { i += 1; }
     i
 }
 
+spec! {
+    requires: n <= 100,
+    invariant: i - 1 <= n,
+    ensures: ret <= 0,
+}
 /// The false twin: the same body, and the invariant no longer implies the
 /// postcondition, so it must not verify. This is the evidence that the shape above
 /// is *decided* rather than discharged vacuously.
-/// requires: n <= 100
-/// invariant: i - 1 <= n
-/// ensures: ret <= 0
 pub fn an_invariant_subtracts_from_a_counter_cannot_prove_this(n: u32) -> u32 {
     let mut i = 1u32;
     while i <= n { i += 1; }
     i
 }
 
+spec! {
+    requires: n <= 100,
+    invariant: 0 - 1 <= n,
+    ensures: ret <= 101,
+}
 /// The *written* constant underflow is still refused: `0u32 - 1u32` is a rustc
 /// const-eval error, so a contract carrying it is malformed rather than
 /// imprecise. The negative control for [`an_invariant_subtracts_from_a_counter`].
-/// requires: n <= 100
-/// invariant: 0 - 1 <= n
-/// ensures: ret <= 101
 pub fn an_invariant_written_underflow_is_refused(n: u32) -> u32 {
     let mut i = 1u32;
     while i <= n { i += 1; }
     i
 }
 
+spec! {
+    requires: a == 255 && b == 1,
+    ensures: ret == 127,
+}
 /// A variable shift whose amount is *wider* than the value, which is the shape
 /// rustc prints: the amount of `a >> b` may be any integer type.
 ///
@@ -7707,35 +9110,43 @@ pub fn an_invariant_written_underflow_is_refused(n: u32) -> u32 {
 /// 32 bits with 8 and the query came back ill-formed. Only the symbolic path
 /// noticed, because `evaluate` folds an ill-formed term anyway -- so a proof about
 /// a shift by a `u32` was refused while the same shift by a `u8` went through.
-/// requires: a == 255 && b == 1
-/// ensures: ret == 127
 pub fn a_shift_by_a_wider_amount(a: u8, b: u32) -> u8 {
     a >> b
 }
 
+spec! {
+    requires: a == 255 && b == 1,
+    ensures: ret == 128,
+}
 /// The false direction of [`a_shift_by_a_wider_amount`]: a logical right shift of
 /// `255` by one is `127`, never `128`.
-/// requires: a == 255 && b == 1
-/// ensures: ret == 128
 pub fn a_shift_by_a_wider_amount_cannot_prove_this(a: u8, b: u32) -> u8 {
     a >> b
 }
 
+spec! {
+    requires: a == -1 && b == 1,
+    ensures: ret == -1,
+}
 /// An arithmetic right shift of a signed value, at a wider amount: `-1 >> 1` is
 /// `-1` because the sign bit is replicated, not `127`.
-/// requires: a == -1 && b == 1
-/// ensures: ret == -1
 pub fn an_arithmetic_shift_by_a_wider_amount(a: i8, b: u32) -> i8 {
     a >> b
 }
 
+spec! {
+    requires: a == -1 && b == 1,
+    ensures: ret == 127,
+}
 /// The false direction: a *logical* shift of `-1` by one would be `127`.
-/// requires: a == -1 && b == 1
-/// ensures: ret == 127
 pub fn an_arithmetic_shift_by_a_wider_amount_cannot_prove_this(a: i8, b: u32) -> i8 {
     a >> b
 }
 
+spec! {
+    requires: a == 3,
+    ensures: ret == 6,
+}
 /// A constant operand makes the multiply-overflow test exact without a `2w`-bit
 /// multiplier, so it decides at widths the general path refuses.
 ///
@@ -7744,82 +9155,102 @@ pub fn an_arithmetic_shift_by_a_wider_amount_cannot_prove_this(a: i8, b: u32) ->
 /// a constant, `x * c` wraps exactly when `x > MAX / c`, which is one comparison
 /// against a compile-time constant. An index scaled by an element size is the
 /// shape this is for, and it is usually `usize`.
-/// requires: a == 3
-/// ensures: ret == 6
 pub fn a_constant_multiply_of_a_wide_unsigned(a: u32) -> u32 {
     a * 2
 }
 
+spec! {
+    requires: a == 3,
+    ensures: ret == 7,
+}
 /// The false direction of [`a_constant_multiply_of_a_wide_unsigned`].
-/// requires: a == 3
-/// ensures: ret == 7
 pub fn a_constant_multiply_of_a_wide_unsigned_cannot_prove_this(a: u32) -> u32 {
     a * 2
 }
 
+spec! {
+    requires: a == 3,
+    ensures: ret == 6,
+}
 /// The constant on the *left* must behave the same as on the right.
-/// requires: a == 3
-/// ensures: ret == 6
 pub fn a_constant_multiply_with_the_constant_on_the_left(a: u32) -> u32 {
     2 * a
 }
 
+spec! {
+    requires: a == 3,
+    ensures: ret == 24,
+}
 /// A scaled index: the element size is the constant and the type is `usize`.
-/// requires: a == 3
-/// ensures: ret == 24
 pub fn a_scaled_index(a: usize) -> usize {
     a * 8
 }
 
+spec! {
+    requires: a == 3,
+    ensures: ret == 25,
+}
 /// The false direction of [`a_scaled_index`].
-/// requires: a == 3
-/// ensures: ret == 25
 pub fn a_scaled_index_cannot_prove_this(a: usize) -> usize {
     a * 8
 }
 
+spec! {
+    requires: a == 2147483647,
+    ensures: ret == 4294967294,
+}
 /// The last value that does *not* wrap: `ceil(2^32 / 2) - 1`, where the product is
 /// `2^32 - 2`. This is the boundary that separates an exact predicate from a
 /// merely sufficient one.
-/// requires: a == 2147483647
-/// ensures: ret == 4294967294
 pub fn a_constant_multiply_at_the_last_safe_value(a: u32) -> u32 {
     a * 2
 }
 
+spec! {
+    requires: a == 2147483648,
+    ensures: ret == 0,
+}
 /// One past that boundary: the product is `2^32`, so the multiply wraps and rustc's
 /// `assert` must fail. A predicate that were too weak here would call this
 /// panic-free, which is the failure mode that reports a *better* result than the
 /// truth.
-/// requires: a == 2147483648
-/// ensures: ret == 0
 pub fn a_constant_multiply_that_overflows_cannot_prove_this(a: u32) -> u32 {
     a * 2
 }
 
+spec! {
+    requires: a == 4294967295,
+    ensures: ret == 0,
+}
 /// Multiplying by zero cannot wrap, even at the type's maximum.
-/// requires: a == 4294967295
-/// ensures: ret == 0
 pub fn a_constant_multiply_by_zero_never_overflows(a: u32) -> u32 {
     a * 0
 }
 
+spec! {
+    requires: a == 4294967295,
+    ensures: ret == 4294967295,
+}
 /// Multiplying by one cannot wrap either, and this is the case where `MAX / c`
 /// itself would not fit -- so it is decided by a constant `false` rather than by a
 /// comparison.
-/// requires: a == 4294967295
-/// ensures: ret == 4294967295
 pub fn a_constant_multiply_by_one_never_overflows(a: u32) -> u32 {
     a * 1
 }
 
+spec! {
+    requires: a == 4294967295,
+    ensures: ret == 0,
+}
 /// The false direction of [`a_constant_multiply_by_one_never_overflows`].
-/// requires: a == 4294967295
-/// ensures: ret == 0
 pub fn a_constant_multiply_by_one_cannot_prove_this(a: u32) -> u32 {
     a * 1
 }
 
+spec! {
+    requires: a == 3,
+    ensures: ret == 6,
+}
 /// A *signed* constant multiply is decided too, once the constant arm makes the
 /// widened product a sum of shifts instead of a `2w`-bit schoolbook multiply.
 ///
@@ -7827,19 +9258,23 @@ pub fn a_constant_multiply_by_one_cannot_prove_this(a: u32) -> u32 {
 /// combination of the three signs, so the arm is what made it affordable rather than
 /// any change to the predicate -- the predicate was already exact, and only the width
 /// bound stood in the way.
-/// requires: a == 3
-/// ensures: ret == 6
 pub fn a_signed_constant_multiply_of_a_wide_value(a: i32) -> i32 {
     a * 2
 }
 
+spec! {
+    requires: a == 3,
+    ensures: ret == 7,
+}
 /// The false direction of [`a_signed_constant_multiply_of_a_wide_value`].
-/// requires: a == 3
-/// ensures: ret == 7
 pub fn a_signed_constant_multiply_of_a_wide_value_cannot_prove_this(a: i32) -> i32 {
     a * 2
 }
 
+spec! {
+    requires: a == 3,
+    ensures: ret == 6,
+}
 /// The signed multiply *at `i64`* is decided, which is the case the `2w`-bit widening
 /// could never reach.
 ///
@@ -7848,36 +9283,40 @@ pub fn a_signed_constant_multiply_of_a_wide_value_cannot_prove_this(a: i32) -> i
 /// The constant path does not need the product -- `x * c` is inside the signed range
 /// exactly when `x` is between `MAX / c` and `MIN / c` rounded one way or the other, and
 /// both bounds are compile-time constants -- so it works here.
-/// requires: a == 3
-/// ensures: ret == 6
 pub fn a_signed_constant_multiply_at_i64(a: i64) -> i64 {
     a * 2
 }
 
+spec! {
+    requires: a == 3,
+    ensures: ret == 7,
+}
 /// The false direction of [`a_signed_constant_multiply_at_i64`], so the entry above is a
 /// proof rather than a query the engine waved through.
-/// requires: a == 3
-/// ensures: ret == 7
 pub fn a_signed_constant_multiply_at_i64_cannot_prove_this(a: i64) -> i64 {
     a * 2
 }
 
+spec! {
+    requires: a == -9223372036854775808,
+    ensures: ret == 0,
+}
 /// A signed `i64` multiply by minus one at the one input it overflows on.
 ///
 /// `-1 * i64::MIN` is `2^63`, one past `i64::MAX`. That is the case the first version of
 /// the predicate called safe, by taking `-1` as never wrapping, so the entry is here to
 /// keep the bound honest: the contract is *false* at `MIN`, and the tool must say so
 /// rather than prove it.
-/// requires: a == -9223372036854775808
-/// ensures: ret == 0
 pub fn a_signed_constant_multiply_by_minus_one_at_the_edge_cannot_prove_this(a: i64) -> i64 {
     a * -1
 }
 
+spec! {
+    requires: a == 3,
+    ensures: ret == 6,
+}
 /// The unsigned multiply at `i64`'s width *is* decided, which is what makes the entry
 /// above a width story rather than a sign story.
-/// requires: a == 3
-/// ensures: ret == 6
 pub fn an_unsigned_constant_multiply_at_u64(a: u64) -> u64 {
     a * 2
 }
@@ -7902,81 +9341,99 @@ pub fn twist(v: &mut u8, x: u8) {
     *v = x;
 }
 
+spec! {
+    requires: w.v == 0,
+    ensures: ret == 0,
+}
 /// The ambiguity tripwire: the call `w.twist(5)` names its receiver's type, so it
 /// must resolve to `Widget::twist` and not to the free function `twist` that
 /// shares the tail. The free function takes a different shape (`&mut u8`) and
 /// would write through it, so inlining *it* would prove this false contract. The
 /// resolver picks the method by the receiver's type, so the correct body runs and
 /// the postcondition is refuted.
-/// requires: w.v == 0
-/// ensures: ret == 0
 pub fn an_ambiguous_method_tail_cannot_prove_this(mut w: Widget) -> u8 {
     w.twist(5);
     w.v
 }
 
+spec! {
+    requires: p.0 < p.1,
+    ensures: ret == p.0,
+}
 /// The positional tripwire: the two fields are independent inputs, so a reader
 /// that bound `p.0` and `p.1` to one variable would make `ret == p.0` hold --
 /// with one variable, `max(v, v)` is `v`. With two, `p.0 <= p.1` and `p.0 != p.1`
 /// gives `ret == p.1 != p.0`, so the contract is refuted. Refuted is the evidence
 /// the fields are distinct rather than one aliased word.
-/// requires: p.0 < p.1
-/// ensures: ret == p.0
 pub fn tuple_struct_fields_are_independent(p: &Pair) -> u8 {
     if p.0 > p.1 { p.0 } else { p.1 }
 }
 
+spec! {
+    requires: p.2 < 100,
+    ensures: ret == 0,
+}
 /// The index beyond the tuple's arity: `Pair` has two fields, so `p.2` names
 /// nothing. It must be refused as an unknown field rather than bound to a
 /// fabricated word.
-/// requires: p.2 < 100
-/// ensures: ret == 0
 pub fn tuple_struct_out_of_range_field_is_refused(p: &Pair) -> u8 {
     let _ = p;
     0
 }
 
+spec! {
+    requires: n.p.0 < 100,
+    ensures: ret == 0,
+}
 /// A tuple struct whose single field is itself a struct: the projection is
 /// nested, `n.p.0`. It is now *bound* -- `n.p` is a `Pair` with a readable layout
 /// and `.0` is its first field -- so the contract is a real obligation rather than
 /// a refusal. The body returns 0, so `ret == 0` verifies and the contract is
 /// decided rather than skipped.
-/// requires: n.p.0 < 100
-/// ensures: ret == 0
 pub fn nested_tuple_projection_reads(n: &NestedPair) -> u8 {
     let _ = n;
     0
 }
 
+spec! {
+    requires: n.p.0 == 42,
+    ensures: ret == 42,
+}
 /// The same nested path, but *read* by the body: the value the contract names as
 /// `n.p.0` and the value the body reads are one input, so pinning it makes the
 /// postcondition hold. A reader that bound the two separately would refute this.
-/// requires: n.p.0 == 42
-/// ensures: ret == 42
 pub fn nested_tuple_projection_is_the_body_value(n: &NestedPair) -> u8 {
     n.p.0
 }
 
+spec! {
+    requires: n.p.0 < n.p.1,
+    ensures: ret == n.p.0,
+}
 /// The tripwire for the nested path: `n.p.0` and `n.p.1` are independent inputs,
 /// so a reader that aliased them would prove `ret == n.p.0` vacuously. With two,
 /// `n.p.0 < n.p.1` gives `ret == n.p.1 != n.p.0`, so the contract is refuted --
 /// which is the evidence the two leaves are distinct.
-/// requires: n.p.0 < n.p.1
-/// ensures: ret == n.p.0
 pub fn nested_tuple_projection_leaves_are_independent(n: &NestedPair) -> u8 {
     if n.p.0 > n.p.1 { n.p.0 } else { n.p.1 }
 }
 
+spec! {
+    requires: n.p.q < 100,
+    ensures: ret == 0,
+}
 /// A nested path that walks off the layout: `n.p` is a `Pair` of scalars, so
 /// `n.p.q` names a field `Pair` does not have. It must be refused as an unknown
 /// field rather than bound to a fabricated word.
-/// requires: n.p.q < 100
-/// ensures: ret == 0
 pub fn nested_path_off_the_layout_is_refused(n: &NestedPair) -> u8 {
     let _ = n;
     0
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A *nested* field write through a `&mut`: `o.i.v = 5`.
 ///
 /// MIR spells it `(((*_1).0).0: u8) = const 5_u8`, a walk of two field projections.
@@ -7984,38 +9441,45 @@ pub fn nested_path_off_the_layout_is_refused(n: &NestedPair) -> u8 {
 /// on `(local, 0)` -- the *outer* field -- and the nested read would then see the
 /// caller's value. This entry pins that the write lands where the read looks:
 /// `ret == 5` holds only if `o.i.v` is the same input on both sides.
-/// requires: true
-/// ensures: ret == 5
 pub fn nested_field_write_through_ref_mut_takes_effect(o: &mut OuterBox) -> u8 {
     o.i.v = 5;
     o.i.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The false direction of [`nested_field_write_through_ref_mut_takes_effect`].
 ///
 /// The body writes `5` and returns it, so `ret == 0` is false for every input. A
 /// dropped or mis-keyed nested write would leave the read on the caller's
 /// unconstrained leaf and make this *provable*; it must be refuted.
-/// requires: true
-/// ensures: ret == 0
 pub fn nested_field_write_through_ref_mut_is_not_dropped(o: &mut OuterBox) -> u8 {
     o.i.v = 5;
     o.i.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// Overwriting the *whole* intermediate aggregate makes the seeded leaf stale.
 ///
 /// `o.i = Inner { v: 9, .. }` replaces the value `o.i.v` was a part of, so the
 /// seed for `o.i.v` no longer describes the store. The read must not return the
 /// pre-write leaf: a reader that kept the stale seed would make this false contract
 /// (`ret == 3`) *provable*. This entry pins the safe direction -- not verified.
-/// requires: true
-/// ensures: ret == 3
 pub fn whole_inner_write_makes_nested_seed_stale(mut o: OuterBox) -> u8 {
     o.i = InnerBox { v: 9 };
     o.i.v
 }
 
+spec! {
+    requires: c.i.v == 0,
+    requires: d.i.v == 1,
+    ensures: ret == 1,
+}
 /// A whole-struct copy carries its *nested* parts, not only its single fields.
 ///
 /// `c = d` copies the value, so `c.i.v` afterwards is `d.i.v`. Nested paths are
@@ -8023,14 +9487,15 @@ pub fn whole_inner_write_makes_nested_seed_stale(mut o: OuterBox) -> u8 {
 /// `c`'s own `c.i.v` seed in place and refute this true contract. The two
 /// preconditions pin the two seeds to different values, so `verified` is the
 /// evidence the copy moved the right one.
-/// requires: c.i.v == 0
-/// requires: d.i.v == 1
-/// ensures: ret == 1
 pub fn whole_struct_copy_carries_nested_paths(mut c: OuterBox, d: OuterBox) -> u8 {
     c = d;
     c.i.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// A *nested* aggregate literal lands where the read looks, and the false direction of
 /// [`whole_inner_write_makes_nested_seed_stale`] is its tripwire.
 ///
@@ -8042,13 +9507,15 @@ pub fn whole_struct_copy_carries_nested_paths(mut c: OuterBox, d: OuterBox) -> u
 /// this true contract was `incomplete` rather than verified. `verified` here is the
 /// positive evidence the re-rooting happened; the companion's refutation is the evidence
 /// it happened in the direction the read consults.
-/// requires: true
-/// ensures: ret == 9
 pub fn whole_inner_write_is_seen_by_the_leaf(mut o: OuterBox) -> u8 {
     o.i = InnerBox { v: 9 };
     o.i.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// The same nested aggregate literal, written *through a mutable reference*.
 ///
 /// On an `&mut OuterBox` the assignment lowers to `((*_1).0) = move _2`, so the
@@ -8057,13 +9524,15 @@ pub fn whole_inner_write_is_seen_by_the_leaf(mut o: OuterBox) -> u8 {
 /// referent -- or the write is refused for the wrong reason and the leaf reads `Unknown`.
 /// `verified` here is the evidence the write reached the target's field path, and it is the
 /// `&mut` companion to `whole_inner_write_is_seen_by_the_leaf`.
-/// requires: true
-/// ensures: ret == 9
 pub fn whole_inner_write_through_a_mutable_reference_is_seen(o: &mut OuterBox) -> u8 {
     o.i = InnerBox { v: 9 };
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 7,
+    ensures: ret == 3,
+}
 /// A nested-to-nested move, `o.i = o.j`.
 ///
 /// The first step is the *nested source* `(_1.1)` moved into a whole temp, the second a whole
@@ -8071,36 +9540,38 @@ pub fn whole_inner_write_through_a_mutable_reference_is_seen(o: &mut OuterBox) -
 /// without the re-rooting the leaf reads `Unknown`. The precondition pins `o.i.v` to `7`, which
 /// the move overwrites with the source's `3` -- so the true `ret == 3` is the evidence the
 /// *source's* leaf arrived.
-/// requires: o.i.v == 7
-/// ensures: ret == 3
 pub fn whole_inner_move_carries_the_source_leaf(mut o: OuterBox) -> u8 {
     o.j.v = 3;
     o.i = o.j;
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 7,
+    ensures: ret == 7,
+}
 /// The false twin of [`whole_inner_move_carries_the_source_leaf`].
 ///
 /// Same body, but the contract claims the *destination's* pre-move leaf survived. A model
 /// that kept `o.i.v`'s stale `7` instead of the source's `3` would prove this; it must be
 /// refuted, and the witness is `o.i.v` at its seeded `7` (the value the move replaced).
-/// requires: o.i.v == 7
-/// ensures: ret == 7
 pub fn whole_inner_move_is_not_the_stale_destination(mut o: OuterBox) -> u8 {
     o.j.v = 3;
     o.i = o.j;
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 3,
+    requires: o.j.v == 4,
+    ensures: ret == 4,
+}
 /// A nested swap through a temp, `let t = o.i; o.i = o.j; o.j = t`.
 ///
 /// Two nested sources and two nested destinations, so it only works if the re-rooting runs
 /// on a nested source as well as a nested destination: the guard is "either side nested", not
 /// "destination nested". The precondition pins the two sides apart (`3` and `4`), so the
 /// returned `4` proves the *other* side arrived rather than the one that was already there.
-/// requires: o.i.v == 3
-/// requires: o.j.v == 4
-/// ensures: ret == 4
 pub fn nested_swap_carries_the_other_side(mut o: OuterBox) -> u8 {
     let tmp = o.i;
     o.i = o.j;
@@ -8108,14 +9579,16 @@ pub fn nested_swap_carries_the_other_side(mut o: OuterBox) -> u8 {
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 3,
+    requires: o.j.v == 4,
+    ensures: ret == 3,
+}
 /// The false twin of [`nested_swap_carries_the_other_side`].
 ///
 /// Same body, but the contract claims the pre-swap `o.i.v == 3` survived. A model that
 /// dropped the nested-to-nested move -- keeping each side's own leaf -- would prove this; it
 /// must be refuted, and the witness is the two seeds (`3` and `4`) that the swap exchanged.
-/// requires: o.i.v == 3
-/// requires: o.j.v == 4
-/// ensures: ret == 3
 pub fn nested_swap_is_not_the_stale_side(mut o: OuterBox) -> u8 {
     let tmp = o.i;
     o.i = o.j;
@@ -8132,25 +9605,29 @@ pub fn identity_inner_box(x: InnerBox) -> InnerBox {
     x
 }
 
+spec! {
+    requires: o.i.v == 9,
+    ensures: ret == 9,
+}
 /// A nested aggregate handed to a helper by value, and the helper's return read back.
 ///
 /// `id_inner(o.i)` lowers to `_3 = move (_1.0); _2 = id_inner(move _3)`, so the aggregate
 /// argument is a *sub-place* whose parts have to be carried in, and the callee's `_0 = _1`
 /// return has to carry its fields back. The precondition pins the leaf so the returned `9` is
 /// the value that crossed, not a fresh variable.
-/// requires: o.i.v == 9
-/// ensures: ret == 9
 pub fn nested_aggregate_argument_reaches_the_helper(mut o: OuterBox) -> u8 {
     identity_inner_box(o.i).v
 }
 
+spec! {
+    requires: o.i.v == 9,
+    ensures: ret == 7,
+}
 /// The false twin of [`nested_aggregate_argument_reaches_the_helper`].
 ///
 /// Same body, but the contract claims a different value survived. A merge that dropped the
 /// returned field would leave the read `Unknown` (a lost proof); one that kept a *stale* field
 /// would prove this. It must be refuted, with the seeded `9` as the witness.
-/// requires: o.i.v == 9
-/// ensures: ret == 7
 pub fn nested_aggregate_argument_is_not_the_stale_destination(mut o: OuterBox) -> u8 {
     identity_inner_box(o.i).v
 }
@@ -8160,24 +9637,28 @@ pub fn wrap_inner_box(x: InnerBox) -> OuterBox {
     OuterBox { i: x, j: InnerBox { v: 0 } }
 }
 
+spec! {
+    requires: o.i.v == 9,
+    ensures: ret == 9,
+}
 /// A returned struct's *field* is read back through a two-level path.
 ///
 /// `wrap_inner_box(o.i)` lowers to `_0 = OuterBox { i: copy _1, j: move _2 }`, so the returned
 /// field's own parts have to be re-rooted onto `_0.i` -- the `Struct` literal stores the field
 /// value but not the operand aggregate's `v`. The precondition pins the leaf so the returned
 /// `9` is the value that crossed.
-/// requires: o.i.v == 9
-/// ensures: ret == 9
 pub fn nested_return_carries_the_field(mut o: OuterBox) -> u8 {
     wrap_inner_box(o.i).i.v
 }
 
+spec! {
+    requires: o.i.v == 9,
+    ensures: ret == 3,
+}
 /// The false twin of [`nested_return_carries_the_field`].
 ///
 /// Same body, but the contract claims a different leaf survived. It must be refuted, with the
 /// seeded `9` as the witness.
-/// requires: o.i.v == 9
-/// ensures: ret == 3
 pub fn nested_return_is_not_the_stale_field(mut o: OuterBox) -> u8 {
     wrap_inner_box(o.i).i.v
 }
@@ -8185,30 +9666,36 @@ pub fn nested_return_is_not_the_stale_field(mut o: OuterBox) -> u8 {
 /// The inner type of [`nested_tuple_projection_reads`].
 pub struct NestedPair { pub p: Pair }
 
+spec! {
+    requires: o.i.v == 7,
+    ensures: ret == 7,
+}
 /// A *named-field* struct whose field is itself a named-field struct, so the
 /// contract can name `o.i.v`. The read is bound to the body's value: pinning
 /// `o.i.v` makes the postcondition hold, which a reader that bound the two
 /// separately would refute.
-/// requires: o.i.v == 7
-/// ensures: ret == 7
 pub fn nested_named_field_reads_its_leaf(o: &OuterBox) -> u8 {
     o.i.v
 }
 
+spec! {
+    requires: o.i.v != o.j.v,
+    ensures: ret == o.j.v,
+}
 /// The named-field tripwire: `o.i.v` and `o.j.v` are leaves under *different*
 /// outer fields, so a reader that keyed only on the leaf name would alias them and
 /// prove `ret == o.j.v` vacuously. With distinct chains, `o.i.v != o.j.v` holds
 /// and the contract is refuted -- the evidence the paths are distinct inputs.
-/// requires: o.i.v != o.j.v
-/// ensures: ret == o.j.v
 pub fn nested_named_leaves_under_different_fields(o: &OuterBox) -> u8 {
     o.i.v
 }
 
+spec! {
+    requires: o.i.v <= 200,
+    ensures: ret == o.i.v,
+}
 /// A nested named-field read that the *body* performs, so the contract's `o.i.v`
 /// and the body's `(((*_1).0).0)` must be the same input for this to verify.
-/// requires: o.i.v <= 200
-/// ensures: ret == o.i.v
 pub fn nested_named_field_is_the_body_value(o: &OuterBox) -> u8 {
     o.i.v
 }
@@ -8217,45 +9704,57 @@ pub fn nested_named_field_is_the_body_value(o: &OuterBox) -> u8 {
 pub struct InnerBox { pub v: u8 }
 pub struct OuterBox { pub i: InnerBox, pub j: InnerBox }
 
+spec! {
+    requires: a == -7,
+    ensures: ret == -3,
+}
 /// A signed `i64` division by a constant power of two, which the divider's sign fixup
 /// could not reach.
 ///
 /// `a / 2` is a shift on a power-of-two divisor, so it needs neither the restoring
 /// divider nor the sign fixup that made the general path a wall at this width.
-/// requires: a == -7
-/// ensures: ret == -3
 pub fn a_signed_constant_division_at_i64(a: i64) -> i64 {
     a / 2
 }
 
+spec! {
+    requires: a == -7,
+    ensures: ret == -4,
+}
 /// The false direction of [`a_signed_constant_division_at_i64`], so the entry is a proof
 /// rather than a query the engine waved through.
-/// requires: a == -7
-/// ensures: ret == -4
 pub fn a_signed_constant_division_at_i64_cannot_prove_this(a: i64) -> i64 {
     a / 2
 }
 
+spec! {
+    requires: a == -7,
+    ensures: ret == -1,
+}
 /// A signed `i64` remainder by a constant power of two.
 ///
 /// `-7 % 2` is `-1`: the remainder takes the *dividend's* sign, and the constant path
 /// builds it as `x - q * 2^k` from the `|c|` quotient, so it needs no sign fixup either.
-/// requires: a == -7
-/// ensures: ret == -1
 pub fn a_signed_constant_remainder_at_i64(a: i64) -> i64 {
     a % 2
 }
 
+spec! {
+    requires: a == -7,
+    ensures: ret == 3,
+}
 /// A signed `i64` division by a *negative* constant power of two.
 ///
 /// `-7 / -2` is `3` in Rust: truncation toward zero, so the sign of the result follows the
 /// signs of the operands. The constant path negates the magnitude quotient for this case.
-/// requires: a == -7
-/// ensures: ret == 3
 pub fn a_signed_constant_division_by_a_negative_power_of_two_at_i64(a: i64) -> i64 {
     a / -2
 }
 
+spec! {
+    requires: a == -7,
+    ensures: ret == -2,
+}
 /// A signed `i64` division by a constant that is *not* a power of two.
 ///
 /// `3` has no shift identity, so this stays on the general divider. It is the shape that
@@ -8265,12 +9764,14 @@ pub fn a_signed_constant_division_by_a_negative_power_of_two_at_i64(a: i64) -> i
 /// The precondition pins `a`, so the divider folds to a literal and the query is decided.
 /// [`a_symbolic_division_by_a_non_power_of_two_at_i64`] is the same body *without* the pin,
 /// which keeps the general divider built -- that one is the deep-walk vehicle.
-/// requires: a == -7
-/// ensures: ret == -2
 pub fn a_signed_division_by_a_non_power_of_two_at_i64(a: i64) -> i64 {
     a / 3
 }
 
+spec! {
+    requires: true,
+    ensures: ret == -2,
+}
 /// The same general divider with a *symbolic* dividend, so the precondition does not pin
 /// `a` and the constant folds cannot collapse the division.
 ///
@@ -8280,8 +9781,6 @@ pub fn a_signed_division_by_a_non_power_of_two_at_i64(a: i64) -> i64 {
 /// `a_deep_term_walk_is_refused_not_allowed_to_overflow_the_stack`. The contract is false in
 /// general (`a / 3 == -2` only for some `a`), so a decided verdict is a counterexample and an
 /// undecided one is the refusal -- never `Verified`, and never a crash.
-/// requires: true
-/// ensures: ret == -2
 pub fn a_symbolic_division_by_a_non_power_of_two_at_i64(a: i64) -> i64 {
     a / 3
 }
@@ -8299,16 +9798,20 @@ pub struct WideBox {
     pub v: i64,
 }
 
-/// requires: w.v == -7
-/// ensures: ret == -2
+spec! {
+    requires: w.v == -7,
+    ensures: ret == -2,
+}
 pub fn a_field_pinned_division_at_i64(w: WideBox) -> i64 {
     w.v / 3
 }
 
+spec! {
+    requires: w.v == -7,
+    ensures: ret == 99,
+}
 /// The same field pin with a claim the fold refutes, so the entry above cannot pass by
 /// being decided to `true` for the wrong reason.
-/// requires: w.v == -7
-/// ensures: ret == 99
 pub fn a_field_pinned_division_cannot_prove_this(w: WideBox) -> i64 {
     w.v / 3
 }
@@ -8324,34 +9827,46 @@ pub struct WideOuter {
     pub i: WideInner,
 }
 
-/// requires: o.i.v == -7
-/// ensures: ret == -2
+spec! {
+    requires: o.i.v == -7,
+    ensures: ret == -2,
+}
 pub fn a_nested_pinned_division_at_i64(o: WideOuter) -> i64 {
     o.i.v / 3
 }
 
+spec! {
+    requires: o.i.v == -7,
+    ensures: ret == 99,
+}
 /// The false direction of the nested pin.
-/// requires: o.i.v == -7
-/// ensures: ret == 99
 pub fn a_nested_pinned_division_cannot_prove_this(o: WideOuter) -> i64 {
     o.i.v / 3
 }
 
+spec! {
+    requires: xs[0] == -7,
+    ensures: ret == -2,
+}
 /// A pin reaches an *element* of an array, not just a field. `requires: xs[0] == -7` names
 /// an element, and the body reads the same element, so the divider folds.
-/// requires: xs[0] == -7
-/// ensures: ret == -2
 pub fn an_element_pinned_division_at_i64(xs: [i64; 2]) -> i64 {
     xs[0] / 3
 }
 
+spec! {
+    requires: xs[0] == -7,
+    ensures: ret == 99,
+}
 /// The false direction of the element pin.
-/// requires: xs[0] == -7
-/// ensures: ret == 99
 pub fn an_element_pinned_division_cannot_prove_this(xs: [i64; 2]) -> i64 {
     xs[0] / 3
 }
 
+spec! {
+    requires: a == 5 && b == a + 1 && c == b * 2,
+    ensures: ret == 3,
+}
 /// A pin whose right-hand side names an *earlier* pinned variable, so the chain has to be
 /// followed before the body folds.
 ///
@@ -8364,23 +9879,27 @@ pub fn an_element_pinned_division_cannot_prove_this(xs: [i64; 2]) -> i64 {
 ///
 /// [`a_transitive_pin_chain_cannot_prove_this`] is the false direction, so the entry above
 /// is a proof rather than a `true` that a broken extraction would also produce.
-/// requires: a == 5 && b == a + 1 && c == b * 2
-/// ensures: ret == 3
 pub fn a_transitive_pin_chain_folds_the_body(a: i64, b: i64, c: i64) -> i64 {
     let _ = (a, b);
     c / 4
 }
 
+spec! {
+    requires: a == 5 && b == a + 1 && c == b * 2,
+    ensures: ret == 99,
+}
 /// The false direction of the transitive chain: the pin fixes `c` at `12`, so the claim is
 /// refuted by the fold rather than proved.
-/// requires: a == 5 && b == a + 1 && c == b * 2
-/// ensures: ret == 99
 pub fn a_transitive_pin_chain_cannot_prove_this(a: i64, b: i64, c: i64) -> i64 {
     let _ = (a, b);
     c / 4
 }
 
 
+spec! {
+    requires: n >= 4 && n <= 7,
+    ensures: ret == 1,
+}
 /// An *unsigned* division by a power of two, with a symbolic dividend.
 ///
 /// The signed twin of this shape was already a shift, but the unsigned side fell through
@@ -8392,31 +9911,37 @@ pub fn a_transitive_pin_chain_cannot_prove_this(a: i64, b: i64, c: i64) -> i64 {
 /// [`an_unsigned_power_of_two_division_cannot_prove_this`] is the false direction, so the
 /// entry above is a proof and not a `true` that a too-permissive fast path would also
 /// produce.
-/// requires: n >= 4 && n <= 7
-/// ensures: ret == 1
 pub fn an_unsigned_power_of_two_division_is_decided(n: u64) -> u64 {
     n / 4
 }
 
+spec! {
+    requires: n >= 4 && n <= 7,
+    ensures: ret == 2,
+}
 /// The false direction of the unsigned shift identity: `n` in `[4, 7]` makes `n / 4` one,
 /// so the claim of two is refuted.
-/// requires: n >= 4 && n <= 7
-/// ensures: ret == 2
 pub fn an_unsigned_power_of_two_division_cannot_prove_this(n: u64) -> u64 {
     n / 4
 }
 
+spec! {
+    requires: n >= 4 && n <= 7,
+    ensures: ret <= 3,
+}
 /// An *unsigned* remainder by a power of two, which is a mask rather than a divider.
 ///
 /// The companion to the division above, and it exercises the other half of
 /// `udivmod_pow2`: `n % 4 == n & 3`. The general divider would be built for a mask.
-/// requires: n >= 4 && n <= 7
-/// ensures: ret <= 3
 pub fn an_unsigned_power_of_two_remainder_is_decided(n: u64) -> u64 {
     n % 4
 }
 
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 9,
+}
 /// An element of an array reached through a struct field, written and read back.
 ///
 /// `x.a[0] = 9; x.a[0]` lowers to `(_1.0)[_2] = const 9_u8` and `_0 = copy (_1.0)[_4]`: the
@@ -8427,29 +9952,31 @@ pub fn an_unsigned_power_of_two_remainder_is_decided(n: u64) -> u64 {
 ///
 /// [`a_field_array_write_is_not_the_seed`] is the false direction, so the entry above is a
 /// proof and not a `true` that a broken store would also produce.
-/// requires: x.a[0] == 5
-/// ensures: ret == 9
 pub fn a_field_array_write_is_read_back(mut x: Boxed) -> u8 {
     x.a[0] = 9;
     x.a[0]
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 5,
+}
 /// The false direction of the field-array write: the body stores 9, so a claim of the seed
 /// is refuted rather than proved.
-/// requires: x.a[0] == 5
-/// ensures: ret == 5
 pub fn a_field_array_write_is_not_the_seed(mut x: Boxed) -> u8 {
     x.a[0] = 9;
     x.a[0]
 }
 
+spec! {
+    requires: x.b[0] == 7,
+    ensures: ret == 7,
+}
 /// Writing one field's array element leaves the sibling array's element alone.
 ///
 /// The whole path is the key, so `x.a[0] = 9` must not disturb `x.b[0]`. A store keyed by
 /// the local and index alone would collide the two and prove `ret == 7` against the wrong
 /// element.
-/// requires: x.b[0] == 7
-/// ensures: ret == 7
 pub fn a_sibling_field_array_is_untouched(mut x: Boxed) -> u8 {
     x.a[0] = 9;
     x.b[0]
@@ -8461,6 +9988,10 @@ pub struct Boxed {
     pub b: [u8; 4],
 }
 
+spec! {
+    requires: o.i.a[0] == 5,
+    ensures: ret == 9,
+}
 /// An array element reached through a *nested* field path is the same word on both sides.
 ///
 /// `o.i.a[0] = 9; o.i.a[0]` lowers to `(_1.0.0)[_2] = 9` and `_0 = copy (_1.0.0)[_4]`. The
@@ -8468,17 +9999,17 @@ pub struct Boxed {
 /// first-level `o.i`; the store and the contract agree on the deeper path.
 ///
 /// [`a_nested_field_array_write_is_not_the_seed`] is the false direction.
-/// requires: o.i.a[0] == 5
-/// ensures: ret == 9
 pub fn a_nested_field_array_write_is_read_back(mut o: NestedArrays) -> u8 {
     o.i.a[0] = 9;
     o.i.a[0]
 }
 
+spec! {
+    requires: o.i.a[0] == 5,
+    ensures: ret == 5,
+}
 /// The false direction of the nested field-array write: the body stores 9, so a claim of
 /// the seed is refuted rather than proved.
-/// requires: o.i.a[0] == 5
-/// ensures: ret == 5
 pub fn a_nested_field_array_write_is_not_the_seed(mut o: NestedArrays) -> u8 {
     o.i.a[0] = 9;
     o.i.a[0]
@@ -8495,6 +10026,10 @@ pub struct ArrayHolder {
     pub a: [u8; 4],
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 9,
+}
 /// A helper's write to a *field-array element* through `&mut` must cross back to the caller.
 ///
 /// `set_first(x); x.a[0]` calls `set_first(&mut Boxed)` which stores `x.a[0] = 9`. The
@@ -8503,17 +10038,17 @@ pub struct ArrayHolder {
 /// *seed*, proving the false `ret == 5` against a body returning 9.
 ///
 /// [`a_helper_field_array_write_is_not_the_seed`] is the false direction.
-/// requires: x.a[0] == 5
-/// ensures: ret == 9
 pub fn a_helper_field_array_write_is_read_back(x: &mut Boxed) -> u8 {
     set_first_element(x);
     x.a[0]
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 5,
+}
 /// The false direction of the helper field-array write: the helper stores 9, so a claim of
 /// the caller's seed is refuted rather than proved.
-/// requires: x.a[0] == 5
-/// ensures: ret == 5
 pub fn a_helper_field_array_write_is_not_the_seed(x: &mut Boxed) -> u8 {
     set_first_element(x);
     x.a[0]
@@ -8524,32 +10059,38 @@ fn set_first_element(x: &mut Boxed) {
     x.a[0] = 9;
 }
 
+spec! {
+    requires: o.i.a[0] == 5,
+    ensures: ret == 9,
+}
 /// A helper handed a *nested aggregate* (`&mut o.i`) that writes an element of the array
 /// inside it: the callee's `_1.a[0]` is the caller's `o.i.a[0]`, so the write-back has to
 /// prefix the target's chain. The sibling `o.k` is left alone.
 ///
 /// [`a_helper_nested_aggregate_element_write_is_not_the_seed`] is the false direction.
-/// requires: o.i.a[0] == 5
-/// ensures: ret == 9
 pub fn a_helper_nested_aggregate_element_write_is_read_back(mut o: NestedArrays) -> u8 {
     set_holder_first_element(&mut o.i);
     o.i.a[0]
 }
 
+spec! {
+    requires: o.i.a[0] == 5,
+    ensures: ret == 5,
+}
 /// The false direction of the nested-aggregate element write: the helper stores 9, so a
 /// claim of the seed is refuted rather than proved.
-/// requires: o.i.a[0] == 5
-/// ensures: ret == 5
 pub fn a_helper_nested_aggregate_element_write_is_not_the_seed(mut o: NestedArrays) -> u8 {
     set_holder_first_element(&mut o.i);
     o.i.a[0]
 }
 
+spec! {
+    requires: o.i.a[0] == 5,
+    ensures: ret == 5,
+}
 /// A helper handed a *shared* nested aggregate that only *reads* the array element: the
 /// caller's seed has to cross *into* the callee, or the callee's read is unknown and the
 /// true contract is unreadable rather than decided.
-/// requires: o.i.a[0] == 5
-/// ensures: ret == 5
 pub fn a_helper_nested_aggregate_element_read(mut o: NestedArrays) -> u8 {
     read_holder_first_element(&o.i)
 }
@@ -8565,6 +10106,10 @@ fn set_holder_first_element(i: &mut ArrayHolder) {
     i.a[0] = 9;
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 9,
+}
 /// The whole-array-target case: an array handed over *as* a reference target
 /// (`&mut x.a`) crosses the frame.
 ///
@@ -8581,18 +10126,18 @@ fn set_holder_first_element(i: &mut ArrayHolder) {
 /// refuted -- so no false proof is claimed. The whole-*local* form
 /// (`set_arr(&mut a); a[0]`) also decides, because the target has no projection and the
 /// store is keyed by the local alone.
-/// requires: x.a[0] == 5
-/// ensures: ret == 9
 pub fn a_whole_array_target_crosses_a_reference_argument(mut x: Boxed) -> u8 {
     set_first_of(&mut x.a);
     x.a[0]
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 5,
+}
 /// The false direction of the whole-array target, named so the corpus-wide
 /// `no_cannot_prove_entry_is_ever_verified` invariant holds it as well: it must never
 /// become `Verified`.
-/// requires: x.a[0] == 5
-/// ensures: ret == 5
 pub fn a_whole_array_target_cannot_prove_this(mut x: Boxed) -> u8 {
     set_first_of(&mut x.a);
     x.a[0]
@@ -8604,6 +10149,10 @@ fn set_first_of(a: &mut [u8; 4]) {
     a[0] = 9;
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 5,
+}
 /// The read-only half of the whole-array-target case: `&x.a` crosses the frame the same
 /// way `&mut x.a` does.
 ///
@@ -8612,15 +10161,15 @@ fn set_first_of(a: &mut [u8; 4]) {
 /// onto the callee's whole-local element store, so the read finds the seed and the
 /// contract decides: `ret == 5` verifies. Without it the callee read `Unknown` and this
 /// was `Incomplete` -- the exact mirror of the write direction above.
-/// requires: x.a[0] == 5
-/// ensures: ret == 5
 pub fn a_whole_array_target_read_crosses_a_reference_argument(x: Boxed) -> u8 {
     peek_of(&x.a)
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 7,
+}
 /// The false direction of the read-only whole-array target: the seed is 5, not 7.
-/// requires: x.a[0] == 5
-/// ensures: ret == 7
 pub fn a_whole_array_target_read_cannot_prove_this(x: Boxed) -> u8 {
     peek_of(&x.a)
 }
@@ -8630,6 +10179,10 @@ fn peek_of(a: &[u8; 4]) -> u8 {
     a[0]
 }
 
+spec! {
+    requires: x.b[0] == 5,
+    ensures: ret == 9,
+}
 /// The sibling-field direction of the whole-array target: the write to `x.a` must not
 /// leak into `x.b`.
 ///
@@ -8639,13 +10192,15 @@ fn peek_of(a: &[u8; 4]) -> u8 {
 /// write on whichever field the caller happened to read and *prove* this. The suffix
 /// also puts it under the corpus-wide `no_cannot_prove_entry_is_ever_verified`
 /// invariant.
-/// requires: x.b[0] == 5
-/// ensures: ret == 9
 pub fn a_whole_array_target_sibling_cannot_prove_this(mut x: Boxed) -> u8 {
     set_first_of(&mut x.a);
     x.b[0]
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 6,
+}
 /// A read-modify-write through a whole-array target: the callee *reads* the element it
 /// also writes.
 ///
@@ -8655,59 +10210,67 @@ pub fn a_whole_array_target_sibling_cannot_prove_this(mut x: Boxed) -> u8 {
 /// result on the caller's `x.a[0]` (else the caller reads its own seed and `ret == 6`
 /// is unprovable). Both are the same re-basing arm, so a fix that did only one would
 /// fail here.
-/// requires: x.a[0] == 5
-/// ensures: ret == 6
 pub fn a_whole_array_target_read_modify_write(mut x: Boxed) -> u8 {
     bump_first_of(&mut x.a);
     x.a[0]
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 5,
+}
 /// The false direction of [`a_whole_array_target_read_modify_write`]: the seed, not the
 /// incremented value. The suffix puts it under the corpus-wide
 /// `no_cannot_prove_entry_is_ever_verified` invariant.
-/// requires: x.a[0] == 5
-/// ensures: ret == 5
 pub fn a_whole_array_target_read_modify_write_cannot_prove_this(mut x: Boxed) -> u8 {
     bump_first_of(&mut x.a);
     x.a[0]
 }
 
+spec! {
+    requires: o.i.a[0] == 5,
+    ensures: ret == 9,
+}
 /// A whole-array target reached through a *nested* field path: `&mut o.i.a`.
 ///
 /// The target's chain is two fields (`[0, 0]`), so the re-basing has to carry a chain of
 /// more than one step, not just a single field. The helper is the same `set_first_of`, so
 /// the difference from the flat case is the target's depth alone.
-/// requires: o.i.a[0] == 5
-/// ensures: ret == 9
 pub fn a_nested_whole_array_target_crosses_a_reference_argument(mut o: NestedArrays) -> u8 {
     set_first_of(&mut o.i.a);
     o.i.a[0]
 }
 
+spec! {
+    requires: o.i.a[0] == 5,
+    ensures: ret == 5,
+}
 /// The false direction of [`a_nested_whole_array_target_crosses_a_reference_argument`].
-/// requires: o.i.a[0] == 5
-/// ensures: ret == 5
 pub fn a_nested_whole_array_target_cannot_prove_this(mut o: NestedArrays) -> u8 {
     set_first_of(&mut o.i.a);
     o.i.a[0]
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 9,
+}
 /// The write crosses *two* frames: the caller hands `&mut x.a` to a helper that hands the
 /// same reference on to [`set_first_of`].
 ///
 /// `relay_first_of` only forwards its argument, so the write reaches the caller's
 /// `x.a[0]` through an inner call. Each frame re-bases independently, so this is the
 /// transitivity check on the re-basing rule rather than a new rule.
-/// requires: x.a[0] == 5
-/// ensures: ret == 9
 pub fn a_whole_array_target_crosses_two_frames(mut x: Boxed) -> u8 {
     relay_first_of(&mut x.a);
     x.a[0]
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 5,
+}
 /// The false direction of [`a_whole_array_target_crosses_two_frames`].
-/// requires: x.a[0] == 5
-/// ensures: ret == 5
 pub fn a_whole_array_target_crosses_two_frames_cannot_prove_this(mut x: Boxed) -> u8 {
     relay_first_of(&mut x.a);
     x.a[0]
@@ -8738,6 +10301,10 @@ impl Boxed {
     }
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 9,
+}
 /// A method that returns `&mut` to an *element* of a field array: the write through the
 /// returned reference must land on `x.a[0]`.
 ///
@@ -8748,52 +10315,62 @@ impl Boxed {
 /// unreadable. Pinning the index to its literal while the callee's locals are still live is
 /// what makes `ret == 9` decide; a symbolic index is left alone, so no write lands on an
 /// element the caller never named.
-/// requires: x.a[0] == 5
-/// ensures: ret == 9
 pub fn returned_ref_to_an_element_crosses_the_frame(mut x: Boxed) -> u8 {
     *x.first_mut() = 9;
     x.a[0]
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 5,
+}
 /// The false direction of [`returned_ref_to_an_element_crosses_the_frame`]: the seed, not
 /// the write. A re-basing that aimed the write at the wrong element could turn this twin
 /// `Verified` before the true case, so it is held by the corpus-wide
 /// `no_cannot_prove_entry_is_ever_verified` invariant.
-/// requires: x.a[0] == 5
-/// ensures: ret == 5
 pub fn returned_ref_to_an_element_cannot_prove_this(mut x: Boxed) -> u8 {
     *x.first_mut() = 9;
     x.a[0]
 }
 
+spec! {
+    requires: x.a[1] == 5,
+    ensures: ret == 9,
+}
 /// The second element: a fix that pinned every returned element to index 0 would decide the
 /// case above and read the wrong element here.
-/// requires: x.a[1] == 5
-/// ensures: ret == 9
 pub fn returned_ref_to_a_sibling_element(mut x: Boxed) -> u8 {
     *x.second_mut() = 9;
     x.a[1]
 }
 
+spec! {
+    requires: x.a[1] == 5,
+    ensures: ret == 5,
+}
 /// The false direction of [`returned_ref_to_a_sibling_element`].
-/// requires: x.a[1] == 5
-/// ensures: ret == 5
 pub fn returned_ref_to_a_sibling_element_cannot_prove_this(mut x: Boxed) -> u8 {
     *x.second_mut() = 9;
     x.a[1]
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 9,
+}
 /// The write through the returned reference must not land on a *different* element.
 ///
 /// The method writes `x.a[1]`, so `x.a[0]` is still the seed. Claiming `ret == 9` here is
 /// false of the body; an element index that was dropped or defaulted would prove it.
-/// requires: x.a[0] == 5
-/// ensures: ret == 9
 pub fn returned_ref_write_is_not_the_wrong_element_cannot_prove_this(mut x: Boxed) -> u8 {
     *x.second_mut() = 9;
     x.a[0]
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 9,
+}
 /// A helper that returns `&mut` to an element of the array it was handed: the write
 /// through the returned reference must reach the caller's array.
 ///
@@ -8805,18 +10382,18 @@ pub fn returned_ref_write_is_not_the_wrong_element_cannot_prove_this(mut x: Boxe
 /// against a body returning 9 -- a false proof, not a lost one. Stripping the argument's
 /// deref (the head `arg_source` already names) and pinning the index is what makes the
 /// true contract decide and the false twin refute.
-/// requires: x.a[0] == 5
-/// ensures: ret == 9
 pub fn returned_ref_to_a_whole_array_element(mut x: Boxed) -> u8 {
     let r = elem_mut(&mut x.a);
     *r = 9;
     x.a[0]
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 5,
+}
 /// The false direction of [`returned_ref_to_a_whole_array_element`]: the seed, not the
 /// write. This is the entry the pre-fix engine *proved*, so it is the sharpest tooth here.
-/// requires: x.a[0] == 5
-/// ensures: ret == 5
 pub fn returned_ref_to_a_whole_array_element_cannot_prove_this(mut x: Boxed) -> u8 {
     let r = elem_mut(&mut x.a);
     *r = 9;
@@ -8829,18 +10406,22 @@ fn elem_mut(a: &mut [u8; 4]) -> &mut u8 {
     &mut a[0]
 }
 
+spec! {
+    requires: o.i.a[0] == 5,
+    ensures: ret == 9,
+}
 /// A returned reference to an element reached through a *nested* field path: the origin is
 /// `(*_1).i.a[_2]`, so the appended projection is a chain of two fields and an index.
-/// requires: o.i.a[0] == 5
-/// ensures: ret == 9
 pub fn returned_ref_to_a_nested_whole_array_element(mut o: NestedArrays) -> u8 {
     *deep_elem_mut(&mut o) = 9;
     o.i.a[0]
 }
 
+spec! {
+    requires: o.i.a[0] == 5,
+    ensures: ret == 5,
+}
 /// The false direction of [`returned_ref_to_a_nested_whole_array_element`].
-/// requires: o.i.a[0] == 5
-/// ensures: ret == 5
 pub fn returned_ref_to_a_nested_whole_array_element_cannot_prove_this(mut o: NestedArrays) -> u8 {
     *deep_elem_mut(&mut o) = 9;
     o.i.a[0]
@@ -8851,36 +10432,46 @@ fn deep_elem_mut(o: &mut NestedArrays) -> &mut u8 {
     &mut o.i.a[0]
 }
 
+spec! {
+    requires: x.a[0] == 5 && i == 0,
+    ensures: ret == 9,
+}
 /// A returned reference to a *guarded* symbolic element: `x.nth_mut(i)` is `&mut x.a[i]`
 /// and the contract admits only `i == 0`, so the write lands on `x.a[0]` and `ret == 9`
 /// decides. The guard is what makes the symbolic index a single element.
-/// requires: x.a[0] == 5 && i == 0
-/// ensures: ret == 9
 pub fn returned_ref_to_a_guarded_symbolic_element(mut x: Boxed, i: usize) -> u8 {
     *x.nth_mut(i) = 9;
     x.a[0]
 }
 
+spec! {
+    requires: x.a[0] == 5 && i == 0,
+    ensures: ret == 5,
+}
 /// The false direction of [`returned_ref_to_a_guarded_symbolic_element`]: same body, so
 /// claiming the seed must be refuted.
-/// requires: x.a[0] == 5 && i == 0
-/// ensures: ret == 5
 pub fn returned_ref_to_a_guarded_symbolic_element_cannot_prove_this(mut x: Boxed, i: usize) -> u8 {
     *x.nth_mut(i) = 9;
     x.a[0]
 }
 
+spec! {
+    requires: x.a[0] == 5,
+    ensures: ret == 5,
+}
 /// A returned reference to an element under a *symbolic* index the contract does not pin:
 /// `i` may be any of the four elements, so the write cannot be aimed at `x.a[0]`. The
 /// engine must not prove either direction -- the true `ret == 9` is a refusal, and the
 /// false `ret == 5` must not be a false proof.
-/// requires: x.a[0] == 5
-/// ensures: ret == 5
 pub fn returned_ref_to_an_unpinned_symbolic_element_cannot_prove_this(mut x: Boxed, i: usize) -> u8 {
     *x.nth_mut(i) = 9;
     x.a[0]
 }
 
+spec! {
+    requires: x.a[0] == 5 && zero == 0 && i < 4,
+    ensures: ret == 5,
+}
 /// A returned reference to an element under a symbolic index, with the caller's
 /// numbering *shifted* by an extra parameter so the callee's index local number
 /// names a different caller local.
@@ -8891,19 +10482,19 @@ pub fn returned_ref_to_an_unpinned_symbolic_element_cannot_prove_this(mut x: Box
 /// element `x.a[0]` and the false `ret == 5` was **proved**. The index cannot be
 /// pinned (the contract admits any `i < 4`), so the write may hit any element and
 /// must be refused, never aimed at a caller local that happens to share its number.
-/// requires: x.a[0] == 5 && zero == 0 && i < 4
-/// ensures: ret == 5
 pub fn a_shifted_symbolic_element_cannot_prove_this(mut x: Boxed, zero: usize, i: usize) -> u8 {
     *x.nth_mut(i) = 9;
     x.a[0]
 }
 
+spec! {
+    requires: x.a[0] == 5 && zero == 0 && i < 4,
+    ensures: ret == 9,
+}
 /// The true direction of [`a_shifted_symbolic_element_cannot_prove_this`]: the
 /// write may land on any element, so `ret == 9` is a refusal, not a proof. A fix
 /// that dropped the write and left the seed readable would turn the false
 /// direction above around and prove *this* one instead, so both are pinned.
-/// requires: x.a[0] == 5 && zero == 0 && i < 4
-/// ensures: ret == 9
 pub fn a_shifted_symbolic_element_is_not_proved(mut x: Boxed, zero: usize, i: usize) -> u8 {
     *x.nth_mut(i) = 9;
     x.a[0]
@@ -8917,6 +10508,10 @@ impl Boxed {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// A struct literal's array field carries its elements.
 ///
 /// `ArrayHolder { a: [9, 1, 2, 3] }` builds the array in a temp whose elements live in
@@ -8927,102 +10522,122 @@ impl Boxed {
 /// missing value proves nothing, so the true `ret == 9` was merely lost. A bare array
 /// literal (`let a = [9, 1, 2, 3]; a[0]`) always worked, which is why only the field case
 /// showed the hole.
-/// requires: true
-/// ensures: ret == 9
 pub fn a_struct_literal_array_element_is_read_back() -> u8 {
     let x = ArrayHolder { a: [9, 1, 2, 3] };
     x.a[0]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// The false direction of [`a_struct_literal_array_element_is_read_back`]: a carry that
 /// landed every element on index 0, or dropped the indices, would decide the wrong one.
-/// requires: true
-/// ensures: ret == 1
 pub fn a_struct_literal_array_element_is_not_the_seed_cannot_prove_this() -> u8 {
     let x = ArrayHolder { a: [9, 1, 2, 3] };
     x.a[0]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// The element at a *different* index, so a fix that pinned the first element for all of
 /// them is caught.
-/// requires: true
-/// ensures: ret == 1
 pub fn a_struct_literal_array_second_element_is_read_back() -> u8 {
     let x = ArrayHolder { a: [9, 1, 2, 3] };
     x.a[1]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// The false direction of [`a_struct_literal_array_second_element_is_read_back`].
-/// requires: true
-/// ensures: ret == 9
 pub fn a_struct_literal_array_second_element_is_not_the_first_cannot_prove_this() -> u8 {
     let x = ArrayHolder { a: [9, 1, 2, 3] };
     x.a[1]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// A *nested* struct literal: the array field is one level deeper, so the move re-roots the
 /// elements under a longer destination chain.
-/// requires: true
-/// ensures: ret == 9
 pub fn a_nested_struct_literal_array_element_is_read_back() -> u8 {
     let o = NestedArrays { i: ArrayHolder { a: [9, 1, 2, 3] }, k: 0 };
     o.i.a[0]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// The false direction of [`a_nested_struct_literal_array_element_is_read_back`].
-/// requires: true
-/// ensures: ret == 1
 pub fn a_nested_struct_literal_array_element_is_not_the_seed_cannot_prove_this() -> u8 {
     let o = NestedArrays { i: ArrayHolder { a: [9, 1, 2, 3] }, k: 0 };
     o.i.a[0]
 }
 
+spec! {
+    requires: o.i.a[0] == 7,
+    ensures: ret == 9,
+}
 /// A whole-field assignment through a reference carries the array field's elements to the
 /// caller. The callee's `*h = n` replaces the field, and the elements of the moved array
 /// have to reach the caller's store or `o.i.a[0]` reads its seed.
-/// requires: o.i.a[0] == 7
-/// ensures: ret == 9
 pub fn a_whole_field_assignment_carries_its_array_elements(mut o: NestedArrays) -> u8 {
     set_holder(&mut o.i, ArrayHolder { a: [9, 1, 2, 3] });
     o.i.a[0]
 }
 
+spec! {
+    requires: o.i.a[0] == 7,
+    ensures: ret == 7,
+}
 /// The false direction of [`a_whole_field_assignment_carries_its_array_elements`].
-/// requires: o.i.a[0] == 7
-/// ensures: ret == 7
 pub fn a_stale_whole_field_array_element_cannot_prove_this(mut o: NestedArrays) -> u8 {
     set_holder(&mut o.i, ArrayHolder { a: [9, 1, 2, 3] });
     o.i.a[0]
 }
 
+spec! {
+    requires: o.k == 5,
+    ensures: ret == 5,
+}
 /// The whole-field replacement must not disturb a sibling scalar.
-/// requires: o.k == 5
-/// ensures: ret == 5
 pub fn a_whole_field_assignment_leaves_its_sibling(mut o: NestedArrays) -> u8 {
     set_holder(&mut o.i, ArrayHolder { a: [9, 1, 2, 3] });
     o.k
 }
 
+spec! {
+    requires: o.k == 5,
+    ensures: ret == 9,
+}
 /// The false direction of [`a_whole_field_assignment_leaves_its_sibling`]: a re-base that
 /// spilled the moved elements onto the sibling would decide this.
-/// requires: o.k == 5
-/// ensures: ret == 9
 pub fn a_whole_field_assignment_leaves_its_sibling_cannot_prove_this(mut o: NestedArrays) -> u8 {
     set_holder(&mut o.i, ArrayHolder { a: [9, 1, 2, 3] });
     o.k
 }
 
+spec! {
+    requires: h.a[0] == 5,
+    ensures: ret == 5,
+}
 /// An array *field* read through a reference argument: the referent's elements are carried
 /// in, so the callee's `h.a[0]` reads the caller's element.
-/// requires: h.a[0] == 5
-/// ensures: ret == 5
 pub fn an_array_field_argument_is_read_by_element(h: ArrayHolder) -> u8 {
     h.a[0]
 }
 
+spec! {
+    requires: h.a[0] == 5,
+    ensures: ret == 9,
+}
 /// The false direction of [`an_array_field_argument_is_read_by_element`].
-/// requires: h.a[0] == 5
-/// ensures: ret == 9
 pub fn an_array_field_argument_is_read_by_element_cannot_prove_this(h: ArrayHolder) -> u8 {
     h.a[0]
 }
@@ -9032,58 +10647,70 @@ pub fn set_holder(h: &mut ArrayHolder, n: ArrayHolder) {
     *h = n;
 }
 
+spec! {
+    requires: o.i.v == 7,
+    ensures: ret == 9,
+}
 /// A whole-aggregate replacement through a sub-place target decides.
 ///
 /// `set_whole(&mut o.i, InnerBox { v: 9 })` replaces the whole referent, and the moved value's
 /// leaf must reach the caller. This was once believed *sound-incomplete*; it is not -- the
 /// re-based write-back re-roots the callee's `fields` entry under the target's chain, and a
 /// whole value and a leaf write are both a `fields` entry there.
-/// requires: o.i.v == 7
-/// ensures: ret == 9
 pub fn whole_replacement_through_sub_place(mut o: OuterBox) -> u8 {
     set_whole(&mut o.i, InnerBox { v: 9 });
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 7,
+    ensures: ret == 7,
+}
 /// The false direction of [`whole_replacement_through_sub_place`]: a dropped replacement
 /// would leave the seed, so this would verify.
-/// requires: o.i.v == 7
-/// ensures: ret == 7
 pub fn whole_replacement_through_sub_place_cannot_prove_this(mut o: OuterBox) -> u8 {
     set_whole(&mut o.i, InnerBox { v: 9 });
     o.i.v
 }
 
+spec! {
+    requires: o.j.v == 5,
+    ensures: ret == 5,
+}
 /// The replacement must not spill onto the sibling field.
-/// requires: o.j.v == 5
-/// ensures: ret == 5
 pub fn whole_replacement_leaves_the_sibling(mut o: OuterBox) -> u8 {
     set_whole(&mut o.i, InnerBox { v: 9 });
     o.j.v
 }
 
+spec! {
+    requires: o.j.v == 5,
+    ensures: ret == 9,
+}
 /// The false direction of [`whole_replacement_leaves_the_sibling`]: a write-back that
 /// re-rooted onto the whole local instead of the target's chain would prove this.
-/// requires: o.j.v == 5
-/// ensures: ret == 9
 pub fn whole_replacement_leaves_the_sibling_cannot_prove_this(mut o: OuterBox) -> u8 {
     set_whole(&mut o.i, InnerBox { v: 9 });
     o.j.v
 }
 
+spec! {
+    requires: o.i.v == 7,
+    ensures: ret == 9,
+}
 /// A replacement whose value is built in a caller local, so the carry crosses the frame
 /// from a temp rather than a literal.
-/// requires: o.i.v == 7
-/// ensures: ret == 9
 pub fn whole_replacement_from_a_local(mut o: OuterBox) -> u8 {
     let n = InnerBox { v: 9 };
     set_whole(&mut o.i, n);
     o.i.v
 }
 
+spec! {
+    requires: o.i.v == 7,
+    ensures: ret == 7,
+}
 /// The false direction of [`whole_replacement_from_a_local`].
-/// requires: o.i.v == 7
-/// ensures: ret == 7
 pub fn whole_replacement_from_a_local_cannot_prove_this(mut o: OuterBox) -> u8 {
     let n = InnerBox { v: 9 };
     set_whole(&mut o.i, n);
@@ -9135,10 +10762,12 @@ const ENABLED: bool = true;
 /// the verdicts for the functions below.
 const HUGE: i128 = 1 + 2;
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// A small function in a file that also declares [`HUGE`], so the parse of the
 /// unused 128-bit item cannot take the process down before this contract decides.
-/// requires: true
-/// ensures: ret == 7
 pub fn a_file_with_an_unused_i128_const_still_verifies(x: u8) -> u8 {
     let _ = x;
     7
@@ -9157,26 +10786,32 @@ const LESS: bool = -1i8 < 0i8;
 /// An unsigned comparison at a width of its own, the control for [`LESS`].
 const BIGGER: bool = 200u8 > 100u8;
 
+spec! {
+    requires: true,
+    ensures: ret == true,
+}
 /// A signed comparison folded in a *constant* is read at its operands' type.
-/// requires: true
-/// ensures: ret == true
 pub fn a_signed_comparison_const_is_read() -> bool {
     LESS
 }
 
+spec! {
+    requires: true,
+    ensures: ret == false,
+}
 /// The false direction of [`a_signed_comparison_const_is_read`]: folding `LESS` at
 /// the `bool` destination would read the operands as unsigned and prove this. It
 /// must not verify.
-/// requires: true
-/// ensures: ret == false
 pub fn a_signed_comparison_const_is_read_cannot_prove_this() -> bool {
     LESS
 }
 
+spec! {
+    requires: true,
+    ensures: ret == true,
+}
 /// The control for [`a_signed_comparison_const_is_read`], at an unsigned type where
 /// the destination reading happens to agree.
-/// requires: true
-/// ensures: ret == true
 pub fn an_unsigned_comparison_const_is_read() -> bool {
     BIGGER
 }
@@ -9192,46 +10827,56 @@ const FWD_NEXT: u8 = FWD_LIMIT + 1;
 /// The forward-referenced limit, declared after its user.
 const FWD_LIMIT: u8 = 10;
 
+spec! {
+    requires: true,
+    ensures: ret == 11,
+}
 /// A forward-referenced constant resolves.
-/// requires: true
-/// ensures: ret == 11
 pub fn a_forward_referenced_const_is_read() -> u8 {
     FWD_NEXT
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 12,
+}
 /// The false direction of [`a_forward_referenced_const_is_read`]: leaving the
 /// forward reference unmodelled would skip rather than prove, but a *guessed* value
 /// would prove this. It must not verify.
-/// requires: true
-/// ensures: ret == 12
 pub fn a_forward_referenced_const_is_read_cannot_prove_this() -> u8 {
     FWD_NEXT
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 10,
+}
 /// Reading a named constant decides.
-/// requires: true
-/// ensures: ret == 10
 pub fn named_const_is_read(x: u8) -> u8 {
     let _ = x;
     LIMIT
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 11,
+}
 /// The false direction of [`named_const_is_read`]: a wrong inlined value would prove
 /// this.
-/// requires: true
-/// ensures: ret == 11
 pub fn named_const_is_read_cannot_prove_this(x: u8) -> u8 {
     let _ = x;
     LIMIT
 }
 
+spec! {
+    requires: x < 10,
+    ensures: ret == 1,
+}
 /// A named constant used as a comparison bound decides. The precondition names the
 /// value the constant holds (`10`) as a plain literal, which is the spelling that
 /// worked before the contract reader could resolve `const` items; the constant
 /// itself is named in the `A contract that names a const` section below. A wrong
 /// inlined value would make the branch unreachable and the postcondition false.
-/// requires: x < 10
-/// ensures: ret == 1
 pub fn named_const_bounds_a_comparison(x: u8) -> u8 {
     if x < LIMIT {
         1
@@ -9240,9 +10885,11 @@ pub fn named_const_bounds_a_comparison(x: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: x < 10,
+    ensures: ret == 2,
+}
 /// The false direction of [`named_const_bounds_a_comparison`].
-/// requires: x < 10
-/// ensures: ret == 2
 pub fn named_const_bounds_a_comparison_cannot_prove_this(x: u8) -> u8 {
     if x < LIMIT {
         1
@@ -9251,9 +10898,11 @@ pub fn named_const_bounds_a_comparison_cannot_prove_this(x: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: x == 10,
+    ensures: ret == 1,
+}
 /// A named constant used in an equality test decides.
-/// requires: x == 10
-/// ensures: ret == 1
 pub fn named_const_matches_an_equality(x: u8) -> u8 {
     if x == LIMIT {
         1
@@ -9262,9 +10911,11 @@ pub fn named_const_matches_an_equality(x: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: x == 10,
+    ensures: ret == 2,
+}
 /// The false direction of [`named_const_matches_an_equality`].
-/// requires: x == 10
-/// ensures: ret == 2
 pub fn named_const_matches_an_equality_cannot_prove_this(x: u8) -> u8 {
     if x == LIMIT {
         1
@@ -9273,6 +10924,10 @@ pub fn named_const_matches_an_equality_cannot_prove_this(x: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 11,
+}
 /// A constant whose definition is an *expression* rather than a literal is
 /// inlined by interpreting its body: rustc prints it with its own locals and
 /// basic blocks (`const NEXT: u8 = { let mut _0: u8; ... }`), and the folder walks
@@ -9283,50 +10938,58 @@ pub fn named_const_matches_an_equality_cannot_prove_this(x: u8) -> u8 {
 /// This was the crate's own named future-work item: before the folder the item
 /// stayed an unreadable path constant and this was `Incomplete` (a coverage
 /// boundary, never a wrong proof).
-/// requires: true
-/// ensures: ret == 11
 pub fn named_const_of_an_expression_is_inlined(x: u8) -> u8 {
     let _ = x;
     NEXT
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 10,
+}
 /// The false direction of [`named_const_of_an_expression_is_inlined`]: a *guessed*
 /// or mis-folded value would prove this. `NEXT` is `LIMIT + 1 == 11`, so `10` is
 /// the wrong value and the contract must refute rather than pass.
-/// requires: true
-/// ensures: ret == 10
 pub fn named_const_of_an_expression_is_inlined_cannot_prove_this(x: u8) -> u8 {
     let _ = x;
     NEXT
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 300,
+}
 /// A folded expression keeps the item's own width. `BIG` is `200 + 100 == 300` at
 /// `u16`; a folder that dropped to a byte would truncate it to `44` and the
 /// contract would not decide. Same tell as [`named_const_keeps_its_width`], but
 /// through the folder rather than a printed literal.
-/// requires: true
-/// ensures: ret == 300
 pub fn an_expression_const_keeps_its_width() -> u16 {
     BIG
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1000,
+}
 /// A constant wider than a byte keeps its own width.
-/// requires: true
-/// ensures: ret == 1000
 pub fn named_const_keeps_its_width() -> u16 {
     WIDE_LIMIT
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 999,
+}
 /// The false direction of [`named_const_keeps_its_width`].
-/// requires: true
-/// ensures: ret == 999
 pub fn named_const_keeps_its_width_cannot_prove_this() -> u16 {
     WIDE_LIMIT
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// A boolean constant selects a branch at the use site.
-/// requires: true
-/// ensures: ret == 7
 pub fn named_bool_const_selects() -> u8 {
     if ENABLED {
         7
@@ -9335,9 +10998,11 @@ pub fn named_bool_const_selects() -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// The false direction of [`named_bool_const_selects`].
-/// requires: true
-/// ensures: ret == 9
 pub fn named_bool_const_selects_cannot_prove_this() -> u8 {
     if ENABLED {
         7
@@ -9346,9 +11011,11 @@ pub fn named_bool_const_selects_cannot_prove_this() -> u8 {
     }
 }
 
+spec! {
+    requires: x >= -1,
+    ensures: ret == 1,
+}
 /// A negative constant's sign survives inlining, so the comparison is a signed one.
-/// requires: x >= -1
-/// ensures: ret == 1
 pub fn named_negative_const_is_signed(x: i8) -> i8 {
     if x < NEG {
         0
@@ -9357,11 +11024,13 @@ pub fn named_negative_const_is_signed(x: i8) -> i8 {
     }
 }
 
+spec! {
+    requires: x >= -1,
+    ensures: ret == 0,
+}
 /// The false direction of [`named_negative_const_is_signed`]: reading `NEG` as a
 /// positive 1 would make this hold for `x == -1` and `x == 0`, so it is not the
 /// false twin of a wrong *value* alone -- it also pins the signed reading.
-/// requires: x >= -1
-/// ensures: ret == 0
 pub fn named_negative_const_is_signed_cannot_prove_this(x: i8) -> i8 {
     if x < NEG {
         0
@@ -9385,21 +11054,29 @@ pub mod high {
     pub const K: u8 = 7;
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
 /// A module-nested constant is inlined by its full path.
-/// requires: true
-/// ensures: ret == 5
 pub fn nested_module_const_is_read() -> u8 {
     low::K
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The false direction of [`nested_module_const_is_read`]: reading the *other*
 /// module's `K` (7) would prove this, so the entry pins the path keying.
-/// requires: true
-/// ensures: ret == 7
 pub fn nested_module_const_is_read_cannot_prove_this() -> u8 {
     low::K
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// A `const` declared *inside* a function body is now inlined for its owner: the
 /// *use* is printed with the enclosing function's path (`const
 /// a_function_local_const_is_inlined::L`) while the *definition* is printed bare
@@ -9415,21 +11092,25 @@ pub fn nested_module_const_is_read_cannot_prove_this() -> u8 {
 /// what [`bare_const_uses`] reads. So the value is keyed by the *qualified* path,
 /// and [`a_local_const_is_not_in_scope_in_another_function`] still holds the bare
 /// key out.
-/// requires: true
-/// ensures: ret == 3
 pub fn a_function_local_const_is_inlined() -> u8 {
     const L: u8 = 3;
     L
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// The function that owns the local `const` the contract below must not see.
-/// requires: true
-/// ensures: ret == 3
 pub fn a_local_const_owner() -> u8 {
     const L: u8 = 3;
     L
 }
 
+spec! {
+    requires: L == 3,
+    ensures: ret == 3,
+}
 /// A function-local `const` is not in scope in another function, and its
 /// definition must not become a program-wide key.
 ///
@@ -9441,8 +11122,6 @@ pub fn a_local_const_owner() -> u8 {
 /// write, and the function was *proved* from another function's body. That is not
 /// a lost proof but a wrong one: the name must resolve to nothing here, leaving
 /// this `Skipped` (unreadable `requires`), never `Verified`.
-/// requires: L == 3
-/// ensures: ret == 3
 pub fn a_local_const_is_not_in_scope_in_another_function() -> u8 {
     3
 }
@@ -9458,12 +11137,14 @@ pub fn a_local_const_is_not_in_scope_in_another_function() -> u8 {
 // built at the item's own width and sign (the dump prints `const 10_u8`), so a
 // `const NEG: i8 = -1` compares as `-1`, not `255`.
 
+spec! {
+    requires: x <= LIMIT,
+    ensures: ret <= LIMIT,
+}
 /// A precondition that names a constant, and a body that names the same one. The
 /// postcondition is only reachable when the reader resolves `LIMIT` to `10` on
 /// both sides; a bare name that resolved to nothing would skip the function
 /// rather than prove it.
-/// requires: x <= LIMIT
-/// ensures: ret <= LIMIT
 pub fn a_contract_names_a_const(x: u8) -> u8 {
     if x > LIMIT {
         LIMIT
@@ -9472,21 +11153,25 @@ pub fn a_contract_names_a_const(x: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret <= LIMIT,
+}
 /// The false direction of [`a_contract_names_a_const`]: the body does *not* clamp
 /// to `LIMIT`, so the postcondition that names the constant is false. Reading the
 /// constant as an unbounded argument would leave this unproved either way, so the
 /// entry pins that the name really is a value.
-/// requires: true
-/// ensures: ret <= LIMIT
 pub fn a_contract_names_a_const_cannot_prove_this(x: u8) -> u8 {
     x
 }
 
+spec! {
+    requires: y >= NEG,
+    ensures: ret >= NEG,
+}
 /// A negative constant named in a contract keeps its sign, so the bound is the
 /// signed `-1`. Read as the unsigned `255`, the precondition would be vacuous and
 /// the postcondition false.
-/// requires: y >= NEG
-/// ensures: ret >= NEG
 pub fn a_contract_names_a_negative_const(y: i8) -> i8 {
     if y < NEG {
         NEG
@@ -9495,19 +11180,23 @@ pub fn a_contract_names_a_negative_const(y: i8) -> i8 {
     }
 }
 
+spec! {
+    requires: b == ENABLED,
+    ensures: ret == ENABLED,
+}
 /// A boolean constant named in a comparison in a contract.
-/// requires: b == ENABLED
-/// ensures: ret == ENABLED
 pub fn a_contract_names_a_bool_const(b: bool) -> bool {
     let _ = b;
     ENABLED
 }
 
+spec! {
+    requires: x <= low::K,
+    ensures: ret <= low::K,
+}
 /// A module-qualified constant named in a contract, resolved by its full path so
 /// it does not collide with a top-level constant of the same last segment. The
 /// body reads `low::K`, and the contract names the same path.
-/// requires: x <= low::K
-/// ensures: ret <= low::K
 pub fn a_contract_names_a_qualified_const(x: u8) -> u8 {
     if x > low::K {
         low::K
@@ -9516,12 +11205,14 @@ pub fn a_contract_names_a_qualified_const(x: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: x <= low::K,
+    ensures: ret == high::K,
+}
 /// The false direction of [`a_contract_names_a_qualified_const`]: naming the
 /// *other* module's `K` (7) is a value the body never exceeds, but the body clamps
 /// to `low::K` (5), so `ret <= high::K` is true -- this entry instead pins the two
 /// values apart by demanding the body reach `high::K`, which it cannot.
-/// requires: x <= low::K
-/// ensures: ret == high::K
 pub fn a_contract_names_a_qualified_const_cannot_prove_this(x: u8) -> u8 {
     if x > low::K {
         low::K
@@ -9530,21 +11221,25 @@ pub fn a_contract_names_a_qualified_const_cannot_prove_this(x: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: x <= NEXT,
+    ensures: ret <= NEXT,
+}
 /// A constant whose definition is an *expression* now resolves in a *contract*
 /// too: the item is folded once, into the program's const table, and both the
 /// body's use site and the contract reader resolve the same value. The
 /// postcondition is `ret <= NEXT`, and the body returns exactly `NEXT`.
-/// requires: x <= NEXT
-/// ensures: ret <= NEXT
 pub fn a_contract_names_an_expression_const(x: u8) -> u8 {
     let _ = x;
     NEXT
 }
 
+spec! {
+    requires: x <= LIMITT,
+    ensures: ret <= LIMIT,
+}
 /// A misspelled constant is refused, not read as an argument that does not exist
 /// nor as zero. The name here differs from `LIMIT` by one letter.
-/// requires: x <= LIMITT
-/// ensures: ret <= LIMIT
 pub fn a_misspelled_const_is_refused(x: u8) -> u8 {
     let _ = x;
     LIMIT
@@ -9557,6 +11252,10 @@ pub struct MethodCounter {
 }
 
 impl MethodCounter {
+    spec! {
+        requires: self.n <= 250,
+        ensures: ret == self.n + 1,
+    }
     /// A method's contract is keyed by the source name `bump`, but the MIR dump
     /// names the body `<impl at …>::bump`. Resolving the contract by the *dump*
     /// name matched nothing, and a missing contract is not a refusal:
@@ -9565,19 +11264,19 @@ impl MethodCounter {
     /// zero obligations, the body never looked at. The true direction must verify
     /// *with* its postcondition checked, which is why the obligation count is
     /// asserted rather than only the verdict.
-    /// requires: self.n <= 250
-    /// ensures: ret == self.n + 1
     pub fn bump(&self) -> u8 {
         self.n + 1
     }
 
+    spec! {
+        requires: self.n <= 250,
+        ensures: ret == self.n + 2,
+    }
     /// The false direction of [`MethodCounter::bump`]: the postcondition demands
     /// one more than the body returns, so it is false on every input. Before the
     /// tail resolution this came back `verified` with zero obligations -- the exact
     /// false proof the resolution closes. The corpus-wide naming invariant holds
     /// it as well.
-    /// requires: self.n <= 250
-    /// ensures: ret == self.n + 2
     pub fn bump_cannot_prove_this(&self) -> u8 {
         self.n + 1
     }
@@ -9599,31 +11298,37 @@ impl MethodCounter {
 // another local shares its name, and prints it bare (`const LEAKY`) when it does
 // not -- and the bare spelling is the one that collides with a crate-level item.
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// A function whose local `const` no other local shares, so rustc prints its
 /// *definition* bare (`const LEAKY: u8 = const 3_u8;`) -- byte-identical to a
 /// crate-level item's.
-/// requires: true
-/// ensures: ret == 3
 pub fn a_unique_local_const_owner() -> u8 {
     const LEAKY: u8 = 3;
     LEAKY
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// A string that contains the text `const LEAKY`, so the leak shape is present.
-/// requires: true
-/// ensures: ret == 0
 pub fn a_string_literal_spells_const_leaky() -> u8 {
     let s = "const LEAKY";
     let _ = s;
     0
 }
 
+spec! {
+    requires: LEAKY == 3,
+    ensures: ret == 3,
+}
 /// A contract that names `LEAKY` where no `const LEAKY` is in scope. The only
 /// `const LEAKY` is a local of [`a_unique_local_const_owner`], reachable here only
 /// if a string literal leaked its name into the bare-use set. It must be
 /// `Skipped`, never `Verified`.
-/// requires: LEAKY == 3
-/// ensures: ret == 3
 pub fn a_string_literal_must_not_leak_a_unique_local_const() -> u8 {
     3
 }
@@ -9640,11 +11345,13 @@ pub fn a_string_literal_must_not_leak_a_unique_local_const() -> u8 {
 /// A crate-level constant named by a contract below and by no body at all.
 const CONTRACT_ONLY: u8 = 7;
 
+spec! {
+    requires: true,
+    ensures: ret <= CONTRACT_ONLY,
+}
 /// The postcondition names [`CONTRACT_ONLY`], which the body never reads. It must
 /// resolve and the function verify; before the crate-scope tell the definition
 /// was dropped and this was `Skipped` (unreadable `ensures`).
-/// requires: true
-/// ensures: ret <= CONTRACT_ONLY
 pub fn a_contract_only_const_is_resolved() -> u8 {
     3
 }
@@ -9666,13 +11373,15 @@ pub fn a_contract_only_const_is_resolved() -> u8 {
 // measure is also required, because the false proof is the recursion route
 // assuming the postcondition; without a measure that route never fires.
 
+spec! {
+    requires: true,
+    decreases: n,
+    ensures: ret == 0,
+}
 /// A free function named exactly `wrapping_add` that calls the *intrinsic* on the
 /// non-base path. Its postcondition `ret == 0` is false for `n == 1` (the body
 /// returns `0u8.wrapping_add(1) == 1`), so it must FAIL. Treating the intrinsic
 /// call as a self-call assumed `ret == 0` for the result and proved it.
-/// requires: true
-/// decreases: n
-/// ensures: ret == 0
 pub fn wrapping_add(n: u8) -> u8 {
     if n == 0 {
         0
@@ -9681,15 +11390,17 @@ pub fn wrapping_add(n: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    decreases: n,
+    ensures: ret <= n,
+}
 /// A free function named exactly `wrapping_add` that *does* call itself. The
 /// type-aware resolver must still fire the recursion: the call `wrapping_add(n-1)`
 /// is printed bare (`wrapping_add`), matches this function by exact name, and its
 /// postcondition is assumed by the induction. This is the companion to the fixture
 /// above -- the intrinsic guard must not refuse a real self-call just because the
 /// tail matches an intrinsic name.
-/// requires: true
-/// decreases: n
-/// ensures: ret <= n
 pub fn wrapping_add_still_recurses(n: u8) -> u8 {
     if n == 0 {
         0
@@ -9698,14 +11409,16 @@ pub fn wrapping_add_still_recurses(n: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret <= x,
+}
 /// A static associated function genuinely named like an intrinsic that recurses on
 /// itself. The tail matches an intrinsic's, but the call `Recursing::wrapping_sub`
 /// resolves to this function -- a `core` intrinsic's name carries an `<impl`
 /// projection and is refused -- so the induction proves the claim. The name is
 /// `wrapping_sub` rather than `wrapping_add` because the free `wrapping_add` above
 /// already owns that outcome key, and a method's report name is its bare tail.
-/// requires: true
-/// ensures: ret <= x
 pub fn a_static_method_named_like_an_intrinsic_still_recurses(x: u8) -> u8 {
     Recursing::wrapping_sub(x)
 }
@@ -9714,10 +11427,12 @@ pub fn a_static_method_named_like_an_intrinsic_still_recurses(x: u8) -> u8 {
 pub struct Recursing;
 
 impl Recursing {
+    spec! {
+        requires: true,
+        decreases: x,
+        ensures: ret <= x,
+    }
     /// Recurses on `x`, with a measure and a postcondition the induction proves.
-    /// requires: true
-    /// decreases: x
-    /// ensures: ret <= x
     pub fn wrapping_sub(x: u8) -> u8 {
         if x == 0 {
             0
@@ -9735,12 +11450,14 @@ impl Recursing {
 // the reader an empty `const` table there made `requires: n <= LIMIT` unreadable
 // at the self-call, so a decidable proof came back a refusal.
 
+spec! {
+    requires: n <= LIMIT,
+    decreases: n,
+    ensures: ret <= LIMIT,
+}
 /// A recursive function whose contract names [`LIMIT`]. The constant resolves at
 /// the self-call now, so the induction goes through and this verifies; before,
 /// the self-call's `requires` was unreadable and the function was `Skipped`.
-/// requires: n <= LIMIT
-/// decreases: n
-/// ensures: ret <= LIMIT
 pub fn a_recursive_contract_naming_a_const_is_resolved(n: u8) -> u8 {
     if n == 0 {
         0
@@ -9766,36 +11483,44 @@ pub fn a_recursive_contract_naming_a_const_is_resolved(n: u8) -> u8 {
 pub struct StaticOwner;
 
 impl StaticOwner {
+    spec! {
+        requires: true,
+        ensures: ret == 99,
+    }
     /// The body returns 99, but the call below never reaches it.
-    /// requires: true
-    /// ensures: ret == 99
     pub fn from(x: u8) -> u16 {
         let _ = x;
         99
     }
 
+    spec! {
+        requires: true,
+        ensures: ret == 7,
+    }
     /// A local static method the call below *does* reach.
-    /// requires: true
-    /// ensures: ret == 7
     pub fn seed() -> u8 {
         7
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 99,
+}
 /// The false direction: `<u16 as From<u8>>::from(x)` is `core`'s conversion,
 /// which returns `x`, so `ret == 99` is false for every `x != 99`. Before the
 /// owner-type check this call matched `StaticOwner::from` on the shared tail and
 /// the contract came back verified -- a false proof.
-/// requires: true
-/// ensures: ret == 99
 pub fn a_static_call_resolves_to_its_own_impl_cannot_prove_this(x: u8) -> u16 {
     <u16 as From<u8>>::from(x)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The true direction: a call to a *local* static method resolves to that method,
 /// so its postcondition is checked and holds.
-/// requires: true
-/// ensures: ret == 7
 pub fn a_local_static_call_resolves_to_its_impl() -> u8 {
     StaticOwner::seed()
 }
@@ -9816,39 +11541,52 @@ pub struct TaggedLeft;
 pub struct TaggedRight;
 
 impl TaggedLeft {
-    /// requires: true
-    /// ensures: ret == 1
+    spec! {
+        requires: true,
+        ensures: ret == 1,
+    }
     pub fn tag() -> u8 {
         1
     }
 
+    spec! {
+        requires: true,
+        ensures: ret == 2,
+    }
     /// The false direction: the body returns 1 but the claim demands 2. If this
     /// resolved to [`TaggedRight::tag`]'s contract (`ret == 2`) it would look
     /// proved -- a false proof the location key closes.
-    /// requires: true
-    /// ensures: ret == 2
     pub fn tag_cannot_prove_this() -> u8 {
         1
     }
 }
 
 impl TaggedRight {
-    /// requires: true
-    /// ensures: ret == 2
+    spec! {
+        requires: true,
+        ensures: ret == 2,
+    }
     pub fn tag() -> u8 {
         2
     }
 
+    spec! {
+        requires: true,
+        ensures: ret == 1,
+    }
     /// The mirror of [`TaggedLeft::tag_cannot_prove_this`]: the body returns 2
     /// but the claim demands 1, so a conflation onto the left contract would
     /// "prove" it.
-    /// requires: true
-    /// ensures: ret == 1
     pub fn tag_cannot_prove_this() -> u8 {
         2
     }
 }
 
+spec! {
+    requires: x <= 100,
+    requires: y <= 100,
+    ensures: ret <= 100,
+}
 /// `Ord::min`/`Ord::max` are *trait* methods, so the dump spells a call `<u8 as
 /// Ord>::min` -- the trait itself, with no `core::num::<impl …>` inherent path.
 /// They are modelled anyway: the model is one ite whose ordering predicate is
@@ -9859,44 +11597,49 @@ impl TaggedRight {
 /// body first and reaches the model only when none claims the name -- the same
 /// rule the intrinsic model follows, and the reason a local `Ord` below is
 /// answered by its body rather than by `core`'s ordering.
-/// requires: x <= 100
-/// requires: y <= 100
-/// ensures: ret <= 100
 pub fn ord_min_is_at_most_both(x: u8, y: u8) -> u8 {
     x.min(y)
 }
 
+spec! {
+    requires: true,
+    ensures: ret >= x,
+}
 /// `max` is at least both operands, so it is at least `x`; a model that swapped
 /// the two would return `min` and refute this.
-/// requires: true
-/// ensures: ret >= x
 pub fn ord_max_is_at_least_x(x: i8, y: i8) -> i8 {
     x.max(y)
 }
 
+spec! {
+    requires: x == i8::MIN,
+    ensures: ret == i8::MIN,
+}
 /// The signed ordering is not the unsigned one. `i8::MIN`'s bits (`0x80`) are the
 /// largest *unsigned* byte, so a model that used `ule` would return `1` here; as a
 /// signed value `MIN` is below `1`, so the signed model returns `MIN`. The
 /// precondition pins the operand to the one value where the two orderings differ.
-/// requires: x == i8::MIN
-/// ensures: ret == i8::MIN
 pub fn ord_min_of_min_and_one_is_min(x: i8) -> i8 {
     x.min(1)
 }
 
+spec! {
+    requires: x <= 100,
+    requires: y <= 100,
+    ensures: ret <= 100,
+}
 /// The explicit `Ord::min` spelling reaches the same model as the method form.
-/// requires: x <= 100
-/// requires: y <= 100
-/// ensures: ret <= 100
 pub fn explicit_ord_min_is_modelled(x: u8, y: u8) -> u8 {
     std::cmp::Ord::min(x, y)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x,
+}
 /// The false direction: `min(x, y) == x` holds only when `x <= y`, so with no
 /// precondition it must be refuted. A model that always returned `x` -- or that
 /// treated `min` as the identity -- would prove it.
-/// requires: true
-/// ensures: ret == x
 pub fn ord_min_is_x_tripwire(x: u8, y: u8) -> u8 {
     x.min(y)
 }
@@ -9919,27 +11662,35 @@ pub mod ord_shim {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 99,
+}
 /// The body returns `99`, so this verifies only if the local trait's body is what
 /// answers the call. If the model answered instead it would return `min(x, y)`,
 /// which is `99` only when one operand is `99`, so the postcondition would be
 /// false.
-/// requires: true
-/// ensures: ret == 99
 pub fn local_ord_min_is_answered_by_its_body(x: u8, y: u8) -> u8 {
     ord_shim::Ord::min(x, y)
 }
 
+spec! {
+    requires: x == 100,
+    requires: y == 200,
+    ensures: ret == 100,
+}
 /// The false direction on the same call: the *model's* answer (`min(100, 200) ==
 /// 100`) is what this claims, and the body returns `99`, so it must be refuted. A
 /// model that answered the call would return `100` and *prove* it -- this is the
 /// tripwire for that mistake.
-/// requires: x == 100
-/// requires: y == 200
-/// ensures: ret == 100
 pub fn local_ord_min_is_not_the_model_tripwire(x: u8, y: u8) -> u8 {
     ord_shim::Ord::min(x, y)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == (x == y),
+}
 /// `PartialEq::eq`/`ne` and `PartialOrd::lt`/`le`/`gt`/`ge` are the six comparison
 /// operators in their *trait-method* spelling, so the dump spells a call `<u8 as
 /// PartialOrd>::lt` -- the trait, with no `core::num::<impl …>` path. They are
@@ -9949,50 +11700,58 @@ pub fn local_ord_min_is_not_the_model_tripwire(x: u8, y: u8) -> u8 {
 ///
 /// The model is a *fallback*, as for `Ord`: a same-dump body is resolved first, so
 /// a local trait method of the same shape is inlined rather than modelled.
-/// requires: true
-/// ensures: ret == (x == y)
 pub fn partial_eq_method_is_the_operator(x: u8, y: u8) -> bool {
     x.eq(&y)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == (x != y),
+}
 /// `ne` is `!=`.
-/// requires: true
-/// ensures: ret == (x != y)
 pub fn partial_ne_method_is_the_operator(x: u8, y: u8) -> bool {
     x.ne(&y)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == (x < y),
+}
 /// `lt` is `<`, read unsigned on a `u8`.
-/// requires: true
-/// ensures: ret == (x < y)
 pub fn partial_lt_method_is_the_operator(x: u8, y: u8) -> bool {
     x.lt(&y)
 }
 
+spec! {
+    requires: x < y,
+    ensures: ret == false,
+}
 /// `ge` is `>=`. A model that read `ge` as `le` -- or that swapped the operands --
 /// would refute this; `x == y` is the point where `>=` and `<=` coincide, so the
 /// precondition is chosen to *separate* the orderings rather than to coincide.
-/// requires: x < y
-/// ensures: ret == false
 pub fn partial_ge_method_is_the_operator(x: u8, y: u8) -> bool {
     x.ge(&y)
 }
 
+spec! {
+    requires: x == i8::MIN,
+    requires: y == 1,
+    ensures: ret == true,
+}
 /// The signed ordering is not the unsigned one. `i8::MIN`'s bits (`0x80`) are the
 /// largest *unsigned* byte, so a model that read `lt` as `ult` would call
 /// `i8::MIN < 1` false; as a signed value `MIN` is below `1`, so it is true. The
 /// precondition pins the operand to the one value where the two orderings differ.
-/// requires: x == i8::MIN
-/// requires: y == 1
-/// ensures: ret == true
 pub fn partial_lt_signed_is_not_unsigned(x: i8, y: i8) -> bool {
     x.lt(&y)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == (x <= y),
+}
 /// The false direction: `x.lt(&y)` is not `x <= y`, so with no precondition it
 /// must be refuted at `x == y`. A model that read `lt` as `le` would prove it.
-/// requires: true
-/// ensures: ret == (x <= y)
 pub fn partial_lt_is_not_le_tripwire(x: u8, y: u8) -> bool {
     x.lt(&y)
 }
@@ -10013,26 +11772,34 @@ pub mod cmp_shim {
     }
 }
 
+spec! {
+    requires: x == 5,
+    requires: y == 5,
+    ensures: ret == true,
+}
 /// The body returns `true`, so this verifies only if the local trait's body is what
 /// answers the call. If the model answered instead it would return `x < y`, which is
 /// `true` only when `x < y`, so the postcondition would be false at `x == y`.
-/// requires: x == 5
-/// requires: y == 5
-/// ensures: ret == true
 pub fn local_partial_ord_lt_is_answered_by_its_body(x: u8, y: u8) -> bool {
     cmp_shim::PartialOrd::lt(&x, &y)
 }
 
+spec! {
+    requires: x == 5,
+    requires: y == 5,
+    ensures: ret == false,
+}
 /// The false direction on the same call: the *model's* answer (`5 < 5` is `false`)
 /// is what this claims, and the body returns `true`, so it must be refuted. A model
 /// that answered the call would return `false` and *prove* it.
-/// requires: x == 5
-/// requires: y == 5
-/// ensures: ret == false
 pub fn local_partial_ord_lt_is_not_the_model_tripwire(x: u8, y: u8) -> bool {
     cmp_shim::PartialOrd::lt(&x, &y)
 }
 
+spec! {
+    requires: x == 5,
+    ensures: ret == true,
+}
 /// A comparison against a *constant* operand. In unoptimised MIR the literal is
 /// promoted to its own item (`const F::promoted[0]: &u8 = { _1 = const 5_u8; _0 =
 /// &_1; }`) and the call passes a reference to it, so the operand is a place
@@ -10040,30 +11807,36 @@ pub fn local_partial_ord_lt_is_not_the_model_tripwire(x: u8, y: u8) -> bool {
 /// was collected the reference's referent was unknown and the call came back
 /// `unmodelled argument to <u8 as PartialEq>::eq` -- every comparison against a
 /// literal bound, an everyday idiom.
-/// requires: x == 5
-/// ensures: ret == true
 pub fn partial_eq_const_is_the_operator(x: u8) -> bool {
     x.eq(&5)
 }
 
+spec! {
+    requires: x == i8::MIN,
+    ensures: ret == true,
+}
 /// The signed reading is the content: `i8::MIN < -1` is true signed, and false
 /// unsigned (`MIN`'s bits, `0x80`, are the largest *unsigned* byte). A model that
 /// read the promoted `-1` as unsigned would refute this.
-/// requires: x == i8::MIN
-/// ensures: ret == true
 pub fn partial_lt_const_signed_is_not_unsigned(x: i8) -> bool {
     x.lt(&-1)
 }
 
+spec! {
+    requires: x == 100,
+    ensures: ret == true,
+}
 /// The false direction on a constant operand: `x.lt(&100)` is not `x <= 100`, so
 /// it fails at `x == 100`. A model that read `lt` as `le` -- or that ignored the
 /// constant and compared the operand with itself -- would prove it.
-/// requires: x == 100
-/// ensures: ret == true
 pub fn partial_lt_const_is_not_le_tripwire(x: i32) -> bool {
     x.lt(&100)
 }
 
+spec! {
+    requires: x < y,
+    ensures: ret == 1,
+}
 /// `Ord::cmp` is the third `Ord` trait method, and unlike every other modelled
 /// shape its result is a *three-variant enum*, `core::cmp::Ordering`, whose
 /// discriminants are the signed `i8` values `Less` = -1, `Equal` = 0, `Greater` =
@@ -10075,8 +11848,6 @@ pub fn partial_lt_const_is_not_le_tripwire(x: i32) -> bool {
 /// The three arms return distinct constants, so each arm pins which tag the model
 /// produced: `Less` and `Greater` separate a swapped operands, and `Equal`
 /// separates the third arm.
-/// requires: x < y
-/// ensures: ret == 1
 pub fn ord_cmp_less_arm(x: u8, y: u8) -> i8 {
     match x.cmp(&y) {
         core::cmp::Ordering::Less => 1,
@@ -10085,9 +11856,11 @@ pub fn ord_cmp_less_arm(x: u8, y: u8) -> i8 {
     }
 }
 
+spec! {
+    requires: x == y,
+    ensures: ret == 0,
+}
 /// The `Equal` arm, reached only when `x == y`.
-/// requires: x == y
-/// ensures: ret == 0
 pub fn ord_cmp_equal_arm(x: u8, y: u8) -> i8 {
     match x.cmp(&y) {
         core::cmp::Ordering::Less => 1,
@@ -10096,10 +11869,12 @@ pub fn ord_cmp_equal_arm(x: u8, y: u8) -> i8 {
     }
 }
 
+spec! {
+    requires: x > y,
+    ensures: ret == -1,
+}
 /// The `Greater` arm. The precondition separates it from `Less`, so a model that
 /// swapped the two comparisons would take the `Less` arm and return `1`.
-/// requires: x > y
-/// ensures: ret == -1
 pub fn ord_cmp_greater_arm(x: u8, y: u8) -> i8 {
     match x.cmp(&y) {
         core::cmp::Ordering::Less => 1,
@@ -10108,13 +11883,15 @@ pub fn ord_cmp_greater_arm(x: u8, y: u8) -> i8 {
     }
 }
 
+spec! {
+    requires: x == i8::MIN,
+    requires: y == 1,
+    ensures: ret == 1,
+}
 /// The signed ordering is not the unsigned one, through the three-way result.
 /// `i8::MIN`'s bits (`0x80`) are the largest *unsigned* byte, so an unsigned model
 /// would take the `Greater` arm and return `-1`; as a signed value `MIN` is below
 /// `1`, so the `Less` arm returns `1`.
-/// requires: x == i8::MIN
-/// requires: y == 1
-/// ensures: ret == 1
 pub fn ord_cmp_signed_is_not_unsigned(x: i8, y: i8) -> i8 {
     match x.cmp(&y) {
         core::cmp::Ordering::Less => 1,
@@ -10123,20 +11900,24 @@ pub fn ord_cmp_signed_is_not_unsigned(x: i8, y: i8) -> i8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == (x < y),
+}
 /// The `matches!` form: `x.cmp(&y) == Ordering::Less` lowers to the same
 /// `switchInt`, and a model that read the tag as unsigned would compare the
 /// `Less` discriminant `0xff` against `255` and take the arm for every input.
-/// requires: true
-/// ensures: ret == (x < y)
 pub fn ord_cmp_matches_less(x: u8, y: u8) -> bool {
     matches!(x.cmp(&y), core::cmp::Ordering::Less)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == (x <= y),
+}
 /// The false direction: `x.cmp(&y) == Less` is not `x <= y`, so with no
 /// precondition it must be refuted at `x == y`. A model that read the tag as
 /// unsigned -- or that confused `Less` with `Equal` -- would prove it.
-/// requires: true
-/// ensures: ret == (x <= y)
 pub fn ord_cmp_is_not_le_tripwire(x: u8, y: u8) -> bool {
     matches!(x.cmp(&y), core::cmp::Ordering::Less)
 }
@@ -10165,72 +11946,86 @@ pub mod conv_shim {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The false direction, and the tripwire for the collision above: the call is
 /// spelled with the *standard library's* trait path, so the compiler resolved it
 /// to `core`'s widening, which returns `x` -- not this module's `7`. The contract
 /// claims the local body's answer, so it must be refuted. Owner-matching alone
 /// answered the call from the local body, returned `7`, and *proved* it.
-/// requires: true
-/// ensures: ret == 7
 pub fn local_from_does_not_answer_the_std_trait(x: u8) -> u16 {
     <u16 as std::convert::From<u8>>::from(x)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The local trait's *own* call, answered by its own body.
 ///
 /// The positive counterpart: this is what must keep working once the trait check
 /// is in place. `conv_shim::From::from(x)` names the local trait, whose body
 /// returns `7`, so the claim verifies only from the body.
-/// requires: true
-/// ensures: ret == 7
 pub fn local_from_is_answered_by_its_own_body(x: u8) -> u16 {
     conv_shim::From::from(x)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x as u16,
+}
 /// A widening conversion, `u16::from(u8)`, is a *trait* method too -- the dump
 /// spells `<u16 as From<u8>>::from` -- so like `Ord::min` it is modelled as a
 /// fallback behind the same-dump lookup. The value is the source widened by its own
 /// signedness, which for an unsigned source is a zero-fill. The contract spells the
 /// comparison at the destination width (`x as u16`) because a contract's two
 /// operands must share a width; the cast is the same widening the model performs.
-/// requires: true
-/// ensures: ret == x as u16
 pub fn from_u8_is_modelled(x: u8) -> u16 {
     u16::from(x)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x as u16,
+}
 /// The `Into` direction of the same conversion reaches one model: `x.into()` on a
 /// `u8` is `<u8 as Into<u16>>::into`, whose destination is the type parameter.
-/// requires: true
-/// ensures: ret == x as u16
 pub fn into_u8_is_modelled(x: u8) -> u16 {
     x.into()
 }
 
+spec! {
+    requires: x == i8::MIN,
+    ensures: ret == x as i16,
+}
 /// A *signed* source widens by sign-extension, so `x` keeps its value across the
 /// width change -- and `i8::MIN` stays `i8::MIN`, which is what separates a
 /// sign-extension from a zero-fill. The contract compares at the destination width,
 /// as above.
-/// requires: x == i8::MIN
-/// ensures: ret == x as i16
 pub fn signed_widening_keeps_negative_values(x: i8) -> i16 {
     i16::from(x)
 }
 
+spec! {
+    requires: x == -1,
+    ensures: ret == 255,
+}
 /// The false direction: `-1i8` widens to `-1i16`, whose bits are `0xffff`, not
 /// `255`. A model that zero-filled a signed source -- the `truncate` mistake -- would
 /// return `255` and *prove* this, so it is the tripwire for that reading.
-/// requires: x == -1
-/// ensures: ret == 255
 pub fn signed_widening_is_not_zero_fill_tripwire(x: i8) -> i16 {
     i16::from(x)
 }
 
+spec! {
+    requires: x == 255,
+    ensures: ret == 255,
+}
 /// A widening that also *changes signedness*: `i16::from(u8)` zero-fills (the
 /// source is unsigned), so `255u8` stays `255` and never becomes `-1`, even though
 /// the destination is signed.
-/// requires: x == 255
-/// ensures: ret == 255
 pub fn unsigned_source_widens_to_signed_destination(x: u8) -> i16 {
     i16::from(x)
 }
@@ -10279,12 +12074,14 @@ pub mod range_shim {
     impl a::Custom for Range<u8> {}
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// A call to a user `Range`'s custom `into_iter` must never be answered by the
 /// range model. The model would return the range unchanged and *prove* `ret == 1`;
 /// the real method always panics, so the honest verdict is a refutation (the panic
 /// fires on every input). This is the tripwire for the unqualified-`Range` hole.
-/// requires: true
-/// ensures: ret == 1
 pub fn user_range_into_iter_is_not_the_model_cannot_prove_this() -> u8 {
     let r = range_shim::Range { start: 1u8, end: 2u8 };
     let x = <range_shim::Range<u8> as range_shim::a::Custom>::into_iter(r);
@@ -10321,20 +12118,24 @@ impl Sized2 for Marker {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// The false direction: the real `set` writes `42`, so `ret == 1` is false. A model
 /// that inlined the *default* `set` would leave the seed `1` and *prove* this.
-/// requires: true
-/// ensures: ret == 1
 pub fn default_body_self_call_is_not_the_default_cannot_prove_this() -> u8 {
     let p = Marker { v: 1 };
     let q = <Marker as Sized2>::go(p);
     q.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 42,
+}
 /// The true direction on the same shape, read where the concrete type *is* known:
 /// `Marker::set` is called directly, so the override's `42` is what answers.
-/// requires: true
-/// ensures: ret == 42
 pub fn impl_override_is_read_when_the_type_is_known() -> u8 {
     let mut p = Marker { v: 1 };
     Sized2::set(&mut p, 42);
@@ -10366,21 +12167,25 @@ pub trait Ord: Copy {
 
 impl Ord for u16 {}
 
+spec! {
+    requires: x == 2,
+    requires: y == 1,
+    ensures: ret == 2,
+}
 /// The default body returns its first operand (`x == 2` here), so this verifies
 /// only if the local trait's body answered. The model would return `min(x, y)`.
-/// requires: x == 2
-/// requires: y == 1
-/// ensures: ret == 2
 pub fn crate_root_ord_default_verifies_from_its_body(x: u16, y: u16) -> u16 {
     <u16 as Ord>::min(x, y)
 }
 
+spec! {
+    requires: x == 2,
+    requires: y == 1,
+    ensures: ret == 1,
+}
 /// The false direction: `core`'s ordering returns `1` for `(2, 1)`, but the local
 /// trait's body returns `2`, so this must be refuted. A model that answered the
 /// bare call would *prove* it -- the false proof this pins.
-/// requires: x == 2
-/// requires: y == 1
-/// ensures: ret == 1
 pub fn crate_root_ord_default_is_not_the_model_tripwire(x: u16, y: u16) -> u16 {
     <u16 as Ord>::min(x, y)
 }
@@ -10414,20 +12219,24 @@ pub struct Root;
 
 impl Trait for Root {}
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// The call names the crate-root trait (bare `Trait`, because `Root: Trait` is in
 /// scope at the call site), whose body returns `9`. It verifies only if that trait
 /// -- not `suffix_shim::Trait`'s `7` -- answered.
-/// requires: true
-/// ensures: ret == 9
 pub fn suffix_collision_verifies_from_the_named_trait(r: &Root) -> u8 {
     <Root as Trait>::pick(r)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The false direction: the module trait's body returns `7`, not `9`, so this must
 /// be refuted. A suffix match answered the bare call from `suffix_shim::Trait` and
 /// *proved* it -- the false proof this pins.
-/// requires: true
-/// ensures: ret == 7
 pub fn suffix_collision_is_not_the_module_trait_tripwire(r: &Root) -> u8 {
     <Root as Trait>::pick(r)
 }
@@ -10456,19 +12265,23 @@ impl Defaulted for Overrider {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
 /// `Overrider` overrides `value` to return `2`, so this verifies only if the
 /// override's body answered rather than the default's `1`.
-/// requires: true
-/// ensures: ret == 2
 pub fn override_wins_over_the_default_body(o: &Overrider) -> u8 {
     <Overrider as Defaulted>::value(o)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// The false direction: the default body returns `1`, not the override's `2`, so
 /// this must be refuted. Answering from the default *proved* it -- the false proof
 /// this pins.
-/// requires: true
-/// ensures: ret == 1
 pub fn override_is_not_the_default_body_tripwire(o: &Overrider) -> u8 {
     <Overrider as Defaulted>::value(o)
 }
@@ -10477,11 +12290,13 @@ pub struct Inheritor;
 
 impl Defaulted for Inheritor {}
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// `Inheritor` does not override `value`, so the trait's default is the body Rust
 /// calls; this verifies only if the default is still reachable when nothing
 /// overrides it.
-/// requires: true
-/// ensures: ret == 1
 pub fn an_unoverridden_method_still_uses_the_default(i: &Inheritor) -> u8 {
     <Inheritor as Defaulted>::value(i)
 }
@@ -10503,19 +12318,23 @@ impl From<ConvLocal> for u16 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// A real library conversion, `7u8` widened to `u16`, so this verifies only if the
 /// modelled conversion answered rather than the local `From<ConvLocal>` body's
 /// `107`.
-/// requires: true
-/// ensures: ret == 7
 pub fn library_from_is_not_the_local_body() -> u16 {
     <u16 as From<u8>>::from(7u8)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 107,
+}
 /// The false direction: the local body returns `107`, not the widened `7`, so this
 /// must be refuted. A match that ignored the trait argument *proved* it.
-/// requires: true
-/// ensures: ret == 107
 pub fn library_from_is_not_the_local_body_tripwire() -> u16 {
     <u16 as From<u8>>::from(7u8)
 }
@@ -10526,16 +12345,20 @@ pub fn library_from_is_not_the_local_body_tripwire() -> u16 {
 // model that refused a same-width call would report a real call unknown -- a lost
 // proof. It is modelled as the source unchanged.
 
-/// requires: x == 200
-/// ensures: ret == 200
+spec! {
+    requires: x == 200,
+    ensures: ret == 200,
+}
 pub fn same_width_from_is_the_identity(x: u8) -> u8 {
     <u8 as From<u8>>::from(x)
 }
 
+spec! {
+    requires: x == 200,
+    ensures: ret == 7,
+}
 /// The false direction: the identity returns `x`, so claiming anything else must be
 /// refuted. A model that guessed a truncation or a constant would *prove* it.
-/// requires: x == 200
-/// ensures: ret == 7
 pub fn same_width_from_is_not_a_guess_tripwire(x: u8) -> u8 {
     <u8 as From<u8>>::from(x)
 }
@@ -10560,18 +12383,22 @@ impl NestedWrap<Option<u8>> for NestedHolder {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// The local body returns `9`, so this verifies only if the balanced argument
 /// matched the impl and the body answered.
-/// requires: true
-/// ensures: ret == 9
 pub fn nested_trait_arg_finds_the_body(h: &NestedHolder) -> u8 {
     <NestedHolder as NestedWrap<Option<u8>>>::get(h)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
 /// The false direction: the body returns `9`, so this must be refuted. A resolver
 /// that lost the body reported the call unmodelled instead (a lost proof).
-/// requires: true
-/// ensures: ret == 4
 pub fn nested_trait_arg_is_not_a_guess_tripwire(h: &NestedHolder) -> u8 {
     <NestedHolder as NestedWrap<Option<u8>>>::get(h)
 }
@@ -10603,18 +12430,22 @@ pub mod cfg_alias_shim {
 
 pub struct CfgOther;
 
+spec! {
+    requires: true,
+    ensures: ret == 107,
+}
 /// The live alias still binds `Conv` to the standard trait, so the impl's call
 /// resolves to its body (returning `107`) and verifies.
-/// requires: true
-/// ensures: ret == 107
 pub fn cfg_disabled_import_keeps_the_live_alias() -> u16 {
     <u16 as std::convert::From<CfgLocal>>::from(CfgLocal)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// The false direction: the body returns `107`, so this must be refuted. Recording
 /// the impl with the *wrong* trait (the disabled alias) lost the call instead.
-/// requires: true
-/// ensures: ret == 9
 pub fn cfg_disabled_import_is_not_the_wrong_alias_tripwire() -> u16 {
     <u16 as std::convert::From<CfgLocal>>::from(CfgLocal)
 }
@@ -10646,18 +12477,22 @@ pub mod cfg_multi_alias_shim {
 
 pub struct CfgMultiOther;
 
+spec! {
+    requires: true,
+    ensures: ret == 108,
+}
 /// The live alias still binds `Conv` to the standard trait, so the impl's call
 /// resolves to its body (returning `108`) and verifies.
-/// requires: true
-/// ensures: ret == 108
 pub fn cfg_multiline_import_keeps_the_live_alias() -> u16 {
     <u16 as std::convert::From<CfgMultiLocal>>::from(CfgMultiLocal)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// The false direction: the body returns `108`, so this must be refuted. Missing
 /// the multi-line condition recorded the impl with the wrong trait and lost the call.
-/// requires: true
-/// ensures: ret == 9
 pub fn cfg_multiline_import_is_not_the_wrong_alias_tripwire() -> u16 {
     <u16 as std::convert::From<CfgMultiLocal>>::from(CfgMultiLocal)
 }
@@ -10688,18 +12523,22 @@ pub mod cfg_quoted_alias_shim {
 
 pub struct CfgQuotedOther;
 
+spec! {
+    requires: true,
+    ensures: ret == 109,
+}
 /// The live alias still binds `Conv` to the standard trait, so the impl's call
 /// resolves to its body (returning `109`) and verifies.
-/// requires: true
-/// ensures: ret == 109
 pub fn cfg_quoted_delimiter_keeps_the_live_alias() -> u16 {
     <u16 as std::convert::From<CfgQuotedLocal>>::from(CfgQuotedLocal)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// The false direction: the body returns `109`, so this must be refuted. Counting the
 /// quoted `(` as a delimiter hid the condition and lost the call instead.
-/// requires: true
-/// ensures: ret == 9
 pub fn cfg_quoted_delimiter_is_not_the_wrong_alias_tripwire() -> u16 {
     <u16 as std::convert::From<CfgQuotedLocal>>::from(CfgQuotedLocal)
 }
@@ -10727,87 +12566,107 @@ pub struct ElemOuter {
     pub j: ElemInner,
 }
 
+spec! {
+    requires: true,
+    ensures: ret.i.v == x && ret.j.v == y,
+}
 /// Builds an `ElemOuter` from two values, so the elements come from a call rather
 /// than a literal in the same body.
-/// requires: true
-/// ensures: ret.i.v == x && ret.j.v == y
 pub fn elem_outer(x: u8, y: u8) -> ElemOuter {
     ElemOuter { i: ElemInner { v: x }, j: ElemInner { v: y } }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// An array literal of inline aggregate elements, read by index then field.
-/// requires: true
-/// ensures: ret == 3
 pub fn an_array_literal_of_aggregates_is_read_back() -> u8 {
     let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
 /// The false direction: element 0's leaf is `3`, so a read that leaked element 1's
 /// leaf would decide this wrongly.
-/// requires: true
-/// ensures: ret == 4
 pub fn an_array_literal_of_aggregates_is_not_the_other_element_cannot_prove_this() -> u8 {
     let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
 /// The *second* element, so a fix that pinned index 0 for every read is caught.
-/// requires: true
-/// ensures: ret == 4
 pub fn an_array_literal_of_aggregates_second_element_is_read_back() -> u8 {
     let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
     a[1].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// The false direction of the second element.
-/// requires: true
-/// ensures: ret == 3
 pub fn an_array_literal_of_aggregates_second_is_not_the_first_cannot_prove_this() -> u8 {
     let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
     a[1].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// The elements are *field reads* of another aggregate, so the parts come from a
 /// call's return rather than a literal, and the literal only stores their value.
-/// requires: true
-/// ensures: ret == 3
 pub fn an_array_literal_of_aggregate_fields_is_read_back() -> u8 {
     let o = elem_outer(3, 4);
     let a = [o.i, o.j];
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
 /// The false direction of the field-derived literal.
-/// requires: true
-/// ensures: ret == 4
 pub fn an_array_literal_of_aggregate_fields_is_not_the_other_cannot_prove_this() -> u8 {
     let o = elem_outer(3, 4);
     let a = [o.i, o.j];
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// A *tuple* literal of aggregates: the same carry, but the read is the
 /// field-then-field spelling `t.0.v` rather than index-then-field.
-/// requires: true
-/// ensures: ret == 3
 pub fn a_tuple_literal_of_aggregates_is_read_back() -> u8 {
     let t = (ElemInner { v: 3 }, ElemInner { v: 4 });
     t.0.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
 /// The false direction of the tuple literal.
-/// requires: true
-/// ensures: ret == 4
 pub fn a_tuple_literal_of_aggregates_is_not_the_other_cannot_prove_this() -> u8 {
     let t = (ElemInner { v: 3 }, ElemInner { v: 4 });
     t.0.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// A whole-aggregate *element write* followed by a leaf read: the write's own
 /// leaves must land on the element, and the pre-write leaf must not survive.
-/// requires: true
-/// ensures: ret == 7
 pub fn an_element_write_of_an_aggregate_is_read_back() -> u8 {
     let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
     let mut b = a;
@@ -10815,9 +12674,11 @@ pub fn an_element_write_of_an_aggregate_is_read_back() -> u8 {
     b[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// The false direction of the element write: the pre-write leaf is `3`.
-/// requires: true
-/// ensures: ret == 3
 pub fn an_element_write_of_an_aggregate_is_not_the_old_leaf_cannot_prove_this() -> u8 {
     let a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
     let mut b = a;
@@ -10837,150 +12698,184 @@ pub fn an_element_write_of_an_aggregate_is_not_the_old_leaf_cannot_prove_this() 
 // look green.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// A leaf write inside an element, then the leaf read back.
-/// requires: true
-/// ensures: ret == 7
 pub fn an_element_leaf_write_is_read_back() -> u8 {
     let mut a = [ElemInner { v: 3 }];
     a[0].v = 7;
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// The false direction: the pre-write leaf is `3`, so a write that never reached
 /// the leaf store would decide this wrongly.
-/// requires: true
-/// ensures: ret == 3
 pub fn an_element_leaf_write_is_not_the_old_leaf_cannot_prove_this() -> u8 {
     let mut a = [ElemInner { v: 3 }];
     a[0].v = 7;
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
 /// The leaf write must not touch its *sibling* element.
-/// requires: true
-/// ensures: ret == 4
 pub fn an_element_leaf_write_leaves_its_sibling() -> u8 {
     let mut a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
     a[0].v = 7;
     a[1].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The false direction of the sibling check.
-/// requires: true
-/// ensures: ret == 7
 pub fn an_element_leaf_write_is_not_the_sibling_cannot_prove_this() -> u8 {
     let mut a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
     a[0].v = 7;
     a[1].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// The *second* element's leaf, so a fix that pinned index 0 for every leaf write
 /// is caught.
-/// requires: true
-/// ensures: ret == 9
 pub fn a_second_element_leaf_write_is_read_back() -> u8 {
     let mut a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
     a[1].v = 9;
     a[1].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
 /// The false direction of the second element's leaf write.
-/// requires: true
-/// ensures: ret == 4
 pub fn a_second_element_leaf_write_is_not_the_old_leaf_cannot_prove_this() -> u8 {
     let mut a = [ElemInner { v: 3 }, ElemInner { v: 4 }];
     a[1].v = 9;
     a[1].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The tuple spelling of the same leaf write: `t.0.v = 7` reads through a field
 /// chain, so it exercises the mirror key rather than the index-first one.
-/// requires: true
-/// ensures: ret == 7
 pub fn a_tuple_component_leaf_write_is_read_back() -> u8 {
     let mut t = (ElemInner { v: 3 }, ElemInner { v: 4 });
     t.0.v = 7;
     t.0.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// The false direction of the tuple component's leaf write.
-/// requires: true
-/// ensures: ret == 3
 pub fn a_tuple_component_leaf_write_is_not_the_old_leaf_cannot_prove_this() -> u8 {
     let mut t = (ElemInner { v: 3 }, ElemInner { v: 4 });
     t.0.v = 7;
     t.0.v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// A helper that writes a leaf through `&mut [ElemInner; 1]`: the write has to
 /// cross back to the caller, and the caller's pre-call leaf must not survive it.
-/// requires: true
-/// ensures: ret == 7
 pub fn a_helper_leaf_write_through_a_mutable_array_is_read_back() -> u8 {
     let mut a = [ElemInner { v: 3 }];
     write_first_leaf(&mut a, 7);
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// The false direction of the helper's leaf write: the caller's own leaf is `3`,
 /// so a call boundary that dropped the write would decide this wrongly.
-/// requires: true
-/// ensures: ret == 3
 pub fn a_helper_leaf_write_is_not_the_callers_leaf_cannot_prove_this() -> u8 {
     let mut a = [ElemInner { v: 3 }];
     write_first_leaf(&mut a, 7);
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// Writes the first element's leaf through a mutable array argument.
-/// requires: true
-/// ensures: true
 pub fn write_first_leaf(a: &mut [ElemInner; 1], v: u8) {
     a[0].v = v;
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// A helper that only *reads* a leaf through its argument: the caller's leaf has
 /// to cross *into* the callee, or the helper's contract is unreadable.
-/// requires: true
-/// ensures: ret == 3
 pub fn a_helper_leaf_read_through_an_array_argument_decides() -> u8 {
     let a = [ElemInner { v: 3 }];
     read_first_leaf(&a)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// The false direction of the helper's leaf read.
-/// requires: true
-/// ensures: ret == 9
 pub fn a_helper_leaf_read_is_not_a_made_up_value_cannot_prove_this() -> u8 {
     let a = [ElemInner { v: 3 }];
     read_first_leaf(&a)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == a[0].v,
+}
 /// Reads the first element's leaf through an array argument.
-/// requires: true
-/// ensures: ret == a[0].v
 pub fn read_first_leaf(a: &[ElemInner; 1]) -> u8 {
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// A helper that *returns* an array of aggregates: the element's leaves have to
 /// cross the return boundary with it, or the caller cannot read them at all.
-/// requires: true
-/// ensures: ret == 3
 pub fn a_returned_array_of_aggregates_keeps_its_leaves() -> u8 {
     make_one(3)[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// The false direction of the returned array's leaf.
-/// requires: true
-/// ensures: ret == 9
 pub fn a_returned_array_of_aggregates_is_not_a_made_up_value_cannot_prove_this() -> u8 {
     make_one(3)[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret[0].v == x,
+}
 /// Builds a one-element array of aggregates from a value.
-/// requires: true
-/// ensures: ret[0].v == x
 pub fn make_one(x: u8) -> [ElemInner; 1] {
     [ElemInner { v: x }]
 }
@@ -11003,9 +12898,11 @@ pub struct ElemCopy {
     pub v: u8,
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// An element copied from another array's element, then its leaf read back.
-/// requires: true
-/// ensures: ret == 7
 pub fn an_element_copy_from_another_element_is_read_back() -> u8 {
     let mut a = [ElemCopy { v: 3 }];
     let b = [ElemCopy { v: 7 }];
@@ -11013,10 +12910,12 @@ pub fn an_element_copy_from_another_element_is_read_back() -> u8 {
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// The false direction: the destination's pre-copy leaf is `3`, so a copy that
 /// never reached the leaf store would decide this wrongly.
-/// requires: true
-/// ensures: ret == 3
 pub fn an_element_copy_is_not_the_old_leaf_cannot_prove_this() -> u8 {
     let mut a = [ElemCopy { v: 3 }];
     let b = [ElemCopy { v: 7 }];
@@ -11024,63 +12923,77 @@ pub fn an_element_copy_is_not_the_old_leaf_cannot_prove_this() -> u8 {
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// A helper replaces a whole element through `&mut [ElemCopy; 1]`: the element's
 /// leaves have to cross back to the caller.
-/// requires: true
-/// ensures: ret == 7
 pub fn a_helper_whole_element_write_is_read_back() -> u8 {
     let mut a = [ElemCopy { v: 3 }];
     set_whole_element(&mut a, 7);
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// The false direction of the helper's whole-element write.
-/// requires: true
-/// ensures: ret == 3
 pub fn a_helper_whole_element_write_is_not_the_callers_leaf_cannot_prove_this() -> u8 {
     let mut a = [ElemCopy { v: 3 }];
     set_whole_element(&mut a, 7);
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// Replaces the first element of a mutable array argument.
-/// requires: true
-/// ensures: true
 pub fn set_whole_element(a: &mut [ElemCopy; 1], v: u8) {
     a[0] = ElemCopy { v };
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// A helper replaces *one* element of a two-element array; the sibling must keep
 /// its own leaf, which a store that dropped the whole array would lose.
-/// requires: true
-/// ensures: ret == 3
 pub fn a_helper_whole_element_write_leaves_its_sibling() -> u8 {
     let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
     set_second_element(&mut a, 9);
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
 /// The false direction of the sibling check: `9` is the *other* element's new
 /// leaf, so a store that put the write on element 0 would prove this.
-/// requires: true
-/// ensures: ret == 9
 pub fn a_helper_whole_element_write_is_not_the_sibling_cannot_prove_this() -> u8 {
     let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
     set_second_element(&mut a, 9);
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// Replaces the second element of a mutable array argument.
-/// requires: true
-/// ensures: true
 pub fn set_second_element(a: &mut [ElemCopy; 2], v: u8) {
     a[1] = ElemCopy { v };
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// A helper copies one element onto another through two arguments: the source's
 /// leaves have to cross *in* and the destination's *out*.
-/// requires: true
-/// ensures: ret == 7
 pub fn a_helper_element_copy_is_read_back() -> u8 {
     let mut a = [ElemCopy { v: 3 }];
     let b = [ElemCopy { v: 7 }];
@@ -11088,9 +13001,11 @@ pub fn a_helper_element_copy_is_read_back() -> u8 {
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// The false direction of the helper's element copy.
-/// requires: true
-/// ensures: ret == 3
 pub fn a_helper_element_copy_is_not_the_old_leaf_cannot_prove_this() -> u8 {
     let mut a = [ElemCopy { v: 3 }];
     let b = [ElemCopy { v: 7 }];
@@ -11098,9 +13013,11 @@ pub fn a_helper_element_copy_is_not_the_old_leaf_cannot_prove_this() -> u8 {
     a[0].v
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// Copies the first element of `b` onto the first element of `a`.
-/// requires: true
-/// ensures: true
 pub fn copy_first_element(a: &mut [ElemCopy; 1], b: &[ElemCopy; 1]) {
     a[0] = b[0];
 }
@@ -11118,10 +13035,12 @@ pub fn copy_first_element(a: &mut [ElemCopy; 1], b: &[ElemCopy; 1]) {
 // must stay unproved -- `incomplete` is the honest answer, not `verified`.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: i < 2,
+    ensures: ret == 3,
+}
 /// An unpinned write, then an element *copy* read through the copy: the leaf must
 /// not be the pre-write `3`.
-/// requires: i < 2
-/// ensures: ret == 3
 pub fn an_element_copy_after_an_unpinned_write_is_not_the_old_leaf(i: usize) -> u8 {
     let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
     a[i] = ElemCopy { v: 7 };
@@ -11129,9 +13048,11 @@ pub fn an_element_copy_after_an_unpinned_write_is_not_the_old_leaf(i: usize) -> 
     x.v
 }
 
+spec! {
+    requires: i < 2,
+    ensures: ret == 4,
+}
 /// The other element's obsolete leaf, the same way.
-/// requires: i < 2
-/// ensures: ret == 4
 pub fn an_element_copy_after_an_unpinned_write_is_not_the_sibling(i: usize) -> u8 {
     let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
     a[i] = ElemCopy { v: 7 };
@@ -11139,10 +13060,12 @@ pub fn an_element_copy_after_an_unpinned_write_is_not_the_sibling(i: usize) -> u
     x.v
 }
 
+spec! {
+    requires: i < 2,
+    ensures: ret == 7,
+}
 /// The *new* leaf is not readable either: the write may have landed on element 1,
 /// so no single element is known to be `7`.
-/// requires: i < 2
-/// ensures: ret == 7
 pub fn an_element_copy_after_an_unpinned_write_is_not_the_new_leaf(i: usize) -> u8 {
     let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
     a[i] = ElemCopy { v: 7 };
@@ -11150,10 +13073,12 @@ pub fn an_element_copy_after_an_unpinned_write_is_not_the_new_leaf(i: usize) -> 
     x.v
 }
 
+spec! {
+    requires: i < 2,
+    ensures: ret == 3,
+}
 /// An unpinned *leaf* write, then an element copy: the same poison, reached
 /// through `a[i].v = 7` rather than a whole-element write.
-/// requires: i < 2
-/// ensures: ret == 3
 pub fn an_element_copy_after_an_unpinned_leaf_write_is_not_the_old_leaf(i: usize) -> u8 {
     let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
     a[i].v = 7;
@@ -11161,10 +13086,12 @@ pub fn an_element_copy_after_an_unpinned_leaf_write_is_not_the_old_leaf(i: usize
     x.v
 }
 
+spec! {
+    requires: i < 2,
+    ensures: ret == 3,
+}
 /// A helper's unpinned write, then an element copy: the poison has to cross the
 /// call boundary, which is where it was lost.
-/// requires: i < 2
-/// ensures: ret == 3
 pub fn a_helper_unpinned_write_is_not_the_callers_old_leaf(i: usize) -> u8 {
     let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
     set_unpinned(&mut a, i);
@@ -11172,9 +13099,11 @@ pub fn a_helper_unpinned_write_is_not_the_callers_old_leaf(i: usize) -> u8 {
     x.v
 }
 
+spec! {
+    requires: i < 2,
+    ensures: ret == 4,
+}
 /// The other element, through the same helper.
-/// requires: i < 2
-/// ensures: ret == 4
 pub fn a_helper_unpinned_write_is_not_the_callers_sibling(i: usize) -> u8 {
     let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
     set_unpinned(&mut a, i);
@@ -11182,9 +13111,11 @@ pub fn a_helper_unpinned_write_is_not_the_callers_sibling(i: usize) -> u8 {
     x.v
 }
 
+spec! {
+    requires: i < 2,
+    ensures: true,
+}
 /// Writes an element the run cannot pin, so the whole array is unknown.
-/// requires: i < 2
-/// ensures: true
 pub fn set_unpinned(a: &mut [ElemCopy; 2], i: usize) {
     a[i] = ElemCopy { v: 7 };
 }
@@ -11201,9 +13132,11 @@ pub fn set_unpinned(a: &mut [ElemCopy; 2], i: usize) {
 // *not* come back is a sibling the poison left unknown, or the pre-write leaf.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: i < 2,
+    ensures: ret == 9,
+}
 /// A pinned leaf rewrite after a symbolic one: the copy reads `9`.
-/// requires: i < 2
-/// ensures: ret == 9
 pub fn a_pinned_leaf_rewrite_after_a_symbolic_write_is_read_back(i: usize) -> u8 {
     let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
     a[i].v = 7;
@@ -11212,9 +13145,11 @@ pub fn a_pinned_leaf_rewrite_after_a_symbolic_write_is_read_back(i: usize) -> u8
     x.v
 }
 
+spec! {
+    requires: i < 2,
+    ensures: ret == 9,
+}
 /// The same through a whole-element rewrite.
-/// requires: i < 2
-/// ensures: ret == 9
 pub fn a_pinned_element_rewrite_after_a_symbolic_write_is_read_back(i: usize) -> u8 {
     let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
     a[i].v = 7;
@@ -11223,9 +13158,11 @@ pub fn a_pinned_element_rewrite_after_a_symbolic_write_is_read_back(i: usize) ->
     x.v
 }
 
+spec! {
+    requires: i < 2,
+    ensures: ret == 9,
+}
 /// A pinned rewrite after a symbolic *whole-element* write, the other order.
-/// requires: i < 2
-/// ensures: ret == 9
 pub fn a_pinned_leaf_rewrite_after_a_symbolic_element_write_is_read_back(i: usize) -> u8 {
     let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
     a[i] = ElemCopy { v: 7 };
@@ -11234,10 +13171,12 @@ pub fn a_pinned_leaf_rewrite_after_a_symbolic_element_write_is_read_back(i: usiz
     x.v
 }
 
+spec! {
+    requires: i < 2,
+    ensures: ret == 9,
+}
 /// A helper that poisons and then re-establishes: the recovery has to cross the
 /// call boundary along with the poison.
-/// requires: i < 2
-/// ensures: ret == 9
 pub fn a_helper_pinned_rewrite_after_a_symbolic_write_is_read_back(i: usize) -> u8 {
     let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
     poison_then_rewrite(&mut a, i);
@@ -11245,17 +13184,21 @@ pub fn a_helper_pinned_rewrite_after_a_symbolic_write_is_read_back(i: usize) -> 
     x.v
 }
 
+spec! {
+    requires: i < 2,
+    ensures: true,
+}
 /// Poisons every element, then re-establishes element 0.
-/// requires: i < 2
-/// ensures: true
 pub fn poison_then_rewrite(a: &mut [ElemCopy; 2], i: usize) {
     a[i].v = 7;
     a[0].v = 9;
 }
 
+spec! {
+    requires: i < 2,
+    ensures: ret == 4,
+}
 /// The sibling the poison left unknown is *not* recovered by a rewrite of element 0.
-/// requires: i < 2
-/// ensures: ret == 4
 pub fn a_pinned_rewrite_does_not_recover_its_sibling(i: usize) -> u8 {
     let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
     a[i].v = 7;
@@ -11264,9 +13207,11 @@ pub fn a_pinned_rewrite_does_not_recover_its_sibling(i: usize) -> u8 {
     x.v
 }
 
+spec! {
+    requires: i < 2,
+    ensures: ret == 3,
+}
 /// Nor the pre-write leaf of the element that was rewritten.
-/// requires: i < 2
-/// ensures: ret == 3
 pub fn a_pinned_rewrite_does_not_revive_the_old_leaf(i: usize) -> u8 {
     let mut a = [ElemCopy { v: 3 }, ElemCopy { v: 4 }];
     a[i].v = 7;
@@ -11275,17 +13220,23 @@ pub fn a_pinned_rewrite_does_not_revive_the_old_leaf(i: usize) -> u8 {
     x.v
 }
 
+spec! {
+    requires: x > -100 && x < 100,
+    ensures: ret >= 0,
+}
 /// The inherent `iN::abs`, modelled as a value plus a *reachable-panic*
 /// obligation. The precondition rules out `MIN` -- the one input where `abs`
 /// overflows -- so the call is panic-free and the postcondition is the
 /// mathematical absolute value. The precondition `x > -100` is what discharges
 /// the `abs(MIN)` panic, and `ret >= 0` is the value's own range.
-/// requires: x > -100 && x < 100
-/// ensures: ret >= 0
 pub fn abs_small_reads(x: i32) -> i32 {
     x.abs()
 }
 
+spec! {
+    requires: x != i32::MIN,
+    ensures: ret <= 127,
+}
 /// The tripwire for `abs`'s *value*: the result is `|x|`, so claiming `ret <= 127`
 /// is false for a wide `i32` at `x == 1000`. A model that treated `abs` as an
 /// uninterpreted call -- or as a constant -- would prove this. It must be
@@ -11297,130 +13248,152 @@ pub fn abs_small_reads(x: i32) -> i32 {
 /// constant would still be refuted, by the panic. Discharging the panic here
 /// leaves the value as the only thing under test, and the failure kind is
 /// asserted to be the postcondition for exactly that reason.
-/// requires: x != i32::MIN
-/// ensures: ret <= 127
 pub fn abs_small_is_a_value_cannot_prove_this(x: i32) -> i32 {
     x.abs()
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// The panic obligation, not the value: `i8::abs` overflows at `MIN`, so with no
 /// precondition ruling it out the call *can* panic and the function must be
 /// reported as a failing panic. This is the entry that separates "the value is
 /// modelled" from "the panic is modelled": a model that returned `|x|` and no
 /// panic predicate would verify a function that panics on a real input.
-/// requires: true
-/// ensures: true
 pub fn abs_min_can_overflow(x: i8) -> i8 {
     x.abs()
 }
 
+spec! {
+    requires: true,
+    ensures: ret >= 0,
+}
 /// The inherent `iN::unsigned_abs`: the same magnitude as `abs`, read as the
 /// unsigned type. `i8::unsigned_abs(-128)` is `128u8`, so the result is always
 /// `>= 0` as an *unsigned* value -- and unlike `abs` the call is total, with no
 /// panic at `MIN`. The postcondition is the value's own range.
-/// requires: true
-/// ensures: ret >= 0
 pub fn unsigned_abs_reads(x: i32) -> u32 {
     x.unsigned_abs()
 }
 
+spec! {
+    requires: x == i8::MIN,
+    ensures: ret == 128,
+}
 /// The `MIN` boundary, which is the whole reason the shape is not `abs`: the
 /// magnitude of `i8::MIN` (`128`) fits the unsigned result, so this call does
 /// *not* panic and the postcondition is exactly the magnitude. A model that
 /// reused the signed `abs`'s failure predicate -- or read the magnitude back as a
 /// signed `-128` -- would fail here.
-/// requires: x == i8::MIN
-/// ensures: ret == 128
 pub fn unsigned_abs_of_min_is_the_magnitude(x: i8) -> u8 {
     x.unsigned_abs()
 }
 
+spec! {
+    requires: true,
+    ensures: ret <= 127,
+}
 /// The tripwire for `unsigned_abs`'s *value*: the result is `|x|`, so claiming
 /// `ret <= 127` is false for a wide `i32` at `x == 1000`. A model that treated
 /// the call as uninterpreted -- or as a constant -- would prove this.
-/// requires: true
-/// ensures: ret <= 127
 pub fn unsigned_abs_is_a_value_cannot_prove_this(x: i32) -> u32 {
     x.unsigned_abs()
 }
 
+spec! {
+    requires: true,
+    ensures: ret >= 0,
+}
 /// The control that separates `unsigned_abs` from `abs`: at `MIN` the signed
 /// `abs` panics, but `unsigned_abs` is total, so this function has *no* panic
 /// obligation to discharge and must verify with `requires: true`. A model that
 /// gave `unsigned_abs` the signed `abs`'s failure predicate would refute it.
-/// requires: true
-/// ensures: ret >= 0
 pub fn unsigned_abs_of_min_is_panic_free(x: i8) -> u8 {
     x.unsigned_abs()
 }
 
+spec! {
+    requires: lo <= hi,
+    ensures: lo <= ret,
+    ensures: ret <= hi,
+}
 /// `Ord::clamp`, the three-operand trait method. With `lo <= hi` the one panic
 /// (`assert!(lo <= hi)`) is discharged, and the postcondition is the clamp's own
 /// range: the result is at or above `lo` and at or below `hi`. `x` may be
 /// anywhere -- an out-of-range `x` is clamped, not an error.
-/// requires: lo <= hi
-/// ensures: lo <= ret
-/// ensures: ret <= hi
 pub fn clamp_builtin_reads(x: u32, lo: u32, hi: u32) -> u32 {
     x.clamp(lo, hi)
 }
 
+spec! {
+    requires: true,
+    ensures: true,
+}
 /// The clamp's panic: with no precondition, `lo > hi` is reachable, so the call
 /// panics and the function must be reported as a failing panic. A model that
 /// ignored the `assert!(lo <= hi)` would verify this.
-/// requires: true
-/// ensures: true
 pub fn clamp_builtin_can_panic(x: u32, lo: u32, hi: u32) -> u32 {
     x.clamp(lo, hi)
 }
 
+spec! {
+    requires: lo <= hi && x <= hi,
+    ensures: ret <= hi - 1,
+}
 /// The clamp's *value* tripwire: the result is never above `hi`, so claiming it
 /// is below `hi - 1` for every input is false at `x == hi`. A model that treated
 /// the call as an uninterpreted value would prove it. The precondition keeps
 /// `lo <= hi`, so the panic is discharged and the value is the only thing under
 /// test (the failure kind is asserted to be the postcondition).
-/// requires: lo <= hi && x <= hi
-/// ensures: ret <= hi - 1
 pub fn clamp_builtin_is_a_value_cannot_prove_this(x: u32, lo: u32, hi: u32) -> u32 {
     x.clamp(lo, hi)
 }
 
+spec! {
+    requires: lo <= hi,
+    ensures: ret >= lo,
+}
 /// A *signed* clamp, which pins the sign of the comparisons: `i8::MIN` is the
 /// smallest signed value, so a model reading the ordering as unsigned would
 /// return the wrong operand for every negative pair. The body clamps into
 /// `[lo, hi]` with `lo <= hi`; the postcondition is the same range.
-/// requires: lo <= hi
-/// ensures: ret >= lo
 pub fn clamp_builtin_signed_reads(x: i8, lo: i8, hi: i8) -> i8 {
     x.clamp(lo, hi)
 }
 
+spec! {
+    requires: true,
+    ensures: ret <= 9,
+}
 /// The ASCII class tests, which are `bool`-valued predicates on `u8` and take
 /// `&self`. `digit` returns the value's digit, so the postcondition pins both the
 /// predicate's boundary and the arithmetic after it: a model that read
 /// `is_ascii_digit` as `false` everywhere would prove `ret == 0`, and one that read
 /// it as `true` everywhere would leave the `b - b'0'` subtraction unguarded.
-/// requires: true
-/// ensures: ret <= 9
 pub fn ascii_digit_value(b: u8) -> u8 {
     if b.is_ascii_digit() { b - b'0' } else { 0 }
 }
 
+spec! {
+    requires: true,
+    ensures: ret >= 1,
+}
 /// A tripwire for the digit test: `b'9' + 1` is not a digit, so the body returns
 /// `0`, and claiming the *subtraction* ran (`ret >= 1`) is false at that input. A
 /// model that made every byte a digit would prove it.
-/// requires: true
-/// ensures: ret >= 1
 pub fn ascii_digit_is_not_every_byte_cannot_prove_this(b: u8) -> u8 {
     if b.is_ascii_digit() { b - b'0' } else { 0 }
 }
 
+spec! {
+    requires: true,
+    ensures: ret <= 2,
+}
 /// `is_ascii_hexdigit` and `is_ascii_alphabetic` are different classes, and the
 /// body returns a different constant for each. The postcondition pins the
 /// discrimination: a model that collapsed the two classes would return one
 /// constant for the other's inputs.
-/// requires: true
-/// ensures: ret <= 2
 pub fn ascii_class_discriminates(b: u8) -> u8 {
     if b.is_ascii_hexdigit() {
         1
@@ -11431,11 +13404,13 @@ pub fn ascii_class_discriminates(b: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret != 2,
+}
 /// A tripwire for the class discrimination: `b'g'` is alphabetic but not a hex
 /// digit, so the body returns `2`, and claiming the hex arm ran for every byte is
 /// false there. A model that answered `1` for a letter would prove it.
-/// requires: true
-/// ensures: ret != 2
 pub fn ascii_class_hex_arm_is_not_every_byte_cannot_prove_this(b: u8) -> u8 {
     if b.is_ascii_hexdigit() {
         1
@@ -11446,131 +13421,161 @@ pub fn ascii_class_hex_arm_is_not_every_byte_cannot_prove_this(b: u8) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret <= 1,
+}
 /// `is_ascii` is the single comparison `b < 128`, so a byte above `0x7f` takes
 /// the else arm. The postcondition pins the boundary: a model that read `is_ascii`
 /// as always true would return `1` for every byte.
-/// requires: true
-/// ensures: ret <= 1
 pub fn ascii_is_ascii_boundary(b: u8) -> u8 {
     if b.is_ascii() { 1 } else { 0 }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// A tripwire for `is_ascii`'s boundary: `0xff` is not ASCII, so the body returns
 /// `0`, and claiming `ret == 1` is false there. A model that answered `true` for
 /// every byte would prove it.
-/// requires: true
-/// ensures: ret == 1
 pub fn ascii_is_ascii_is_not_every_byte_cannot_prove_this(b: u8) -> u8 {
     if b.is_ascii() { 1 } else { 0 }
 }
 
+spec! {
+    requires: a <= b,
+    ensures: ret == b - a,
+}
 /// `abs_diff` returns the *unsigned* magnitude of the difference. `b >= a` makes
 /// the body take the `b - a` arm, so the result is `b - a`; the postcondition pins
 /// that the arms are not swapped. A model that returned the signed difference
 /// would give a negative value read as a huge unsigned one.
-/// requires: a <= b
-/// ensures: ret == b - a
 pub fn abs_diff_ordered(a: u32, b: u32) -> u32 {
     a.abs_diff(b)
 }
 
+spec! {
+    requires: a > b,
+    ensures: ret == b - a,
+}
 /// A tripwire for `abs_diff`: the difference is symmetric in the operands, so
 /// `a.abs_diff(b)` is not `b - a` when `a > b`. A model that ignored the ordering
 /// would prove it.
-/// requires: a > b
-/// ensures: ret == b - a
 pub fn abs_diff_is_symmetric_cannot_prove_this(a: u32, b: u32) -> u32 {
     a.abs_diff(b)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// A rotation by a nonzero constant moves bits and wraps the top to the bottom.
 /// `0b1000_0001` rotated left by one is `0b0000_0011`; the postcondition pins the
 /// wrap, which a plain shift (dropping the top bit) would get wrong.
-/// requires: true
-/// ensures: ret == 3
 pub fn rotate_left_wraps_the_top_bit() -> u8 {
     0x81u8.rotate_left(1)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
 /// A tripwire for the rotation: a rotation is not a shift, so the body is not
 /// `0x81 << 1` (which wraps to `2` in eight bits). A model that used a shift would
 /// prove it.
-/// requires: true
-/// ensures: ret == 2
 pub fn rotate_is_not_a_shift_cannot_prove_this() -> u8 {
     0x81u8.rotate_left(1)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0x81,
+}
 /// A rotation by the full width is the identity, which is what the amount being
 /// reduced modulo the width means. A model that saturated the amount (as a shift
 /// does) would give `0` instead.
-/// requires: true
-/// ensures: ret == 0x81
 pub fn rotate_by_the_width_is_the_identity() -> u8 {
     0x81u8.rotate_right(8)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// A rotation by more than the width wraps, so `w + 1` is a rotation by `1`. A
 /// model that read the amount as a shift would return `0` past the width.
-/// requires: true
-/// ensures: ret == 3
 pub fn rotate_by_more_than_the_width_wraps() -> u8 {
     0x81u8.rotate_left(9)
 }
 
+spec! {
+    requires: x == i8::MIN,
+    ensures: ret == -1,
+}
 /// `signum` is `-1`, `0` or `1`. This pins the negative arm, which is the one an
 /// unsigned reading of the top bit would get wrong: `i8::MIN`'s bits (`0x80`) are
 /// the largest unsigned byte, so an unsigned `signum` would return `1`, not `-1`.
-/// requires: x == i8::MIN
-/// ensures: ret == -1
 pub fn signum_of_min_is_minus_one(x: i8) -> i8 {
     x.signum()
 }
 
+spec! {
+    requires: x == -5,
+    ensures: ret == 0,
+}
 /// The tripwire: `signum` is not `x / |x|` rounded toward zero, so it is not `0`
 /// for a negative input. A model that answered `0` for every negative value, or
 /// that read the sign unsigned, would prove it.
-/// requires: x == -5
-/// ensures: ret == 0
 pub fn signum_of_a_negative_cannot_prove_this(x: i8) -> i8 {
     x.signum()
 }
 
+spec! {
+    requires: x == -1,
+    ensures: ret == 4294967295,
+}
 /// `i32::cast_unsigned` reinterprets the same 32 bits as `u32`: `-1i32` is
 /// `0xffff_ffff`, which reads as `4294967295u32`, not `-1`.
-/// requires: x == -1
-/// ensures: ret == 4294967295
 pub fn cast_unsigned_reinterprets_negative_as_large(x: i32) -> u32 {
     x.cast_unsigned()
 }
 
+spec! {
+    requires: x == -1,
+    ensures: ret == 0,
+}
 /// The false direction: an unsigned reading of `-1i32` is `4294967295`, so a
 /// model that carried the operand's *signed* type would prove this.
-/// requires: x == -1
-/// ensures: ret == 0
 pub fn cast_unsigned_reinterprets_negative_cannot_prove_this(x: i32) -> u32 {
     x.cast_unsigned()
 }
 
+spec! {
+    requires: x == 4294967295,
+    ensures: ret == -1,
+}
 /// `u32::cast_signed` reinterprets `0xffff_ffff` as `-1i32`.
-/// requires: x == 4294967295
-/// ensures: ret == -1
 pub fn cast_signed_reinterprets_large_as_negative(x: u32) -> i32 {
     x.cast_signed()
 }
 
+spec! {
+    requires: x == 4294967295,
+    ensures: ret == 0,
+}
 /// The false direction: a model that kept the *unsigned* type would read
 /// `4294967295` and prove this.
-/// requires: x == 4294967295
-/// ensures: ret == 0
 pub fn cast_signed_reinterprets_large_cannot_prove_this(x: u32) -> i32 {
     x.cast_signed()
 }
 
+spec! {
+    requires: x == -1,
+    ensures: ret == 1,
+}
 /// The type the cast produces is what a *later* comparison reads: `-1i32` cast
 /// to `u32` is greater than `0` unsigned, where the signed `-1` is not.
-/// requires: x == -1
-/// ensures: ret == 1
 pub fn cast_unsigned_makes_a_comparison_unsigned(x: i32) -> u8 {
     if x.cast_unsigned() > 0 {
         1
@@ -11579,252 +13584,310 @@ pub fn cast_unsigned_makes_a_comparison_unsigned(x: i32) -> u8 {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == -3,
+}
 /// `div_euclid` rounds the quotient so the remainder is non-negative, which is
 /// what separates it from `/` for a negative dividend. `-7 / 3` is `-2` (the
 /// truncating quotient) but `-7.div_euclid(3)` is `-3`.
-/// requires: true
-/// ensures: ret == -3
 pub fn div_euclid_rounds_toward_negative_infinity() -> i32 {
     (-7i32).div_euclid(3)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == -2,
+}
 /// The tripwire: `div_euclid` is *not* the truncating `/` for a negative dividend.
 /// A model that used `/` would prove this.
-/// requires: true
-/// ensures: ret == -2
 pub fn div_euclid_is_not_truncating_division_cannot_prove_this() -> i32 {
     (-7i32).div_euclid(3)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
 /// `rem_euclid` returns a *non-negative* remainder, unlike `%`: `-7 % 3` is `-1`,
 /// but `-7.rem_euclid(3)` is `2`.
-/// requires: true
-/// ensures: ret == 2
 pub fn rem_euclid_is_non_negative() -> i32 {
     (-7i32).rem_euclid(3)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == -1,
+}
 /// The tripwire: `rem_euclid` is not `%` for a negative dividend. A model that
 /// used `%` would prove this.
-/// requires: true
-/// ensures: ret == -1
 pub fn rem_euclid_is_not_the_truncating_remainder_cannot_prove_this() -> i32 {
     (-7i32).rem_euclid(3)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// On an *unsigned* receiver the remainder is never negative, so `rem_euclid` is
 /// the plain `%` and `7u32.rem_euclid(3)` is `1`. This pins that the model does
 /// not apply the signed adjustment where the sign cannot be negative.
-/// requires: true
-/// ensures: ret == 1
 pub fn unsigned_rem_euclid_is_the_plain_remainder() -> u32 {
     7u32.rem_euclid(3)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
 /// The tripwire: on an unsigned receiver `rem_euclid` is not `% + 3` (the signed
 /// adjustment). A model that kept the signed path for an unsigned operand would
 /// compute `1 + 3 == 4` here.
-/// requires: true
-/// ensures: ret == 4
 pub fn unsigned_rem_euclid_is_not_the_signed_adjustment_cannot_prove_this() -> u32 {
     7u32.rem_euclid(3)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
 /// On an unsigned receiver `div_euclid` is the truncating `/`: `7u32.div_euclid(3)`
 /// is `2`.
-/// requires: true
-/// ensures: ret == 2
 pub fn unsigned_div_euclid_is_the_plain_quotient() -> u32 {
     7u32.div_euclid(3)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// The tripwire: on an unsigned receiver `div_euclid` is not the signed
 /// Euclidean quotient (which would subtract one where the signed remainder was
 /// negative, a case that cannot arise for an unsigned operand).
-/// requires: true
-/// ensures: ret == 1
 pub fn unsigned_div_euclid_is_not_the_signed_adjustment_cannot_prove_this() -> u32 {
     7u32.div_euclid(3)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
 /// `div_ceil` rounds toward positive infinity: `7 / 2` is `3` with a remainder,
 /// so `7u32.div_ceil(2)` is `4`. It is the unsigned, *stable* counterpart of
 /// `div_euclid` rounding, and it is modelled only on the unsigned types.
-/// requires: true
-/// ensures: ret == 4
 pub fn div_ceil_rounds_toward_positive_infinity() -> u32 {
     7u32.div_ceil(2)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
 /// The tripwire: `div_ceil` is not the truncating `/`, so it is not `3` here. A
 /// model that used `/` would prove it.
-/// requires: true
-/// ensures: ret == 3
 pub fn div_ceil_is_not_truncating_division_cannot_prove_this() -> u32 {
     7u32.div_ceil(2)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// `reverse_bits` reverses the bit order: `0b1000_0000` (`128`) becomes `1`. A
 /// model that returned the operand unchanged, or applied a rotation, would fail.
-/// requires: true
-/// ensures: ret == 1
 pub fn reverse_bits_of_the_top_bit() -> u8 {
     0x80u8.reverse_bits()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0x80,
+}
 /// The tripwire: `reverse_bits` is not a byte swap on a single-byte type (both
 /// are the identity there), so this pins that the *bits* are reversed at all. A
 /// model that returned the operand unchanged would prove it.
-/// requires: true
-/// ensures: ret == 0x80
 pub fn reverse_bits_is_not_the_identity_cannot_prove_this() -> u8 {
     0x80u8.reverse_bits()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0x3412,
+}
 /// `swap_bytes` reverses the *bytes*: `0x1234u16.swap_bytes()` is `0x3412`. This
 /// is the multi-byte case, which the rotation model has to get right (a rotation
 /// by `w/2` bits, not by `w/2 * 8`).
-/// requires: true
-/// ensures: ret == 0x3412
 pub fn swap_bytes_reverses_the_bytes() -> u16 {
     0x1234u16.swap_bytes()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0x1234,
+}
 /// The tripwire: `swap_bytes` is not the identity on a multi-byte type. A model
 /// that returned the operand unchanged (or that took the rotation amount at the
 /// wrong width) would prove this.
-/// requires: true
-/// ensures: ret == 0x1234
 pub fn swap_bytes_is_not_the_identity_cannot_prove_this() -> u16 {
     0x1234u16.swap_bytes()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0x3412,
+}
 /// `to_be` on a little-endian target is a byte swap; the model reads the target
 /// endianness from the compilation rather than guessing. This is the shape a
 /// plain `#[cfg]`-free body has, and the value is Rust's own `to_be`.
-/// requires: true
-/// ensures: ret == 0x3412
 pub fn to_be_on_a_little_endian_target_swaps() -> u16 {
     0x1234u16.to_be()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0x1234,
+}
 /// The tripwire: on a little-endian target `to_be` is *not* the identity. A model
 /// that read the target as big-endian would prove this.
-/// requires: true
-/// ensures: ret == 0x1234
 pub fn to_be_is_not_the_identity_here_cannot_prove_this() -> u16 {
     0x1234u16.to_be()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0x1234,
+}
 /// `to_le` on a little-endian target is the identity (the value is already in
 /// little-endian order), which is the mirror of `to_be` above.
-/// requires: true
-/// ensures: ret == 0x1234
 pub fn to_le_on_a_little_endian_target_is_the_identity() -> u16 {
     0x1234u16.to_le()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0x3412,
+}
 /// `from_be` is the involution of `to_be`: on a little-endian target both are the
 /// same byte swap, so `from_be` swaps here too.
-/// requires: true
-/// ensures: ret == 0x3412
 pub fn from_be_on_a_little_endian_target_swaps() -> u16 {
     u16::from_be(0x1234)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0x1234,
+}
 /// The tripwire: on a little-endian target `from_be` is *not* the identity. A
 /// model that read `from_be` as a no-op -- or that took it for a `to_le`-style
 /// identity -- would prove this.
-/// requires: true
-/// ensures: ret == 0x1234
 pub fn from_be_is_not_the_identity_here_cannot_prove_this() -> u16 {
     u16::from_be(0x1234)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0x1234,
+}
 /// `from_le` on a little-endian target is the identity, the mirror of `from_be`.
-/// requires: true
-/// ensures: ret == 0x1234
 pub fn from_le_on_a_little_endian_target_is_the_identity() -> u16 {
     u16::from_le(0x1234)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0x1234,
+}
 /// A `to_be`/`from_be` round trip is the identity on every target: the two are the
 /// same permutation, so applying it twice cancels. This is the property that makes
 /// `from_be` the involution of `to_be`, and it holds whatever the target's
 /// endianness.
-/// requires: true
-/// ensures: ret == 0x1234
 pub fn to_be_then_from_be_is_the_identity() -> u16 {
     u16::from_be(0x1234u16.to_be())
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0x1234,
+}
 /// The tripwire for the round trip: `to_le` then `from_be` is *not* the identity
 /// when the two directions disagree, so a model that collapsed every byte-order
 /// method to one no-op would prove this.
-/// requires: true
-/// ensures: ret == 0x1234
 pub fn to_le_then_from_be_is_not_the_identity_cannot_prove_this() -> u16 {
     u16::from_be(0x1234u16.to_le())
 }
 
+spec! {
+    requires: b == 97,
+    ensures: ret == 65,
+}
 /// `to_ascii_uppercase` maps `b'a'..=b'z'` to their uppercase letters and leaves
 /// every other byte alone. This is the boundary: `b'a'` becomes `b'A'`. The
 /// receiver is an *argument* rather than a literal, because a literal receiver
 /// lowers to a promoted `const` reference (`const f::promoted[0]: &u8`), which is
 /// a separate shape the frontend does not model; the argument form is the one a
 /// contract can pin.
-/// requires: b == 97
-/// ensures: ret == 65
 pub fn to_ascii_uppercase_of_a_lowercase_letter(b: u8) -> u8 {
     b.to_ascii_uppercase()
 }
 
+spec! {
+    requires: b == 65,
+    ensures: ret == 97,
+}
 /// The tripwire: a byte outside the lowercase range is unchanged, so `b'A'`
 /// (already uppercase) stays `b'A'` -- a model that added `32` unconditionally
 /// would prove the wrong value here.
-/// requires: b == 65
-/// ensures: ret == 97
 pub fn to_ascii_uppercase_leaves_uppercase_cannot_prove_this(b: u8) -> u8 {
     b.to_ascii_uppercase()
 }
 
+spec! {
+    requires: b == 65,
+    ensures: ret == 97,
+}
 /// `to_ascii_lowercase` is the mirror of the uppercase conversion.
-/// requires: b == 65
-/// ensures: ret == 97
 pub fn to_ascii_lowercase_of_an_uppercase_letter(b: u8) -> u8 {
     b.to_ascii_lowercase()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == true,
+}
 /// `is_multiple_of` is `a % b == 0`, with `b == 0` defined as `a == 0`. This pins
 /// the ordinary true case.
-/// requires: true
-/// ensures: ret == true
 pub fn is_multiple_of_six_by_three() -> bool {
     6u32.is_multiple_of(3)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == true,
+}
 /// The tripwire: seven is not a multiple of three, so a model that answered
 /// `true` unconditionally would prove it.
-/// requires: true
-/// ensures: ret == true
 pub fn is_multiple_of_seven_by_three_cannot_prove_this() -> bool {
     7u32.is_multiple_of(3)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == true,
+}
 /// The `b == 0` corner, which `core` defines as `a == 0`: `0.is_multiple_of(0)`
 /// is `true`. A model that read `a % 0` without the `b != 0` guard would take the
 /// engine's defined `urem(a, 0)` value and could answer `false`.
-/// requires: true
-/// ensures: ret == true
 pub fn is_multiple_of_zero_by_zero() -> bool {
     0u32.is_multiple_of(0)
 }
 
+spec! {
+    requires: true,
+    ensures: ret == false,
+}
 /// The complement of the zero corner: `5.is_multiple_of(0)` is `false`, because
 /// `core` defines it as `a == 0` and `a` is not zero. A model that answered `true`
 /// for every zero divisor would prove this.
-/// requires: true
-/// ensures: ret == false
 pub fn is_multiple_of_five_by_zero() -> bool {
     5u32.is_multiple_of(0)
 }
@@ -11837,53 +13900,63 @@ impl Drop for QuietGuard {
     fn drop(&mut self) {}
 }
 
+spec! {
+    requires: true,
+    ensures: ret == x,
+}
 /// The C1 gap the review named: a function holding an RAII local was `incomplete`
 /// on an unmodelled `drop`. With an empty destructor the value of `x` is what
 /// survives, so the contract is the body's own value.
-/// requires: true
-/// ensures: ret == x
 pub fn guard_is_dropped_cleanly(x: u8) -> u8 {
     let _g = QuietGuard(x);
     x
 }
 
+spec! {
+    requires: x < 200,
+    ensures: ret == 1,
+}
 /// The `guard_guarded` half of the review's C1 exit criterion: an assert that
 /// holds is verified even with a live `Drop` local.
-/// requires: x < 200
-/// ensures: ret == 1
 pub fn guard_guarded(x: u8) -> u8 {
     let _g = QuietGuard(0);
     assert!(x < 200);
     1
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// The `guard_misguarded` half: the same body with no precondition, so the assert
 /// is a reachable panic. A `drop` treated as a no-op would not change this, but
 /// dropping the *path* at the `drop` -- the pre-fix behaviour -- would leave it
 /// undecided rather than refuted.
-/// requires: true
-/// ensures: ret == 1
 pub fn guard_misguarded_cannot_prove_this(x: u8) -> u8 {
     let _g = QuietGuard(0);
     assert!(x < 200);
     1
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// A destructor that *panics* on part of its domain. Treating the `drop` as a
 /// no-op -- the tempting way to make RAII locals decide -- would prove this
 /// function, which panics for `x >= 10`. The destructor's body is executed, so the
 /// panic is a real obligation.
-/// requires: true
-/// ensures: ret == 1
 pub fn destructor_panic_cannot_prove_this(x: u8) -> u8 {
     let _p = PanicGuard { v: x };
     1
 }
 
+spec! {
+    requires: x < 10,
+    ensures: ret == 1,
+}
 /// The guarded companion: with `x < 10` the destructor cannot panic, so the same
 /// body verifies. A refusal of every `drop` would leave it undecided.
-/// requires: x < 10
-/// ensures: ret == 1
 pub fn destructor_panic_guarded(x: u8) -> u8 {
     let _p = PanicGuard { v: x };
     1
@@ -11899,12 +13972,14 @@ impl Drop for PanicGuard {
     }
 }
 
+spec! {
+    requires: true,
+    ensures: ret == s.x,
+}
 /// A plain struct with no `impl Drop`. rustc emits no `drop` for it (a type with
 /// no drop glue is dropped nowhere), so this function never reaches the
 /// `Term::Drop` arm -- it pins that an aggregate local still decides, which is the
 /// shape the review's `everyday` corpus hits.
-/// requires: true
-/// ensures: ret == s.x
 pub fn plain_struct_local_decides(s: PlainStruct) -> u8 {
     let _p = s;
     s.x
@@ -11916,21 +13991,25 @@ pub struct PlainStruct {
     pub x: u8,
 }
 
+spec! {
+    requires: true,
+    ensures: ret == a[0],
+}
 /// An array local. Like the struct above, an array of a glue-free type carries no
 /// drop glue, so rustc emits no `drop` and this pins that the local decides.
-/// requires: true
-/// ensures: ret == a[0]
 pub fn array_local_decides(a: [u8; 4]) -> u8 {
     let _copy = a;
     a[0]
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// A `String` local: its destructor frees the heap, which this tool cannot
 /// represent, so the `drop` is *refused* -- never assumed to be a no-op. Assuming
 /// it were a no-op would be a false proof whenever the destructor's effect is
 /// observable, which is the one outcome this crate must never produce.
-/// requires: true
-/// ensures: ret == 1
 pub fn string_drop_is_refused(s: String) -> u8 {
     let _owned = s;
     1
@@ -11945,58 +14024,72 @@ pub fn string_drop_is_refused(s: String) -> u8 {
 // the C9 exit shape: `bump(c: &mut u16)` with `ensures: c == old(c) + 1`.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: c < 65535,
+    ensures: c == old(c) + 1,
+}
 /// The C9 exit criterion: a scalar `&mut` argument named in the postcondition.
-/// requires: c < 65535
-/// ensures: c == old(c) + 1
 pub fn bump_scalar_ref(c: &mut u16) {
     *c += 1;
 }
 
+spec! {
+    requires: c < 65535,
+    ensures: c == old(c),
+}
 /// The false direction of [`bump_scalar_ref`]: the postcondition's `c` is the
 /// *final* value, so claiming the entry value must be refuted. Binding `c` to the
 /// entry value instead (the bug this shape closed) would **prove** it.
-/// requires: c < 65535
-/// ensures: c == old(c)
 pub fn a_stale_scalar_ref_cannot_prove_this(c: &mut u16) {
     *c += 1;
 }
 
+spec! {
+    requires: true,
+    ensures: c == 5,
+}
 /// A scalar `&mut` argument written to a constant.
-/// requires: true
-/// ensures: c == 5
 pub fn set_scalar_ref(c: &mut u16) {
     *c = 5;
 }
 
+spec! {
+    requires: true,
+    ensures: c == 0,
+}
 /// The false direction of [`set_scalar_ref`].
-/// requires: true
-/// ensures: c == 0
 pub fn a_scalar_ref_write_cannot_prove_this(c: &mut u16) {
     *c = 5;
 }
 
+spec! {
+    requires: true,
+    ensures: c < 0,
+}
 /// A *signed* scalar `&mut` argument: `c < 0` is a signed comparison. An unsigned
 /// reading would make `-1` read as `65535`, so `c < 0` would be false and the
 /// function refuted rather than verified -- `verified` is the evidence the sign
 /// was read.
-/// requires: true
-/// ensures: c < 0
 pub fn signed_scalar_ref(c: &mut i16) {
     *c = -1;
 }
 
+spec! {
+    requires: x == 4,
+    ensures: ret == 5,
+}
 /// A caller of the scalar-`&mut` helper, verified through the inlined body.
-/// requires: x == 4
-/// ensures: ret == 5
 pub fn a_scalar_ref_caller(x: u16) -> u16 {
     let mut y = x;
     bump_scalar_ref(&mut y);
     y
 }
 
+spec! {
+    requires: c < 65535,
+    ensures: *c == old(*c) + 1,
+}
 /// The roadmap's exact exit spelling: `*c` (the explicit deref) and `old(*c)`.
-/// requires: c < 65535
-/// ensures: *c == old(*c) + 1
 pub fn bump_scalar_ref_star(c: &mut u16) {
     *c += 1;
 }
@@ -12008,25 +14101,31 @@ pub fn bump_scalar_ref_star(c: &mut u16) {
 // predicate is widened to a one-bit word, exactly as a `bool` `ret` is.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: true,
+    ensures: c == true,
+}
 /// A `&mut bool` written to a constant.
-/// requires: true
-/// ensures: c == true
 pub fn set_bool_ref(c: &mut bool) {
     *c = true;
 }
 
+spec! {
+    requires: true,
+    ensures: c == false,
+}
 /// The false direction of [`set_bool_ref`]: the final value is `true`, so a claim
 /// of `false` is refutable. Dropping the binding would make the contract
 /// *unreadable* rather than refuted, which is the milder bug this pins shut.
-/// requires: true
-/// ensures: c == false
 pub fn a_bool_ref_write_cannot_prove_this(c: &mut bool) {
     *c = true;
 }
 
+spec! {
+    requires: c == true,
+    ensures: c == true,
+}
 /// A `&mut bool` read but not written: the final value is the entry value.
-/// requires: c == true
-/// ensures: c == true
 pub fn keep_bool_ref(c: &mut bool) {
     let _ = *c;
 }
@@ -12043,166 +14142,202 @@ pub fn keep_bool_ref(c: &mut bool) {
 // the opposite direction.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: r.is_ok(),
+    ensures: ret.is_ok() && ret.Ok == r.Ok,
+}
 /// `?` on a `Result`, success path: the value flows through unchanged.
-/// requires: r.is_ok()
-/// ensures: ret.is_ok() && ret.Ok == r.Ok
 pub fn result_try_ok_value(r: Result<u8, u8>) -> Result<u8, u8> {
     let v = r?;
     Ok(v)
 }
 
+spec! {
+    requires: r.is_ok(),
+    ensures: ret.is_err(),
+}
 /// The false direction of [`result_try_ok_value`]: under `is_ok` the result is
 /// `Ok`, so a claim of `Err` is refutable.
-/// requires: r.is_ok()
-/// ensures: ret.is_err()
 pub fn result_try_ok_value_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
     let v = r?;
     Ok(v)
 }
 
+spec! {
+    requires: r.is_err(),
+    ensures: ret.is_err() && ret.Err == r.Err,
+}
 /// `?` on a `Result`, failure path: the error propagates as `Err`.
-/// requires: r.is_err()
-/// ensures: ret.is_err() && ret.Err == r.Err
 pub fn result_try_err_propagates(r: Result<u8, u8>) -> Result<u8, u8> {
     let v = r?;
     Ok(v)
 }
 
+spec! {
+    requires: r.is_err(),
+    ensures: ret.is_ok(),
+}
 /// The false direction of [`result_try_err_propagates`]: under `is_err` the
 /// result is `Err`, so a claim of `Ok` is refutable.
-/// requires: r.is_err()
-/// ensures: ret.is_ok()
 pub fn result_try_err_propagates_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
     let v = r?;
     Ok(v)
 }
 
+spec! {
+    requires: r.is_ok() && r.Ok < 100,
+    ensures: ret.is_ok() && ret.Ok == r.Ok + 1,
+}
 /// `?` whose yielded value is then *used*: the `Continue` payload reaches the
 /// arithmetic, so a model that bound the payload to the wrong variant would
 /// refute the `+ 1` relation.
-/// requires: r.is_ok() && r.Ok < 100
-/// ensures: ret.is_ok() && ret.Ok == r.Ok + 1
 pub fn result_try_value_used(r: Result<u8, u8>) -> Result<u8, u8> {
     let v = r?;
     Ok(v + 1)
 }
 
+spec! {
+    requires: r.is_ok() && r.Ok < 100,
+    ensures: ret.Ok == r.Ok,
+}
 /// The false direction of [`result_try_value_used`]: the result is `r.Ok + 1`,
 /// not `r.Ok`, so claiming the value passed through unchanged is refutable.
-/// requires: r.is_ok() && r.Ok < 100
-/// ensures: ret.Ok == r.Ok
 pub fn result_try_value_used_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u8> {
     let v = r?;
     Ok(v + 1)
 }
 
+spec! {
+    requires: x.is_some(),
+    ensures: ret.is_some(),
+}
 /// `?` on an `Option`, success path: the value flows through.
-/// requires: x.is_some()
-/// ensures: ret.is_some()
 pub fn option_try_some_value(x: Option<u8>) -> Option<u8> {
     let v = x?;
     Some(v)
 }
 
+spec! {
+    requires: x.is_some(),
+    ensures: ret.is_none(),
+}
 /// The false direction of [`option_try_some_value`]: under `is_some` the result
 /// is `Some`, so a claim of `None` is refutable.
-/// requires: x.is_some()
-/// ensures: ret.is_none()
 pub fn option_try_some_value_cannot_prove_this(x: Option<u8>) -> Option<u8> {
     let v = x?;
     Some(v)
 }
 
+spec! {
+    requires: x.is_none(),
+    ensures: ret.is_none(),
+}
 /// `?` on an `Option`, failure path: `None` propagates.
-/// requires: x.is_none()
-/// ensures: ret.is_none()
 pub fn option_try_none_propagates(x: Option<u8>) -> Option<u8> {
     let v = x?;
     Some(v)
 }
 
+spec! {
+    requires: x.is_none(),
+    ensures: ret.is_some(),
+}
 /// The false direction of [`option_try_none_propagates`]: under `is_none` the
 /// result is `None`, so a claim of `Some` is refutable.
-/// requires: x.is_none()
-/// ensures: ret.is_some()
 pub fn option_try_none_propagates_cannot_prove_this(x: Option<u8>) -> Option<u8> {
     let v = x?;
     Some(v)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_ok() && ret.Ok == 6,
+}
 /// `?` on a *locally constructed* `Ok`: the receiver's tag is a known constant,
 /// so the `branch` is decided statically and the value flows through.
-/// requires: true
-/// ensures: ret.is_ok() && ret.Ok == 6
 pub fn result_try_of_a_known_ok() -> Result<u8, u8> {
     let r: Result<u8, u8> = Ok(5);
     let v = r?;
     Ok(v + 1)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_err(),
+}
 /// `?` on a locally constructed `Err`: the early return is taken unconditionally.
-/// requires: true
-/// ensures: ret.is_err()
 pub fn result_try_of_a_known_err() -> Result<u8, u8> {
     let r: Result<u8, u8> = Err(3);
     let v = r?;
     Ok(v)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_ok(),
+}
 /// The false direction of [`result_try_of_a_known_err`]: the known `Err` always
 /// returns `Err`, so a claim of `Ok` is refutable.
-/// requires: true
-/// ensures: ret.is_ok()
 pub fn result_try_of_a_known_err_cannot_prove_this() -> Result<u8, u8> {
     let r: Result<u8, u8> = Err(3);
     let v = r?;
     Ok(v)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_none(),
+}
 /// `?` on a locally constructed `None`: the early return is taken, `None` flows.
-/// requires: true
-/// ensures: ret.is_none()
 pub fn option_try_of_a_known_none() -> Option<u8> {
     let r: Option<u8> = None;
     let v = r?;
     Some(v)
 }
 
+spec! {
+    requires: true,
+    ensures: ret.is_some(),
+}
 /// The false direction of [`option_try_of_a_known_none`]: a known `None` always
 /// returns `None`, so a claim of `Some` is refutable.
-/// requires: true
-/// ensures: ret.is_some()
 pub fn option_try_of_a_known_none_cannot_prove_this() -> Option<u8> {
     let r: Option<u8> = None;
     let v = r?;
     Some(v)
 }
 
+spec! {
+    requires: r.is_ok() && s.is_ok(),
+    ensures: ret.is_ok(),
+}
 /// Two `?` in sequence: each propagates independently, so the result is `Err`
 /// whenever *either* input is, and the second `?` is only reached on the first's
 /// success path.
-/// requires: r.is_ok() && s.is_ok()
-/// ensures: ret.is_ok()
 pub fn result_try_chained(r: Result<u8, u8>, s: Result<u8, u8>) -> Result<u8, u8> {
     let a = r?;
     let b = s?;
     Ok(a.wrapping_add(b))
 }
 
+spec! {
+    requires: r.is_ok() && s.is_ok(),
+    ensures: ret.is_err(),
+}
 /// The false direction of [`result_try_chained`]: both inputs are `Ok`, so the
 /// result is `Ok`; a claim of `Err` is refutable.
-/// requires: r.is_ok() && s.is_ok()
-/// ensures: ret.is_err()
 pub fn result_try_chained_cannot_prove_this(r: Result<u8, u8>, s: Result<u8, u8>) -> Result<u8, u8> {
     let a = r?;
     let b = s?;
     Ok(a.wrapping_add(b))
 }
 
+spec! {
+    requires: r.is_err() && s.is_err(),
+    ensures: ret.is_err(),
+}
 /// `?` on one of *two* branches: the propagation must be path-sensitive, so under
 /// "both inputs are `Err`" every path returns `Err`.
-/// requires: r.is_err() && s.is_err()
-/// ensures: ret.is_err()
 pub fn result_try_in_either_branch(c: bool, r: Result<u8, u8>, s: Result<u8, u8>) -> Result<u8, u8> {
     if c {
         let v = r?;
@@ -12213,10 +14348,12 @@ pub fn result_try_in_either_branch(c: bool, r: Result<u8, u8>, s: Result<u8, u8>
     }
 }
 
+spec! {
+    requires: r.is_ok() && s.is_ok(),
+    ensures: ret.is_err(),
+}
 /// The false direction of [`result_try_in_either_branch`]: both inputs are `Ok`,
 /// so no branch can produce an `Err`.
-/// requires: r.is_ok() && s.is_ok()
-/// ensures: ret.is_err()
 pub fn result_try_in_either_branch_cannot_prove_this(
     c: bool,
     r: Result<u8, u8>,
@@ -12231,22 +14368,26 @@ pub fn result_try_in_either_branch_cannot_prove_this(
     }
 }
 
+spec! {
+    requires: r.is_err() && r.Err == 200,
+    ensures: ret.is_err() && ret.Err == 200,
+}
 /// A `?` that widens the error type: `Result<u8, u8>` into a function returning
 /// `Result<u8, u16>`, so the residual `u8` is converted by `From`. The conversion
 /// happens inside `from_residual`, so a model that copied the error value without
 /// widening it would refute the `200` claim (or, at the wrong width, accept a
 /// wrong one).
-/// requires: r.is_err() && r.Err == 200
-/// ensures: ret.is_err() && ret.Err == 200
 pub fn result_try_widens_the_error(r: Result<u8, u8>) -> Result<u8, u16> {
     let v = r?;
     Ok(v)
 }
 
+spec! {
+    requires: r.is_err() && r.Err == 200,
+    ensures: ret.Err == 201,
+}
 /// The false direction of [`result_try_widens_the_error`]: the widened error is
 /// `200`, not `201`, so the claim is refutable.
-/// requires: r.is_err() && r.Err == 200
-/// ensures: ret.Err == 201
 pub fn result_try_widens_the_error_cannot_prove_this(r: Result<u8, u8>) -> Result<u8, u16> {
     let v = r?;
     Ok(v)
@@ -12262,445 +14403,559 @@ pub fn result_try_widens_the_error_cannot_prove_this(r: Result<u8, u8>) -> Resul
 // entry whose *failure* is the evidence, and a control that must not panic.
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: true,
+    ensures: ret == a,
+}
 /// `midpoint` is `(a + b) / 2` computed so the sum cannot overflow, and
 /// `midpoint(a, a)` is `a` for every input -- a value, not a constant, so a model
 /// that folded the method away would fail this.
-/// requires: true
-/// ensures: ret == a
 pub fn midpoint_self_is_the_identity(a: u8) -> u8 {
     a.midpoint(a)
 }
 
+spec! {
+    requires: a == 255 && b == 255,
+    ensures: ret == 255,
+}
 /// `255u8.midpoint(255)` is `255`: the true sum is `510`, whose half is `255`. A
 /// model that formed `a + b` at eight bits would wrap to `254` and refute this.
-/// requires: a == 255 && b == 255
-/// ensures: ret == 255
 pub fn midpoint_of_an_overflowing_sum(a: u8, b: u8) -> u8 {
     a.midpoint(b)
 }
 
+spec! {
+    requires: a == 255 && b == 255,
+    ensures: ret == 254,
+}
 /// The false direction of [`midpoint_of_an_overflowing_sum`]: the wrapped sum
 /// would give `254`, so this is the claim a width-losing model proves.
-/// requires: a == 255 && b == 255
-/// ensures: ret == 254
 pub fn midpoint_of_an_overflowing_sum_cannot_prove_this(a: u8, b: u8) -> u8 {
     a.midpoint(b)
 }
 
+spec! {
+    requires: a == 3 && b == 4,
+    ensures: ret == 3,
+}
 /// `midpoint` rounds toward zero, not toward negative infinity: `(3 + 4) / 2` is
 /// `3`, where the floor is `3` too -- but see the signed entry, where the two
 /// differ.
-/// requires: a == 3 && b == 4
-/// ensures: ret == 3
 pub fn midpoint_rounds_toward_zero(a: u8, b: u8) -> u8 {
     a.midpoint(b)
 }
 
+spec! {
+    requires: a == 3 && b == 4,
+    ensures: ret == 4,
+}
 /// The false direction of [`midpoint_rounds_toward_zero`].
-/// requires: a == 3 && b == 4
-/// ensures: ret == 4
 pub fn midpoint_rounds_toward_zero_cannot_prove_this(a: u8, b: u8) -> u8 {
     a.midpoint(b)
 }
 
+spec! {
+    requires: a == -5 && b == -2,
+    ensures: ret == -3,
+}
 /// `(-5).midpoint(-2)` is `-3`, which is *truncation* toward zero; the floor of
 /// `-3.5` is `-4`. A model that used a logical shift (or the floor) would give
 /// `-4` and refute this.
-/// requires: a == -5 && b == -2
-/// ensures: ret == -3
 pub fn midpoint_signed_truncates(a: i8, b: i8) -> i8 {
     a.midpoint(b)
 }
 
+spec! {
+    requires: a == -5 && b == -2,
+    ensures: ret == -4,
+}
 /// The false direction of [`midpoint_signed_truncates`]: the floor, which a model
 /// without the odd-bit correction would prove.
-/// requires: a == -5 && b == -2
-/// ensures: ret == -4
 pub fn midpoint_signed_truncates_cannot_prove_this(a: i8, b: i8) -> i8 {
     a.midpoint(b)
 }
 
+spec! {
+    requires: a <= b,
+    ensures: ret >= a && ret <= b,
+}
 /// `midpoint` lies between its arguments when they are ordered -- a symbolic
 /// property, so it pins the whole model rather than one point.
-/// requires: a <= b
-/// ensures: ret >= a && ret <= b
 pub fn midpoint_is_between(a: u8, b: u8) -> u8 {
     a.midpoint(b)
 }
 
+spec! {
+    requires: a <= b,
+    ensures: ret < a,
+}
 /// The false direction of [`midpoint_is_between`].
-/// requires: a <= b
-/// ensures: ret < a
 pub fn midpoint_is_between_cannot_prove_this(a: u8, b: u8) -> u8 {
     a.midpoint(b)
 }
 
+spec! {
+    requires: a == 100 && b == 7,
+    ensures: ret == 105,
+}
 /// `100u8.next_multiple_of(7)` is `105` (`7 * 15`), not `100` or `112`.
-/// requires: a == 100 && b == 7
-/// ensures: ret == 105
 pub fn next_multiple_of_rounds_up(a: u8, b: u8) -> u8 {
     a.next_multiple_of(b)
 }
 
+spec! {
+    requires: a == 21 && b == 7,
+    ensures: ret == 21,
+}
 /// When `a` is already a multiple of `b`, `next_multiple_of` is the identity --
 /// the case a model that always added `b` would get wrong.
-/// requires: a == 21 && b == 7
-/// ensures: ret == 21
 pub fn next_multiple_of_an_exact_multiple_is_the_identity(a: u8, b: u8) -> u8 {
     a.next_multiple_of(b)
 }
 
+spec! {
+    requires: a == 100 && b == 7,
+    ensures: ret == 112,
+}
 /// The false direction of [`next_multiple_of_rounds_up`].
-/// requires: a == 100 && b == 7
-/// ensures: ret == 112
 pub fn next_multiple_of_rounds_up_cannot_prove_this(a: u8, b: u8) -> u8 {
     a.next_multiple_of(b)
 }
 
+spec! {
+    requires: a == 255 && b == 100,
+    ensures: false,
+}
 /// `255u8.next_multiple_of(100)` overflows (`300 > 255`), so the method panics --
 /// the obligation is the evidence the failure predicate is exact.
-/// requires: a == 255 && b == 100
-/// ensures: false
 pub fn next_multiple_of_that_overflows_panics(a: u8, b: u8) -> u8 {
     a.next_multiple_of(b)
 }
 
+spec! {
+    requires: a == 100 && b == 7,
+    ensures: ret <= 255,
+}
 /// The control: `next_multiple_of` is total wherever it does not overflow, so a
 /// model that reported a panic unconditionally would fail here.
-/// requires: a == 100 && b == 7
-/// ensures: ret <= 255
 pub fn next_multiple_of_is_panic_free_here(a: u8, b: u8) -> u8 {
     a.next_multiple_of(b)
 }
 
+spec! {
+    requires: a == 100 && b == 7,
+    ensures: ret.is_some() && ret.Some == 105,
+}
 /// The `Option` counterpart: `100u8.checked_next_multiple_of(7)` is `Some(105)`,
 /// so the tag is `1` and the payload is the same value the plain method returns.
 /// A model that swapped the tag would have `None` here.
-/// requires: a == 100 && b == 7
-/// ensures: ret.is_some() && ret.Some == 105
 pub fn checked_next_multiple_of_rounds_up(a: u8, b: u8) -> Option<u8> {
     a.checked_next_multiple_of(b)
 }
 
+spec! {
+    requires: a == 255 && b == 100,
+    ensures: ret.is_none(),
+}
 /// `255u8.checked_next_multiple_of(100)` would overflow, so it is `None` -- the
 /// `Option` spelling of the panic the plain method reports. The tag is a *term*,
 /// so a model that wrote a constant tag would take one arm always and prove this.
-/// requires: a == 255 && b == 100
-/// ensures: ret.is_none()
 pub fn checked_next_multiple_of_that_overflows_is_none(a: u8, b: u8) -> Option<u8> {
     a.checked_next_multiple_of(b)
 }
 
+spec! {
+    requires: a == 10 && b == 0,
+    ensures: ret.is_none(),
+}
 /// A zero divisor is the other `None`: `10u8.checked_next_multiple_of(0)` is
 /// `None` where the plain method panics.
-/// requires: a == 10 && b == 0
-/// ensures: ret.is_none()
 pub fn checked_next_multiple_of_by_zero_is_none(a: u8, b: u8) -> Option<u8> {
     a.checked_next_multiple_of(b)
 }
 
+spec! {
+    requires: a == 255 && b == 100,
+    ensures: ret.is_some(),
+}
 /// The false direction: an overflowing input is `None`, so claiming it is `Some`
 /// must be refuted. A model that ignored the failure predicate and always wrote
 /// the tag `1` would prove this.
-/// requires: a == 255 && b == 100
-/// ensures: ret.is_some()
 pub fn checked_next_multiple_of_overflow_is_some_cannot_prove_this(a: u8, b: u8) -> Option<u8> {
     a.checked_next_multiple_of(b)
 }
 
+spec! {
+    requires: a == 100,
+    ensures: ret == 6,
+}
 /// `100u8.ilog2()` is `6` (`2^6 = 64 <= 100 < 128 = 2^7`).
-/// requires: a == 100
-/// ensures: ret == 6
 pub fn ilog2_of_100(a: u8) -> u32 {
     a.ilog2()
 }
 
+spec! {
+    requires: a == 100,
+    ensures: ret == 7,
+}
 /// The false direction of [`ilog2_of_100`].
-/// requires: a == 100
-/// ensures: ret == 7
 pub fn ilog2_of_100_cannot_prove_this(a: u8) -> u32 {
     a.ilog2()
 }
 
+spec! {
+    requires: a == 1,
+    ensures: ret == 0,
+}
 /// `1u8.ilog2()` is `0` -- the boundary a model built from `leading_zeros` gets
 /// right only if the index is `w - 1 - lz`, not `lz`.
-/// requires: a == 1
-/// ensures: ret == 0
 pub fn ilog2_of_one_is_zero(a: u8) -> u32 {
     a.ilog2()
 }
 
+spec! {
+    requires: a == 100,
+    ensures: ret == 6,
+}
 /// The result is a `u32` even for an `i8` operand, and the index of the highest
 /// set bit of `100` is `6`.
-/// requires: a == 100
-/// ensures: ret == 6
 pub fn ilog2_of_a_signed_100(a: i8) -> u32 {
     a.ilog2()
 }
 
+spec! {
+    requires: a >= 1,
+    ensures: ret <= 7,
+}
 /// `ilog2` is at most `w - 1` on the live path, so it is bounded by `7` at eight
 /// bits -- a symbolic property, and the panic precondition is what makes the
 /// obligation discharge.
-/// requires: a >= 1
-/// ensures: ret <= 7
 pub fn ilog2_is_bounded(a: u8) -> u32 {
     a.ilog2()
 }
 
+spec! {
+    requires: a == 0,
+    ensures: false,
+}
 /// `ilog2` panics on `0`, so the obligation is the evidence the failure predicate
 /// fires on exactly the non-positive argument.
-/// requires: a == 0
-/// ensures: false
 pub fn ilog2_of_zero_panics(a: u8) -> u32 {
     a.ilog2()
 }
 
+spec! {
+    requires: a == 100,
+    ensures: ret == 2,
+}
 /// `100u8.ilog10()` is `2` (`10^2 = 100 <= 100 < 1000`).
-/// requires: a == 100
-/// ensures: ret == 2
 pub fn ilog10_of_100(a: u8) -> u32 {
     a.ilog10()
 }
 
+spec! {
+    requires: a == 9,
+    ensures: ret == 0,
+}
 /// Below ten, `ilog10` is `0`.
-/// requires: a == 9
-/// ensures: ret == 0
 pub fn ilog10_below_ten_is_zero(a: u8) -> u32 {
     a.ilog10()
 }
 
+spec! {
+    requires: a == 100,
+    ensures: ret == 3,
+}
 /// The false direction of [`ilog10_of_100`].
-/// requires: a == 100
-/// ensures: ret == 3
 pub fn ilog10_of_100_cannot_prove_this(a: u8) -> u32 {
     a.ilog10()
 }
 
+spec! {
+    requires: a == 1000,
+    ensures: ret == 3,
+}
 /// `ilog10` at a wider width: `1000u32.ilog10()` is `3`.
-/// requires: a == 1000
-/// ensures: ret == 3
 pub fn ilog10_of_a_u32_thousand(a: u32) -> u32 {
     a.ilog10()
 }
 
+spec! {
+    requires: a == 0,
+    ensures: false,
+}
 /// `ilog10` panics on `0`.
-/// requires: a == 0
-/// ensures: false
 pub fn ilog10_of_zero_panics(a: u8) -> u32 {
     a.ilog10()
 }
 
+spec! {
+    requires: a >= 1,
+    ensures: ret <= 2,
+}
 /// `ilog10` is bounded by the number of powers of ten that fit `w` bits.
-/// requires: a >= 1
-/// ensures: ret <= 2
 pub fn ilog10_is_bounded(a: u8) -> u32 {
     a.ilog10()
 }
 
+spec! {
+    requires: a == 100,
+    ensures: ret.is_some() && ret.Some == 6,
+}
 /// `checked_ilog2` is `Some(6)` for `100` (`2^6 = 64 <= 100 < 128`).
-/// requires: a == 100
-/// ensures: ret.is_some() && ret.Some == 6
 pub fn checked_ilog2_in_range(a: u8) -> Option<u32> {
     a.checked_ilog2()
 }
 
+spec! {
+    requires: a == 100,
+    ensures: ret.is_some() && ret.Some == 7,
+}
 /// The false direction: the payload is `6`, so a model that read the tag or the
 /// payload the wrong way round would prove this.
-/// requires: a == 100
-/// ensures: ret.is_some() && ret.Some == 7
 pub fn checked_ilog2_overflow_is_some_cannot_prove_this(a: u8) -> Option<u32> {
     a.checked_ilog2()
 }
 
+spec! {
+    requires: a == 0,
+    ensures: ret.is_none(),
+}
 /// `checked_ilog2` is `None` on `0`, where the plain call would panic -- so no
 /// panic obligation is emitted here, and the value is the `None` tag.
-/// requires: a == 0
-/// ensures: ret.is_none()
 pub fn checked_ilog2_of_zero_is_none(a: u8) -> Option<u32> {
     a.checked_ilog2()
 }
 
+spec! {
+    requires: a == 100,
+    ensures: ret.is_some() && ret.Some == 2,
+}
 /// `checked_ilog10` is `Some(2)` for `100`.
-/// requires: a == 100
-/// ensures: ret.is_some() && ret.Some == 2
 pub fn checked_ilog10_in_range(a: u8) -> Option<u32> {
     a.checked_ilog10()
 }
 
+spec! {
+    requires: a == 0,
+    ensures: ret.is_none(),
+}
 /// `checked_ilog10` is `None` on `0` (the plain `ilog10` would panic there).
-/// requires: a == 0
-/// ensures: ret.is_none()
 pub fn checked_ilog10_of_zero_is_none(a: u8) -> Option<u32> {
     a.checked_ilog10()
 }
 
+spec! {
+    requires: a == -1,
+    ensures: ret.is_none(),
+}
 /// `checked_ilog2` on a signed argument is signed too: `-1i8` is non-positive,
 /// so it is `None`.
-/// requires: a == -1
-/// ensures: ret.is_none()
 pub fn checked_ilog2_of_a_negative_is_none(a: i8) -> Option<u32> {
     a.checked_ilog2()
 }
 
+spec! {
+    requires: a == -1,
+    ensures: ret.is_some() && ret.Some == 7,
+}
 /// `checked_ilog2` on a signed argument reads the signed order: `-1i8` is
 /// `0xff`, the *largest* unsigned byte, so an unsigned model would report
 /// `Some(7)` where Rust reports `None`.
-/// requires: a == -1
-/// ensures: ret.is_some() && ret.Some == 7
 pub fn checked_ilog2_of_a_negative_cannot_prove_this(a: i8) -> Option<u32> {
     a.checked_ilog2()
 }
 
+spec! {
+    requires: a == 100,
+    ensures: ret == 128,
+}
 /// `100u8.next_power_of_two()` is `128` (`2^7`, the smallest power of two that
 /// is `>= 100`), not `100` or `64`.
-/// requires: a == 100
-/// ensures: ret == 128
 pub fn next_power_of_two_rounds_up(a: u8) -> u8 {
     a.next_power_of_two()
 }
 
+spec! {
+    requires: a == 128,
+    ensures: ret == 128,
+}
 /// An input that is already a power of two rounds to itself -- the case a model
 /// that smeared the value without first subtracting one would get wrong.
-/// requires: a == 128
-/// ensures: ret == 128
 pub fn next_power_of_two_of_a_power_is_itself(a: u8) -> u8 {
     a.next_power_of_two()
 }
 
+spec! {
+    requires: a == 0,
+    ensures: ret == 1,
+}
 /// `0.next_power_of_two()` is `1`, which `core` defines specially (`x <= 1 => 1`)
 /// -- the input an unguarded `x - 1` would wrap to all-ones on.
-/// requires: a == 0
-/// ensures: ret == 1
 pub fn next_power_of_two_of_zero_is_one(a: u8) -> u8 {
     a.next_power_of_two()
 }
 
+spec! {
+    requires: a == 100,
+    ensures: ret == 100,
+}
 /// The false direction of [`next_power_of_two_rounds_up`].
-/// requires: a == 100
-/// ensures: ret == 100
 pub fn next_power_of_two_rounds_up_cannot_prove_this(a: u8) -> u8 {
     a.next_power_of_two()
 }
 
+spec! {
+    requires: a == 1000,
+    ensures: ret == 1024,
+}
 /// At a wider width the rounding is the same: `1000u32.next_power_of_two()` is
 /// `1024`.
-/// requires: a == 1000
-/// ensures: ret == 1024
 pub fn next_power_of_two_of_a_u32_thousand(a: u32) -> u32 {
     a.next_power_of_two()
 }
 
+spec! {
+    requires: a == 129,
+    ensures: false,
+}
 /// `129u8.next_power_of_two()` overflows (`256` does not fit), so the method
 /// panics -- the obligation is the evidence the failure predicate fires exactly
 /// where the result does not fit.
-/// requires: a == 129
-/// ensures: false
 pub fn next_power_of_two_that_overflows_panics(a: u8) -> u8 {
     a.next_power_of_two()
 }
 
+spec! {
+    requires: a == 100,
+    ensures: ret <= 255,
+}
 /// The control: `next_power_of_two` is total wherever it does not overflow, so a
 /// model that reported a panic unconditionally would fail here.
-/// requires: a == 100
-/// ensures: ret <= 255
 pub fn next_power_of_two_is_panic_free_here(a: u8) -> u8 {
     a.next_power_of_two()
 }
 
+spec! {
+    requires: a == 100,
+    ensures: ret.is_some() && ret.Some == 128,
+}
 /// `100u8.checked_next_power_of_two()` is `Some(128)`, so the payload of the
 /// `Some` arm is the rounded value.
-/// requires: a == 100
-/// ensures: ret.is_some() && ret.Some == 128
 pub fn checked_next_power_of_two_in_range(a: u8) -> Option<u8> {
     a.checked_next_power_of_two()
 }
 
+spec! {
+    requires: a == 100,
+    ensures: ret.is_none(),
+}
 /// The false direction of [`checked_next_power_of_two_in_range`].
-/// requires: a == 100
-/// ensures: ret.is_none()
 pub fn checked_next_power_of_two_in_range_cannot_prove_this(a: u8) -> Option<u8> {
     a.checked_next_power_of_two()
 }
 
+spec! {
+    requires: a == 100,
+    ensures: ret.Some == 127,
+}
 /// The payload of the `Some` arm is `128`, so claiming `127` is refutable.
-/// requires: a == 100
-/// ensures: ret.Some == 127
 pub fn checked_next_power_of_two_payload_cannot_prove_this(a: u8) -> Option<u8> {
     a.checked_next_power_of_two()
 }
 
+spec! {
+    requires: a == 129,
+    ensures: ret.is_none(),
+}
 /// `129u8.checked_next_power_of_two()` is `None`, where the plain method panics
 /// -- the `checked_` shape turning a panic into a value.
-/// requires: a == 129
-/// ensures: ret.is_none()
 pub fn checked_next_power_of_two_out_of_range_is_none(a: u8) -> Option<u8> {
     a.checked_next_power_of_two()
 }
 
+spec! {
+    requires: true,
+    ensures: ret <= s.len(),
+}
 /// A `&str` length is a symbolic input, so an unbounded one bounds nothing but
 /// itself.
-/// requires: true
-/// ensures: ret <= s.len()
 pub fn str_len_is_itself(s: &str) -> usize {
     s.len()
 }
 
+spec! {
+    requires: s.len() == 3,
+    ensures: ret == 3,
+}
 /// The length is pinned by the precondition, so the body's read is that value --
 /// the contract's `s.len()` and the body's are one variable.
-/// requires: s.len() == 3
-/// ensures: ret == 3
 pub fn str_len_pinned(s: &str) -> usize {
     s.len()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
 /// The false twin: an unbounded `&str` length is not a fixed value.
-/// requires: true
-/// ensures: ret == 4
 pub fn str_len_cannot_prove_this(s: &str) -> usize {
     s.len()
 }
 
+spec! {
+    requires: s.len() == 0,
+    ensures: ret,
+}
 /// `is_empty` reads the same length variable, so it agrees with `len`.
-/// requires: s.len() == 0
-/// ensures: ret
 pub fn str_is_empty_pinned(s: &str) -> bool {
     s.is_empty()
 }
 
+spec! {
+    requires: s.len() == 5,
+    ensures: ret,
+}
 /// The false twin of `str_is_empty_pinned`: a non-empty string is not empty.
-/// requires: s.len() == 5
-/// ensures: ret
 pub fn str_is_empty_cannot_prove_this(s: &str) -> bool {
     s.is_empty()
 }
 
+spec! {
+    requires: x.is_none(),
+    ensures: ret == 0,
+}
 /// `unwrap_or_default` is total and yields the payload's own zero on the failure
 /// variant, so a `None` receiver is `0`.
-/// requires: x.is_none()
-/// ensures: ret == 0
 pub fn unwrap_or_default_none_is_zero(x: Option<u8>) -> u8 {
     x.unwrap_or_default()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
 /// The false twin: the `Some` path can carry any payload, so a fixed value is not
 /// provable.
-/// requires: true
-/// ensures: ret == 7
 pub fn unwrap_or_default_cannot_prove_this(x: Option<u8>) -> u8 {
     x.unwrap_or_default()
 }
 
+spec! {
+    requires: r.is_err(),
+    ensures: ret == 0,
+}
 /// The same shape on a `Result`: the failure variant (`Err`) yields the payload's
 /// zero.
-/// requires: r.is_err()
-/// ensures: ret == 0
 pub fn result_unwrap_or_default_err_is_zero(r: Result<u8, u8>) -> u8 {
     r.unwrap_or_default()
 }
 
+spec! {
+    requires: r.is_err(),
+    ensures: ret == 5,
+}
 /// The false twin on a `Result`.
-/// requires: r.is_err()
-/// ensures: ret == 5
 pub fn result_unwrap_or_default_cannot_prove_this(r: Result<u8, u8>) -> u8 {
     r.unwrap_or_default()
 }
@@ -12710,68 +14965,84 @@ pub fn result_unwrap_or_default_cannot_prove_this(r: Result<u8, u8>) -> u8 {
 // `Vec::is_empty` and `Vec::pop`
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// A fresh vector is empty.
-/// requires: true
-/// ensures: ret == 1
 pub fn vec_is_empty_new() -> u8 {
     Vec::<u8>::new().is_empty() as u8
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The false twin: a fresh vector is not non-empty.
-/// requires: true
-/// ensures: ret == 0
 pub fn vec_is_empty_new_cannot_prove_this() -> u8 {
     Vec::<u8>::new().is_empty() as u8
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// After one push the vector is no longer empty.
-/// requires: true
-/// ensures: ret == 0
 pub fn vec_not_empty_after_push() -> u8 {
     let mut v = Vec::<u8>::new();
     v.push(1u8);
     v.is_empty() as u8
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// The false twin: the push made it non-empty, so `is_empty` is not `1`.
-/// requires: true
-/// ensures: ret == 1
 pub fn vec_not_empty_after_push_cannot_prove_this() -> u8 {
     let mut v = Vec::<u8>::new();
     v.push(1u8);
     v.is_empty() as u8
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// `pop` on a fresh vector is `None` and leaves the length at zero.
-/// requires: true
-/// ensures: ret == 0
 pub fn vec_pop_empty_then_len() -> usize {
     let mut v = Vec::<u8>::new();
     v.pop();
     v.len()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// The false twin: `pop` on a fresh vector cannot leave a length of one.
-/// requires: true
-/// ensures: ret == 1
 pub fn vec_pop_empty_then_len_cannot_prove_this() -> usize {
     let mut v = Vec::<u8>::new();
     v.pop();
     v.len()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
 /// `pop` on a one-element vector yields `Some` and returns the length to zero.
-/// requires: true
-/// ensures: ret == 1
 pub fn vec_pop_one_is_some() -> u8 {
     let mut v = Vec::<u8>::new();
     v.push(9u8);
     v.pop().is_some() as u8
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
 /// The false twin: `pop` on a one-element vector is not `None`.
-/// requires: true
-/// ensures: ret == 0
 pub fn vec_pop_one_is_some_cannot_prove_this() -> u8 {
     let mut v = Vec::<u8>::new();
     v.push(9u8);
@@ -12782,96 +15053,114 @@ pub fn vec_pop_one_is_some_cannot_prove_this() -> u8 {
 // Chained `Option` combinators: the element identity must compose
 // ---------------------------------------------------------------------------
 
+spec! {
+    requires: a.len() > 0,
+    requires: b.len() > 0,
+    requires: c.len() > 0,
+    requires: a[0] == 5,
+    requires: b[0] == 7,
+    requires: c[0] == 9,
+    ensures: ret == 5,
+}
 /// A chain of `or` selects the *first* non-empty slice's element. The identity
 /// must compose through both combinators; a flat representation that read only
 /// the operands' leaves would take `c`'s element on the `Some` path.
-/// requires: a.len() > 0
-/// requires: b.len() > 0
-/// requires: c.len() > 0
-/// requires: a[0] == 5
-/// requires: b[0] == 7
-/// requires: c[0] == 9
-/// ensures: ret == 5
 pub fn chained_or_selects_the_first(a: &[u8], b: &[u8], c: &[u8]) -> u8 {
     *a.first().or(b.first()).or(c.first()).unwrap()
 }
 
+spec! {
+    requires: a.len() > 0,
+    requires: b.len() > 0,
+    requires: c.len() > 0,
+    requires: a[0] == 5,
+    requires: b[0] == 7,
+    requires: c[0] == 9,
+    ensures: ret == 9,
+}
 /// The false twin: the chain returns `a[0]` (`5`), never `c[0]` (`9`).
-/// requires: a.len() > 0
-/// requires: b.len() > 0
-/// requires: c.len() > 0
-/// requires: a[0] == 5
-/// requires: b[0] == 7
-/// requires: c[0] == 9
-/// ensures: ret == 9
 pub fn chained_or_selects_the_first_cannot_prove_this(a: &[u8], b: &[u8], c: &[u8]) -> u8 {
     *a.first().or(b.first()).or(c.first()).unwrap()
 }
 
+spec! {
+    requires: a.len() > 0,
+    requires: b.len() > 0,
+    requires: c.len() > 0,
+    requires: b[0] == 7,
+    requires: c[0] == 9,
+    ensures: ret == 7,
+}
 /// `and` with a conditional argument: on `Some` the result is the argument, whose
 /// own element identity is a chain.
-/// requires: a.len() > 0
-/// requires: b.len() > 0
-/// requires: c.len() > 0
-/// requires: b[0] == 7
-/// requires: c[0] == 9
-/// ensures: ret == 7
 pub fn and_with_a_conditional_argument(a: &[u8], b: &[u8], c: &[u8]) -> u8 {
     *a.first().and(b.first().or(c.first())).unwrap()
 }
 
+spec! {
+    requires: a.len() > 0,
+    requires: b.len() > 0,
+    requires: c.len() > 0,
+    requires: b[0] == 7,
+    requires: c[0] == 9,
+    ensures: ret == 9,
+}
 /// The false twin: the argument's `or` selects `b[0]` (`7`), never `c[0]` (`9`).
-/// requires: a.len() > 0
-/// requires: b.len() > 0
-/// requires: c.len() > 0
-/// requires: b[0] == 7
-/// requires: c[0] == 9
-/// ensures: ret == 9
 pub fn and_with_a_conditional_argument_cannot_prove_this(a: &[u8], b: &[u8], c: &[u8]) -> u8 {
     *a.first().and(b.first().or(c.first())).unwrap()
 }
 
+spec! {
+    requires: a.len() > 0,
+    requires: b.len() > 0,
+    requires: a[0] == -1,
+    ensures: ret == 1,
+}
 /// A conditional choice between two elements of a *signed* slice keeps its
 /// signedness, so `< 0` is a signed comparison.
-/// requires: a.len() > 0
-/// requires: b.len() > 0
-/// requires: a[0] == -1
-/// ensures: ret == 1
 pub fn signed_or_element_is_signed(a: &[i8], b: &[i8]) -> u8 {
     (*a.first().or(b.first()).unwrap() < 0) as u8
 }
 
+spec! {
+    requires: a.len() > 0,
+    requires: b.len() > 0,
+    requires: a[0] == -1,
+    ensures: ret == 0,
+}
 /// The false twin: `-1 < 0` is true, so the unsigned reading (255) is not `false`.
-/// requires: a.len() > 0
-/// requires: b.len() > 0
-/// requires: a[0] == -1
-/// ensures: ret == 0
 pub fn signed_or_element_is_signed_cannot_prove_this(a: &[i8], b: &[i8]) -> u8 {
     (*a.first().or(b.first()).unwrap() < 0) as u8
 }
 
+spec! {
+    requires: a.len() > 0,
+    requires: b.len() > 0,
+    requires: a[0] == -4,
+    ensures: ret == -2,
+}
 /// The signedness also drives signed division: `-4 / 2` is `-2`, not `126`.
-/// requires: a.len() > 0
-/// requires: b.len() > 0
-/// requires: a[0] == -4
-/// ensures: ret == -2
 pub fn signed_or_element_divides_signed(a: &[i8], b: &[i8]) -> i8 {
     *a.first().or(b.first()).unwrap() / 2
 }
 
+spec! {
+    requires: a.len() > 0,
+    requires: b.len() > 0,
+    requires: a[0] == -4,
+    ensures: ret == 126,
+}
 /// The false twin: the unsigned reading of `-4` divided by two is `126`.
-/// requires: a.len() > 0
-/// requires: b.len() > 0
-/// requires: a[0] == -4
-/// ensures: ret == 126
 pub fn signed_or_element_divides_signed_cannot_prove_this(a: &[i8], b: &[i8]) -> i8 {
     *a.first().or(b.first()).unwrap() / 2
 }
 
+spec! {
+    requires: xs.len() > 0,
+    ensures: ret <= 255,
+}
 /// `slice::last` on a slice is a fresh element: a contract true of every element
 /// holds of the last one, so this verifies.
-/// requires: xs.len() > 0
-/// ensures: ret <= 255
 pub fn slice_last_is_an_element(xs: &[u8]) -> u8 {
     match xs.last() {
         Some(v) => *v,
@@ -12879,18 +15168,22 @@ pub fn slice_last_is_an_element(xs: &[u8]) -> u8 {
     }
 }
 
+spec! {
+    requires: a[3] == 7,
+    ensures: ret == 7,
+}
 /// `slice::last` on an *array* is the exact element `a[N-1]`, so a contract about
 /// that element decides rather than being a fresh value.
-/// requires: a[3] == 7
-/// ensures: ret == 7
 pub fn array_last_is_the_last_element(a: [u8; 4]) -> u8 {
     a.last().copied().unwrap_or(0)
 }
 
+spec! {
+    requires: xs.len() > 0,
+    ensures: ret == 0,
+}
 /// The false twin: the fresh element of a slice is not pinned to any value, so a
 /// claim that it is `0` is refuted (a slice whose last element is non-zero exists).
-/// requires: xs.len() > 0
-/// ensures: ret == 0
 pub fn slice_last_is_an_element_cannot_prove_this(xs: &[u8]) -> u8 {
     match xs.last() {
         Some(v) => *v,
@@ -12898,15 +15191,21 @@ pub fn slice_last_is_an_element_cannot_prove_this(xs: &[u8]) -> u8 {
     }
 }
 
+spec! {
+    requires: a[0] == 9,
+    requires: a[3] == 7,
+    ensures: ret == 9,
+}
 /// The false twin: the array's last element is `a[3]`, not `a[0]`, so a claim
 /// about the first element refutes.
-/// requires: a[0] == 9
-/// requires: a[3] == 7
-/// ensures: ret == 9
 pub fn array_last_is_the_last_element_cannot_prove_this(a: [u8; 4]) -> u8 {
     a.last().copied().unwrap_or(0)
 }
 
+spec! {
+    requires: xs.len() == 1,
+    ensures: ret == 1,
+}
 /// A concrete-index write can reach the last element, so a `last()` read after it
 /// must see the write when the length makes the index the last one.
 ///
@@ -12917,35 +15216,41 @@ pub fn array_last_is_the_last_element_cannot_prove_this(a: [u8; 4]) -> u8 {
 /// write replaced the only element. The sentinel now carries the relationship
 /// `last == x` when `len == index + 1`, so this verifies (the write is seen) while
 /// its false twin refutes (the pre-write value is not kept).
-/// requires: xs.len() == 1
-/// ensures: ret == 1
 pub fn slice_last_after_write_is_seen(xs: &mut [u8]) -> u8 {
     xs[0] = 1;
     *xs.last().unwrap()
 }
 
+spec! {
+    requires: xs.len() == 1,
+    ensures: ret == 0,
+}
 /// The false twin: `xs[0] = 1` on a one-element slice *is* the write to `last()`,
 /// so the pre-write value does not survive. A model that left the sentinel at its
 /// pre-write value would prove this.
-/// requires: xs.len() == 1
-/// ensures: ret == 0
 pub fn slice_last_after_write_is_seen_cannot_prove_this(xs: &mut [u8]) -> u8 {
     xs[0] = 1;
     *xs.last().unwrap()
 }
 
+spec! {
+    requires: xs.len() == 2,
+    ensures: ret == true,
+}
 /// The mirror: a write to an index that is *not* the last element leaves `last()`
 /// alone, so a read taken before the write equals the one after it. The
 /// relationship is `len == index + 1`, so at length 2 the index `0` write does not
 /// touch `last()`.
-/// requires: xs.len() == 2
-/// ensures: ret == true
 pub fn slice_last_is_kept_when_another_index_is_written(xs: &mut [u8]) -> bool {
     let before = *xs.last().unwrap();
     xs[0] = 9;
     before == *xs.last().unwrap()
 }
 
+spec! {
+    requires: xs.len() == 1,
+    ensures: ret == true,
+}
 /// The discriminating twin of the fixture above: at length 1 the write *does*
 /// reach `last()`, so a read taken before it and a read taken after it differ and
 /// their equality is false. A model that left the sentinel at its pre-write value
@@ -12953,40 +15258,46 @@ pub fn slice_last_is_kept_when_another_index_is_written(xs: &mut [u8]) -> bool {
 /// `len == 2` fixture above cannot catch that: it keeps `last()` on both reads, so
 /// it stays green whether or not the sentinel is refreshed, and it is the `len == 1`
 /// direction that has teeth.
-/// requires: xs.len() == 1
-/// ensures: ret == true
 pub fn slice_last_read_before_a_write_is_not_kept_cannot_prove_this(xs: &mut [u8]) -> bool {
     let before = *xs.last().unwrap();
     xs[0] = 1;
     before == *xs.last().unwrap()
 }
 
+spec! {
+    requires: true,
+    ensures: ret <= 1,
+}
 /// `u8::from(bool)` is the zero-extension of the one-bit value: `false` -> 0,
 /// `true` -> 1. A `bool` has no integer width, so this is the one conversion the
 /// integer model would otherwise refuse.
-/// requires: true
-/// ensures: ret <= 1
 pub fn bool_to_u8_is_zero_or_one(b: bool) -> u8 {
     u8::from(b)
 }
 
+spec! {
+    requires: b == true,
+    ensures: ret == 1,
+}
 /// The `true` direction, so the bit is the *value* and not a constant zero.
-/// requires: b == true
-/// ensures: ret == 1
 pub fn bool_to_u8_of_true_is_one(b: bool) -> u8 {
     u8::from(b)
 }
 
+spec! {
+    requires: b == false,
+    ensures: ret == 1,
+}
 /// The false twin: `false` is 0, so a claim that it is 1 refutes.
-/// requires: b == false
-/// ensures: ret == 1
 pub fn bool_to_u8_of_true_is_one_cannot_prove_this(b: bool) -> u8 {
     u8::from(b)
 }
 
+spec! {
+    requires: true,
+    ensures: ret <= 1,
+}
 /// A wider destination zero-extends the same bit.
-/// requires: true
-/// ensures: ret <= 1
 pub fn bool_to_u32_is_zero_or_one(b: bool) -> u32 {
     u32::from(b)
 }

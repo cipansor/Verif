@@ -62,7 +62,7 @@ Done in one commit. The traps, so a future rename does not repeat them:
 
 ## Publishing to crates.io
 
-Both crates are published: `verif-arithmetic` at `0.1.0` and `verif` at `0.1.1`.
+Both crates are published: `verif-arithmetic` at `0.1.0` and `verif` at `0.2.0`.
 They version independently, so those numbers are not required to agree — see the
 `verif-arithmetic` requirement note in the root `Cargo.toml`. The repository is
 arranged so they stay publishable, and the checks that make that true are separate
@@ -9019,6 +9019,71 @@ and when it points at another commit (including one whose version matches);
 `--confirm-index` succeeds on a published crate, retries a 404-then-200, and
 fails a 403 immediately rather than after the timeout.
 
+## Migrating the corpus to `spec!`: a verdict diff is the check, and one guard hid a spelling
+
+0.2.0 made `spec! { … }` the only spelling in this repository's own sources: the
+examples, the three MIR corpora, the `comparison/` fixtures and the 149 inline
+sources in `tests/mir.rs`. The work is mechanical and that is exactly why it needed
+a check that is not "it compiles".
+
+**The check is the verdict table, diffed row by row.** For each corpus file,
+`mir_coverage` was run before and after the rewrite and the two tables compared:
+`everyday.rs` 24 rows and `realistic.rs` 1151 rows came out byte-identical, and
+`comparison_check` kept its six claims (one verified, four bug witnesses, one
+degenerate). A rewrite that changed a clause's *meaning* — a body re-parenthesised
+wrongly, a clause dropped, a `ret` renamed — shows up as a verdict that moved. It
+is the same discipline as the SOUNDNESS ledger: the claim is about behaviour, so
+the evidence has to be behaviour.
+
+**The converter has to be a tokenizer, not a regex.** The clauses live inside Rust
+*string literals*, in two shapes: `r#"…"#` raw strings, and normal strings with
+`\n` escapes and `\`-continuations. A regex over the file matches the inside of a
+raw string twice (once as raw, once as a normal literal), which over-counted the
+work by 60% on the first attempt (785 clauses against a true 478). The working
+converter walks the file once, tracking `//`, `/* */`, raw-string hashes and
+escape sequences, decodes each literal, rewrites the clause run, and re-encodes
+with a round-trip assertion (`decode(encode(x)) == x`).
+
+**A clause body can be legal Rust and still break the macro matcher.** `-x as u8 <
+127` parses as `as u8<127>` — the matcher reads the comparison as a generic
+argument list — so the fixture stopped compiling. `(-x as u8) < 127` is the same
+expression and the frontend's own parser reads nested parentheses, so the rewrite
+is meaning-preserving. This is the `spec!` spelling's one ergonomic cost: a clause
+is tokenised, so anything the macro matcher could mis-read needs a parenthesis.
+The doc-comment form has no such problem, which is a real (if small) argument for
+keeping it available.
+
+**Three classes of source must keep `///`.** Converting them deletes the thing they
+test or breaks the tool that reads them:
+
+* the tests whose *subject* is the doc-comment reader
+  (`scanner_reads_contracts_and_ignores_inner_docs`,
+  `scanner_does_not_leak_a_contract_onto_a_later_function`,
+  `scanner_finds_a_pub_crate_fn`,
+  `a_clause_shaped_doc_comment_that_is_not_a_clause_is_refused`);
+* `format!`-template fixtures, whose braces are placeholders, so a `spec!` block's
+  own braces would need escaping throughout — their subject is const generics,
+  trait paths and unwind bounds, not the spelling;
+* a source that deliberately must not import `verif`.
+
+**The migration found a real defect, and it is the lesson worth keeping.**
+`assert_not_dropped` — the guard that fails a test when a contracted function is
+absent from the report — decided "this source has a contract" with
+`src.contains("///")`. A `spec!`-only source has no `///`, so it looked
+contract-free and a *dropped* function passed the guard: the test would assert
+nothing, which is the exact failure the guard was added to prevent. The marker is
+now the clause *keyword* (`requires:`, `ensures:`, …), which both spellings carry.
+
+The general shape, which this file has met before in other clothes: **a test helper
+that recognises a feature by one of its spellings silently stops recognising it
+when a second spelling is introduced.** The helper is not part of the feature, so
+nothing points at it — only running the suite with the new spelling, which is what
+the migration did.
+
+**Evidence.** `tests/mir.rs` 359 passed / 0 failed with a nightly `rustc`;
+`everyday.rs` and `realistic.rs` verdict tables unchanged; `comparison_check` 6/6;
+`scripts/gate.sh` green; clippy clean on both crates.
+
 ## The docs.rs front page was three claims behind the code
 
 The crate-level doc comment in `src/lib.rs` is not a comment. It is the page
@@ -10401,3 +10466,48 @@ the unmodified tree (`git stash` and re-run), which is what makes it a rollover 
 not a regression. A review of *findings* is not a review of the *gate*; run the gate
 on the toolchain the reviewer names, or the build stays red behind twelve green
 "already fixed" replies.
+
+## An identity is not a path, and a test that skips itself still reports `ok`
+
+`canonical_compiler` answers "which *build* is this", as `commit-hash/host` from
+`rustc -vV`, because a path cannot: `rustc` on `PATH` is the rustup *shim*, a
+different file from the toolchain binary `rustup which` prints, so the two
+spellings of one compiler never compare equal by path. That fix is correct, and
+the three tests written beside it were wrong in two ways -- both of which are the
+recurring "a test that cannot fail" class, in a new place.
+
+**An identity was used as an executable.** `extern_compiles` *spawns* the
+compiler; `Command::new("0ef1bc386…/x86_64-unknown-linux-gnu")` fails to start,
+`extern_compiles` returns `false` on a failed spawn, and the cross-toolchain test
+read that `false` as "the other compiler rejected the rlib" -- the assertion it
+exists for -- while the *positive* half (`producer` accepts its own rlib) failed
+to build and the test returned early. Net: `ok`, having tested nothing. The fix
+is to keep the two apart at the source: `have()`/`active()` return `(path,
+identity)` together, the *path* is what gets spawned and the *identity* is only
+ever compared. The early return also became a `panic!` when the producing
+compiler cannot build a trivial rlib -- a compiler that cannot compile is a
+broken environment, not "nothing to test".
+
+**The identity test assumed which toolchain was active.** It compared a bare
+`rustc` against `rustup which --toolchain stable`, so under a nightly override
+(or any `RUSTUP_TOOLCHAIN`) the bare name correctly resolved to nightly and the
+equality assertion failed *while the identification was right*. The absolute path
+must come from `rustup which rustc` with **no** `--toolchain`, which resolves the
+active toolchain -- the same one a bare `rustc` dispatches to.
+
+Both were confirmed the only way that counts: reintroduce each defect and watch
+the test go red. Using the identity as the executable now panics with "the
+producing compiler (rustc, identity …) must be able to build a trivial rlib";
+running under `RUSTUP_TOOLCHAIN=nightly` with the `--toolchain stable` form fails
+with the two identities printed, and passes with `active()`.
+
+Two general rules, both already in this file in other words and worth repeating
+because they recur: **an identity, a handle, and a path are three different
+things**, and a function that takes "a compiler" has to say which it wants -- a
+spawn needs a path, a comparison needs an identity, and passing one where the
+other belongs fails in the *silent* direction (a failed spawn reads as `false`).
+And **a test whose body can return early must prove it ran**: a skip and a pass
+both print `ok`, so a skipped test is the same "green that checked nothing" as the
+gate that did not run. Where the environment is genuinely absent, say so with
+`eprintln!` and assert on what *was* reachable; where it is present but broken,
+panic rather than return.
