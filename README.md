@@ -134,6 +134,16 @@ verif = "0.2"
 verif = { version = "0.2", features = ["std"] }
 ```
 
+> **Which version is on crates.io.** The published line is **0.1.x**; `0.2.0` is
+> the release this tree prepares and is not yet uploaded, so a reader copying the
+> block above today should use `verif = "0.1"` until 0.2.0 appears on the
+> [crates.io page](https://crates.io/crates/verif). The `0.2` requirement is
+> deliberate here rather than a stale one: the in-code `spec!` spelling, the
+> `verif!` refusal and the doc-comment migration are all in this tree and not in
+> 0.1.x, so pinning the README to `0.1` would document a crate that does not have
+> the feature the page is about. `tests/readme.rs` pins the `"0.2"` spelling, so
+> this note and that test move together when 0.2.0 ships.
+
 There is nothing else to add: `verif`'s only dependency is `verif-arithmetic`,
 which is itself `no_std` and dependency-free, so the artifact's crates.io supply
 chain is those two crates and no third party.
@@ -1990,6 +2000,21 @@ A program calls the frontend directly through `MirOptions { edition: Some(..) }`
 which takes precedence over both; the environment variable is for the examples and
 the tests, which have no options struct to fill in.
 
+**One boundary on the probe tools.** `mir_coverage` (and the other single-file
+examples) runs `rustc` on one file with no Cargo graph behind it, so a source that
+opens with `use verif::spec;` needs an `--extern` entry the example does not supply.
+The corpora in this repository avoid that with a local no-op shim
+(`macro_rules! spec { … }`, one line at the top of the file), which is why
+`mir_coverage` decides them. A file you write for a real crate should import the
+macro instead, and then it is the **build script** route that reads it — `build.rs`
+locates the rlib it is already linked against with
+`verify::extern_options_with` and passes the options to `verify_file_with_opts`,
+which is the recipe in "The same function, two ways" above. If you do want
+`mir_coverage` on a `use verif::spec;` file, add the shim or call the frontend from
+a program that fills `MirOptions.externs` — the example deliberately does not guess
+an rlib path, because a guessed one is either the wrong compiler's or the wrong
+features' and surfaces as a compiler error about a program that is fine.
+
 The five differential oracles (z3, Kani, Lean, Coq, Verus) all build their terms
 with `smt::` calls, so they start *below* the contract reader. That left the reader
 — the layer that turns contract text into terms — with no independent check, and
@@ -3197,6 +3222,12 @@ fn main() {
         &rustc, "src/lib.rs".as_ref(), &[], &opts,
     )
     .expect("the MIR frontend could not read the source");
+    // A report with no outcomes verified nothing, and a loop over an empty list
+    // would pass silently. Demand at least one obligation was discharged.
+    assert!(
+        !report.outcomes.is_empty(),
+        "verif: no contract was found in src/lib.rs, so nothing was verified"
+    );
     for (name, outcome) in &report.outcomes {
         assert!(outcome.is_verified(), "verif: {name} is not verified: {outcome}");
     }
@@ -3296,15 +3327,40 @@ shipped binary contains none of the prover:
 
 ```rust,ignore
 // build.rs — the verifier, as a build script
+use std::path::Path;
+
 fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
-    let report = verif::mir::verify::verify_file_with("rustc", "src/lib.rs".as_ref(), &[])
-        .expect("the MIR frontend could not read the source");
+    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
+    // The frontend runs `rustc` on one file with no Cargo graph behind it, so the
+    // source's own `use verif::spec;` needs an `--extern` entry. This locates the
+    // rlib the build script is already linked against, and the search paths its
+    // dependencies live on, so `verif` and `verif-arithmetic` both resolve.
+    let opts = verif::mir::verify::extern_options_with(&rustc, "verif").unwrap_or_default();
+    let report = verif::mir::verify::verify_file_with_opts(
+        &rustc,
+        Path::new("src/lib.rs"),
+        &[],
+        &opts,
+    )
+    .expect("the MIR frontend could not read the source");
+    // A report with no outcomes is a build that verified nothing, and a loop over
+    // an empty list would pass silently -- the "harness that cannot fail" this
+    // repository treats as a defect. Demand at least one obligation was discharged.
+    assert!(
+        !report.outcomes.is_empty(),
+        "verif: no contract was found in src/lib.rs, so nothing was verified"
+    );
     for (name, outcome) in &report.outcomes {
         assert!(outcome.is_verified(), "verif: {name} is not verified: {outcome}");
     }
 }
 ```
+
+`extern_options` is the `VERIF_RUSTC`-aware form of the same call; use
+`extern_options_with` when the script resolves its own compiler, so the lookup and the
+emission name one toolchain (an rlib's metadata is compiler-specific, and probing with one
+compiler then emitting with another is an `E0514` against a program that is fine).
 
 **Verified on the target** — the same bound is discharged by the engine compiled into the
 binary, at the moment the function runs. The engine is `no_std`, so this compiles for bare
