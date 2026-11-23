@@ -6192,6 +6192,106 @@ pub(crate) fn vec_elem_ty_loose(name: &str) -> Option<Ty> {
 ///   created by a deref'd read is not the one a later `v[k]` creates, so
 ///   `v.first() == v[0]` is a lost proof in that one ordering -- never a false one.
 #[allow(clippy::too_many_arguments)]
+fn string_method(
+    name: &str,
+    kind: intrinsics::StringMethod,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+    f: &MirFn,
+) -> Result<Vec<Obligation>, String> {
+    use intrinsics::StringMethod;
+    // The string's tracked length, read through one reference (`len`/`is_empty`
+    // take `&self`, `push_str` `&mut self`). `new` has no receiver.
+    let receiver = |env: &Env| -> Result<u32, String> {
+        match args.first() {
+            Some(Operand::Copy(p)) | Some(Operand::Move(p)) => Ok(env.pointee(p).local),
+            _ => Err(format!("unmodelled receiver for `{name}`")),
+        }
+    };
+    let length = |env: &Env, l: u32| -> Result<Var, String> {
+        match env.indexed.get(&l) {
+            Some(s) => Ok(s.len),
+            None => Err(format!("`{name}` on a receiver whose length is not modelled")),
+        }
+    };
+    // A `&str`'s byte length, as the same variable `str::len` reads: a symbolic
+    // input for an argument, a constant for a literal. A source whose length is
+    // not modelled is refused rather than given an invented number.
+    let str_len = |env: &Env, a: Option<&Operand>| -> Result<Var, String> {
+        // A literal reaches the call either directly (`from(const "abc")`) or
+        // through a local (`_4 = const "ab"; push_str(_, move _4)`).
+        if let Some(Operand::Const(Const::Str(text))) = a {
+            return Ok(smt::word(text.len() as u64, USIZE_WIDTH));
+        }
+        let p = match a {
+            Some(Operand::Copy(p)) | Some(Operand::Move(p)) => p.clone(),
+            _ => return Err(format!("unmodelled argument to `{name}`")),
+        };
+        match length_of(env, f, &p) {
+            Val::Sym(v, _) => Ok(v),
+            _ => Err(format!("`{name}` on a `&str` whose length is not modelled")),
+        }
+    };
+    match kind {
+        StringMethod::New => {
+            env.indexed.insert(
+                dest.local,
+                Indexed {
+                    len: smt::word(0, USIZE_WIDTH),
+                    len_mutable: true,
+                    elem_w: 8,
+                    elem_signed: false,
+                    elems: BTreeMap::new(),
+                    fixed_len: None,
+                    slice_steps: None,
+                    poisoned: false,
+                },
+            );
+            Ok(Vec::new())
+        }
+        StringMethod::From => {
+            let len = str_len(env, args.first())?;
+            env.indexed.insert(
+                dest.local,
+                Indexed {
+                    len,
+                    len_mutable: true,
+                    elem_w: 8,
+                    elem_signed: false,
+                    elems: BTreeMap::new(),
+                    fixed_len: None,
+                    slice_steps: None,
+                    poisoned: false,
+                },
+            );
+            Ok(Vec::new())
+        }
+        StringMethod::PushStr => {
+            let l = receiver(env)?;
+            let add = str_len(env, args.get(1))?;
+            let cur = length(env, l)?;
+            if let Some(s) = env.indexed.get_mut(&l) {
+                s.len = smt::add(cur, add);
+            }
+            Ok(Vec::new())
+        }
+        StringMethod::Len => {
+            let l = receiver(env)?;
+            let len = length(env, l)?;
+            env.set(dest, Val::Sym(len, Sign::Unsigned));
+            Ok(Vec::new())
+        }
+        StringMethod::IsEmpty => {
+            let l = receiver(env)?;
+            let len = length(env, l)?;
+            env.set(dest, Val::Bool(smt::eq_const(len, 0)));
+            Ok(Vec::new())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn vec_method(
     name: &str,
     kind: intrinsics::VecMethod,
@@ -6632,6 +6732,14 @@ fn try_intrinsic(
                 | intrinsics::Intrinsic::TryBranch
                 | intrinsics::Intrinsic::FromResidual
                 | intrinsics::Intrinsic::VecMethod(_)
+                // The `String` length model is an inherent method on the standard
+                // `String` (`String::new`, `String::push_str`, …) and `String::from`
+                // is `<String as From<&str>>::from` -- neither carries `<impl`, so
+                // both need the exception. `classify` accepts only the standard
+                // `String` path (`names_string_impl`, and the `String`/`&str` types
+                // in the conversion branch), and the same-dump lookup answers a real
+                // body first, which keeps a local type spelled `String` out.
+                | intrinsics::Intrinsic::StringMethod(_)
                 // Slice iteration is a *trait* call too (`<&[u8] as
                 // IntoIterator>::into_iter`, `<slice::Iter as Iterator>::next`), so
                 // it has no `<impl`. `classify` accepts it only for a `[T]` head or
@@ -6692,6 +6800,12 @@ fn try_intrinsic(
     let cur = &prog.fns[func];
     if let intrinsics::Intrinsic::VecMethod(kind) = op {
         return Some(vec_method(name, kind, args, dest, env, path, pins, cur));
+    }
+    // The `String` length model. Like `Vec`, it reads a length the executor tracks
+    // rather than an operand term, and `String::new()` has no argument, so it runs
+    // before the operand read.
+    if let intrinsics::Intrinsic::StringMethod(kind) = op {
+        return Some(string_method(name, kind, args, dest, env, cur));
     }
     // The operand width, from the first argument's declared type. It is not the
     // destination's: `checked_add` on a `u8` writes an `Option<u8>`, and taking
@@ -7603,6 +7717,13 @@ where
                 // recorded the same way and for the same reason.
                 if let Rvalue::Use(Operand::Const(Const::Bytes(b))) = rv {
                     st.env.tmpl_bytes.insert(dest.local, b.clone());
+                }
+                // A `&str` literal reaches `str::len`/`String::from`/`push_str` through
+                // a local (`_4 = const "ab"`), so its byte length is kept in the string
+                // store -- recorded *after* `set`, because a whole-place write forgets
+                // the destination's parts. `length_of` reads it back as the length.
+                if let Rvalue::Use(Operand::Const(Const::Str(text))) = rv {
+                    st.env.strs.insert(dest.local, text.clone());
                 }
                 // A *nested* aggregate assignment moves the source's parts under the
                 // destination's path. Two shapes need it: a struct literal into a nested field
@@ -8752,6 +8873,13 @@ fn drop_is_noop(ty: &Ty) -> bool {
             if name.contains("slice::Iter") {
                 return true;
             }
+            // A standard `String` is a `Vec<u8>` underneath: its destructor only
+            // frees the byte buffer, which runs no `Drop`, so it is glue-free. The
+            // *qualified* path is checked (`std::string::String`), so a user
+            // `struct String` is not treated as the container.
+            if name.contains("string::String") {
+                return true;
+            }
             if let Some(elem) = array_into_iter_elem(name) {
                 return drop_is_noop(&elem);
             }
@@ -9585,7 +9713,14 @@ fn length_of(env: &Env, f: &MirFn, p: &Place) -> Val {
         // writes `a.len() == 4` on an `a: [u8; 4]` has something to agree with.
         None => match type_of_place(f, &p) {
             Some(Ty::Array(_, n)) => Val::Sym(smt::word(n, USIZE_WIDTH), Sign::Unsigned),
-            _ => Val::Unknown,
+            // A string literal (`const "ab"`) has a *constant* byte length, kept
+            // in the string store. It is the receiver of `str::len`/`is_empty` and
+            // the source of `String::from`/`push_str`, so its length is read here
+            // rather than left unknown.
+            _ => match env.strs.get(&p.local) {
+                Some(text) => Val::Sym(smt::word(text.len() as u64, USIZE_WIDTH), Sign::Unsigned),
+                None => Val::Unknown,
+            },
         },
     }
 }

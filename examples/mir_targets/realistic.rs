@@ -14006,12 +14006,13 @@ spec! {
     requires: true,
     ensures: ret == 1,
 }
-/// A `String` local: its destructor frees the heap, which this tool cannot
+/// A `Box<T>` local: its destructor frees the heap, which this tool cannot
 /// represent, so the `drop` is *refused* -- never assumed to be a no-op. Assuming
 /// it were a no-op would be a false proof whenever the destructor's effect is
-/// observable, which is the one outcome this crate must never produce.
-pub fn string_drop_is_refused(s: String) -> u8 {
-    let _owned = s;
+/// observable, which is the one outcome this crate must never produce. (A `String`
+/// is a `Vec<u8>` underneath and is glue-free; `Box` has no modelled field set.)
+pub fn box_drop_is_refused(b: Box<u8>) -> u8 {
+    let _owned = b;
     1
 }
 
@@ -15613,6 +15614,46 @@ pub fn iter_enumerate_value_sum_cannot_prove_this(xs: &[u8]) -> u8 {
         s = s.wrapping_add(x);
     }
     s
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
+/// `String::from("ab")` has byte length `2`; `len` reads the tracked length.
+pub fn string_from_len() -> usize {
+    String::from("ab").len()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
+/// The false twin: `"ab"` is length `2`, not `3`.
+pub fn string_from_len_cannot_prove_this() -> usize {
+    String::from("ab").len()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
+/// `String::new` is length `0`, `push_str("ab")` adds `2`.
+pub fn string_push_len() -> usize {
+    let mut s = String::new();
+    s.push_str("ab");
+    s.len()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
+/// The false twin: the pushed string is not empty.
+pub fn string_push_len_cannot_prove_this() -> usize {
+    let mut s = String::new();
+    s.push_str("ab");
+    s.len()
 }
 
 // ---------------------------------------------------------------------------

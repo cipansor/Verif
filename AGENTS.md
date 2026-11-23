@@ -10520,6 +10520,42 @@ deeper: a *tail* after the downcast group means the outer group is not itself a
 downcast. Pinned by `mir::parse::tests::a_nested_downcast_with_a_tail_parses_whole`
 (no toolchain needed) and `a_slice_iterator_enumerate_carries_the_index_and_element`.
 
+### `String` is a length, and its drop is glue-free (unlike a `Box`'s)
+
+A `String` is a `Vec<u8>` underneath, and the dump prints neither the pointer nor
+the length, so the model tracks the **length** only -- exactly the `Vec` shape,
+reusing the `indexed` store (`len_mutable`, `elem_w = 8`). `String::new` is `0`,
+`push_str` adds the appended `&str`'s byte length, the `<String as From<&str>>::from`
+constructor is that length, and `len`/`is_empty` read it. Three facts cost the most:
+
+- **A `&str`'s byte length is symbolic for an argument and constant for a
+  literal.** `length_of` already answered a `&str` argument (the binder seeds its
+  length variable, the same one `str::len` reads); a *literal* (`const "abc"`) has
+  no such variable, so its byte length is kept in the string store (`Env::strs`,
+  recorded after `set` because a whole-place write forgets the destination) and
+  `length_of` reads `text.len()` back. That one addition is what makes `"abc".len()`
+  and `String::from("abc").len()` decide.
+- **`String::from(&str)` is a `From` call, so it is intercepted before the integer
+  conversion model.** `<String as From<&str>>::from` would otherwise be classified
+  as `Conversion` and refused ("converts a type the model does not hold"). The
+  `classify` conversion branch checks the *name* -- self type `String`, parameter a
+  `&str` -- and returns `StringMethod::From` first.
+- **A `String` drop is glue-free, a `Box`'s is not.** `String`'s destructor frees
+  its byte buffer and runs no `Drop`, exactly like `Vec<u8>`, so `drop(_s)` is a
+  no-op and a `String`-using function decides. The check is on the *qualified* path
+  (`string::String`), so a user `struct String` is not treated as the container. A
+  `Box<T>` has no modelled field set, so its drop stays refused -- and that is the
+  example `an_unmodelled_drop_is_refused_not_assumed_away` and the corpus fixture
+  `box_drop_is_refused` now use (a `String` was the example before `String` became
+  modelled).
+
+The path guard is `names_string_impl` (bare `String::m` head or a `string::String`
+segment), and `Intrinsic::StringMethod(_)` is added to `try_intrinsic`'s
+`trait_method` exception list -- `String::new` and `<String as From<&str>>::from`
+carry no `<impl`, so the guard would otherwise refuse them. The bytes are not
+modelled, so a contents-dependent method stays refused. Pinned by
+`a_string_length_model_decides_new_from_push_len` (eight verified, two refutations).
+
 
 
 

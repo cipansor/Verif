@@ -2547,7 +2547,10 @@ says "I could not decide" is worth more than one that guesses.
    `xs[pos]`, so `for (i, &x) in xs.iter().enumerate()` decides. What is *not*
    modelled is an iterator chain that must run a closure (`fold`, `map`, `filter`);
    those are reported `incomplete` with the unmodelled call named, so the gap is
-   visible rather than silent. A `Vec`'s *elements* are modelled — `v[k]`, `v.first()`,
+   visible rather than silent. A `String` is modelled by its **length** (`new`,
+   `push_str`, `from(&str)`, `len`, `is_empty`), with a `&str` literal's byte length
+   a constant and an argument's a symbolic input; the bytes are not modelled, so a
+   contents-dependent method stays refused, and a `String` drop is glue-free. A `Vec`'s *elements* are modelled — `v[k]`, `v.first()`,
    `v.get(k)` and `pop` read back what `push` wrote, and a `Vec` argument's
    `v.len()`/`v[k]` are symbolic inputs — and `v.iter()` derefs to a slice, so
    `for &x in v.iter()` decides like one over a slice. Two limits of the iteration model

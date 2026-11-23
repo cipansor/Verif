@@ -7914,6 +7914,62 @@ pub fn idx_symbolic(xs: &[u8]) -> u8 { let mut s = 0u8; for (i, _) in xs.iter().
     );
 }
 
+/// `String` is modelled by its **length** only: `new` is `0`, `push_str` adds the
+/// appended `&str`'s byte length, `from` is that length, and `len`/`is_empty` read
+/// it. A `&str`'s byte length is a symbolic input when it is an argument and a
+/// constant when it is a literal (`const "abc"` is `3`). The bytes are not
+/// modelled, so a method whose result depends on the *contents* stays refused --
+/// the length model is exact for what it claims and silent about the rest.
+#[test]
+fn a_string_length_model_decides_new_from_push_len() {
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! { requires: true, ensures: ret == 3, }
+pub fn lit_len() -> usize { "abc".len() }
+spec! { requires: true, ensures: ret == true, }
+pub fn lit_empty() -> bool { "".is_empty() }
+spec! { requires: true, ensures: ret == 0, }
+pub fn new_len() -> usize { String::new().len() }
+spec! { requires: true, ensures: ret == true, }
+pub fn new_empty() -> bool { String::new().is_empty() }
+spec! { requires: true, ensures: ret == 3, }
+pub fn from_len() -> usize { String::from("abc").len() }
+spec! { requires: true, ensures: ret == 2, }
+pub fn push_len() -> usize { let mut s = String::new(); s.push_str("ab"); s.len() }
+spec! { requires: true, ensures: ret == false, }
+pub fn push_nonempty_empty() -> bool { let mut s = String::new(); s.push_str("x"); s.is_empty() }
+spec! { requires: true, ensures: ret == s.len(), }
+pub fn str_arg_len(s: &str) -> usize { s.len() }
+
+spec! { requires: true, ensures: ret == 2, }
+pub fn from_len_bad() -> usize { String::from("abc").len() }
+spec! { requires: true, ensures: ret == 3, }
+pub fn push_len_bad() -> usize { let mut s = String::new(); s.push_str("ab"); s.len() }
+"#;
+    for name in [
+        "lit_len",
+        "lit_empty",
+        "new_len",
+        "new_empty",
+        "from_len",
+        "push_len",
+        "push_nonempty_empty",
+        "str_arg_len",
+    ] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    // The length model must be *exact*: a wrong length is refuted, so the tests
+    // above are not passing because `len` returns a constant the claim accepts.
+    for name in ["from_len_bad", "push_len_bad"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` is a false length claim and must be refuted, got: {o}"
+        );
+    }
+}
+
 /// A user type spelled `Vec` is not the container, and its *methods* are answered
 /// by their own bodies.
 ///
@@ -12778,11 +12834,13 @@ pub fn guarded(x: u8) -> u8 {
 
 /// C1: a container whose destructor the tool cannot represent is *refused*.
 ///
-/// A `String` local frees the heap, which is not a bit-vector fact. Assuming the
+/// A `Box<T>` local frees the heap, which is not a bit-vector fact. Assuming the
 /// `drop` were a no-op would be a false proof whenever the destructor's effect is
 /// observable, so the honest answer is a refusal -- not a verdict. This is the
 /// case the dump cannot tell apart from a struct holding a user-`Drop` field (both
 /// print `drop(_x) -> [return: …]`), which is why the no-op is not taken here.
+/// (A `String` is a `Vec<u8>` underneath and *is* glue-free, so it is no longer
+/// this example; a `Box` has no modelled field set.)
 #[test]
 fn an_unmodelled_drop_is_refused_not_assumed_away() {
     let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
@@ -12791,16 +12849,16 @@ spec! {
     requires: true,
     ensures: ret == 1,
 }
-pub fn owns_string(s: String) -> u8 {
-    let _owned = s;
+pub fn owns_box(b: Box<u8>) -> u8 {
+    let _owned = b;
     1
 }
 "#;
-    let Some(o) = verify_src("owns_string", src) else { return };
+    let Some(o) = verify_src("owns_box", src) else { return };
     match o {
         FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. } => {}
         other => panic!(
-            "a `String` drop is not representable and must be refused, got: {other} -- \
+            "a `Box` drop is not representable and must be refused, got: {other} -- \
              a verdict here would be a false proof"
         ),
     }
@@ -12821,7 +12879,7 @@ fn the_drop_fixtures_decide_and_the_false_ones_are_refuted() {
         "destructor_panic_guarded",
         "guard_misguarded_cannot_prove_this",
         "destructor_panic_cannot_prove_this",
-        "string_drop_is_refused",
+        "box_drop_is_refused",
     ];
     let Some(report) = verify_realistic(&names) else { return };
 
@@ -12850,7 +12908,7 @@ fn the_drop_fixtures_decide_and_the_false_ones_are_refuted() {
         }
     }
     // A container drop is a refusal, not a verdict.
-    match outcome(&report, "string_drop_is_refused") {
+    match outcome(&report, "box_drop_is_refused") {
         FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. } => {}
         other => panic!("a `String` drop must be refused, got: {other}"),
     }

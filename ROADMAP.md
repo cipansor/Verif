@@ -1003,8 +1003,8 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     no longer reads the entry length at the exit (`ret == 0` for `ret == 3`); and
     a `Vec` move (`let w = v`) and a returned vector transfer the length to the
     destination rather than dropping it.
-  - Remaining: `String`, `Box`, symbolic-length slices. (Iteration, `pop`,
-    `is_empty` and the **element** model are done — see the progress notes below.)
+  - Remaining: `Box`, symbolic-length slices. (`String` is done — see the progress
+    note below. Iteration, `pop`, `is_empty` and the **element** model are done.)
   - Progress (`pop`, `is_empty`): `Vec::is_empty` reads the tracked length;
     `Vec::pop` returns `None` iff the length is zero and decrements it on the
     non-empty path; on a constant-length vector the popped element is the payload.
@@ -1102,6 +1102,21 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     654/1194**; `mir::parse::tests::a_nested_downcast_with_a_tail_parses_whole`
     pins the parse without a toolchain and
     `a_slice_iterator_enumerate_carries_the_index_and_element` pins the verdicts.
+  - Progress (**`String`**, the length half): a `String` is a `Vec<u8>` underneath
+    and its fields are not printed, so the model tracks its **length** only --
+    `String::new` is `0`, `push_str` adds the appended `&str`'s byte length, the
+    `<String as From<&str>>::from` constructor is that length, and `len`/`is_empty`
+    read it. A `&str`'s byte length is a symbolic input for an argument (the same
+    variable `str::len` reads) and a **constant** for a literal (`const "abc"` is
+    `3`, kept in the string store and read back by `length_of`). A `String` drop is
+    glue-free (like `Vec<u8>`), so a `String`-using function decides. The path is
+    checked (`names_string_impl`, and the `String`/`&str` types in the conversion
+    branch) so a user type spelled `String` is refused, and the same-dump lookup
+    answers a real body first. The bytes are not modelled, so a method whose result
+    depends on the *contents* stays refused. `realistic.rs` **654/1194 →
+    656/1198**; `tests/mir.rs` `a_string_length_model_decides_new_from_push_len`
+    pins eight verified (incl. a `&str`-argument reflexive length) and two
+    refutations, so the model is exact rather than a constant the claim accepts.
   - Move: **build**.
 - **C12. A specification language that can say more.** · P1 · in progress · Verus,
   Creusot, Prusti, SPARK

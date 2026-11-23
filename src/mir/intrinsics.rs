@@ -446,6 +446,18 @@ pub enum Intrinsic {
     /// The *path* is checked (see [`names_vec_impl`]) so a user type spelled
     /// `Vec` is refused, and the same-dump lookup answers a real body first.
     VecMethod(VecMethod),
+    /// `String::{new, from, push_str, len, is_empty}`: the `String` *length* model.
+    ///
+    /// A `String` is a `Vec<u8>` underneath, and its fields are not printed by the
+    /// dump, so only the length is tracked -- `new` is `0`, `push_str` adds the
+    /// appended `&str`'s byte length, `from` is that length, and `len`/`is_empty`
+    /// read it. A `&str`'s byte length is a *symbolic* input when it is an
+    /// argument (the same variable `str::len` reads) and a constant when it is a
+    /// literal (`const "ab"` is `2`). The bytes are not modelled, so a call whose
+    /// result depends on the *contents* is refused. The path is checked (see
+    /// [`names_string_impl`]) so a user type spelled `String` is refused, and the
+    /// same-dump lookup answers a real body first.
+    StringMethod(StringMethod),
     /// `iN::abs_diff`: the absolute difference of two operands, as the type.
     ///
     /// Its result is *unsigned* even on a signed type -- `i8::abs_diff(-128, 127)`
@@ -721,6 +733,29 @@ pub enum VecMethod {
     Deref,
     /// `Vec::as_slice(&self) -> &[T]`, the explicit spelling of [`Self::Deref`].
     AsSlice,
+}
+
+/// A method on a `String`, modelled by its *length* only.
+///
+/// A `String` is a `Vec<u8>` underneath and its fields are not printed, so the
+/// model tracks the length exactly as [`VecMethod`] does: `new` is `0`,
+/// `push_str` adds the appended `&str`'s byte length, `from` is that length, and
+/// `len`/`is_empty` read it. The bytes are not modelled, so a method whose result
+/// depends on the contents is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StringMethod {
+    /// `String::new()` -> an empty string, length `0`.
+    New,
+    /// `String::from(&str)` (spelled `<String as From<&str>>::from`) -> a string
+    /// whose length is the source's byte length.
+    From,
+    /// `String::push_str(&mut self, &str)` -> the length grows by the appended
+    /// slice's byte length.
+    PushStr,
+    /// `String::len(&self) -> usize` -> the tracked length.
+    Len,
+    /// `String::is_empty(&self) -> bool` -> the length is zero.
+    IsEmpty,
 }
 
 /// Which extreme `Iterator::max`/`Iterator::min` computes.
@@ -1363,6 +1398,18 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             _ => {}
         }
     }
+    // `String::{new, push_str, len, is_empty}`: the `String` length model. The
+    // `from(&str)` constructor is the `<String as From<&str>>::from` spelling and
+    // is intercepted in the conversion branch below.
+    if names_string_impl(name) {
+        match short {
+            "new" => return Some(Intrinsic::StringMethod(StringMethod::New)),
+            "push_str" => return Some(Intrinsic::StringMethod(StringMethod::PushStr)),
+            "len" => return Some(Intrinsic::StringMethod(StringMethod::Len)),
+            "is_empty" => return Some(Intrinsic::StringMethod(StringMethod::IsEmpty)),
+            _ => {}
+        }
+    }
     // `v[i]` and `v.first()`/`v.get(k)` reach `Vec` through a *trait* projection
     // (`<Vec<u8> as Index<usize>>::index`, `<Vec<u8> as Deref>::deref`), which
     // carries no `vec::Vec` path, so the bare-`Vec` head is matched separately and
@@ -1562,6 +1609,23 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if short == "from" || short == "into" {
         if !names_conversion_trait(name) {
             return None;
+        }
+        // `<String as From<&str>>::from` is the `String` constructor, not an
+        // integer conversion: its self type is `String` and its parameter is a
+        // `&str`. Intercept it here, before the integer `Conversion` model, which
+        // would refuse it ("converts a type the model does not hold"). The check is
+        // on the *name* only -- the executor reads the argument's byte length.
+        if short == "from" {
+            if let Some((self_part, after_as)) = name.rsplit_once(" as ") {
+                let self_is_string = self_part
+                    .trim_start_matches('<')
+                    .trim()
+                    .ends_with("String");
+                let param_is_str = after_as.contains("str");
+                if self_is_string && param_is_str {
+                    return Some(Intrinsic::StringMethod(StringMethod::From));
+                }
+            }
         }
         let kind = if short == "from" { Conversion::From } else { Conversion::Into };
         return Some(Intrinsic::Conversion(kind));
@@ -1962,6 +2026,26 @@ pub fn names_vec_impl(name: &str) -> bool {
     name.contains("vec::Vec") || name.starts_with("Vec::")
 }
 
+/// True when a call names an inherent method on the standard library's `String`.
+///
+/// `new`/`len`/`is_empty`/`push_str` are spelled on many types, so the *path* is
+/// checked: rustc prints a `String` method as `String::new` (the shortened spelling
+/// when nothing shadows it) or `alloc::string::String::push_str` /
+/// `std::string::String::len`. A user type spelled `String` in a local module is
+/// `m::String::new`, which has neither a leading `String::` nor a `string::String`
+/// segment, and is refused; the same-dump lookup answers a real body first. A
+/// `String::from(&str)` is the `<String as From<&str>>::from` spelling, handled in
+/// `classify`'s conversion branch, not here.
+pub fn names_string_impl(name: &str) -> bool {
+    if name.contains("string::String") {
+        return true;
+    }
+    match name.strip_prefix("String::") {
+        Some(rest) => !rest.contains("::"),
+        None => false,
+    }
+}
+
 /// The head of a type spelled `<Vec<T> …>` is the standard container.
 ///
 /// rustc prints a `Vec`'s *trait* call with the bare type (`<Vec<u8> as
@@ -2222,6 +2306,8 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // hold). Total here so an `is_modelled` probe does not report them
         // unmodelled.
         Intrinsic::VecMethod(_) => true,
+        // The `String` length model is store-based, answered by the executor.
+        Intrinsic::StringMethod(_) => true,
         // The `Option` methods. They read the receiver's tag and payload, which
         // live in the executor's stores rather than in an operand term, so there is
         // no width or sign to check here -- `eval` never sees them and the
@@ -2458,6 +2544,11 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
     if matches!(op, Intrinsic::VecMethod(_)) {
         return None;
     }
+    // The `String` methods read the length the executor tracks, so `eval` has
+    // nothing to compute. The executor answers them (see `string_method`).
+    if matches!(op, Intrinsic::StringMethod(_)) {
+        return None;
+    }
     // The `Option` methods read the receiver's tag and payload from the executor's
     // stores, not from an operand term, so `eval` has nothing to compute for them
     // either. The executor answers them (see `enum_method`).
@@ -2484,6 +2575,9 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         return None;
     }
     Some(match op {
+        // The `String` length model is answered by the executor's `string_method`;
+        // the early return above keeps it from reaching here.
+        Intrinsic::StringMethod(_) => unreachable!("String methods are answered by the executor"),
         // Answered by `eval_slice` from the executor's length variable; the early
         // return above keeps them from reaching here.
         Intrinsic::SliceLen
