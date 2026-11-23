@@ -1051,6 +1051,28 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     refuted) and `a_for_loop_with_an_invariant_refuses_the_iterator` pin both
     directions, and `slice_iteration_classifies_and_a_user_iterator_does_not`
     pins the path guard.
+  - Progress (**iterator consumers**): `Iterator::{sum, count}` and the
+    cursor-preserving `copied` adapter now decide on a slice/array cursor.
+    `count` is `len - pos` on the slice's own length variable (exact even when the
+    length is symbolic, since `pos <= len`). `sum::<T>` folds the remaining
+    elements `s[pos] + ... + s[len-1]` with a **checked** `+`, so each partial sum
+    raises a reachable-panic obligation -- an unguarded `xs.iter().sum()` over
+    `u8`s is *refuted* as a panic (it overflows for `[200, 100]`), not proved; a
+    contract that bounds the elements discharges the two additions and verifies.
+    The number of addends is the length, so `sum` is modelled only when that length
+    is a constant (an array's type length, or a slice the precondition pinned with
+    `requires: xs.len() == N`); a symbolic length has no fixed addend count and is
+    refused. `copied` is the identity on the cursor (a reference is modelled as its
+    referent), and `next`/`sum`/`count`/`into_iter` accept an adapter over a
+    slice/array iterator (`Copied<..>`, and the `Enumerate<..>` spelling is
+    classified for `next` though the tuple payload is not yet modelled), so
+    `xs.iter().copied().sum()` and `for x in xs.iter().copied()` decide. `classify`
+    checks the receiver *type* (`slice::Iter`/`array::IntoIter`, or an adapter whose
+    payload is one) and the `Iterator`/`IntoIterator` trait, so a user iterator is
+    refused. `realistic.rs` **643/1174 → 647/1181**; `tests/mir.rs`
+    `a_slice_iterator_sum_and_count_are_modelled` pins four verified, two
+    postcondition refutations, the overflow *panic* refutation, and the
+    symbolic-length refusal.
   - Move: **build**.
 - **C12. A specification language that can say more.** · P1 · in progress · Verus,
   Creusot, Prusti, SPARK

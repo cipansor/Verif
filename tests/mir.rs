@@ -7714,6 +7714,77 @@ pub fn sum_inv(xs: &[u8]) -> u8 { let mut s = 0u8; for &x in xs { s = s.wrapping
     );
 }
 
+/// Iterator *consumers* on a slice/array cursor: `sum`, `count`, and the `copied`
+/// adapter.
+///
+/// `sum` folds with a *checked* `+`, so an unguarded sum over `u8`s is a reachable
+/// panic (refuted, not proved) -- the model must not hide it. The sum's length must
+/// be a constant (an array's type length, or a slice length the precondition
+/// pinned), so a symbolic-length sum is refused rather than summed over a wrong
+/// range. `count` is `len - pos`, exact even with a symbolic length.
+#[test]
+fn a_slice_iterator_sum_and_count_are_modelled() {
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! { requires: xs.len() == 2, requires: xs[0] <= 10, requires: xs[1] <= 10, ensures: ret == xs[0] + xs[1], }
+pub fn sum2(xs: &[u8]) -> u8 { xs.iter().sum() }
+
+spec! { requires: xs.len() == 2, requires: xs[0] <= 10, requires: xs[1] <= 10, ensures: ret == xs[0], }
+pub fn sum2_bad(xs: &[u8]) -> u8 { xs.iter().sum() }
+
+spec! { requires: a[0] <= 10, requires: a[1] <= 10, ensures: ret == a[0] + a[1], }
+pub fn arr_sum(a: [u8; 2]) -> u8 { a.into_iter().sum() }
+
+spec! { requires: xs.len() == 2, requires: xs[0] <= 10, requires: xs[1] <= 10, ensures: ret == xs[0] + xs[1], }
+pub fn copied_sum(xs: &[u8]) -> u8 { xs.iter().copied().sum() }
+
+spec! { requires: xs.len() <= 3, ensures: ret == xs.len(), }
+pub fn count2(xs: &[u8]) -> usize { xs.iter().count() }
+
+spec! { requires: xs.len() <= 3, ensures: ret == xs.len() + 1, }
+pub fn count2_bad(xs: &[u8]) -> usize { xs.iter().count() }
+
+spec! { requires: xs.len() == 2, ensures: true, }
+pub fn sum_may_overflow(xs: &[u8]) -> u8 { xs.iter().sum() }
+
+spec! { requires: true, ensures: true, }
+pub fn sum_symbolic(xs: &[u8]) -> u8 { xs.iter().sum() }
+"#;
+    for name in ["sum2", "arr_sum", "copied_sum", "count2"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    for name in ["sum2_bad", "count2_bad"] {
+        let Some(o) = verify_src(name, src) else { return };
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "`{name}` must fail on its postcondition; got `{kind}`"
+            ),
+            other => panic!("`{name}` is a false claim and must be refuted, got: {other}"),
+        }
+    }
+    // An unguarded sum overflows for `[200, 100]` and must be refuted as a *panic*,
+    // not proved -- the model sums with a checked `+`.
+    let Some(o) = verify_src("sum_may_overflow", src) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.starts_with("panic"),
+            "an unguarded `sum` must fail as a reachable panic; got `{kind}`"
+        ),
+        other => panic!(
+            "`sum` over unbounded `u8`s can overflow and must be refuted as a panic, \
+             got: {other} -- a `verified` here is a hidden panic"
+        ),
+    }
+    // A symbolic-length sum has no fixed number of addends and is refused.
+    let Some(o) = verify_src("sum_symbolic", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Incomplete { .. }),
+        "a symbolic-length `sum` must be refused, got: {o}"
+    );
+}
+
 /// A user type spelled `Vec` is not the container, and its *methods* are answered
 /// by their own bodies.
 ///

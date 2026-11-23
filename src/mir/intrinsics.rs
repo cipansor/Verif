@@ -384,6 +384,32 @@ pub enum Intrinsic {
     /// concrete `pos`, recorded in `slice_elem_ref` so the loop body's
     /// `*_payload` read resolves to it.
     SliceNext,
+    /// `Iterator::copied` on a slice/array cursor: the identity adapter.
+    ///
+    /// `xs.iter().copied()` wraps the cursor in a `Copied<Iter>` that yields `T`
+    /// by value instead of `&T`. The model treats a reference as its referent, so
+    /// the *cursor* is unchanged -- the adapter only carries it to the destination
+    /// -- and `next` on the result reads the same element. The element type must be
+    /// `Copy` for `.copied()` to compile, so nothing is skipped.
+    SliceCopied,
+    /// `Iterator::count` on a slice/array cursor: `len - pos`.
+    ///
+    /// The cursor is a concrete position, so the remaining count is the length
+    /// minus it, on the slice's own length variable -- the same one `len`/
+    /// `is_empty`/`first` read. Exact even when the length is symbolic, because
+    /// `pos <= len` always holds.
+    SliceCount,
+    /// `Iterator::sum::<T>` on a slice/array cursor: the sum of the remaining
+    /// elements, `s[pos] + ... + s[len-1]`.
+    ///
+    /// The number of addends is the *length*, so this is modelled only when that
+    /// length is a constant -- an array's type length, or a slice whose length the
+    /// precondition pinned (`requires: xs.len() == N`). A symbolic length has no
+    /// fixed number of addends to build a term from, so it is refused rather than
+    /// summed over a wrong range. Each element is the store's element at that
+    /// concrete index, so the sum is over the same variables a contract's `xs[k]`
+    /// names.
+    SliceSum,
     /// A method on a `Vec<T>`: `new`, `push` or `len`.
     ///
     /// A `Vec` has no bit-vector value (its fields -- a heap pointer, a length
@@ -1389,6 +1415,19 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if short == "next" && names_slice_iter_next(name) {
         return Some(Intrinsic::SliceNext);
     }
+    // The cursor-preserving `copied` adapter and the two value-consuming methods
+    // `count`/`sum`. All are trait calls on a slice/array cursor (or an adapter over
+    // one), so the *receiver* type and the `Iterator` trait are checked. `sum`'s
+    // tail carries its type argument (`sum::<u8>`), which `short` already strips.
+    if short == "copied" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceCopied);
+    }
+    if short == "count" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceCount);
+    }
+    if short == "sum" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceSum);
+    }
     // `Try::branch` and `FromResidual::from_residual`, the two calls the `?`
     // operator's desugaring makes. Both are *trait* methods -- the dump spells
     // them `<Result<u8, u8> as Try>::branch` and `<Result<u8, u8> as
@@ -1766,18 +1805,37 @@ pub fn names_slice_into_iter(name: &str) -> bool {
     ty.strip_prefix('[').and_then(|s| s.strip_suffix(']')).is_some()
 }
 
-/// True for `<slice::Iter<..> as IntoIterator>::into_iter` (or `<array::IntoIter<..>
-/// as IntoIterator>`), the identity call `for x in xs.iter()` makes (an iterator is
-/// already an `IntoIterator`).
-pub fn names_slice_iter_into_iter(name: &str) -> bool {
-    let Some(inner) = name.strip_prefix('<') else { return false };
-    let Some((ty, rest)) = inner.split_once(" as ") else { return false };
+/// True when `ty` (the part before ` as ` in a call name) is a slice/array
+/// iterator cursor or a cursor-preserving adapter over one.
+///
+/// The cursor types are `std::slice::Iter` and `array::IntoIter`; the adapters the
+/// model treats as a cursor transform are `Copied<..>` and `Enumerate<..>`, and
+/// their *payload* must itself be a slice/array iterator, so a user
+/// `Copied<MyIter>` is not read as one.
+fn is_cursor_ty(ty: &str) -> bool {
     let head = ty.split('<').next().unwrap_or(ty).trim();
-    let is_iter = head == "slice::Iter"
+    let is_core = head == "slice::Iter"
         || head.ends_with("::slice::Iter")
         || head == "array::IntoIter"
         || head.ends_with("::array::IntoIter");
-    if !is_iter {
+    if is_core {
+        return true;
+    }
+    let is_adapter = head == "Copied"
+        || head.ends_with("::Copied")
+        || head == "Enumerate"
+        || head.ends_with("::Enumerate");
+    is_adapter && (ty.contains("slice::Iter") || ty.contains("array::IntoIter"))
+}
+
+/// True for `<slice::Iter<..> as IntoIterator>::into_iter` (or `<array::IntoIter<..>
+/// as IntoIterator>`, or an adapter over one), the identity call `for x in
+/// xs.iter()` / `for x in xs.iter().copied()` makes (an iterator is already an
+/// `IntoIterator`).
+pub fn names_slice_iter_into_iter(name: &str) -> bool {
+    let Some(inner) = name.strip_prefix('<') else { return false };
+    let Some((ty, rest)) = inner.split_once(" as ") else { return false };
+    if !is_cursor_ty(ty.trim()) {
         return false;
     }
     let trait_path = rest.split(['<', '>']).next().unwrap_or(rest).trim();
@@ -1791,26 +1849,35 @@ pub fn names_slice_iter_impl(name: &str) -> bool {
     name.contains("slice::<impl [")
 }
 
+/// True when a call names a method on a *slice/array iterator cursor*: a
+/// `std::slice::Iter`, an `array::IntoIter`, or one of the adapters modelled as a
+/// cursor transform (`Copied<..>`, and the `Enumerate<..>` spelling, which must
+/// still contain a slice/array iterator so a user `Enumerate` is refused).
+///
+/// The receiver is the type before ` as `, and the trait must be the standard
+/// library's `Iterator` (or `IntoIterator` for the identity `into_iter`). A user
+/// iterator named `Iter`/`Copied` in a local module has no `slice::Iter`/
+/// `array::IntoIter` segment, so it is refused.
+pub fn names_slice_iter_ty(name: &str) -> bool {
+    let Some(inner) = name.strip_prefix('<') else { return false };
+    let Some((ty, rest)) = inner.split_once(" as ") else { return false };
+    let trait_path = rest.split(['<', '>']).next().unwrap_or(rest).trim();
+    if !(trait_path == "Iterator" || trait_path.ends_with("::Iterator")) {
+        return false;
+    }
+    is_cursor_ty(ty.trim())
+}
+
 /// True for `<slice::Iter<..> as Iterator>::next` (or the `core::slice` spelling),
-/// and the by-value array iterator `<array::IntoIter<..> as Iterator>::next`.
+/// the by-value array iterator `<array::IntoIter<..> as Iterator>::next`, and the
+/// same call on a cursor adapter (`Copied<..>`/`Enumerate<..>`).
 ///
 /// The `next` tail is also the range desugaring's, but that is matched by
 /// `names_range` *before* this in `classify`, so the only thing this adds is the
 /// slice/array cursor. A user iterator named `Iter` in a local module is `m::Iter`,
 /// which has no `slice::Iter`/`array::IntoIter` segment, and is refused.
 pub fn names_slice_iter_next(name: &str) -> bool {
-    let Some(inner) = name.strip_prefix('<') else { return false };
-    let Some((ty, rest)) = inner.split_once(" as ") else { return false };
-    let head = ty.split('<').next().unwrap_or(ty).trim();
-    let is_iter = head == "slice::Iter"
-        || head.ends_with("::slice::Iter")
-        || head == "array::IntoIter"
-        || head.ends_with("::array::IntoIter");
-    if !is_iter {
-        return false;
-    }
-    let trait_path = rest.split(['<', '>']).next().unwrap_or(rest).trim();
-    trait_path == "Iterator" || trait_path.ends_with("::Iterator")
+    names_slice_iter_ty(name)
 }
 
 /// True when a call names an inherent method on `str`.
@@ -2090,7 +2157,10 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         | Intrinsic::SliceGet
         | Intrinsic::SliceLast
         | Intrinsic::SliceIntoIter
-        | Intrinsic::SliceNext => true,
+        | Intrinsic::SliceNext
+        | Intrinsic::SliceCopied
+        | Intrinsic::SliceCount
+        | Intrinsic::SliceSum => true,
         // The `Vec` methods. Like the slice shapes they read a length the
         // executor tracks rather than an operand term, so there is no width or
         // sign to check here; `eval` never sees them and the executor answers
@@ -2319,6 +2389,9 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             | Intrinsic::SliceLast
             | Intrinsic::SliceIntoIter
             | Intrinsic::SliceNext
+            | Intrinsic::SliceCopied
+            | Intrinsic::SliceCount
+            | Intrinsic::SliceSum
     ) {
         return None;
     }
@@ -2363,7 +2436,11 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         | Intrinsic::SliceLast => {
             unreachable!("slice shapes are answered from the executor's stores")
         }
-        Intrinsic::SliceIntoIter | Intrinsic::SliceNext => {
+        Intrinsic::SliceIntoIter
+        | Intrinsic::SliceNext
+        | Intrinsic::SliceCopied
+        | Intrinsic::SliceCount
+        | Intrinsic::SliceSum => {
             unreachable!("slice iteration is answered from the executor's cursor store")
         }
         // Answered by the executor's `enum_method` from the discriminant/payload
@@ -6157,6 +6234,36 @@ mod tests {
             classify("<std::ops::RangeInclusive<u32> as Iterator>::next"),
             Some(Intrinsic::Range(RangeMethod::Next))
         );
+        // The cursor-preserving `copied` adapter and the value consumers `count`/
+        // `sum`, on a slice iterator and on an adapter over one. `sum`'s tail
+        // carries its type argument.
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::copied::<'_, u8>"),
+            Some(Intrinsic::SliceCopied)
+        );
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::count"),
+            Some(Intrinsic::SliceCount)
+        );
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::sum::<u8>"),
+            Some(Intrinsic::SliceSum)
+        );
+        assert_eq!(
+            classify("<Copied<std::slice::Iter<'_, u8>> as Iterator>::sum::<u8>"),
+            Some(Intrinsic::SliceSum)
+        );
+        assert_eq!(
+            classify("<std::array::IntoIter<u8, 3> as Iterator>::sum::<u8>"),
+            Some(Intrinsic::SliceSum)
+        );
+        // The identity `into_iter` on an adapter is still the cursor identity.
+        assert_eq!(
+            classify("<Copied<std::slice::Iter<'_, u8>> as IntoIterator>::into_iter"),
+            Some(Intrinsic::SliceIntoIter)
+        );
+        // A user adapter over a user iterator is refused.
+        assert!(classify("<m::Copied<m::Iter> as Iterator>::sum::<u8>").is_none());
     }
 
     /// The module header's "what is modelled" list must match the tables below it.

@@ -5725,6 +5725,16 @@ fn slice_element(
     Ok(Vec::new())
 }
 
+/// The context a slice-iterator call needs beyond its receiver: the function (for
+/// the destination's type), the precondition's pins (for `sum`'s length), and the
+/// current path (for a `sum` step's overflow obligation). Bundled so the helper
+/// stays within clippy's argument limit.
+struct IterCall<'a> {
+    f: &'a MirFn,
+    pins: &'a [(u32, u64)],
+    path: Pred,
+}
+
 /// Model `for x in xs` over a slice: `into_iter`/`iter` starts a cursor, `next`
 /// advances it and yields `Option<&T>`.
 ///
@@ -5736,12 +5746,16 @@ fn slice_element(
 /// `len`/`is_empty`/`first`. A cursor whose base is not a modelled slice (a
 /// havoced iterator, a user iterator) is refused rather than read as an arbitrary
 /// element.
+///
+/// `copied` is the identity on the cursor; `count` is `len - pos`; `sum` folds the
+/// remaining elements with a checked `+` (see [`slice_sum`]).
 fn slice_iter(
     name: &str,
     op: intrinsics::Intrinsic,
     receiver: &Place,
     dest: &Place,
     env: &mut Env,
+    cx: &IterCall<'_>,
 ) -> Result<Vec<Obligation>, String> {
     use intrinsics::Intrinsic;
     let recv = env.pointee(receiver);
@@ -5760,6 +5774,17 @@ fn slice_iter(
                 return Err(format!("`{name}` on a slice whose element width is not modelled"));
             }
             env.iters.insert(dest.local, IterState { base: recv.local, pos: 0 });
+            Ok(Vec::new())
+        }
+        // `copied()` wraps the cursor in an adapter that yields `T` instead of `&T`.
+        // A reference is modelled as its referent, so the cursor is unchanged -- the
+        // adapter only carries it to the destination. A receiver with no cursor is a
+        // non-modelled iterator, refused rather than guessed.
+        Intrinsic::SliceCopied => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            env.iters.insert(dest.local, it);
             Ok(Vec::new())
         }
         Intrinsic::SliceNext => {
@@ -5791,8 +5816,122 @@ fn slice_iter(
             }
             Ok(Vec::new())
         }
+        Intrinsic::SliceCount => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            let Some(s) = env.indexed.get(&it.base) else {
+                return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+            };
+            let len = s.len;
+            let w = smt::bits(len);
+            // `len - pos`, guarded so a cursor already advanced past the end (a `next`
+            // that returned `None` still advances the position) counts zero rather
+            // than underflowing. `pos` is concrete, so the guard is one comparison.
+            let count = if it.pos == 0 {
+                len
+            } else {
+                smt::ite(
+                    smt::ule_const(len, it.pos),
+                    smt::word(0, w),
+                    smt::sub(len, smt::word(it.pos, w)),
+                )
+            };
+            env.set(dest, Val::Sym(count, Sign::Unsigned));
+            // The iterator is consumed by value; its cursor has no further use.
+            env.iters.remove(&recv.local);
+            Ok(Vec::new())
+        }
+        Intrinsic::SliceSum => slice_sum(name, &recv, dest, env, cx),
         _ => Err(format!("`{name}` is not a slice iterator method")),
     }
+}
+
+/// The largest slice length `sum` will unroll. Each addend is one `+` on the
+/// running total, so the term grows with the length; a length past this is refused
+/// rather than turned into a term the solver cannot hold.
+const MAX_SUM_LEN: u64 = 256;
+
+/// `Iterator::sum::<T>` over a slice/array cursor: `s[pos] + ... + s[len-1]`.
+///
+/// The number of addends is the length, so this is modelled only when that length
+/// is a *constant* -- an array's type length, or a slice whose length the
+/// precondition pinned (`requires: xs.len() == N`). A symbolic length has no fixed
+/// number of addends, so it is refused. Each step is a checked `+`: `sum` uses
+/// `Add::add`, which panics on overflow in a debug build, so each partial sum
+/// raises a reachable-panic obligation -- a model that summed with a silent wrap
+/// would hide a panic, which this frontend must never do.
+fn slice_sum(
+    name: &str,
+    recv: &Place,
+    dest: &Place,
+    env: &mut Env,
+    cx: &IterCall<'_>,
+) -> Result<Vec<Obligation>, String> {
+    let IterCall { f, pins, path } = *cx;
+    let Some(it) = env.iters.get(&recv.local).copied() else {
+        return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+    };
+    let Some(s) = env.indexed.get(&it.base) else {
+        return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+    };
+    let (len, elem_w, elem_signed, fixed_len) = (s.len, s.elem_w, s.elem_signed, s.fixed_len);
+    let Some(dest_w) = type_of_place(f, dest).and_then(|t| t.width()) else {
+        return Err(format!("`{name}` on a destination whose width is not modelled"));
+    };
+    // The element type must be the sum's own type: `Sum<&u8> for u8` sums `u8`s at
+    // `u8` width, and a mismatched width would be a different operation.
+    if elem_w != dest_w {
+        return Err(format!(
+            "`{name}` over `{elem_w}`-bit elements into a `{dest_w}`-bit sum is not modelled"
+        ));
+    }
+    // The number of addends. An array's length is its type's constant; a slice's is
+    // a symbolic input, modelled only when the precondition pinned it to a constant.
+    let n = match fixed_len {
+        Some(n) => n,
+        None => match pins.iter().find(|(i, _)| *i == smt::index(len)) {
+            Some((_, k)) => *k,
+            None => {
+                return Err(format!(
+                    "`{name}` over a slice whose length is not a constant (write \
+                     `requires: <slice>.len() == N`)"
+                ))
+            }
+        },
+    };
+    if n > MAX_SUM_LEN {
+        return Err(format!("`{name}` over {n} elements is past the {MAX_SUM_LEN}-element limit"));
+    }
+    let sign = Sign::of_bool(elem_signed);
+    let mut acc = smt::word(0, dest_w);
+    let mut obligations = Vec::new();
+    for k in it.pos..n {
+        let Some((elem, _)) = env.index_elem(it.base, k) else {
+            return Err(format!("`{name}` on an iterator whose elements are not modelled"));
+        };
+        // `Add::add` panics on overflow in a debug build, so each step is a
+        // reachable-panic obligation, exactly as the `overflowing_*` family's own
+        // `assert` would be. A step whose overflow predicate cannot be built is
+        // *refused* rather than summed without a check -- a silent wrap would hide a
+        // panic.
+        let Some(over) = overflow_pred(
+            BinOp::Add,
+            Val::Sym(acc, sign),
+            Val::Sym(elem, sign),
+            dest_w,
+        ) else {
+            return Err(format!("`{name}` overflow predicate is not modelled"));
+        };
+        obligations.push(Obligation {
+            kind: ObligationKind::Panic { message: format!("`{name}` overflows") },
+            verdict: find_obligation(smt::and(path, over), pins),
+        });
+        acc = smt::add(acc, elem);
+    }
+    env.set(dest, Val::Sym(acc, sign));
+    env.iters.remove(&recv.local);
+    Ok(obligations)
 }
 
 /// The element type of a `Vec<T>`, from its printed name.
@@ -6314,6 +6453,9 @@ fn try_intrinsic(
                 // first, so a user iterator cannot be answered by the model.
                 | intrinsics::Intrinsic::SliceIntoIter
                 | intrinsics::Intrinsic::SliceNext
+                | intrinsics::Intrinsic::SliceCopied
+                | intrinsics::Intrinsic::SliceCount
+                | intrinsics::Intrinsic::SliceSum
         );
     if !name.contains("<impl") && !trait_method {
         return None;
@@ -6421,13 +6563,24 @@ fn try_intrinsic(
     // not an operand term.
     if matches!(
         op,
-        intrinsics::Intrinsic::SliceIntoIter | intrinsics::Intrinsic::SliceNext
+        intrinsics::Intrinsic::SliceIntoIter
+            | intrinsics::Intrinsic::SliceNext
+            | intrinsics::Intrinsic::SliceCopied
+            | intrinsics::Intrinsic::SliceCount
+            | intrinsics::Intrinsic::SliceSum
     ) {
         let p = match first {
             Operand::Copy(p) | Operand::Move(p) => p,
             Operand::Const(_) => return Some(Err(format!("unmodelled argument to `{name}`"))),
         };
-        return Some(slice_iter(name, op, p, dest, env));
+        return Some(slice_iter(
+            name,
+            op,
+            p,
+            dest,
+            env,
+            &IterCall { f: cur, pins, path },
+        ));
     }
     // The standard library's `Option`/`Result` methods. The receiver is an
     // `Option<T>`/`Result<T, E>` whose tag and payload the model's own

@@ -10427,6 +10427,42 @@ symbolic `xs.len()` the unwinding forks at every `pos < len` and runs into the
 unwind bound, so the contract carries `requires: xs.len() == N` (or an `unwind:`).
 An array's length is its type's constant, so it needs no such precondition.
 
+## An iterator consumer folds the cursor, and `sum`'s `+` is *checked*
+
+The same cursor models the consumers `count`, `sum` and the `copied` adapter:
+
+- **`count` is `len - pos`**, on the slice's own length variable. Exact even when
+  the length is symbolic, because `pos <= len` always holds; a cursor advanced past
+  the end (a `next` that returned `None` still advances the position) is guarded so
+  the count is `0` rather than an underflow.
+- **`copied` is the identity on the cursor.** A reference is modelled as its
+  referent, so `Copied<Iter>` yields the same element `Iter` does; the adapter only
+  carries the cursor to its destination. `next`/`sum`/`count`/`into_iter` therefore
+  accept a `Copied<..>` (and the `Enumerate<..>` spelling, though its tuple payload
+  is not yet modelled) receiver, and `is_cursor_ty` requires the adapter's *payload*
+  to be a slice/array iterator, so a user `Copied<MyIter>` is refused.
+- **`sum::<T>` folds the remaining elements with a checked `+`.** `Iterator::sum`
+  is `fold(0, Add::add)`, and `Add::add` panics on overflow in a debug build, so
+  each partial sum raises a reachable-panic obligation. This is not decoration: an
+  unguarded `xs.iter().sum()` over `u8`s is *refuted as a panic* (`[200, 100]`
+  overflows), and a model that summed with a silent wrap would prove a function
+  that panics. A contract that bounds the elements discharges the additions and
+  verifies. A step whose overflow predicate cannot be built is *refused*, never
+  summed without a check.
+
+The one boundary is the **number of addends**: `sum` is modelled only when the
+length is a constant -- an array's type length, or a slice whose length the
+precondition pinned (`requires: xs.len() == N`, read from `pins` by the length
+variable's index). A symbolic length has no fixed addend count to build a term
+from, so it is refused with a message naming the missing precondition. This is the
+one place a slice's symbolic length is *not* enough, because the other consumers
+(`count`) need only the length as a term while `sum` needs to enumerate it.
+
+`classify` accepts these only for a slice/array cursor (or an adapter over one) and
+the standard library's `Iterator`/`IntoIterator` trait, so a user iterator is
+refused; the `sum` tail carries its type argument (`sum::<u8>`), which `short`
+strips.
+
 
 ## A qualified type name must not resolve to a bare layout
 

@@ -2529,8 +2529,16 @@ says "I could not decide" is worth more than one that guesses.
    starts a *cursor* at a concrete position and `next` reads the element there, so each
    iteration names the same element variable a contract's `xs[k]` names — `for x in xs
    { s += x }` verifies against `requires: xs.len() == 2, ensures: s == xs[0] + xs[1]`,
-   and the false twin is refuted. What is *not* modelled is an **iterator chain**
-   (`fold`, `map`, `sum`, `filter`, `.enumerate()`, `for (i, x) in xs.iter().enumerate()`);
+   and the false twin is refuted. The **consumers** `sum`, `count` and the
+   `copied` adapter are modelled on that cursor: `xs.iter().count()` is the length,
+   `xs.iter().copied().sum()` reads the same elements, and `xs.iter().sum()` folds
+   them with a *checked* `+` — so an unguarded `u8` sum is *refuted as a panic*
+   (it overflows for `[200, 100]`), while a contract that bounds the elements
+   discharges the additions and verifies. A `sum` over a *symbolic*-length slice is
+   refused (there is no fixed number of addends to build a term from); an array's
+   type length, or a slice the precondition pins (`requires: xs.len() == N`), is a
+   constant and is summed. What is *not* modelled is an **iterator chain**
+   (`fold`, `map`, `filter`, `.enumerate()`, `for (i, x) in xs.iter().enumerate()`);
    those are reported `incomplete` with the unmodelled call named, so the gap is visible
    rather than silent. A `Vec`'s *elements* are modelled — `v[k]`, `v.first()`,
    `v.get(k)` and `pop` read back what `push` wrote, and a `Vec` argument's

@@ -15383,6 +15383,93 @@ pub fn for_slice_max(xs: &[u8]) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Iterator *consumers*: `sum`, `count`, and the `copied` adapter
+// ---------------------------------------------------------------------------
+//
+// `xs.iter().sum()` folds the remaining elements with a *checked* `+` (debug
+// `Add::add` panics on overflow), so a contract that does not rule out overflow
+// is refuted as a reachable panic; `count` is `len - pos`; `copied` is a cursor
+// identity. The sum's length must be a constant (an array's type length, or a
+// slice whose length the precondition pinned), because a symbolic length has no
+// fixed number of addends to build a term from.
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= 10,
+    requires: xs[1] <= 10,
+    ensures: ret == xs[0] + xs[1],
+}
+/// `xs.iter().sum()` over a bounded two-element slice. The element bounds make the
+/// sum non-overflowing, so the two checked additions are discharged and the sum is
+/// the elements' sum.
+pub fn iter_sum_slice(xs: &[u8]) -> u8 {
+    xs.iter().sum()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= 10,
+    requires: xs[1] <= 10,
+    ensures: ret == xs[0],
+}
+/// The false twin: the sum of two elements is not the first one.
+pub fn iter_sum_slice_cannot_prove_this(xs: &[u8]) -> u8 {
+    xs.iter().sum()
+}
+
+spec! {
+    requires: a[0] <= 10,
+    requires: a[1] <= 10,
+    ensures: ret == a[0] + a[1],
+}
+/// `a.into_iter().sum()` over an array: the length is the type's constant, so no
+/// length precondition is needed.
+pub fn iter_sum_array(a: [u8; 2]) -> u8 {
+    a.into_iter().sum()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= 10,
+    requires: xs[1] <= 10,
+    ensures: ret == xs[0] + xs[1],
+}
+/// `xs.iter().copied().sum()`: the `copied` adapter is a cursor identity, so the
+/// sum reads the same elements.
+pub fn iter_sum_copied(xs: &[u8]) -> u8 {
+    xs.iter().copied().sum()
+}
+
+spec! {
+    requires: xs.len() <= 3,
+    ensures: ret == xs.len(),
+}
+/// `xs.iter().count()` is the slice length: the cursor starts at `0` and the count
+/// is `len - 0`.
+pub fn iter_count_slice(xs: &[u8]) -> usize {
+    xs.iter().count()
+}
+
+spec! {
+    requires: xs.len() <= 3,
+    ensures: ret == xs.len() + 1,
+}
+/// The false twin: the count is the length, not one more.
+pub fn iter_count_slice_cannot_prove_this(xs: &[u8]) -> usize {
+    xs.iter().count()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    ensures: true,
+}
+/// An unguarded `sum` over `u8`s can overflow (`[200, 100]`), and `sum` uses a
+/// checked `+`, so this is a reachable panic -- refuted, not proved.
+pub fn iter_sum_may_overflow_is_a_panic(xs: &[u8]) -> u8 {
+    xs.iter().sum()
+}
+
+// ---------------------------------------------------------------------------
 // Chained `Option` combinators: the element identity must compose
 // ---------------------------------------------------------------------------
 
