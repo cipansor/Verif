@@ -1,5 +1,9 @@
 # Security Policy
 
+The trusted computing base — what a `verified` line trusts, and the check behind
+each layer — is written down in [`docs/tcb.md`](docs/tcb.md). A soundness bug is a
+false `Valid`; that is the vulnerability class this policy is about.
+
 ## Reporting a vulnerability
 
 Report vulnerabilities through **GitHub's private vulnerability reporting** on

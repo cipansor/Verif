@@ -1517,11 +1517,18 @@ scoreboard against Kani is live.
     this obligation as a Lean/Coq goal" a user-facing option.
   - Exit: one obligation from `everyday.rs` re-checked by a kernel.
   - Move: **bridge**.
-- **A4. A trusted computing base and a semantics.** · P1 · todo · —
+- **A4. A trusted computing base and a semantics.** · P1 · in progress · —
   - Write down what is trusted (parser, MIR-printer stability, executor, blasters,
     solvers), a short formal semantics of the supported MIR subset, and back both
     with mutation testing (exists) and external review before any 1.0 claim.
-  - Exit: a `SECURITY.md`-style TCB document and an external review.
+  - Progress (the document, done): [`docs/tcb.md`](docs/tcb.md) enumerates the TCB
+    (rustc's MIR, the text parser, the contract scanner, the executor, both
+    blasters, the CDCL solver, the SMT-LIB2 exporter) with the check behind each,
+    states the semantics of the supported MIR subset (bit-vector values with an
+    explicit `Sign`, a path condition, and per-construct obligations), and lists
+    what is refused. Linked from `README.md` and `SECURITY.md`.
+  - Remaining: the **external review** the exit names. The document is not a
+    substitute for it, and `docs/tcb.md` says so.
   - Move: **build**.
 - **A5. A qualification path.** · P2 · todo · SPARK (the only one with
     qualification kits)

@@ -411,6 +411,9 @@ wall, an unbounded-length sum, and a nonlinear inductive invariant -- and are tr
   closing move (build / bridge / won't do), and a status.
 - [`SECURITY.md`](SECURITY.md) covers reporting a **soundness bug** — a false
   `Valid` — which is the vulnerability class that matters in a verifier.
+- [`docs/tcb.md`](docs/tcb.md) is the **trusted computing base** and the semantics of
+  the supported MIR subset: what a `verified` line trusts, and the check behind each
+  layer (roadmap A4).
 - [`SOUNDNESS.md`](SOUNDNESS.md) is the ledger of every false proof and wrong
   verdict the project has found, each with the fixture that fails if the fix is
   undone; `tests/soundness.rs` checks the fixtures still exist.
