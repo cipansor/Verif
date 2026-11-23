@@ -41,16 +41,62 @@ fn main() -> ExitCode {
 }
 
 /// The crate's source file among rustc's arguments: the positional argument that is an
-/// existing file. A flag *value* (`--crate-name foo`, `--out-dir dir`) is not an existing
-/// file, and a custom target path (`src/library.rust`) has no `.rs` suffix, so `is_file`
-/// is the right test where `ends_with(".rs")` skipped the custom path unchecked.
+/// existing file, *after* consuming option values. A flag value can itself be an existing
+/// file -- `--crate-name app` where `app` is an extensionless binary root -- so the value
+/// of every value-taking flag is skipped before the filesystem is consulted, or the
+/// wrapper would verify the wrong file and leave the real target's contracts unchecked.
 fn source_arg(args: &[OsString]) -> Option<OsString> {
-    args.iter()
-        .find(|a| {
-            let s = a.to_string_lossy();
-            !s.starts_with('-') && Path::new(a.as_os_str()).is_file()
-        })
-        .cloned()
+    let mut skip_next = false;
+    for a in args {
+        let s = a.to_string_lossy();
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if s.starts_with('-') {
+            if takes_value(&s) {
+                skip_next = true;
+            }
+            continue;
+        }
+        if Path::new(a.as_os_str()).is_file() {
+            return Some(a.clone());
+        }
+    }
+    None
+}
+
+/// rustc flags that take a separate value argument (so the next argument is not the input).
+fn takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--crate-name"
+            | "--crate-type"
+            | "--edition"
+            | "--emit"
+            | "--out-dir"
+            | "-o"
+            | "--extern"
+            | "-L"
+            | "--cfg"
+            | "--target"
+            | "--print"
+            | "-C"
+            | "--cap-lints"
+            | "--color"
+            | "--error-format"
+            | "--json"
+            | "--sysroot"
+            | "-A"
+            | "-W"
+            | "-D"
+            | "-F"
+            | "--remap-path-prefix"
+            | "--check-cfg"
+            | "-Z"
+            | "--diagnostic-width"
+            | "--env-set"
+    )
 }
 
 /// Run the frontend on `src`. A failed verdict prints the failing functions and
@@ -168,6 +214,40 @@ fn target_refusal(rustc: &str, args: &[OsString]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_arg_skips_a_crate_name_value_that_is_an_existing_file() {
+        // `--crate-name <path>` whose value happens to be an existing file must not be
+        // taken as the input; the real `src/lib.rs` is.
+        let dir = std::env::temp_dir().join(format!("verif_srcarg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("app");
+        std::fs::write(&root, "fn main() {}\n").unwrap();
+        let lib = dir.join("lib.rs");
+        std::fs::write(&lib, "\n").unwrap();
+        let args = vec![
+            OsString::from("--crate-name"),
+            root.clone().into_os_string(),
+            OsString::from("--edition"),
+            OsString::from("2024"),
+            lib.clone().into_os_string(),
+        ];
+        let picked = source_arg(&args).expect("an input");
+        assert_eq!(Path::new(&picked), lib.as_path(), "must pick lib.rs, not the crate-name value");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_arg_finds_a_custom_extension_path() {
+        let dir = std::env::temp_dir().join(format!("verif_srcarg2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = dir.join("library.rust");
+        std::fs::write(&lib, "\n").unwrap();
+        let args = vec![OsString::from("--edition"), OsString::from("2024"), lib.clone().into_os_string()];
+        let picked = source_arg(&args).expect("an input");
+        assert_eq!(Path::new(&picked), lib.as_path(), "a custom-extension input is found by is_file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_32_bit_target_is_refused_and_the_host_is_not() {

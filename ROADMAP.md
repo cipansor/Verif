@@ -1761,6 +1761,15 @@ carries string/char/raw-string state across lines, so a multiline literal contai
 no longer leaves the scanner in a comment. Regression:
 `function_params_tolerates_a_multiline_string_with_comment_tokens`.
 
+**Round 13 (also fixed):** `verif-wrap`'s `source_arg` consumes option values, so a
+`--crate-name <path>` whose value is an existing file is not mistaken for the input
+(`source_arg_skips_a_crate_name_value_that_is_an_existing_file`); `code_of_line` masks
+literal contents to spaces, so a `{` or a fake `fn bad(b, a)` inside a multiline string
+neither unbalances the depth nor supplies a signature
+(`function_params_masks_literal_braces_and_fake_signatures`); the README action ref is
+already a commit-SHA placeholder. Regressions:
+`source_arg_finds_a_custom_extension_path`.
+
 **Tracked (open):**
 - Executor: compound iterator closures (`closure_map`/`closure_binop`/`closure_filter`
   read an intermediate as the result), `Vec::clear`/drops of user-`Drop` elements,

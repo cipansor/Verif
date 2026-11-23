@@ -3223,11 +3223,12 @@ enum Lit {
     Raw(usize),
 }
 
-/// The code part of a line: string/char literals kept, line comments and block comments
-/// removed. The `Lex` state is carried across lines so a **nested** block comment
-/// (`/* /* */ */`) and a **multiline** literal (a `/*` inside a string) are handled:
-/// comment delimiters are recognised only outside a literal, literal delimiters only
-/// outside a comment.
+/// The code part of a line, for declaration search and brace counting: line and block
+/// comments are removed and **literal contents are masked to spaces**, so a `{` or a
+/// `fn bad(` inside a string cannot contribute a brace or a fake signature. The `Lex`
+/// state is carried across lines (nested block comments, multiline literals). Masking
+/// keeps one space per char, so an offset into the result is the same offset in the
+/// original for the code spans, and the real signature is read back from that offset.
 fn code_of_line(line: &str, lex: &mut Lex) -> String {
     let chars: Vec<char> = line.chars().collect();
     let mut out = String::with_capacity(line.len());
@@ -3248,10 +3249,10 @@ fn code_of_line(line: &str, lex: &mut Lex) -> String {
         }
         match lex.lit {
             Lit::Str => {
-                out.push(c);
+                out.push(' ');
                 if c == '\\' {
-                    if let Some(n) = chars.get(i + 1) {
-                        out.push(*n);
+                    if chars.get(i + 1).is_some() {
+                        out.push(' ');
                         i += 2;
                         continue;
                     }
@@ -3262,10 +3263,10 @@ fn code_of_line(line: &str, lex: &mut Lex) -> String {
                 continue;
             }
             Lit::Chr => {
-                out.push(c);
+                out.push(' ');
                 if c == '\\' {
-                    if let Some(n) = chars.get(i + 1) {
-                        out.push(*n);
+                    if chars.get(i + 1).is_some() {
+                        out.push(' ');
                         i += 2;
                         continue;
                     }
@@ -3276,9 +3277,11 @@ fn code_of_line(line: &str, lex: &mut Lex) -> String {
                 continue;
             }
             Lit::Raw(n) => {
-                out.push(c);
+                out.push(' ');
                 if c == '"' && (1..=n).all(|k| chars.get(i + k) == Some(&'#')) {
-                    out.extend(&chars[i + 1..=i + n]);
+                    for _ in 0..n {
+                        out.push(' ');
+                    }
                     i += n + 1;
                     lex.lit = Lit::None;
                     continue;
@@ -3310,28 +3313,30 @@ fn code_of_line(line: &str, lex: &mut Lex) -> String {
                 h += 1;
             }
             if chars.get(h) == Some(&'"') {
-                out.extend(&chars[i..=h]);
+                for _ in i..=h {
+                    out.push(' ');
+                }
                 lex.lit = Lit::Raw(h - from);
                 i = h + 1;
                 continue;
             }
         }
         if c == 'b' && chars.get(i + 1) == Some(&'"') {
-            out.push('b');
-            out.push('"');
+            out.push(' ');
+            out.push(' ');
             lex.lit = Lit::Str;
             i += 2;
             continue;
         }
         if c == '"' {
             lex.lit = Lit::Str;
-            out.push(c);
+            out.push(' ');
             i += 1;
             continue;
         }
         if c == '\'' && is_char_literal_start(&chars, i) {
             lex.lit = Lit::Chr;
-            out.push(c);
+            out.push(' ');
             i += 1;
             continue;
         }
@@ -9065,6 +9070,20 @@ mod tests {
             .map(|(n, _)| n)
             .collect();
         assert_eq!(names, ["a", "b"]);
+    }
+
+    #[test]
+    fn function_params_masks_literal_braces_and_fake_signatures() {
+        // A brace and a fake `fn bad(b, a)` inside a multiline raw string must be masked,
+        // so neither the depth nor the declaration search is fooled.
+        let src = "const T: &str = r#\"\n/* { */\nfn bad(b: u8, a: u8) {}\n\"#;\n\n\
+                   pub fn bad(a: u8, b: u8) -> u8 { 0 }\n";
+        let names: Vec<String> = super::function_params(src, "bad")
+            .expect("a free function")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["a", "b"], "a brace/signature inside a literal must be masked");
     }
 
     #[test]
