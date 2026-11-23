@@ -14138,6 +14138,60 @@ pub fn explicit_drop_string(s: String) -> u8 {
     1
 }
 
+spec! {
+    requires: xs[0] <= xs[1],
+    ensures: ret == xs[1],
+}
+/// `xs.iter().max()` over a constant-length array.
+pub fn array_iter_max(xs: &[u8; 2]) -> u8 {
+    *xs.iter().max().unwrap()
+}
+
+spec! {
+    requires: xs[0] <= xs[1],
+    ensures: ret == xs[0],
+}
+/// The same body claiming the minimum must be refuted.
+pub fn array_iter_max_tripwire(xs: &[u8; 2]) -> u8 {
+    *xs.iter().max().unwrap()
+}
+
+spec! {
+    requires: xs[0] <= xs[1],
+    ensures: ret == xs[0],
+}
+/// `xs.iter().min()` over a constant-length array.
+pub fn array_iter_min(xs: &[u8; 2]) -> u8 {
+    *xs.iter().min().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[1],
+}
+/// `xs.iter().last()` over a constant-length array.
+pub fn array_iter_last(xs: &[u8; 2]) -> u8 {
+    *xs.iter().last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[0],
+}
+/// The same body claiming the last element is the first must be refuted.
+pub fn array_iter_last_tripwire(xs: &[u8; 2]) -> u8 {
+    *xs.iter().last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[1],
+}
+/// `xs.iter().nth(1)` over a constant-length array.
+pub fn array_iter_nth(xs: &[u8; 2]) -> u8 {
+    *xs.iter().nth(1).unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // A scalar reference argument named in a contract (C9)
 //

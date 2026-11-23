@@ -12915,6 +12915,12 @@ fn a_slice_iter_and_explicit_drop_decide() {
         "array_iter_count_tripwire",
         "array_iter_sum",
         "array_iter_sum_tripwire",
+        "array_iter_max",
+        "array_iter_max_tripwire",
+        "array_iter_min",
+        "array_iter_last",
+        "array_iter_last_tripwire",
+        "array_iter_nth",
         "explicit_drop_box",
         "explicit_drop_string",
     ];
@@ -12922,13 +12928,22 @@ fn a_slice_iter_and_explicit_drop_decide() {
     for name in [
         "array_iter_count",
         "array_iter_sum",
+        "array_iter_max",
+        "array_iter_min",
+        "array_iter_last",
+        "array_iter_nth",
         "explicit_drop_box",
         "explicit_drop_string",
     ] {
         let o = outcome(&report, name);
         assert!(o.is_verified(), "`{name}` must verify, got: {o}");
     }
-    for name in ["array_iter_count_tripwire", "array_iter_sum_tripwire"] {
+    for name in [
+        "array_iter_count_tripwire",
+        "array_iter_sum_tripwire",
+        "array_iter_max_tripwire",
+        "array_iter_last_tripwire",
+    ] {
         let o = outcome(&report, name);
         assert!(
             matches!(o, FnOutcome::Failed { .. }),
