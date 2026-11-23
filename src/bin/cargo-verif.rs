@@ -80,7 +80,11 @@ fn main() {
 
     let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
     let only: Vec<String> = function.into_iter().collect();
-    let report = match verify::verify_file_with(&rustc, &file, &only) {
+    // Make the crate's own dependencies resolvable, so a file that `use`s another
+    // crate compiles (C8). `crate_options` returns the default when the crate has no
+    // deps or they are not built, so this changes nothing for a single-file file.
+    let opts = verify::crate_options(&file);
+    let report = match verify::verify_file_with_opts(&rustc, &file, &only, &opts) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("cargo-verif: could not verify {}: {e}", file.display());

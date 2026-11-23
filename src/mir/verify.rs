@@ -222,6 +222,141 @@ pub fn extern_options_with(rustc: &str, name: &str) -> Option<MirOptions> {
     None
 }
 
+/// `MirOptions` that make a crate's *own dependencies* resolvable when the frontend
+/// compiles one of its files, so `cargo verif --file src/lib.rs` works on a crate that
+/// `use`s another crate.
+///
+/// The rlibs live in the crate's own `target/<profile>/deps`; the crate names come
+/// from the manifest's `[dependencies]` table (dev/build deps are not linked by the
+/// verified source, so they are skipped). Each name's newest `lib<name>-*.rlib` is
+/// picked and the whole set is *probed* with the emitting compiler (`extern_compiles`);
+/// if the probe fails -- no rlib built yet, or a stale one from another toolchain --
+/// this returns `MirOptions::default()`, so the caller falls back to a compile error
+/// that names the unresolved import rather than a guessed path. A guessed rlib is
+/// either the wrong compiler's or the wrong features', and both surface as a compiler
+/// error about a program that is fine.
+#[cfg(feature = "std")]
+pub fn crate_options(file: &Path) -> MirOptions {
+    let Some(manifest) = nearest_manifest(file) else {
+        return MirOptions::default();
+    };
+    let crate_root = manifest.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        return MirOptions::default();
+    };
+    let deps = dependency_names(&text);
+    if deps.is_empty() {
+        return MirOptions::default();
+    }
+    // Where a dependency's rlib can land: `<profile>/deps` (a normal build) and every
+    // `<profile>/build/<pkg>/<hash>/out` (a build-script output, which some toolchains
+    // and this container's cargo use for a path dependency too). Searching both is the
+    // same set `build_script_roots` walks for a build script.
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for profile in ["debug", "release"] {
+        let base = crate_root.join("target").join(profile);
+        let deps = base.join("deps");
+        if deps.is_dir() {
+            dirs.push(deps);
+        }
+        if let Ok(pkgs) = std::fs::read_dir(base.join("build")) {
+            for pkg in pkgs.flatten() {
+                if let Ok(hashes) = std::fs::read_dir(pkg.path()) {
+                    for h in hashes.flatten() {
+                        let out = h.path().join("out");
+                        if out.is_dir() {
+                            dirs.push(out);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if dirs.is_empty() {
+        return MirOptions::default();
+    }
+    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
+    let mut externs: Vec<(String, PathBuf)> = Vec::new();
+    for name in &deps {
+        let us = name.replace('-', "_");
+        let prefix = format!("lib{us}-");
+        let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+        for d in &dirs {
+            let Ok(entries) = std::fs::read_dir(d) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                let Some(f) = p.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if f.starts_with(&prefix) && f.ends_with(".rlib") {
+                    if let Ok(mt) = std::fs::metadata(&p).and_then(|m| m.modified()) {
+                        if best.as_ref().map(|(_, b)| mt > *b).unwrap_or(true) {
+                            best = Some((p, mt));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((rlib, _)) = best {
+            externs.push((name.clone(), rlib));
+        }
+    }
+    if externs.is_empty() {
+        return MirOptions::default();
+    }
+    let opts = MirOptions {
+        externs,
+        search_paths: dirs,
+        probed_with: Some(canonical_compiler(&rustc)),
+        ..MirOptions::default()
+    };
+    if extern_compiles(&rustc, &opts) {
+        opts
+    } else {
+        MirOptions::default()
+    }
+}
+
+/// The crate names in a manifest's `[dependencies]` table. Handles `name = "1"`,
+/// `name = { … }`, and the `[dependencies.name]` sub-table form; skips dev and build
+/// dependencies, which the verified source does not link.
+#[cfg(feature = "std")]
+fn dependency_names(text: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut in_deps = false;
+    for raw in text.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            let inner = line.trim_start_matches('[').trim_end_matches(']').trim();
+            in_deps = inner == "dependencies";
+            if let Some(rest) = inner.strip_prefix("dependencies.") {
+                let name = rest.trim();
+                if !name.is_empty() {
+                    names.push(name.to_string());
+                }
+                in_deps = false;
+            }
+            continue;
+        }
+        if in_deps {
+            if let Some(eq) = line.find('=') {
+                let key = line[..eq].trim().trim_matches('"').trim_matches('\'').trim();
+                if !key.is_empty() {
+                    names.push(key.to_string());
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// A compiler *identity*, so two spellings of one compiler compare equal.
 ///
 /// A path cannot answer this. `rustc` on `PATH` is usually a rustup **shim** -- a
@@ -2024,6 +2159,27 @@ mod edition_tests {
 #[cfg(all(test, feature = "std"))]
 mod extern_probe_tests {
     use super::*;
+
+    /// `dependency_names` reads the `[dependencies]` table and *only* it: dev and
+    /// build dependencies are not linked by the verified source, so naming them would
+    /// add an `--extern` for a crate the file never sees. Both value shapes
+    /// (`name = "1"`, `name = { … }`) and the `[dependencies.name]` sub-table are read.
+    #[test]
+    fn dependency_names_reads_the_dependencies_table_only() {
+        let toml = "[package]\nname = \"x\"\n\
+                    [dependencies]\n\
+                    serde = \"1\"\n\
+                    foo = { path = \"../foo\" }\n\
+                    [dev-dependencies]\n\
+                    criterion = \"0.5\"\n\
+                    [build-dependencies]\n\
+                    cc = \"1\"\n\
+                    [dependencies.bar]\n\
+                    version = \"1\"\n";
+        assert_eq!(dependency_names(toml), vec!["bar", "foo", "serde"]);
+        // No `[dependencies]` at all -> nothing, so `crate_options` is the default.
+        assert!(dependency_names("[package]\nname = \"x\"\n").is_empty());
+    }
 
     /// The *path* and the *identity* of a toolchain's `rustc`, when it is installed.
     ///

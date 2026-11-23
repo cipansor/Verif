@@ -960,12 +960,22 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     `extract_crate_reads_external_module_contracts` (the keying) and
     `a_multi_module_crate_is_verified_through_its_root` (a clean module exits 0, a
     false one exits 1, each naming the module function).
-  - Remaining: dependency resolution. `MirOptions { externs, search_paths }` already
-    passes `--extern`/`-L` to the frontend's `rustc`, but `cargo verif` does not yet
-    read the crate's own dependencies from `Cargo.lock` / `target/*/deps` and fill
-    them in, so a crate that `use`s another crate still needs the caller to supply
-    them. And the `cargo verif` subcommand is `cargo-verif` (a `[[bin]]`), not a
-    `RUSTC_WRAPPER`.
+  - Progress (dependencies, done): `verify::crate_options` reads the crate's own
+    `[dependencies]` table (`dependency_names`: `name = "1"`, `name = { … }`, and the
+    `[dependencies.name]` sub-table; dev/build deps skipped) and, for each, finds its
+    newest `lib<name>-*.rlib` under `target/<profile>/deps` *or* a
+    `target/<profile>/build/<pkg>/<hash>/out` (the build-script layout this container's
+    cargo uses for a path dependency), then *probes* the whole set with the emitting
+    compiler (`extern_compiles`). `cargo-verif` passes the result as `--extern`/`-L`,
+    so a file that `use`s another crate compiles and its contract is checked. A crate
+    whose deps are not built, or whose rlibs are stale, falls back to
+    `MirOptions::default()` and the honest `E0432`/`E0514` -- never a guessed path.
+    Pinned by `dependency_names_reads_the_dependencies_table_only` (the parser) and
+    `a_crate_with_a_dependency_is_verified` (a path-dep crate verifies; a false
+    contract is still refuted, so the dependency did not hide the check).
+  - Remaining: a *demonstration* on a real external crate (`embedded-hal`) needs a
+    network install; the mechanism is identical to the path-dependency fixture. The
+    `cargo verif` subcommand is `cargo-verif` (a `[[bin]]`), not a `RUSTC_WRAPPER`.
   - Exit: one function in a real `no_std` crate with at least one dependency
     (an `embedded-hal` driver, say) verified end to end with `cargo verif`.
   - Move: **build**.

@@ -216,3 +216,91 @@ fn a_multi_module_crate_is_verified_through_its_root() {
     assert!(out.contains("a::bad"), "the failing module function must be named: {out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A crate that `use`s a *path dependency*: `cargo verif` finds the dependency's rlib
+/// in the crate's own `target` and passes it as `--extern`, so the file compiles and
+/// its contract is checked. Without this the frontend's `rustc` fails `E0432`
+/// (unresolved import) and the tool reports "could not run" over a crate that builds
+/// fine under cargo -- C8's dependency half. A clean contract verifies and a false one
+/// is still refuted, so the dependency did not hide the check.
+#[test]
+fn a_crate_with_a_dependency_is_verified() {
+    if !have_rustc() {
+        eprintln!("skipping a_crate_with_a_dependency_is_verified: no rustc");
+        return;
+    }
+    let cargo_ok = Command::new("cargo")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !cargo_ok {
+        eprintln!("skipping a_crate_with_a_dependency_is_verified: no cargo");
+        return;
+    }
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("verif-dep-{}-{}", std::process::id(), n));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("dep").join("src")).unwrap();
+    std::fs::create_dir_all(root.join("app").join("src")).unwrap();
+    std::fs::write(
+        root.join("dep").join("Cargo.toml"),
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("dep").join("src").join("lib.rs"),
+        "pub struct Wrapper(pub u32);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app").join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\ndep = { path = \"../dep\" }\n",
+    )
+    .unwrap();
+    let lib = root.join("app").join("src").join("lib.rs");
+    let true_src = "use dep::Wrapper;\n\
+         macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n\
+         spec! { requires: x <= 100, ensures: ret <= 100, }\n\
+         pub fn clampish(x: u8) -> u8 { if x > 100 { 100 } else { x } }\n\
+         #[allow(dead_code)]\n\
+         fn uses(_w: Wrapper) {}\n";
+    std::fs::write(&lib, true_src).unwrap();
+    // Build so the dependency's rlib exists, with the compiler the frontend will use
+    // (an rlib from another toolchain is unreadable -- `E0514`).
+    let mut build = Command::new("cargo");
+    build
+        .current_dir(root.join("app"))
+        .arg("build")
+        .arg("--offline")
+        .arg("-q");
+    if let Ok(rustc) = std::env::var("VERIF_RUSTC") {
+        build.env("RUSTC", rustc);
+    }
+    let built = build.output().expect("run cargo build");
+    assert!(
+        built.status.success(),
+        "cargo build of the path-dep fixture failed: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let (code, out) = run(&[], &lib);
+    assert_eq!(code, 0, "a crate with a dependency must verify: {out}");
+    assert!(out.contains("clampish"), "the function must be named: {out}");
+
+    std::fs::write(
+        &lib,
+        "use dep::Wrapper;\n\
+         macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n\
+         spec! { requires: true, ensures: ret == 99, }\n\
+         pub fn bad(x: u8) -> u8 { x }\n\
+         #[allow(dead_code)]\n\
+         fn uses(_w: Wrapper) {}\n",
+    )
+    .unwrap();
+    let (code, out) = run(&[], &lib);
+    assert_eq!(code, 1, "a false contract in a crate with a dependency must fail: {out}");
+    assert!(out.contains("bad"), "the failing function must be named: {out}");
+    let _ = std::fs::remove_dir_all(&root);
+}
