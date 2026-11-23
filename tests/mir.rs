@@ -13044,6 +13044,27 @@ fn an_iterator_can_be_taken() {
     );
 }
 
+/// C11 symbolic-length iteration: a slice sum is unrolled to `MAX_SYMBOLIC_LEN`
+/// steps, each guarded by `k < len`, which is exact only when the precondition
+/// proves `len <= 8`. A guarded sum of small elements is panic-free (verified); a
+/// bounded length with unbounded elements overflows (refuted); an unbounded length
+/// cannot be unrolled and is refused.
+#[test]
+fn a_symbolic_length_sum_is_bounded_by_its_precondition() {
+    let names = [
+        "symbolic_sum_no_overflow",
+        "symbolic_sum_tripwire",
+        "symbolic_sum_unbounded_refused",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    let o = outcome(&report, "symbolic_sum_no_overflow");
+    assert!(o.is_verified(), "`symbolic_sum_no_overflow` must verify, got: {o}");
+    let o = outcome(&report, "symbolic_sum_tripwire");
+    assert!(matches!(o, FnOutcome::Failed { .. }), "`symbolic_sum_tripwire` must be refuted, got: {o}");
+    let o = outcome(&report, "symbolic_sum_unbounded_refused");
+    assert!(!o.is_verified(), "`symbolic_sum_unbounded_refused` must not verify, got: {o}");
+}
+
 /// C11 iteration: `Iterator::all`/`any` fold a predicate to a `bool` -- `all` is
 /// the conjunction over the elements, `any` the disjunction. The tripwires claim
 /// the opposite of what the predicate fold yields.

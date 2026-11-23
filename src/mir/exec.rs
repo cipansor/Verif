@@ -6462,6 +6462,10 @@ fn slice_iter(
 /// into a term the solver cannot hold.
 const MAX_SUM_LEN: u64 = 256;
 
+/// The bound a *symbolic*-length sum is unrolled to. The precondition must prove
+/// `<slice>.len() <= MAX_SYMBOLIC_LEN`; past it the shape is refused.
+const MAX_SYMBOLIC_LEN: u64 = 8;
+
 /// A constant `u64` from an operand: a literal, or a local the run pinned to a
 /// constant (a `smt::evaluate` of its value). `None` for anything symbolic, which
 /// the callers refuse rather than guess.
@@ -6659,28 +6663,52 @@ fn slice_sum(
             "`{name}` over `{elem_w}`-bit elements into a `{dest_w}`-bit sum is not modelled"
         ));
     }
-    // The number of addends: an array's type length, or a slice the precondition
-    // pinned. A symbolic slice length has no fixed addend count.
-    let Some(n) = iterator_const_len(s, pins) else {
-        return Err(format!(
-            "`{name}` over a slice whose length is not a constant (write \
-             `requires: <slice>.len() == N`)"
-        ));
-    };
-    if n > MAX_SUM_LEN {
-        return Err(format!("`{name}` over {n} elements is past the {MAX_SUM_LEN}-element limit"));
-    }
     if it.filter.is_some() {
         return Err(format!("`{name}` over a filtered iterator is not modelled"));
     }
+    // The number of addends. A *constant* length is unrolled exactly. A *symbolic*
+    // length is unrolled to a bound `K` and each step is guarded by `k < len`, which
+    // is exact exactly when the length is at most `K` -- so the precondition must
+    // *prove* `len <= K`; otherwise the sum would silently miss elements, which is a
+    // wrong value, so the shape is refused.
+    let len = s.len;
+    let (hi, symbolic) = match iterator_const_len(s, pins) {
+        Some(n) => {
+            if n > MAX_SUM_LEN {
+                return Err(format!("`{name}` over {n} elements is past the {MAX_SUM_LEN}-element limit"));
+            }
+            (it.end.map_or(n, |e| e.min(n)), false)
+        }
+        None => {
+            if it.step != 1 || it.end.is_some() {
+                return Err(format!(
+                    "`{name}` over a symbolic-length slice with `step_by`/`take` is not modelled"
+                ));
+            }
+            let within = smt::ule_const(len, MAX_SYMBOLIC_LEN);
+            if !matches!(find_obligation(smt::and(path, smt::not(within)), pins), Verdict::Unsat) {
+                return Err(format!(
+                    "`{name}` over a slice whose length is not bounded (write \
+                     `requires: <slice>.len() <= {MAX_SYMBOLIC_LEN}`)"
+                ));
+            }
+            (MAX_SYMBOLIC_LEN, true)
+        }
+    };
     let sign = Sign::of_bool(elem_signed);
-    let hi = it.end.map_or(n, |e| e.min(n));
     let mut acc = smt::word(0, dest_w);
     let mut obligations = Vec::new();
     let mut k = it.pos;
     while k < hi {
         let Some((elem, _)) = env.index_elem(it.base, k) else {
             return Err(format!("`{name}` on an iterator whose elements are not modelled"));
+        };
+        // A symbolic-length sum guards each step by `k < len`, so an index past the
+        // real length contributes 0. Exact because `len <= MAX_SYMBOLIC_LEN` was proved.
+        let elem = if symbolic {
+            smt::ite(smt::not(smt::ule_const(len, k)), elem, smt::word(0, elem_w))
+        } else {
+            elem
         };
         // A `map` transform is applied to each element before it is summed.
         let elem = if let Some(m) = it.map {

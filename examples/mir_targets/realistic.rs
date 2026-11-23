@@ -14533,6 +14533,41 @@ pub fn array_iter_any_gt_tripwire(xs: &[u8; 4]) -> bool {
     xs.iter().copied().any(|x| x > 10)
 }
 
+spec! {
+    requires: v.len() <= 4,
+    requires: v[0] <= 10,
+    requires: v[1] <= 10,
+    requires: v[2] <= 10,
+    requires: v[3] <= 10,
+    ensures: true,
+}
+/// A *symbolic-length* sum is unrolled to a bound the precondition must prove
+/// (`len <= 8`); each step is guarded by `k < len`. Here every element is small
+/// enough that the sum cannot overflow, so it is panic-free.
+pub fn symbolic_sum_no_overflow(v: &[u8]) -> u8 {
+    v.iter().sum()
+}
+
+spec! {
+    requires: v.len() <= 4,
+    ensures: true,
+}
+/// The length is bounded but the elements are not, so the sum can overflow: the
+/// reachable-panic obligation must be refuted.
+pub fn symbolic_sum_tripwire(v: &[u8]) -> u8 {
+    v.iter().sum()
+}
+
+spec! {
+    requires: true,
+    ensures: true,
+}
+/// An *unbounded* symbolic length cannot be unrolled, so this stays an honest
+/// refusal (a bounded unroll would silently miss elements).
+pub fn symbolic_sum_unbounded_refused(v: &[u8]) -> u8 {
+    v.iter().sum()
+}
+
 // ---------------------------------------------------------------------------
 // A scalar reference argument named in a contract (C9)
 //

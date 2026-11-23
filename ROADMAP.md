@@ -43,11 +43,18 @@ small change:
   ~186 s with `MAX_APPLY_STEPS` raised 32× (to `1 << 24`) and after 5.7 s with the
   SAT conflict budget raised to 20 000 000 — so it is an engine wall (C7), not a
   budget knob. `n / d` at `u32` is equally undecided, which is the same fact.
-- `sum_iter` (`v.iter().sum()`) is **not verifiable at all**: an unbounded slice
-  sum can overflow, so the honest verdict for a total postcondition is a panic,
-  not `verified` — a bare `a + b` under `requires: true` fails the same way. The
-  `incomplete` is the unmodelled `iter`/`sum` (C10); modelling them would move the
-  entry to `FAILED`, never to `verified`, and so would not change this score.
+- `sum_iter` (`v.iter().sum()`) is `incomplete` because its length is **unbounded**
+  (`requires: true`). The `iter`/`sum` path is modelled now (C11 symbolic-length
+  iteration), and a slice sum is unrolled to `MAX_SYMBOLIC_LEN` steps guarded by
+  `k < len` — exact only when the precondition *proves* `len <= 8`. An unbounded
+  length cannot be unrolled (a shorter unroll would silently miss elements, a wrong
+  value), so `sum_iter` stays an honest refusal. A **guarded** sum decides:
+  `symbolic_sum_no_overflow` (`len <= 4`, elements `<= 10`) **verifies** (the sum
+  cannot overflow — a real panic-freedom proof over a runtime-length slice),
+  `symbolic_sum_tripwire` (bounded length, unbounded elements) is **refuted** with
+  an overflow witness, and `symbolic_sum_unbounded_refused` is the honest refusal.
+  So the entry is decided *for the guarded shape*; `sum_iter` itself is a
+  length-unbounded refusal, not an unmodelled `sum`.
 - `tri` (`s += i` over `0..=n`, `n <= 100`, `ret <= 5050`) needs an **inductive**
   loop invariant, and the invariant that is inductive for a running sum is
   *nonlinear* (`s <= i(i+1)/2`). `s <= 5050` is not inductive (from `s == 5050`
@@ -1194,6 +1201,19 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     `tests/mir.rs::an_iterator_can_be_folded_with_a_closure` pins three verified
     (checked sum, `wrapping_add`, a non-zero init) and one refuted tripwire (an
     unguarded fold overflows), and `mir::intrinsics` pins the classification.
+
+  - Progress (**symbolic-length `sum`**): a slice whose length is a *symbolic*
+    input (`v: &[T]`, `v.iter().sum()`) is summed by unrolling to
+    `MAX_SYMBOLIC_LEN` (8) steps, each guarded by `k < len` (`ite(k < len, v[k],
+    0)`), which is exact **iff** the precondition proves `len <= 8`; the handler
+    proves `path => len <= 8` with `find_obligation` and **refuses** the shape
+    otherwise (a shorter unroll would silently miss elements — a wrong value, so
+    the direction is a refusal). The elements are created on demand
+    (`index_elem`), so a guarded sum of small elements is a real panic-freedom
+    proof over a runtime-length slice. `step_by`/`take` on a symbolic length are
+    refused (they need a constant count). Pinned by
+    `a_symbolic_length_sum_is_bounded_by_its_precondition` (verified / refuted /
+    refused).
 
   - Progress (**`map`/`filter`**): `map(f)`/`filter(f)` are lazy: they set a
     transform/predicate on the cursor and carry it. `sum` applies the transform
