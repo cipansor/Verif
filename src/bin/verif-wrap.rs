@@ -163,3 +163,25 @@ fn target_refusal(rustc: &str, args: &[OsString]) -> Option<String> {
     }
     if reasons.is_empty() { None } else { Some(reasons.join("; ")) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_32_bit_target_is_refused_and_the_host_is_not() {
+        // The probe needs a real `rustc`; skip if there is none.
+        if Command::new("rustc").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("verif-wrap: no rustc; skipping target_refusal test");
+            return;
+        }
+        // No `--target` means the host layout, which the model assumes.
+        assert!(target_refusal("rustc", &[]).is_none(), "the host target is modelled");
+        // A 32-bit target's pointer width is not.
+        let args = vec![OsString::from("--target"), OsString::from("i686-unknown-linux-gnu")];
+        assert!(
+            target_refusal("rustc", &args).is_some(),
+            "a 32-bit pointer width must be refused"
+        );
+    }
+}

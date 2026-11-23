@@ -1729,17 +1729,30 @@ the deep executor and multi-file ones are tracked here.
 - The `everyday.rs` "wall" pin no longer rejects a *sound* `Verified` (the contracts are
   sound; only a false `Failed` is forbidden).
 
+**Round 10 (also fixed):** `verif-wrap` refuses a cross target whose pointer width or
+endianness the model does not represent; `function_params` is comment-aware across lines
+(a `/* { */` no longer blocks replay); `extern_compiles` imports every `--extern`;
+`dependency_names` splits before stripping quotes (`"dep".path`); `cargo-verif` errors on
+an unmatched `--function`/`--emit-test`; the `everyday.rs` pin allows a panic finding for
+`sum_iter`; the TCB path test skips inside a packaged crate; the action fails on exit 2
+regardless of `fail-on-findings`; the SARIF smoke test requires an `error` level; docs
+(build-time `verif-wrap`, CLI dependency resolution, TQL-5 objectives, TCB executor
+evidence = panic replay, input-selection trust). Regressions:
+`function_params_is_comment_aware_across_lines`,
+`dependency_names_reads_dotted_and_quoted_keys`,
+`a_32_bit_target_is_refused_and_the_host_is_not`.
+
 **Tracked (open):**
 - Executor: compound iterator closures (`closure_map`/`closure_binop`/`closure_filter`
   read an intermediate as the result), `Vec::clear`/drops of user-`Drop` elements,
   `*b = v` through a `Box` (stale payload), mutable-`Vec` postcondition length, adapter
   chains (`next`/`fold`/`all`/`any`/`last`/`nth` after `map`/`filter`/`rev`/`skip`/`take`/
-  `step_by`/`enumerate`), reversed reductions, padded mapped sums.
-- Spec multi-file: `#[path]`/nested external modules; method matching after external
-  declarations (synthetic line coordinates).
+  `step_by`/`enumerate`), reversed reductions, padded mapped sums, enumeration index,
+  `iterator_const_len` pin reuse, `all`/`any` discarding a live cursor.
+- Spec multi-file: `#[path]`/nested external modules (silent skip); method matching after
+  external declarations (synthetic line coordinates); `--emit-test` for module functions.
 - `verif-wrap`: forward the real `--extern`/`-L` (own lib, workspace/custom target dir,
   renamed/custom-name deps), build-script targets, nested wrappers, cached-build
-  invalidation, custom source paths.
+  invalidation, custom source paths, inactive `#[cfg]` contracts.
 - Docs/tooling: qualification determinism (per-function verdict equality, not a count),
-  TCB/MIR-evidence wording, CLI dependency docs, SARIF module paths, unknown `--function`,
-  report-only exit codes, action ref, iterator differential harness.
+  SARIF module paths, action ref, iterator differential harness, `checked_ilog` base.

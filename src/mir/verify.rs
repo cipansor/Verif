@@ -2619,4 +2619,17 @@ mod render_tests {
         assert_eq!(render_arg("x", &Ty::I8, "127").unwrap(), "127");
         assert!(render_arg("x", &Ty::Other("S".into()), "0").is_err());
     }
+
+    #[test]
+    fn dependency_names_reads_dotted_and_quoted_keys() {
+        let toml = "[dependencies]\ndep.path = \"../dep\"\nfoo = \"1\"\n\n                    [dependencies.\"bar\"]\nversion = \"1\"\n";
+        let names = super::dependency_names(toml);
+        assert!(names.contains(&"dep".to_string()), "dotted key -> `dep`, got {names:?}");
+        assert!(names.contains(&"foo".to_string()), "got {names:?}");
+        assert!(names.contains(&"bar".to_string()), "quoted sub-table, got {names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains('.') || n.contains('"')),
+            "no dots or quotes may survive, got {names:?}"
+        );
+    }
 }

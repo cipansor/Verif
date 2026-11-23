@@ -8965,6 +8965,19 @@ mod tests {
     }
 
     #[test]
+    fn function_params_is_comment_aware_across_lines() {
+        // A block comment with an unmatched `{` above the declaration must not leave
+        // the scanner at depth > 0 (which would make the real `fn` look nested).
+        let src = "/* match the delimiter { */\npub fn bad(a: u8, b: u8) -> u8 { 0 }\n";
+        let names: Vec<String> = super::function_params(src, "bad")
+            .expect("a free function")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["a", "b"]);
+    }
+
+    #[test]
     fn function_params_refuses_a_method() {
         let src = "impl S { fn m(&self, x: u8) {} }\n";
         assert!(
