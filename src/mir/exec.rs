@@ -6437,13 +6437,17 @@ fn slice_iter(
                         "`{name}` with `rev` on a slice whose length is not a constant"
                     ));
                 };
-                // The last element of the remaining *reversed* sequence is `s[pos]`.
-                let (idx, tag) = if it.pos < n {
-                    (it.pos, smt::word(intrinsics::SOME_TAG, 1))
+                // The remaining reversed sequence yields bases `n-1-pos`, `n-1-pos-step`,
+                // ...; `last()` is its final element, at the largest stride position below
+                // the effective end `hi`. A bare `pos` ignored `step` and the `take` cap,
+                // so `rev().take(2).last()` named the wrong element (a false refutation).
+                let hi = it.end.map_or(n, |e| e.min(n));
+                if it.pos < hi {
+                    let last_pos = it.pos + ((hi - 1 - it.pos) / it.step) * it.step;
+                    (n - 1 - last_pos, smt::word(intrinsics::SOME_TAG, 1))
                 } else {
                     (0, smt::word(0, 1))
-                };
-                (idx, tag)
+                }
             } else {
                 let const_n = iterator_const_len(s, cx.pins);
                 let idx = match const_n {

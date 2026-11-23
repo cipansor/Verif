@@ -14779,3 +14779,22 @@ fn nth_advances_by_step() {
         "the remaining count is 2, so == 3 must be refuted"
     );
 }
+
+#[test]
+fn rev_last_and_take_last_name_the_right_element() {
+    // `rev().last()` is the original's first element; `rev().take(k).last()` is the
+    // original's `n-k`. The rev branch named `base pos`, ignoring `step` and the take
+    // cap, so `rev().take(2).last()` returned base 0 (10) instead of base n-2 (40) --
+    // a false refutation of the true 40 and a false proof of 10.
+    let f = |name: &str, e: u64, body: &str| {
+        verify_src(name, &format!("/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n/// ensures: ret == {e}\npub fn {name}(xs: &[u8]) -> u8 {{ {body} }}"))
+    };
+    assert!(f("rl", 10, "xs.iter().rev().last().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    assert!(f("rtl", 40, "xs.iter().rev().take(2).last().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    assert!(f("rsl", 10, "xs.iter().rev().step_by(2).last().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    // Teeth: the pre-fix value of rev().take(2).last() was 10; it is 40, so == 10 is refuted.
+    assert!(
+        matches!(f("rtlf", 10, "xs.iter().rev().take(2).last().copied().unwrap_or(0)"), Some(FnOutcome::Failed { .. })),
+        "rev().take(2).last() is 40, so == 10 must be refuted"
+    );
+}
