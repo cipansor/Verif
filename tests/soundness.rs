@@ -424,3 +424,35 @@ mod helpers {
     }
 }
 
+/// The TCB document names the files it trusts, so those names are checked.
+///
+/// `docs/tcb.md` (roadmap A4) points at the source of each layer it trusts. A
+/// renamed or moved module would leave the table pointing at nothing while the
+/// prose still read as authoritative -- the same defect the ledger's fixture
+/// column has, one document over. Every backticked repository path in the table
+/// must exist, and at least a handful must be found so the test cannot pass
+/// vacuously.
+#[test]
+fn the_tcb_names_files_that_exist() {
+    let doc = std::fs::read_to_string(root().join("docs/tcb.md"))
+        .expect("docs/tcb.md must exist");
+    let mut checked = 0usize;
+    for raw in doc.split('`') {
+        let p = raw.trim();
+        let looks_like_path = (p.starts_with("src/")
+            || p.starts_with("tools/")
+            || p.starts_with("examples/")
+            || p.starts_with("tests/"))
+            && (p.ends_with(".rs") || p.contains('/'));
+        if !looks_like_path || p.contains(char::is_whitespace) {
+            continue;
+        }
+        checked += 1;
+        assert!(
+            root().join(p).exists(),
+            "docs/tcb.md names `{p}`, which does not exist"
+        );
+    }
+    assert!(checked >= 5, "docs/tcb.md must name at least 5 repository paths; found {checked}");
+}
+
