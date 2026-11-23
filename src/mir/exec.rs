@@ -6770,18 +6770,27 @@ fn slice_sum(
         let Some((elem, _)) = env.index_elem(it.base, k) else {
             return Err(format!("`{name}` on an iterator whose elements are not modelled"));
         };
-        // A symbolic-length sum guards each step by `k < len`, so an index past the
-        // real length contributes 0. Exact because `len <= MAX_SYMBOLIC_LEN` was proved.
-        let elem = if symbolic {
-            smt::ite(smt::not(smt::ule_const(len, k)), elem, smt::word(0, elem_w))
+        // The per-step guard: for a symbolic length only `k < len` is a real element;
+        // padding contributes 0. Exact because `len <= MAX_SYMBOLIC_LEN` was proved.
+        let within = if symbolic {
+            smt::not(smt::ule_const(len, k))
+        } else {
+            smt::truth(true)
+        };
+        // A `map` transform is applied to each *real* element, then the mapped value is
+        // guarded -- the other order (`map` after the guard) applied `map(0)` to the
+        // padding, so `x + 1` added `MAX - len` extra and `x - 1` underflowed: a wrong
+        // value, and a spurious overflow. The map's overflow obligation is under
+        // `within`, so padding cannot raise a panic it does not reach.
+        let elem = if let Some(m) = it.map {
+            let (v, obs) = apply_map(m, elem, elem_w, sign, smt::and(path, within), pins)?;
+            obligations.extend(obs);
+            v
         } else {
             elem
         };
-        // A `map` transform is applied to each element before it is summed.
-        let elem = if let Some(m) = it.map {
-            let (v, obs) = apply_map(m, elem, elem_w, sign, path, pins)?;
-            obligations.extend(obs);
-            v
+        let elem = if symbolic {
+            smt::ite(within, elem, smt::word(0, elem_w))
         } else {
             elem
         };

@@ -1821,6 +1821,14 @@ after the enumerate recorded its start). Pinned by
 `an_enumerate_index_counts_from_the_enumerates_start` (skip/rev index 0, the old raw-position
 value refuted, `enumerate().skip(1)` index 1).
 
+**Round 18 — mapped symbolic-length sum no longer includes the padding (FIXED).**
+A `map(...).sum()` over a slice with a *symbolic* length zeroed the padding (indices `>= len`)
+to 0 and then applied the `map`, so `map(0)` (e.g. `0 - 1`) contributed to the padding: a wrong
+value and a spurious overflow. The `map` now applies to the *real* element and the *mapped* value
+is guarded to 0; the map's overflow obligation is under the per-step guard, so padding raises no
+panic. Pinned by `a_mapped_symbolic_sum_does_not_include_the_padding` (verified `ret <= 1`; the
+control `ret == 0` refuted; verified to fail without the fix — the old order reports `ret = 8`).
+
 **Fixed already (rounds 10–17):** compound-closure refusals, `Vec::clear` of droppable
 elements, `*b = v` through a `Box`, mutable-`Vec` postcondition length (16), adapter-chain/
 reversed-reduction refusals, `enumerate` index (17), wrapper `--extern`/`-L` forwarding +
@@ -1828,8 +1836,8 @@ build-script forwarding, custom source path, action ref, literal-masking replay 
 `source_arg` option-value parsing.
 
 **Tracked (open):**
-- Executor/iterator: `iterator_const_len` pin reuse, mapped sums including padded zeros,
-  composed `rev`/`step_by`/`skip`/`take`/`nth` adapters. (`all`/`any` audited — they consume
+- Executor/iterator: `iterator_const_len` pin reuse, composed `rev`/`step_by`/`skip`/`take`/
+  `nth` adapters. (`all`/`any` audited — they consume
   the iterator by removing the cursor, which is correct.)
 - Spec multi-file: `#[path]`/nested external modules (silent skip); method matching after
   external declarations (synthetic line coordinates); `--emit-test` for module functions.

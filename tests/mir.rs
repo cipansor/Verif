@@ -14668,3 +14668,30 @@ fn an_enumerate_index_counts_from_the_enumerates_start() {
     let Some(rev) = rev else { return };
     assert!(matches!(rev, FnOutcome::Verified { .. }), "rev().enumerate().next().0 is 0, got {rev}");
 }
+
+/// A mapped sum over a *symbolic*-length slice must apply the `map` to the real
+/// elements only: the padding (indices `>= len`) contributes 0, never `map(0)`. With
+/// `requires: xs.len() <= 1 && xs[0] == 0`, `map(|x| x + 1).sum()` is 0 (len 0) or 1
+/// (len 1). Applying the map *after* the zero-guard added `MAX_SYMBOLIC_LEN - len`
+/// extra (map(0) = 1), so `ret <= 1` was refuted -- a wrong value.
+#[test]
+fn a_mapped_symbolic_sum_does_not_include_the_padding() {
+    let ok = verify_src(
+        "mapped_sum_pad",
+        "/// requires: xs.len() <= 1 && xs[0] == 0\n/// ensures: ret <= 1\npub fn mapped_sum_pad(xs: &[u8]) -> u8 { xs.iter().copied().map(|x| x + 1).sum() }",
+    );
+    let Some(ok) = ok else { return };
+    assert!(
+        matches!(ok, FnOutcome::Verified { .. }),
+        "map(|x| x + 1).sum() over len <= 1 with xs[0] == 0 is <= 1, got {ok}"
+    );
+    let bad = verify_src(
+        "mapped_sum_pad_bad",
+        "/// requires: xs.len() <= 1 && xs[0] == 0\n/// ensures: ret == 0\npub fn mapped_sum_pad_bad(xs: &[u8]) -> u8 { xs.iter().copied().map(|x| x + 1).sum() }",
+    );
+    let Some(bad) = bad else { return };
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "the sum is 1 at len 1, so == 0 must be refuted, got {bad}"
+    );
+}
