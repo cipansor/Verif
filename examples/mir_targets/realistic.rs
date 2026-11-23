@@ -14227,6 +14227,67 @@ pub fn array_iter_nth(xs: &[u8; 2]) -> u8 {
     *xs.iter().nth(1).unwrap()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == xs[0],
+}
+/// `xs.iter().rev().last()`: the *last* of the reversed sequence is the first
+/// element. `last` is order-dependent, so this pins the direction mapping.
+pub fn array_iter_rev_last(xs: &[u8; 2]) -> u8 {
+    *xs.iter().rev().last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[1],
+}
+/// The same body claiming the *unreversed* last element must be refuted.
+pub fn array_iter_rev_last_tripwire(xs: &[u8; 2]) -> u8 {
+    *xs.iter().rev().last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[0],
+}
+/// `xs.iter().rev().nth(1)` names the second element of the reversed sequence,
+/// which is `xs[0]` for a two-element array.
+pub fn array_iter_rev_nth(xs: &[u8; 2]) -> u8 {
+    *xs.iter().rev().nth(1).unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[0],
+}
+/// A `for x in xs.iter().rev()` loop visits the elements back-to-front, so the
+/// last one assigned is `xs[0]`.
+pub fn array_iter_rev_for(xs: &[u8; 2]) -> u8 {
+    let mut last = 0u8;
+    for x in xs.iter().rev() {
+        last = *x;
+    }
+    last
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[1],
+}
+/// `rev().rev()` is the identity, so its last element is the original last.
+pub fn array_iter_rev_rev_last(xs: &[u8; 2]) -> u8 {
+    *xs.iter().rev().rev().last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
+/// `rev()` does not change the count.
+pub fn array_iter_rev_count(xs: &[u8; 2]) -> u32 {
+    xs.iter().rev().count() as u32
+}
+
 // ---------------------------------------------------------------------------
 // A scalar reference argument named in a contract (C9)
 //

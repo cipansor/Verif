@@ -392,6 +392,8 @@ pub enum Intrinsic {
     /// -- and `next` on the result reads the same element. The element type must be
     /// `Copy` for `.copied()` to compile, so nothing is skipped.
     SliceCopied,
+    /// `Iterator::rev` on a cursor: a direction flag, carried like `copied`.
+    SliceRev,
     /// `Iterator::count` on a slice/array cursor: `len - pos`.
     ///
     /// The cursor is a concrete position, so the remaining count is the length
@@ -1545,6 +1547,9 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if short == "copied" && names_slice_iter_ty(name) {
         return Some(Intrinsic::SliceCopied);
     }
+    if short == "rev" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceRev);
+    }
     if short == "count" && names_slice_iter_ty(name) {
         return Some(Intrinsic::SliceCount);
     }
@@ -1983,7 +1988,9 @@ fn is_cursor_ty(ty: &str) -> bool {
     let is_adapter = head == "Copied"
         || head.ends_with("::Copied")
         || head == "Enumerate"
-        || head.ends_with("::Enumerate");
+        || head.ends_with("::Enumerate")
+        || head == "Rev"
+        || head.ends_with("::Rev");
     is_adapter && (ty.contains("slice::Iter") || ty.contains("array::IntoIter"))
 }
 
@@ -2356,6 +2363,7 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         | Intrinsic::SliceIntoIter
         | Intrinsic::SliceNext
         | Intrinsic::SliceCopied
+        | Intrinsic::SliceRev
         | Intrinsic::SliceCount
         | Intrinsic::SliceSum
         | Intrinsic::SliceIterLast
@@ -2596,6 +2604,7 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             | Intrinsic::SliceIntoIter
             | Intrinsic::SliceNext
             | Intrinsic::SliceCopied
+            | Intrinsic::SliceRev
             | Intrinsic::SliceCount
             | Intrinsic::SliceSum
             | Intrinsic::SliceIterLast
@@ -2666,6 +2675,7 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         Intrinsic::SliceIntoIter
         | Intrinsic::SliceNext
         | Intrinsic::SliceCopied
+        | Intrinsic::SliceRev
         | Intrinsic::SliceCount
         | Intrinsic::SliceSum
         | Intrinsic::SliceIterLast
@@ -6470,6 +6480,17 @@ mod tests {
         assert_eq!(
             classify("<std::slice::Iter<'_, u8> as Iterator>::copied::<'_, u8>"),
             Some(Intrinsic::SliceCopied)
+        );
+        // `rev` reverses the cursor's direction; it is the same cursor trait call
+        // as `copied`, and the reversed cursor's terminals (`sum`/`count`/`last`/…)
+        // still classify because `is_cursor_ty` accepts the `Rev` adapter.
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::rev"),
+            Some(Intrinsic::SliceRev)
+        );
+        assert_eq!(
+            classify("<std::iter::Rev<std::slice::Iter<'_, u8>> as Iterator>::last"),
+            Some(Intrinsic::SliceIterLast)
         );
         assert_eq!(
             classify("<std::slice::Iter<'_, u8> as Iterator>::count"),

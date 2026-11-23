@@ -12952,6 +12952,37 @@ fn a_slice_iter_and_explicit_drop_decide() {
     }
 }
 
+/// C11 iteration: `Iterator::rev` reverses the direction a sequence position
+/// names. `last`/`nth`/a `for` loop are order-dependent, so they pin the mapping
+/// (`rev().last()` is the *first* element); `count` is order-independent.
+#[test]
+fn an_iterator_can_be_reversed() {
+    let names = [
+        "array_iter_rev_last",
+        "array_iter_rev_last_tripwire",
+        "array_iter_rev_nth",
+        "array_iter_rev_for",
+        "array_iter_rev_rev_last",
+        "array_iter_rev_count",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in [
+        "array_iter_rev_last",
+        "array_iter_rev_nth",
+        "array_iter_rev_for",
+        "array_iter_rev_rev_last",
+        "array_iter_rev_count",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let o = outcome(&report, "array_iter_rev_last_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`array_iter_rev_last_tripwire` claims the unreversed last element and must be refuted, got: {o}"
+    );
+}
+
 /// C11 containers: `Vec::clear`/`String::clear` reset the tracked length to zero,
 /// and the tripwire that claims the pre-clear length is refuted.
 #[test]

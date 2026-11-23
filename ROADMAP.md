@@ -1144,6 +1144,20 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     `tests/mir.rs` `a_slice_iterator_extremes_and_offsets_are_modelled` pins six
     verified (incl. signed `i8` and a reference payload), five postcondition
     refutations, and the symbolic-length refusal.
+  - Progress (**`rev`**): `Iterator::rev` is a direction flag on the cursor
+    (`IterState::rev`), carried like `copied`; `rev().rev()` toggles it back to the
+    identity. Only the order-dependent terminals read it: `next` names base index
+    `len-1-pos` (so a `for x in xs.iter().rev()` loop walks back-to-front), `last`
+    names `s[pos]` (the first *remaining* element, so `rev().last()` is `xs[0]`),
+    and `nth(k)` names `s[len-1-(pos+k)]`. `count`/`sum`/`max`/`min` are
+    order-independent and unchanged. `rev` needs a *constant* length so the index
+    is a constant (a symbolic-length reversed cursor is refused, the honest
+    direction); `is_cursor_ty` accepts the `Rev` adapter, so the reversed cursor's
+    terminals still classify. `realistic.rs` **654/1194 → 660/1200**;
+    `tests/mir.rs::an_iterator_can_be_reversed` pins five verified (`last`/`nth`/
+    `for`/`rev().rev()`/`count`) and one refuted tripwire, and
+    `mir::intrinsics` pins the classification without a toolchain.
+
   - Progress (**`enumerate`**): `Iterator::enumerate` is a cursor identity whose
     `next` yields `Option<(usize, &T)>`. `next` writes the concrete index and the
     element into the tuple store and sets the payload to an aggregate, so the

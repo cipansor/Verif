@@ -680,7 +680,12 @@ fn eval_elem_id(id: &ElemId, read: &impl Fn(ElemRef) -> Option<Val>) -> Option<V
 #[derive(Clone, Copy, Debug)]
 struct IterState {
     base: u32,
+    /// The next element's *base* position when not reversed; when reversed, the
+    /// distance from the end (`base index = len-1-pos`). Only `next`/`last`/`nth`
+    /// read the direction; `count`/`sum`/`max`/`min` are order-independent.
     pos: u64,
+    /// `Iterator::rev`. Reverses which base index a sequence position names.
+    rev: bool,
 }
 
 /// Local-to-symbolic environment, with side maps for aggregate parts.
@@ -5791,7 +5796,7 @@ fn slice_iter(
             if s.elem_w == 0 {
                 return Err(format!("`{name}` on a slice whose element width is not modelled"));
             }
-            env.iters.insert(dest.local, IterState { base: recv.local, pos: 0 });
+            env.iters.insert(dest.local, IterState { base: recv.local, pos: 0, rev: false });
             Ok(Vec::new())
         }
         // `copied()` wraps the cursor in an adapter that yields `T` instead of `&T`.
@@ -5805,6 +5810,15 @@ fn slice_iter(
             env.iters.insert(dest.local, it);
             Ok(Vec::new())
         }
+        // `rev()` flips the cursor's direction, carried to the destination like
+        // `copied`. `rev().rev()` is the identity, so the flag toggles.
+        Intrinsic::SliceRev => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            env.iters.insert(dest.local, IterState { rev: !it.rev, ..it });
+            Ok(Vec::new())
+        }
         Intrinsic::SliceNext => {
             let Some(it) = env.iters.get(&recv.local).copied() else {
                 return Err(format!(
@@ -5816,16 +5830,36 @@ fn slice_iter(
                 return Err(format!("`{name}` on an iterator whose slice is not modelled"));
             };
             let (len, elem_w) = (s.len, s.elem_w);
-            let (elem, sign) = env.index_elem(base, pos).ok_or_else(|| {
+            // The base index the sequence position `pos` names: `pos` itself, or
+            // `len-1-pos` when reversed. `rev` needs a *constant* length so the
+            // index is a constant (a symbolic one would need the ite chain), and a
+            // symbolic-length reversed cursor is refused rather than guessed.
+            let (idx, tag) = if it.rev {
+                let Some(n) = iterator_const_len(s, cx.pins) else {
+                    return Err(format!(
+                        "`{name}` with `rev` on a slice whose length is not a constant"
+                    ));
+                };
+                if pos < n {
+                    (n - 1 - pos, smt::word(intrinsics::SOME_TAG, 1))
+                } else {
+                    (0, smt::word(0, 1))
+                }
+            } else {
+                // `None` exactly when `pos >= len` (a concrete `pos`); `Some`
+                // otherwise. The tag is one bit like `first`/`get`.
+                (
+                    pos,
+                    smt::ite(
+                        smt::ule_const(len, pos),
+                        smt::word(0, 1),
+                        smt::word(intrinsics::SOME_TAG, 1),
+                    ),
+                )
+            };
+            let (elem, sign) = env.index_elem(base, idx).ok_or_else(|| {
                 format!("`{name}` on an iterator whose elements are not modelled")
             })?;
-            // `None` exactly when `pos >= len`, which is `len <= pos` (a concrete
-            // `pos`). `Some` otherwise; the tag is one bit like `first`/`get`.
-            let tag = smt::ite(
-                smt::ule_const(len, pos),
-                smt::word(0, 1),
-                smt::word(intrinsics::SOME_TAG, 1),
-            );
             env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
             if name.contains("Enumerate") {
                 // `Enumerate::next` yields `Option<(usize, &T)>`. The payload is a
@@ -5843,7 +5877,7 @@ fn slice_iter(
             } else {
                 env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(elem, sign), elem_w);
             }
-            env.slice_elem_ref.insert(dest.local, ElemId::Leaf((base, pos)));
+            env.slice_elem_ref.insert(dest.local, ElemId::Leaf((base, idx)));
             if let Some(it) = env.iters.get_mut(&recv.local) {
                 it.pos = it.pos.saturating_add(1);
             }
@@ -5890,19 +5924,35 @@ fn slice_iter(
             // `xs[n-1]` names. Only a *symbolic*-length slice falls back to the single
             // fresh `LAST_INDEX` variable, the same over-approximation `slice::last`
             // uses. `None` exactly when the cursor has run out (`pos >= len`).
-            let idx = match iterator_const_len(s, cx.pins) {
-                Some(0) => 0,
-                Some(n) => n - 1,
-                None => LAST_INDEX,
+            let (idx, tag) = if it.rev {
+                let Some(n) = iterator_const_len(s, cx.pins) else {
+                    return Err(format!(
+                        "`{name}` with `rev` on a slice whose length is not a constant"
+                    ));
+                };
+                // The last element of the remaining *reversed* sequence is `s[pos]`.
+                let (idx, tag) = if it.pos < n {
+                    (it.pos, smt::word(intrinsics::SOME_TAG, 1))
+                } else {
+                    (0, smt::word(0, 1))
+                };
+                (idx, tag)
+            } else {
+                let idx = match iterator_const_len(s, cx.pins) {
+                    Some(0) => 0,
+                    Some(n) => n - 1,
+                    None => LAST_INDEX,
+                };
+                let tag = smt::ite(
+                    smt::ule_const(len, it.pos),
+                    smt::word(0, 1),
+                    smt::word(intrinsics::SOME_TAG, 1),
+                );
+                (idx, tag)
             };
             let (elem, sign) = env.index_elem(it.base, idx).ok_or_else(|| {
                 format!("`{name}` on an iterator whose elements are not modelled")
             })?;
-            let tag = smt::ite(
-                smt::ule_const(len, it.pos),
-                smt::word(0, 1),
-                smt::word(intrinsics::SOME_TAG, 1),
-            );
             env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
             env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(elem, sign), elem_w);
             env.slice_elem_ref.insert(dest.local, ElemId::Leaf((it.base, idx)));
@@ -5923,17 +5973,33 @@ fn slice_iter(
                 ));
             };
             let j = it.pos.saturating_add(k);
-            let (elem, sign) = env.index_elem(it.base, j).ok_or_else(|| {
+            let (idx, tag) = if it.rev {
+                let Some(n) = iterator_const_len(s, cx.pins) else {
+                    return Err(format!(
+                        "`{name}` with `rev` on a slice whose length is not a constant"
+                    ));
+                };
+                if j < n {
+                    (n - 1 - j, smt::word(intrinsics::SOME_TAG, 1))
+                } else {
+                    (0, smt::word(0, 1))
+                }
+            } else {
+                (
+                    j,
+                    smt::ite(
+                        smt::ule_const(len, j),
+                        smt::word(0, 1),
+                        smt::word(intrinsics::SOME_TAG, 1),
+                    ),
+                )
+            };
+            let (elem, sign) = env.index_elem(it.base, idx).ok_or_else(|| {
                 format!("`{name}` on an iterator whose elements are not modelled")
             })?;
-            let tag = smt::ite(
-                smt::ule_const(len, j),
-                smt::word(0, 1),
-                smt::word(intrinsics::SOME_TAG, 1),
-            );
             env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
             env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(elem, sign), elem_w);
-            env.slice_elem_ref.insert(dest.local, ElemId::Leaf((it.base, j)));
+            env.slice_elem_ref.insert(dest.local, ElemId::Leaf((it.base, idx)));
             // `nth` consumes the returned element, so the cursor advances past it.
             if let Some(it) = env.iters.get_mut(&recv.local) {
                 it.pos = j.saturating_add(1);
@@ -6856,6 +6922,7 @@ fn try_intrinsic(
                 | intrinsics::Intrinsic::SliceIntoIter
                 | intrinsics::Intrinsic::SliceNext
                 | intrinsics::Intrinsic::SliceCopied
+                | intrinsics::Intrinsic::SliceRev
                 | intrinsics::Intrinsic::SliceCount
                 | intrinsics::Intrinsic::SliceSum
                 | intrinsics::Intrinsic::SliceIterLast
@@ -6985,6 +7052,7 @@ fn try_intrinsic(
         intrinsics::Intrinsic::SliceIntoIter
             | intrinsics::Intrinsic::SliceNext
             | intrinsics::Intrinsic::SliceCopied
+            | intrinsics::Intrinsic::SliceRev
             | intrinsics::Intrinsic::SliceCount
             | intrinsics::Intrinsic::SliceSum
             | intrinsics::Intrinsic::SliceIterLast
