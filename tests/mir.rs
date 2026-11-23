@@ -14636,3 +14636,35 @@ fn a_replay_call_uses_the_real_declaration_not_a_comment() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `enumerate`'s index counts from the enumerate's own start (0, 1, ...), not the raw
+/// slice position: `skip(1).enumerate().next().0` is 0 and `rev().enumerate().next().0`
+/// is 0, while `enumerate().skip(1).next().0` is 1. Using `pos` for the index made the
+/// first two report the slice position (`skip`'s 1), so that old value is a tripwire.
+#[test]
+fn an_enumerate_index_counts_from_the_enumerates_start() {
+    let skip = verify_src(
+        "ei_skip",
+        "/// requires: xs.len() == 2\n/// ensures: ret == 0\npub fn ei_skip(xs: &[u8]) -> usize { match xs.iter().skip(1).enumerate().next() { Some((i, _)) => i, None => 99 } }",
+    );
+    let Some(skip) = skip else { return };
+    assert!(matches!(skip, FnOutcome::Verified { .. }), "skip(1).enumerate().next().0 is 0, got {skip}");
+    let old = verify_src(
+        "ei_old",
+        "/// requires: xs.len() == 2\n/// ensures: ret == 1\npub fn ei_old(xs: &[u8]) -> usize { match xs.iter().skip(1).enumerate().next() { Some((i, _)) => i, None => 99 } }",
+    );
+    let Some(old) = old else { return };
+    assert!(matches!(old, FnOutcome::Failed { .. }), "1 is the raw slice position, not the enumerate index; must be refuted, got {old}");
+    let after = verify_src(
+        "ei_after",
+        "/// requires: xs.len() == 2\n/// ensures: ret == 1\npub fn ei_after(xs: &[u8]) -> usize { match xs.iter().enumerate().skip(1).next() { Some((i, _)) => i, None => 99 } }",
+    );
+    let Some(after) = after else { return };
+    assert!(matches!(after, FnOutcome::Verified { .. }), "enumerate().skip(1).next().0 is 1, got {after}");
+    let rev = verify_src(
+        "ei_rev",
+        "/// requires: xs.len() == 2\n/// ensures: ret == 0\npub fn ei_rev(xs: &[u8]) -> usize { match xs.iter().rev().enumerate().next() { Some((i, _)) => i, None => 99 } }",
+    );
+    let Some(rev) = rev else { return };
+    assert!(matches!(rev, FnOutcome::Verified { .. }), "rev().enumerate().next().0 is 0, got {rev}");
+}

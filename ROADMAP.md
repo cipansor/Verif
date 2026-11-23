@@ -1812,17 +1812,31 @@ slice/array length cannot change, so the rebind is a no-op there; only a `&mut V
 pushed length. Pinned both ways by `a_mut_vec_postcondition_reads_the_final_length` (false `== 0`
 refuted, true `== 1` verified).
 
+**Round 17 — `enumerate` index counts from the enumerate's own start (FIXED).**
+`skip(1).enumerate().next().0` reported the raw slice position (`1`) instead of the
+enumerate index (`0`), and `rev().enumerate()` likewise. `IterState` gained `enum_start`
+(set to `pos` when `enumerate` is applied, which rides the `SliceCopied` arm); the yielded
+index is `pos - enum_start`. `enumerate().skip(1)` still yields `1` (skip advances `pos`
+after the enumerate recorded its start). Pinned by
+`an_enumerate_index_counts_from_the_enumerates_start` (skip/rev index 0, the old raw-position
+value refuted, `enumerate().skip(1)` index 1).
+
+**Fixed already (rounds 10–17):** compound-closure refusals, `Vec::clear` of droppable
+elements, `*b = v` through a `Box`, mutable-`Vec` postcondition length (16), adapter-chain/
+reversed-reduction refusals, `enumerate` index (17), wrapper `--extern`/`-L` forwarding +
+build-script forwarding, custom source path, action ref, literal-masking replay lexer,
+`source_arg` option-value parsing.
+
 **Tracked (open):**
-- Executor: compound iterator closures (`closure_map`/`closure_binop`/`closure_filter`
-  read an intermediate as the result), `Vec::clear`/drops of user-`Drop` elements,
-  `*b = v` through a `Box` (stale payload), mutable-`Vec` postcondition length, adapter
-  chains (`next`/`fold`/`all`/`any`/`last`/`nth` after `map`/`filter`/`rev`/`skip`/`take`/
-  `step_by`/`enumerate`), reversed reductions, padded mapped sums, enumeration index,
-  `iterator_const_len` pin reuse, `all`/`any` discarding a live cursor.
+- Executor/iterator: `iterator_const_len` pin reuse, mapped sums including padded zeros,
+  composed `rev`/`step_by`/`skip`/`take`/`nth` adapters. (`all`/`any` audited — they consume
+  the iterator by removing the cursor, which is correct.)
 - Spec multi-file: `#[path]`/nested external modules (silent skip); method matching after
   external declarations (synthetic line coordinates); `--emit-test` for module functions.
-- `verif-wrap`: forward the real `--extern`/`-L` (own lib, workspace/custom target dir,
-  renamed/custom-name deps), build-script targets, nested wrappers, cached-build
-  invalidation, custom source paths, inactive `#[cfg]` contracts.
-- Docs/tooling: qualification determinism (per-function verdict equality, not a count),
-  SARIF module paths, action ref, iterator differential harness, `checked_ilog` base.
+- `verif-wrap`: nested Cargo wrappers, cached-build invalidation (documented, not fixed),
+  inactive `#[cfg]` contracts (audited — a `#[cfg]` line clears `pending`, so a disabled
+  fn's contract does not leak onto the next function).
+- CLI: `cargo verif` (non-wrapper) still uses mtime-ranked `crate_options`, so workspace/
+  custom-target/renamed-dependency resolution is fixed only for the wrapper.
+- Docs/tooling: SARIF module paths, iterator differential harness, `checked_ilog` base
+  (audited — `checked_ilog(base)` is refused, not mis-modelled).

@@ -695,6 +695,10 @@ struct IterState {
     map: Option<MapOp>,
     /// `Iterator::filter`'s lazy element predicate, or `None`.
     filter: Option<FilterOp>,
+    /// The `pos` when `Iterator::enumerate` was applied, so the yielded index is
+    /// `pos - enum_start` (0, 1, ... from the enumerate's own start) rather than the
+    /// raw slice position -- `skip(2).enumerate()` must yield index 0 first.
+    enum_start: Option<u64>,
 }
 
 /// A `map` closure's transform: `|x| x <op> rhs` (or `rhs <op> x`), checked or
@@ -6059,7 +6063,7 @@ fn slice_iter(
             if s.elem_w == 0 {
                 return Err(format!("`{name}` on a slice whose element width is not modelled"));
             }
-            env.iters.insert(dest.local, IterState { base: recv.local, pos: 0, rev: false, step: 1, end: None, map: None, filter: None });
+            env.iters.insert(dest.local, IterState { base: recv.local, pos: 0, rev: false, step: 1, end: None, map: None, filter: None, enum_start: None });
             Ok(Vec::new())
         }
         // `copied()` wraps the cursor in an adapter that yields `T` instead of `&T`.
@@ -6070,7 +6074,15 @@ fn slice_iter(
             let Some(it) = env.iters.get(&recv.local).copied() else {
                 return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
             };
-            env.iters.insert(dest.local, it);
+            // `enumerate()` rides this arm (its cursor is unchanged), but it records
+            // where its own index count starts, so `skip(2).enumerate()` yields index
+            // 0 first rather than the raw slice position 2.
+            let next = if name.contains("enumerate") {
+                IterState { enum_start: Some(it.pos), ..it }
+            } else {
+                it
+            };
+            env.iters.insert(dest.local, next);
             Ok(Vec::new())
         }
         // `rev()` flips the cursor's direction, carried to the destination like
@@ -6321,8 +6333,13 @@ fn slice_iter(
                 // read falls back to), and the payload itself is `Val::Agg` so a
                 // whole-payload copy does not read a wrong single word. The element
                 // identity is recorded so `*((_7 as Some).0).1` resolves to `xs[pos]`.
-                env.elems
-                    .insert((dest.local, 0), Val::Sym(smt::word(pos, 64), Sign::Unsigned));
+                env.elems.insert(
+                    (dest.local, 0),
+                    Val::Sym(
+                        smt::word(pos.saturating_sub(it.enum_start.unwrap_or(0)), 64),
+                        Sign::Unsigned,
+                    ),
+                );
                 env.elems.insert((dest.local, 1), Val::Sym(elem, sign));
                 env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Agg, 0);
             } else {
