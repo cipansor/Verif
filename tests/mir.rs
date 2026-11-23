@@ -14816,3 +14816,21 @@ fn extreme_folds_the_reversed_prefix() {
         "rev().take(2).max() is 50, so == 20 must be refuted"
     );
 }
+
+#[test]
+fn all_any_fold_the_reversed_prefix() {
+    // `rev().take(3).any(|x| *x == 20)` is false: the reversed prefix is [50,40,30].
+    // `all`/`any` read forward ([10,20,30], which contains 20), so the false verdict was
+    // proved and the true one refuted -- the same `rev`-mapping bug `slice_extreme` had.
+    let pre = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n";
+    let b = |name: &str, e: bool, body: &str| {
+        verify_src(name, &format!("{pre}/// ensures: ret == {e}\npub fn {name}(xs: &[u8]) -> bool {{ {body} }}"))
+    };
+    assert!(b("rta", false, "xs.iter().rev().take(3).any(|x| *x == 20)").is_some_and(|o| o.is_verified()));
+    assert!(b("rtl", true, "xs.iter().rev().take(3).all(|x| *x > 25)").is_some_and(|o| o.is_verified()));
+    // Teeth: the pre-fix (forward) `any` found 20 -> true; it is false, so == true is refuted.
+    assert!(
+        matches!(b("rtaf", true, "xs.iter().rev().take(3).any(|x| *x == 20)"), Some(FnOutcome::Failed { .. })),
+        "rev().take(3).any(==20) is false, so == true must be refuted"
+    );
+}

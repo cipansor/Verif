@@ -6259,9 +6259,13 @@ fn slice_iter(
             };
             let sign = Sign::of_bool(elem_signed);
             let mut acc = smt::truth(is_all);
+            // A `rev` cursor yields base `n-1-pos`, `n-1-pos-step`, ...; read the
+            // reversed base so `rev().take(k).any/all` folds the reversed prefix, not the
+            // forward one (a false proof of the wrong verdict).
+            let base_of = |p: u64| if it.rev { n - 1 - p } else { p };
             let mut k = it.pos;
             while k < hi {
-                let Some((elem, _)) = env.index_elem(it.base, k) else {
+                let Some((elem, _)) = env.index_elem(it.base, base_of(k)) else {
                     return Err(format!("`{name}` on an iterator whose elements are not modelled"));
                 };
                 let pred = filter_pred(fl, elem, elem_w, sign)?;
