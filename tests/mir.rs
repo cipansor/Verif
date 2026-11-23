@@ -14763,3 +14763,19 @@ fn take_cap_is_respected_by_last_and_count() {
     assert!(cnt("c0", "xs.iter().take(0).count()", 0).is_some_and(|o| o.is_verified()));
     assert!(cnt("c2", "xs.iter().take(2).count()", 2).is_some_and(|o| o.is_verified()));
 }
+
+#[test]
+fn nth_advances_by_step() {
+    // `nth(k)` consumes k+1 *yielded* elements, each `step` apart, so the cursor must
+    // advance by `(k+1)*step`. A bare `+1` under-advanced after `step_by`, so a later
+    // `count()` miscounted (a false proof of the wrong count).
+    let f = |name: &str, n: u64| {
+        verify_src(name, &format!("/// requires: xs.len() == 12\n/// ensures: ret == {n}\npub fn {name}(xs: &[u8]) -> usize {{ let mut it = xs.iter().step_by(3); let _ = it.nth(1); it.count() }}"))
+    };
+    // step_by(3) over len 12 yields 0,3,6,9; nth(1) takes base 3, leaving 6,9 -> 2.
+    assert!(f("nc", 2).is_some_and(|o| o.is_verified()));
+    assert!(
+        matches!(f("ncf", 3), Some(FnOutcome::Failed { .. })),
+        "the remaining count is 2, so == 3 must be refuted"
+    );
+}

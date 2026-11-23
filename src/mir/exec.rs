@@ -6530,9 +6530,10 @@ fn slice_iter(
             env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
             env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(elem, sign), elem_w);
             env.slice_elem_ref.insert(dest.local, ElemId::Leaf((it.base, idx)));
-            // `nth` consumes the returned element, so the cursor advances past it.
+            // `nth(k)` consumes the k+1 yielded elements, each `step` apart, so the next
+            // yield is at `j + step` -- a bare `j + 1` under-advances after `step_by`.
             if let Some(it) = env.iters.get_mut(&recv.local) {
-                it.pos = j.saturating_add(1);
+                it.pos = j.saturating_add(it.step);
             }
             Ok(Vec::new())
         }
