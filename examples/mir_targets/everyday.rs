@@ -256,3 +256,51 @@ spec! {
 pub fn pct(x: u8) -> u8 {
     x / 10
 }
+
+// ---------------------------------------------------------------------------
+// Decidable variants of the three gaps above
+//
+// The corpus rule is "do not edit a function to make it decide: add a new one
+// and leave the old one as the record". So the three gaps above stay, and these
+// show the *decidable* shape of each:
+//
+//   * `sum_iter` needs a constant length (a symbolic-length `sum` is a fold over
+//     a symbolic count -- a quantifier, C12); `sum_iter_bounded` pins it.
+//   * `tri` is a `for` loop over a symbolic range, which needs a bounded unwind;
+//     the range desugaring makes 101 unrollings too expensive, so `tri_bounded`
+//     uses a small bound and `unwind: 11`.
+//   * `div_unwrap` divides `u32` by a symbolic `d`, which is the BDD divider wall
+//     (C7); `div_unwrap_byte` divides `u8`, where the divider decides.
+// ---------------------------------------------------------------------------
+
+spec! {
+    requires: v.len() == 2 && v[0] <= 1000 && v[1] <= 1000,
+    ensures: ret == v[0] + v[1],
+}
+/// A sum over a length the contract pins, with elements small enough not to wrap.
+pub fn sum_iter_bounded(v: &[u32]) -> u32 {
+    v.iter().sum()
+}
+
+spec! {
+    requires: n <= 10,
+    ensures: ret <= 55,
+    unwind: 11,
+}
+/// The same counted loop with a bound small enough to unwind.
+pub fn tri_bounded(n: u32) -> u32 {
+    let mut s = 0;
+    for i in 0..=n {
+        s += i;
+    }
+    s
+}
+
+spec! {
+    requires: d != 0,
+    ensures: ret <= n,
+}
+/// Guarded division at a width the divider decides.
+pub fn div_unwrap_byte(n: u8, d: u8) -> u8 {
+    n.checked_div(d).unwrap()
+}

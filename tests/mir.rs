@@ -12834,13 +12834,14 @@ pub fn guarded(x: u8) -> u8 {
 
 /// C1: a container whose destructor the tool cannot represent is *refused*.
 ///
-/// A `Box<T>` local frees the heap, which is not a bit-vector fact. Assuming the
-/// `drop` were a no-op would be a false proof whenever the destructor's effect is
-/// observable, so the honest answer is a refusal -- not a verdict. This is the
-/// case the dump cannot tell apart from a struct holding a user-`Drop` field (both
-/// print `drop(_x) -> [return: …]`), which is why the no-op is not taken here.
-/// (A `String` is a `Vec<u8>` underneath and *is* glue-free, so it is no longer
-/// this example; a `Box` has no modelled field set.)
+/// An `Rc<T>` local's destructor decrements a refcount and may free the
+/// allocation, which is not a bit-vector fact. Assuming the `drop` were a no-op
+/// would be a false proof whenever the destructor's effect is observable, so the
+/// honest answer is a refusal -- not a verdict. This is the case the dump cannot
+/// tell apart from a struct holding a user-`Drop` field (both print
+/// `drop(_x) -> [return: …]`), which is why the no-op is not taken here.
+/// (A `String` and a `Box<u8>` *are* glue-free, so they are no longer this
+/// example; an `Rc` has no modelled field set.)
 #[test]
 fn an_unmodelled_drop_is_refused_not_assumed_away() {
     let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
@@ -12849,18 +12850,55 @@ spec! {
     requires: true,
     ensures: ret == 1,
 }
-pub fn owns_box(b: Box<u8>) -> u8 {
-    let _owned = b;
+pub fn owns_rc(r: std::rc::Rc<u8>) -> u8 {
+    let _owned = r;
     1
 }
 "#;
-    let Some(o) = verify_src("owns_box", src) else { return };
+    let Some(o) = verify_src("owns_rc", src) else { return };
     match o {
         FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. } => {}
         other => panic!(
-            "a `Box` drop is not representable and must be refused, got: {other} -- \
+            "an `Rc` drop is not representable and must be refused, got: {other} -- \
              a verdict here would be a false proof"
         ),
+    }
+}
+
+/// C11 `Box<T>`: `Box::new` stores the value, the deref reads it back, the
+/// compiler's null/alignment checks are discharged, and a glue-free `Box<T>`
+/// argument's drop is a no-op.
+///
+/// Each true direction must verify and each tripwire must be refuted, so the model
+/// is pinned in both directions -- a `Box` deref that read a constant would prove
+/// the tripwires, and one that read `Unknown` would leave the true directions
+/// undecided.
+#[test]
+fn a_box_new_deref_decides() {
+    let names = [
+        "box_new_reads_its_value",
+        "box_new_reads_its_value_tripwire",
+        "box_guarded_inc",
+        "box_guarded_inc_tripwire",
+        "box_u32_reads_its_value",
+        "owns_box_glue_free",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in [
+        "box_new_reads_its_value",
+        "box_guarded_inc",
+        "box_u32_reads_its_value",
+        "owns_box_glue_free",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in ["box_new_reads_its_value_tripwire", "box_guarded_inc_tripwire"] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` claims a false result and must be refuted, got: {o}"
+        );
     }
 }
 
@@ -12879,7 +12917,7 @@ fn the_drop_fixtures_decide_and_the_false_ones_are_refuted() {
         "destructor_panic_guarded",
         "guard_misguarded_cannot_prove_this",
         "destructor_panic_cannot_prove_this",
-        "box_drop_is_refused",
+        "rc_drop_is_refused",
     ];
     let Some(report) = verify_realistic(&names) else { return };
 
@@ -12908,9 +12946,9 @@ fn the_drop_fixtures_decide_and_the_false_ones_are_refuted() {
         }
     }
     // A container drop is a refusal, not a verdict.
-    match outcome(&report, "box_drop_is_refused") {
+    match outcome(&report, "rc_drop_is_refused") {
         FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. } => {}
-        other => panic!("a `String` drop must be refused, got: {other}"),
+        other => panic!("an `Rc` drop must be refused, got: {other}"),
     }
 }
 

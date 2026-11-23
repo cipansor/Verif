@@ -458,6 +458,15 @@ pub enum Intrinsic {
     /// [`names_string_impl`]) so a user type spelled `String` is refused, and the
     /// same-dump lookup answers a real body first.
     StringMethod(StringMethod),
+    /// `Box::<T>::new`: the boxed-value model.
+    ///
+    /// A `Box<T>` is a pointer to a heap `T`, and the dump never prints the
+    /// allocation, so the model tracks the *boxed value* the executor stored at
+    /// construction and makes the pointer a nonzero token. The compiler's null
+    /// check before the deref (`Ne(SIZE, 0) && Eq(ptr, 0)`) is then discharged, and
+    /// `*b` reads the stored value. A `Box<T>`'s drop glue is `T`'s, so a
+    /// `Box<u8>` is glue-free while a `Box<PanicOnDrop>` is not.
+    BoxMethod(BoxMethod),
     /// `iN::abs_diff`: the absolute difference of two operands, as the type.
     ///
     /// Its result is *unsigned* even on a signed type -- `i8::abs_diff(-128, 127)`
@@ -756,6 +765,20 @@ pub enum StringMethod {
     Len,
     /// `String::is_empty(&self) -> bool` -> the length is zero.
     IsEmpty,
+}
+
+/// The one `Box` method modelled: `Box::new`.
+///
+/// A `Box<T>` is a pointer to a heap `T`; the dump never prints the allocation, so
+/// the model tracks the *boxed value* the executor stored at construction and makes
+/// the pointer a nonzero token (so the null check `Ne(SIZE, 0) && Eq(ptr, 0)` the
+/// compiler inserts before the deref is discharged). The deref `*b` then reads the
+/// stored value. `T`'s own drop glue is honoured by `drop_is_noop`, so a `Box<T>`
+/// is glue-free exactly when `T` is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoxMethod {
+    /// `Box::<T>::new(v)` -> a box holding `v`.
+    New,
 }
 
 /// Which extreme `Iterator::max`/`Iterator::min` computes.
@@ -1410,6 +1433,10 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             _ => {}
         }
     }
+    // `Box::<T>::new(v)`: the boxed-value model.
+    if names_box_impl(name) && short == "new" {
+        return Some(Intrinsic::BoxMethod(BoxMethod::New));
+    }
     // `v[i]` and `v.first()`/`v.get(k)` reach `Vec` through a *trait* projection
     // (`<Vec<u8> as Index<usize>>::index`, `<Vec<u8> as Deref>::deref`), which
     // carries no `vec::Vec` path, so the bare-`Vec` head is matched separately and
@@ -2046,6 +2073,17 @@ pub fn names_string_impl(name: &str) -> bool {
     }
 }
 
+/// True when a call names the standard library's `Box`.
+///
+/// `Box::<u8>::new` is printed with the type argument (`Box::<u8>::new`) or as
+/// `alloc::boxed::Box::<u8>::new`, so the *path* is checked: a `boxed::Box` segment
+/// or a bare `Box::` head. A user type spelled `Box` in a local module is
+/// `m::Box::new`, which has neither, and the same-dump lookup answers a real body
+/// first regardless.
+pub fn names_box_impl(name: &str) -> bool {
+    name.contains("boxed::Box") || name.starts_with("Box::")
+}
+
 /// The head of a type spelled `<Vec<T> …>` is the standard container.
 ///
 /// rustc prints a `Vec`'s *trait* call with the bare type (`<Vec<u8> as
@@ -2308,6 +2346,8 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         Intrinsic::VecMethod(_) => true,
         // The `String` length model is store-based, answered by the executor.
         Intrinsic::StringMethod(_) => true,
+        // The `Box` model is store-based, answered by the executor.
+        Intrinsic::BoxMethod(_) => true,
         // The `Option` methods. They read the receiver's tag and payload, which
         // live in the executor's stores rather than in an operand term, so there is
         // no width or sign to check here -- `eval` never sees them and the
@@ -2549,6 +2589,11 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
     if matches!(op, Intrinsic::StringMethod(_)) {
         return None;
     }
+    // The `Box` model reads the boxed value the executor stored, so `eval` has
+    // nothing to compute. The executor answers it (see `box_method`).
+    if matches!(op, Intrinsic::BoxMethod(_)) {
+        return None;
+    }
     // The `Option` methods read the receiver's tag and payload from the executor's
     // stores, not from an operand term, so `eval` has nothing to compute for them
     // either. The executor answers them (see `enum_method`).
@@ -2578,6 +2623,7 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         // The `String` length model is answered by the executor's `string_method`;
         // the early return above keeps it from reaching here.
         Intrinsic::StringMethod(_) => unreachable!("String methods are answered by the executor"),
+        Intrinsic::BoxMethod(_) => unreachable!("Box methods are answered by the executor"),
         // Answered by `eval_slice` from the executor's length variable; the early
         // return above keeps them from reaching here.
         Intrinsic::SliceLen

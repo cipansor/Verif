@@ -14006,12 +14006,74 @@ spec! {
     requires: true,
     ensures: ret == 1,
 }
-/// A `Box<T>` local: its destructor frees the heap, which this tool cannot
-/// represent, so the `drop` is *refused* -- never assumed to be a no-op. Assuming
-/// it were a no-op would be a false proof whenever the destructor's effect is
-/// observable, which is the one outcome this crate must never produce. (A `String`
-/// is a `Vec<u8>` underneath and is glue-free; `Box` has no modelled field set.)
-pub fn box_drop_is_refused(b: Box<u8>) -> u8 {
+/// An `Rc<T>` local: its destructor decrements a refcount and may free the
+/// allocation, which this tool cannot represent, so the `drop` is *refused* --
+/// never assumed to be a no-op. Assuming it were a no-op would be a false proof
+/// whenever the destructor's effect is observable, which is the one outcome this
+/// crate must never produce. (A `Box<u8>` and a `String` are glue-free and are
+/// modelled; `Rc` has no modelled field set.)
+pub fn rc_drop_is_refused(r: std::rc::Rc<u8>) -> u8 {
+    let _owned = r;
+    1
+}
+
+spec! {
+    requires: true,
+    ensures: ret == x,
+}
+/// `Box::new` + a deref: the boxed value is read back (`C11` `Box<T>`).
+pub fn box_new_reads_its_value(x: u8) -> u8 {
+    let b = Box::new(x);
+    *b
+}
+
+spec! {
+    requires: true,
+    ensures: ret == x + 1,
+}
+/// The same body claiming the wrong value must be refuted -- the deref reads the
+/// box, not a constant.
+pub fn box_new_reads_its_value_tripwire(x: u8) -> u8 {
+    let b = Box::new(x);
+    *b
+}
+
+spec! {
+    requires: x < 255,
+    ensures: ret == x + 1,
+}
+/// A guarded increment through a box: the add cannot overflow.
+pub fn box_guarded_inc(x: u8) -> u8 {
+    let b = Box::new(x);
+    *b + 1
+}
+
+spec! {
+    requires: x < 255,
+    ensures: ret == x + 2,
+}
+/// The same guarded body claiming the wrong result must be refuted.
+pub fn box_guarded_inc_tripwire(x: u8) -> u8 {
+    let b = Box::new(x);
+    *b + 1
+}
+
+spec! {
+    requires: true,
+    ensures: ret == x,
+}
+/// A `u32` box: the deref's alignment check (`addr & (ALIGN-1) == 0`) is discharged.
+pub fn box_u32_reads_its_value(x: u32) -> u32 {
+    let b = Box::new(x);
+    *b
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
+/// A `Box<u8>` argument's implicit drop is glue-free (it runs no `Drop`).
+pub fn owns_box_glue_free(b: Box<u8>) -> u8 {
     let _owned = b;
     1
 }

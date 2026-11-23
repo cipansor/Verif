@@ -865,6 +865,13 @@ struct Env {
     /// spelling. Kept raw -- not decoded -- because the decode needs the argument
     /// count, which only the consuming call knows.
     tmpl_bytes: BTreeMap<u32, Vec<u8>>,
+    /// The value each `Box` local holds, keyed by the box local. `Box::<T>::new(v)`
+    /// stores `v` here; the compiler's null check reads a nonzero pointer token from
+    /// the box's field 0, and the deref `*b` reads this back.
+    boxed: BTreeMap<u32, Val>,
+    /// The pointer local a `Box`'s deref goes through, mapped to the box local.
+    /// `_3 = (_2.0) as *const u8` records `_3 -> _2`, so `*_3` reads `boxed[_2]`.
+    box_refs: BTreeMap<u32, u32>,
     /// The string pieces of each `promoted` constant, copied from
     /// [`crate::mir::parse::MirProgram::promoted_strs`] so `eval_rvalue` can read
     /// a `const NAME::promoted[0]` operand without the whole program in hand.
@@ -963,6 +970,8 @@ impl Env {
             strs: BTreeMap::new(),
             piece_sets: BTreeMap::new(),
             tmpl_bytes: BTreeMap::new(),
+            boxed: BTreeMap::new(),
+            box_refs: BTreeMap::new(),
             promoted: BTreeMap::new(),
         }
     }
@@ -1703,6 +1712,11 @@ impl Env {
                             };
                             return eval_elem_id(id, &read).unwrap_or(Val::Unknown);
                         }
+                        // A `Box`'s deref: `_3` was built from a box's field 0, so
+                        // `*_3` is the boxed value the executor stored at `new`.
+                        if let Some(&boxl) = self.box_refs.get(&p.local) {
+                            return self.boxed.get(&boxl).copied().unwrap_or(Val::Unknown);
+                        }
                     }
                     if i != 0 || !self.deref_ok.contains_key(&p.local) {
                         return Val::Unknown;
@@ -2069,6 +2083,8 @@ impl Env {
         self.strs.remove(&local);
         self.piece_sets.remove(&local);
         self.tmpl_bytes.remove(&local);
+        self.boxed.remove(&local);
+        self.box_refs.remove(&local);
         self.iters.remove(&local);
         // A `Vec` local overwritten as a whole place is no longer the value the
         // length and elements were tracking, so the whole entry is dropped rather
@@ -6160,6 +6176,20 @@ pub(crate) fn vec_elem_ty_loose(name: &str) -> Option<Ty> {
     crate::mir::spec::angle_inner(name).map(Ty::parse)
 }
 
+/// The element type of a standard `Box<T>`, from its printed name.
+///
+/// The head is checked against the *full* path (`std::boxed::Box` /
+/// `alloc::boxed::Box`), because a user `struct Box` must not be treated as the
+/// container: a `Box<T>`'s drop glue is `T`'s, so a user `Box` mis-read here would
+/// be a false "glue-free" and hide a panicking destructor.
+pub(crate) fn box_elem_ty(name: &str) -> Option<Ty> {
+    let head = name.split('<').next().unwrap_or(name).trim();
+    if head != "std::boxed::Box" && head != "alloc::boxed::Box" {
+        return None;
+    }
+    crate::mir::spec::angle_inner(name).map(Ty::parse)
+}
+
 /// The `Vec<T>` model: a length plus the elements, an `indexed` store exactly as a
 /// slice has.
 ///
@@ -6192,6 +6222,33 @@ pub(crate) fn vec_elem_ty_loose(name: &str) -> Option<Ty> {
 ///   created by a deref'd read is not the one a later `v[k]` creates, so
 ///   `v.first() == v[0]` is a lost proof in that one ordering -- never a false one.
 #[allow(clippy::too_many_arguments)]
+fn box_method(
+    name: &str,
+    kind: intrinsics::BoxMethod,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+) -> Result<Vec<Obligation>, String> {
+    match kind {
+        intrinsics::BoxMethod::New => {
+            let Some(a) = args.first() else {
+                return Err(format!("`{name}` with no argument"));
+            };
+            let v = operand(env, a);
+            env.boxed.insert(dest.local, v);
+            // The compiler reads the box's field 0 as the pointer, then checks it
+            // against null. A nonzero token makes `Eq(ptr, 0)` false, so the null
+            // check (with `Ne(SIZE, 0)`) is discharged and the deref is reachable.
+            // A large power of two: nonzero (the null check passes) and a multiple
+            // of any primitive alignment up to 2^24 (the alignment check
+            // `addr & (ALIGN - 1) == 0` passes for every `T` the model holds).
+            env.fields
+                .insert((dest.local, 0), Val::Sym(smt::word(1 << 24, 64), Sign::Unsigned));
+            Ok(Vec::new())
+        }
+    }
+}
+
 fn string_method(
     name: &str,
     kind: intrinsics::StringMethod,
@@ -6740,6 +6797,11 @@ fn try_intrinsic(
                 // in the conversion branch), and the same-dump lookup answers a real
                 // body first, which keeps a local type spelled `String` out.
                 | intrinsics::Intrinsic::StringMethod(_)
+                // `Box::<T>::new` is an inherent method on the standard `Box` and
+                // carries no `<impl`, so it needs the exception too. `classify`
+                // accepts it only for the standard `Box` path (`names_box_impl`),
+                // and the same-dump lookup answers a real body first.
+                | intrinsics::Intrinsic::BoxMethod(_)
                 // Slice iteration is a *trait* call too (`<&[u8] as
                 // IntoIterator>::into_iter`, `<slice::Iter as Iterator>::next`), so
                 // it has no `<impl`. `classify` accepts it only for a `[T]` head or
@@ -6806,6 +6868,11 @@ fn try_intrinsic(
     // before the operand read.
     if let intrinsics::Intrinsic::StringMethod(kind) = op {
         return Some(string_method(name, kind, args, dest, env, cur));
+    }
+    // The `Box` model. `Box::<T>::new` stores the boxed value and a nonzero
+    // pointer token; the deref reads it back (see `get`'s `Deref` arm).
+    if let intrinsics::Intrinsic::BoxMethod(kind) = op {
+        return Some(box_method(name, kind, args, dest, env));
     }
     // The operand width, from the first argument's declared type. It is not the
     // destination's: `checked_add` on a `u8` writes an `Option<u8>`, and taking
@@ -7701,6 +7768,15 @@ where
                     }
                 }
                 st.env.set(dest, v);
+                // A `Box`'s pointer: `_5 = (_2.0) as *const u8` names box `_2`'s
+                // field 0, so `*_5` reads the boxed value. Recorded *after* `set`,
+                // because a whole-place write forgets the destination's parts (and
+                // this mapping with them).
+                if let Rvalue::Cast(Operand::Copy(q) | Operand::Move(q), _) = rv {
+                    if q.proj.as_slice() == [Proj::Field(0)] && st.env.boxed.contains_key(&q.local) {
+                        st.env.box_refs.insert(dest.local, q.local);
+                    }
+                }
                 // A promoted `&[&str]` constant (`_4 = const f::promoted[0]`) is the
                 // format-piece array a `panic!`/`assert!` message is built from on
                 // edition 2024. Its pieces are recorded *here*, after `set`, because
@@ -8419,7 +8495,7 @@ where
                 report.unknown_paths.push("drop of a place with no modelled type".into());
                 return;
             };
-            if drop_is_noop(&ty) {
+            if drop_is_noop(&ty) || std_container_glue_free(&ty, callees.structs()) {
                 let next = State { block: *target, ..st };
                 advance(prog, next, *target, report, work, pins);
                 return;
@@ -8839,6 +8915,30 @@ where
 /// of which has a destructor. Treating it as nothing to run would be a false
 /// proof whenever that destructor is observable, so it is refused instead. A
 /// user `impl Drop` for it is found by [`drop_destructor`] and executed; a
+/// A *bare* standard container whose destructor runs no `Drop` (`Box<T>`,
+/// `String`, `Vec<T>` with a glue-free element).
+///
+/// rustc prints a function *argument*'s type by its shortest crate-unique path, so
+/// a `Box<u8>` argument's `drop` names `Box<u8>` rather than `std::boxed::Box<u8>`.
+/// A bare name is only the standard type when the crate declares no struct of that
+/// name: a user `struct Box` shadowing it would otherwise be read as glue-free and
+/// hide a panicking destructor, which is a false proof. The declared layouts are
+/// what settle it, so this takes them.
+fn std_container_glue_free(ty: &Ty, structs: &BTreeMap<String, spec::StructDef>) -> bool {
+    let Ty::Other(name) = ty else { return false };
+    let head = name.split('<').next().unwrap_or(name).trim();
+    let elem = || crate::mir::spec::angle_inner(name).map(|t| drop_is_noop(&Ty::parse(t)));
+    match head {
+        "std::boxed::Box" | "alloc::boxed::Box" => elem().unwrap_or(false),
+        "Box" => !structs.contains_key(head) && elem().unwrap_or(false),
+        "std::string::String" | "alloc::string::String" => true,
+        "String" => !structs.contains_key(head),
+        "std::vec::Vec" | "alloc::vec::Vec" => elem().unwrap_or(false),
+        "Vec" => !structs.contains_key(head) && elem().unwrap_or(false),
+        _ => false,
+    }
+}
+
 /// container is refused. See the `Term::Drop` executor arm.
 fn drop_is_noop(ty: &Ty) -> bool {
     match ty {
@@ -8880,6 +8980,12 @@ fn drop_is_noop(ty: &Ty) -> bool {
             if name.contains("string::String") {
                 return true;
             }
+            // A `Box<T>` runs `T`'s destructor, so it is glue-free exactly when `T`
+            // is: `Box<u8>` yes, `Box<PanicOnDrop>` no. The head is the full path,
+            // so a user `struct Box` is not the container.
+            if let Some(elem) = box_elem_ty(name) {
+                return drop_is_noop(&elem);
+            }
             if let Some(elem) = array_into_iter_elem(name) {
                 return drop_is_noop(&elem);
             }
@@ -8888,6 +8994,50 @@ fn drop_is_noop(ty: &Ty) -> bool {
                 None => false,
             }
         }
+    }
+}
+
+/// The `size_of` a `SizedTypeProperties::SIZE` constant names, from its path
+/// `<T as std::mem::SizedTypeProperties>::SIZE`.
+///
+/// Only `SIZE != 0` is used (the compiler's null check before a `Box` deref), so a
+/// primitive's size is exact and any other type is a nonzero placeholder -- a
+/// zero-sized type's `SIZE` is `0`, but the null check folds to `false` either way.
+fn size_of_type_name(name: &str) -> u64 {
+    let ty = name
+        .split_once('<')
+        .and_then(|(_, r)| r.split_once(" as "))
+        .map(|(t, _)| t.trim())
+        .unwrap_or("");
+    match ty {
+        "u8" | "i8" | "bool" => 1,
+        "u16" | "i16" => 2,
+        "u32" | "i32" | "char" | "f32" => 4,
+        "u64" | "i64" | "usize" | "isize" | "f64" => 8,
+        "u128" | "i128" => 16,
+        _ => 1,
+    }
+}
+
+/// The `align_of` a `SizedTypeProperties::ALIGN` constant names, from its path
+/// `<T as std::mem::SizedTypeProperties>::ALIGN`.
+///
+/// The deref's alignment check is `address & (ALIGN - 1) == 0`, and the pointer
+/// token the model stores is a large power of two, so any alignment up to that
+/// power passes. An unknown type's alignment is `1` (no mask), the conservative
+/// value: it never makes an aligned pointer look misaligned.
+fn align_of_type_name(name: &str) -> u64 {
+    let ty = name
+        .split_once('<')
+        .and_then(|(_, r)| r.split_once(" as "))
+        .map(|(t, _)| t.trim())
+        .unwrap_or("");
+    match ty {
+        "u16" | "i16" => 2,
+        "u32" | "i32" | "char" | "f32" => 4,
+        "u64" | "i64" | "usize" | "isize" | "f64" => 8,
+        "u128" | "i128" => 16,
+        _ => 1,
     }
 }
 
@@ -9275,7 +9425,19 @@ fn operand(env: &mut Env, o: &Operand) -> Val {
             // expression rather than a literal -- stays unknown; the enum case is
             // resolved by the caller in `eval_rvalue`, which knows the
             // destination's width.
-            Const::Other(name) => match env.consts.get(name) {
+            Const::Other(name) => {
+                // `<T as std::mem::SizedTypeProperties>::SIZE` is the compiler's
+                // `size_of` in the null check before a `Box` deref. Only `!= 0` is
+                // used, so the primitive sizes are exact and anything else is a
+                // nonzero placeholder.
+                if name.contains("SizedTypeProperties>::SIZE") {
+                    return Val::Sym(smt::word(size_of_type_name(name), 64), Sign::Unsigned);
+                }
+                // The alignment the deref's mask is built from (`ALIGN - 1`).
+                if name.contains("SizedTypeProperties>::ALIGN") {
+                    return Val::Sym(smt::word(align_of_type_name(name), 64), Sign::Unsigned);
+                }
+                match env.consts.get(name) {
                 Some(Const::UInt(v, ty)) => match ty.as_ref().and_then(|t| t.width()) {
                     Some(1) => Val::Bool(smt::truth(*v == 1)),
                     Some(w) => {
@@ -9286,7 +9448,8 @@ fn operand(env: &mut Env, o: &Operand) -> Val {
                 },
                 Some(Const::Bool(b)) => Val::Bool(smt::truth(*b)),
                 _ => Val::Unknown,
-            },
+                }
+            }
             Const::Unit => Val::Unknown,
         },
     }
@@ -9454,6 +9617,19 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
                 }
             }
             let v = operand(env, o);
+            // A cast to a raw pointer (`*const T`/`*mut T`) is a reinterpretation
+            // of a 64-bit word: the `Box` deref's `(_2.0) as *const u8` and the
+            // `as *const ()` / `as usize` chain that follows the null check all
+            // carry one token. `Ty::width` has no width for a pointer type, so the
+            // numeric arms below would refuse it; the pointer value is a `u64`.
+            if let Ty::Other(s) = ty {
+                if s.starts_with("*const ") || s.starts_with("*mut ") {
+                    return match v {
+                        Val::Sym(x, _) => Val::Sym(smt::truncate(x, 64), Sign::Unsigned),
+                        _ => Val::Unknown,
+                    };
+                }
+            }
             // The cast's *result* has the target type, so its sign is the
             // target's. The source's sign comes out of the value, which is what
             // decides whether a widening sign-extends or zero-fills.

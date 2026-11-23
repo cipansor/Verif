@@ -10556,7 +10556,41 @@ carry no `<impl`, so the guard would otherwise refuse them. The bytes are not
 modelled, so a contents-dependent method stays refused. Pinned by
 `a_string_length_model_decides_new_from_push_len` (eight verified, two refutations).
 
+## `Box<T>`: the value is stored, the pointer is a token, and the checks are discharged
 
+`Box::<T>::new(v)` + the deref `*b` are modelled (`Intrinsic::BoxMethod`). The dump
+never prints the allocation, so `box_method` stores `v` in `Env::boxed[local]` and
+writes a **large power-of-two token** to the box's field 0 -- `1 << 24`, which is
+nonzero (the compiler's null check `Ne(SIZE, 0) && Eq(ptr, 0)` is discharged) and a
+multiple of every primitive alignment (the `addr & (ALIGN-1) == 0` check is too).
+The deref `_5 = (_2.0) as *const u8; *_5` reads the stored value back: the cast
+records `box_refs[5] = 2`, and `get`'s `Deref` arm returns `boxed[2]`.
+
+Three things cost time and are worth keeping:
+
+* **A cast of an *annotated* place was swallowed as a bare place.** `parse_rvalue`
+  tried the `copy`/`move`-place check *before* the cast check, and
+  `parse_place("(_2.0: Unique<u8>) as *const u8")` reads the annotation parens,
+  returns `_2.0`, and ignores the trailing ` as ...` -- so the cast was dropped and
+  the pointer local held the box's *field value*, not a pointer. The cast check now
+  runs first, and it is safe because `find_top_level_as` is depth-aware: a downcast
+  place's ` as ` sits inside parentheses and is invisible to it.
+* **A cast's trailing kind annotation truncated the type.** `dst.split_whitespace()
+  .next()` turned `*const u8 (BoxDerefTransmute)` into `*const`, which has no width.
+  `strip_cast_kind` removes a trailing ` (Kind)` (a non-empty, uppercase-initial
+  parenthesised identifier) so `*const ()`'s empty `()` is kept.
+* **`SizedTypeProperties::{SIZE, ALIGN}` are in the constant's path.** The null and
+  alignment checks read `<T as std::mem::SizedTypeProperties>::SIZE` / `::ALIGN`;
+  both are modelled from the type in the path, so the checks fold rather than
+  leaving the assert unmodelled.
+
+A `Box<T>`'s drop glue is `T`'s: `drop_is_noop(Box<u8>)` is true, `Box<PanicOnDrop>`
+is not (`box_elem_ty` reads the element). A *bare* `Box<u8>` -- how an argument
+prints -- is accepted only when the crate declares no `struct Box`
+(`std_container_glue_free` takes the declared layouts), so a shadowing user type
+with a destructor is not read as glue-free. An explicit `std::mem::drop(b)` call is
+still refused (it lowers to a `std::mem::drop::<T>` call, not the `drop(_2)`
+terminator). Pinned by `a_box_new_deref_decides` (four verified, two refuted).
 
 
 ## A qualified type name must not resolve to a bare layout

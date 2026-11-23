@@ -1003,8 +1003,30 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     no longer reads the entry length at the exit (`ret == 0` for `ret == 3`); and
     a `Vec` move (`let w = v`) and a returned vector transfer the length to the
     destination rather than dropping it.
-  - Remaining: `Box`, symbolic-length slices. (`String` is done — see the progress
-    note below. Iteration, `pop`, `is_empty` and the **element** model are done.)
+  - Remaining: symbolic-length slices. (`Box<T>` and `String` are done — see the
+    progress notes below. Iteration, `pop`, `is_empty` and the **element** model
+    are done.)
+  - Progress (`Box<T>`): `Box::<T>::new` + the deref `*b` are modelled. The dump
+    never prints the allocation, so `Box::new` stores the boxed value and makes
+    the pointer a large power-of-two token (nonzero, so the compiler's null check
+    `Ne(SIZE, 0) && Eq(ptr, 0)` is discharged, and a multiple of every primitive
+    alignment, so the `addr & (ALIGN-1) == 0` check is too); the deref
+    `_5 = (_2.0) as *const u8; *_5` reads the stored value. Two parser fixes were
+    needed and are general: a cast is now recognised *before* the copy/move-place
+    attempt (a cast of an *annotated* place, `copy (_2.0: Unique<u8>) as *const u8`,
+    was being swallowed as a bare place and the cast dropped), and a cast's
+    trailing kind annotation (` (BoxDerefTransmute)`, ` (PtrToPtr)`) is stripped
+    so `*const u8` is not truncated to `*const`. `SizedTypeProperties::{SIZE,
+    ALIGN}` are modelled from the type in the constant's path. A `Box<T>`'s drop
+    glue is `T`'s, so `drop_is_noop(Box<u8>)` is true while `Box<PanicOnDrop>` is
+    not; the *bare* `Box<u8>` spelling an argument prints is treated as the
+    standard one only when the crate declares no `struct Box` (a shadow would
+    otherwise be read as glue-free and hide a panicking destructor). Fixtures:
+    `box_new_reads_its_value`, `box_guarded_inc`, `box_u32_reads_its_value`,
+    `owns_box_glue_free` and their two tripwires, pinned by
+    `a_box_new_deref_decides`. An explicit `std::mem::drop(b)` call and a
+    symbolic-length `sum` remain refusals (honest incompletenesses); `realistic.rs`
+    656/1198 → 660/1204.
   - Progress (`pop`, `is_empty`): `Vec::is_empty` reads the tracked length;
     `Vec::pop` returns `None` iff the length is zero and decrements it on the
     non-empty path; on a constant-length vector the popped element is the payload.
