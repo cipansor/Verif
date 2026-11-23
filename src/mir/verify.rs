@@ -1485,7 +1485,7 @@ pub fn verify_file_with_opts(
     check_probe_compiler(rustc, opts)?;
     let text = std::fs::read_to_string(source)
         .map_err(|e| format!("could not read {}: {e}", source.display()))?;
-    let specs = spec::extract(&text);
+    let specs = spec::extract_crate(source, &text);
     let (mir, edition) = emit_mir_with_opts(rustc, source, opts)?;
     let prog =
         parse::parse_program_scoped(&mir, &enum_layouts(&specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners, &specs.impl_traits, &specs.impl_trait_args, &specs.declared_traits);

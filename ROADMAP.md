@@ -941,7 +941,7 @@ keeps growing.
 Exit: one real `no_std` crate with a dependency verified end to end with
 `cargo verif`; Kani agrees on every function both tools decide.
 
-- **C8. Cargo, multi-module crates and dependencies.** · P1 · todo · Kani
+- **C8. Cargo, multi-module crates and dependencies.** · P1 · in progress · Kani
   (`cargo kani`)
   - Gap: the frontend runs `rustc --crate-type=lib` on one file, without
     `--extern`, so a crate that `use`s another crate, or a file whose
@@ -949,6 +949,23 @@ Exit: one real `no_std` crate with a dependency verified end to end with
   - Approach: a `cargo verif` subcommand through `cargo rustc`/`RUSTC_WRAPPER`,
     emitting MIR for the target crate with its real flags. Dependency calls are
     answered through contracts (C2), not bodies.
+  - Progress (multi-module, done): `spec::extract_crate` inlines every external
+    `mod name;` declaration (`name.rs` / `name/mod.rs`, recursively) before scanning,
+    so a contract written in a *module file* is read and keyed by the `mod`-qualified
+    path rustc prints for it (`a::clampish`). `cargo verif --file src/lib.rs` on a
+    crate with `pub mod a;` now verifies `a`'s functions instead of reporting "all
+    contracts held" over zero checked functions -- which was a silent pass, the worst
+    direction. A module file that cannot be read stays a bare `mod name;`, so its
+    functions are reported `missing`, never silently passed. Pinned by
+    `extract_crate_reads_external_module_contracts` (the keying) and
+    `a_multi_module_crate_is_verified_through_its_root` (a clean module exits 0, a
+    false one exits 1, each naming the module function).
+  - Remaining: dependency resolution. `MirOptions { externs, search_paths }` already
+    passes `--extern`/`-L` to the frontend's `rustc`, but `cargo verif` does not yet
+    read the crate's own dependencies from `Cargo.lock` / `target/*/deps` and fill
+    them in, so a crate that `use`s another crate still needs the caller to supply
+    them. And the `cargo verif` subcommand is `cargo-verif` (a `[[bin]]`), not a
+    `RUSTC_WRAPPER`.
   - Exit: one function in a real `no_std` crate with at least one dependency
     (an `embedded-hal` driver, say) verified end to end with `cargo verif`.
   - Move: **build**.

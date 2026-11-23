@@ -177,3 +177,42 @@ fn a_function_filter_ignores_the_broken_sibling() {
     assert!(!text.contains("wrong"), "the broken sibling must not be reported:\n{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A multi-file crate: `cargo verif --file src/lib.rs` reads the contracts from the
+/// module files (`mod a;` -> `src/a.rs`), keyed by the `mod`-qualified path, so a
+/// crate's modules are verified -- not silently reported clean. A clean module
+/// verifies (exit 0) and a false contract in the module is refuted (exit 1), each
+/// naming the module function.
+#[test]
+fn a_multi_module_crate_is_verified_through_its_root() {
+    if !have_rustc() {
+        eprintln!("skipping a_multi_module_crate_is_verified_through_its_root: no rustc");
+        return;
+    }
+    let dir = scratch_crate("pub mod a;\n");
+    let lib = dir.join("src").join("lib.rs");
+    let module = dir.join("src").join("a.rs");
+
+    std::fs::write(
+        &module,
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n\
+         spec! { requires: x <= 100, ensures: ret <= 100, }\n\
+         pub fn clampish(x: u8) -> u8 { if x > 100 { 100 } else { x } }\n",
+    )
+    .expect("write module");
+    let (code, out) = run(&[], &lib);
+    assert_eq!(code, 0, "a clean module must verify: {out}");
+    assert!(out.contains("a::clampish"), "the module function must be named: {out}");
+
+    std::fs::write(
+        &module,
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n\
+         spec! { requires: true, ensures: ret == 99, }\n\
+         pub fn bad(x: u8) -> u8 { x }\n",
+    )
+    .expect("rewrite module");
+    let (code, out) = run(&[], &lib);
+    assert_eq!(code, 1, "a false module contract must fail: {out}");
+    assert!(out.contains("a::bad"), "the failing module function must be named: {out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

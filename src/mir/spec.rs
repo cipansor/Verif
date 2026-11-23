@@ -245,6 +245,8 @@ pub enum ParamSlot {
     Named(String),
 }
 
+use std::path::{Path, PathBuf};
+
 /// Every function's contract, keyed by function name.
 #[derive(Clone, Debug, Default)]
 pub struct Specs {
@@ -2001,6 +2003,84 @@ fn parse_use(raw: &str) -> Vec<(String, String)> {
 /// Only `///` (outer) doc comments are read. `//!` (inner) comments are ignored
 /// so that module documentation describing the syntax is not read as a contract
 /// for the next function in the file.
+/// Like [`extract`], but for a *multi-file* crate: it inlines every external
+/// `mod name;` declaration with the contents of `name.rs` / `name/mod.rs`
+/// (recursively) before scanning. A contract written in a module file is then read
+/// and keyed by the same `mod`-qualified path rustc prints for its function, so
+/// `cargo verif --file src/lib.rs` verifies a crate's modules, not just the root.
+///
+/// A module file that cannot be read (or a cycle) is left as the bare `mod name;`
+/// line, so the functions in it are reported `missing` -- never silently passed. The
+/// `line` a contract carries is the line within the module file, so a multi-file
+/// line number is best-effort; the *verdict* and its keying are exact.
+pub fn extract_crate(root: &Path, root_src: &str) -> Specs {
+    let dir = root.parent().unwrap_or_else(|| Path::new("."));
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let inlined = inline_external_modules(root_src, dir, &mut seen);
+    extract(&inlined)
+}
+
+/// Replace each `mod name;` line with an inline `mod name { <file contents> }`.
+fn inline_external_modules(src: &str, dir: &Path, seen: &mut Vec<PathBuf>) -> String {
+    let mut out = String::new();
+    for line in src.lines() {
+        if let Some((vis, name)) = external_mod(line) {
+            let candidates = [dir.join(format!("{name}.rs")), dir.join(&name).join("mod.rs")];
+            if let Some(file) = candidates.iter().find(|p| p.is_file()) {
+                let canonical = file.canonicalize().unwrap_or_else(|_| file.clone());
+                if seen.contains(&canonical) {
+                    out.push_str(line);
+                    out.push('\n');
+                    continue;
+                }
+                if let Ok(sub) = std::fs::read_to_string(file) {
+                    seen.push(canonical);
+                    let body = inline_external_modules(&sub, &dir.join(&name), seen);
+                    out.push_str(&format!("{vis}mod {name} {{\n{body}\n}}\n"));
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Match a bare external-module declaration `[pub[(..)] ] mod name;`, returning the
+/// visibility prefix (with a trailing space, or empty) and the module name. Returns
+/// `None` for an inline `mod name { … }` and for anything that is not that shape.
+fn external_mod(line: &str) -> Option<(String, String)> {
+    let t = line.trim();
+    let (vis, rest) = if let Some(r) = t.strip_prefix("pub(crate) ") {
+        ("pub(crate) ", r)
+    } else if let Some(r) = t.strip_prefix("pub(super) ") {
+        ("pub(super) ", r)
+    } else if let Some(r) = t.strip_prefix("pub(self) ") {
+        ("pub(self) ", r)
+    } else if let Some(r) = t.strip_prefix("pub ") {
+        ("pub ", r)
+    } else {
+        ("", t)
+    };
+    let rest = rest.strip_prefix("mod ")?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    if rest[name.len()..].trim_start().starts_with(';') {
+        Some((vis.to_string(), name))
+    } else {
+        None
+    }
+}
+
+/// Read every contract from a single source string, keyed by the `mod`-qualified
+/// path rustc prints for each function. For a multi-file crate use [`extract_crate`],
+/// which inlines external `mod` declarations first.
 pub fn extract(source: &str) -> Specs {
     let mut specs = Specs::default();
     let mut pending = FnContract::default();
@@ -8745,6 +8825,36 @@ pub fn arg_name_of(
 
 #[cfg(test)]
 mod tests {
+    /// A multi-file crate: `mod a;` in the root is inlined from `a.rs`, so a
+    /// contract written in the module file is read and keyed `a::f` -- the path
+    /// rustc prints for it. Without this, a crate's modules verified *nothing* and
+    /// the report still said "all contracts held".
+    #[test]
+    fn extract_crate_reads_external_module_contracts() {
+        let dir = std::env::temp_dir().join(format!(
+            "verif-extract-crate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "spec! { requires: x <= 100, ensures: ret <= 100, }\npub fn clampish(x: u8) -> u8 { x }\n",
+        )
+        .unwrap();
+        let root = dir.join("lib.rs");
+        std::fs::write(&root, "pub mod a;\n").unwrap();
+        let specs = extract_crate(&root, "pub mod a;\n");
+        let keys: Vec<_> = specs.by_fn.keys().cloned().collect();
+        assert!(specs.by_fn.contains_key("a::clampish"), "keys: {keys:?}");
+        let c = specs.by_fn.get("a::clampish").unwrap();
+        assert!(!c.ensures.is_empty(), "the module contract must be read, not just the name");
+        // `extract` alone (the root text) sees nothing in the module.
+        assert!(!extract("pub mod a;\n").by_fn.contains_key("a::clampish"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A contract written as a `spec! { … }` block is read from the source text,
     /// and it must read *exactly* like the `///` spelling.
     ///
