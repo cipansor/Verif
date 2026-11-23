@@ -91,6 +91,7 @@ fn main() {
     match format.as_str() {
         "human" => print_human(&file, &report),
         "json" => print_json(&file, &report),
+        "sarif" => print_sarif(&file, &report),
         other => {
             eprintln!("cargo-verif: unknown --format `{other}` (human | json)");
             std::process::exit(2);
@@ -168,6 +169,54 @@ fn print_json(file: &Path, report: &verify::FileReport) {
     out.push_str(",\"clean\":");
     out.push_str(if report.is_clean() { "true" } else { "false" });
     out.push_str("}}");
+    println!("{out}");
+}
+
+/// The SARIF 2.1.0 report, so `github/codeql-action/upload-sarif` can annotate a
+/// pull request. One `result` per outcome that is *not* `verified` -- a failure
+/// is an `error`, an incomplete or skipped function is a `warning` -- each
+/// located at the file. A clean run has an empty `results` array, which is what
+/// tells code scanning there is nothing to report.
+fn print_sarif(file: &Path, report: &verify::FileReport) {
+    let mut out = String::from(
+        "{\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\",\"version\":\"2.1.0\",\"runs\":[{",
+    );
+    out.push_str("\"tool\":{\"driver\":{\"name\":\"verif\",\"informationUri\":\"https://github.com/cipansor/verif\",\"rules\":[]}},");
+    out.push_str("\"results\":[");
+    let mut first = true;
+    let mut push = |out: &mut String, rule: &str, level: &str, name: &str, detail: &str, file: &Path| {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str("{\"ruleId\":");
+        json_str(out, rule);
+        out.push_str(",\"level\":");
+        json_str(out, level);
+        out.push_str(",\"message\":{\"text\":");
+        json_str(out, &format!("{name}: {detail}"));
+        out.push_str("},\"locations\":[{\"physicalLocation\":{\"artifactLocation\":{\"uri\":");
+        json_str(out, &file.display().to_string());
+        out.push_str("}}}]}");
+    };
+    for (name, outcome) in &report.outcomes {
+        match outcome {
+            FnOutcome::Verified { .. } => {}
+            FnOutcome::Failed { kind, detail } => {
+                push(&mut out, "verif.failed", "error", name, &format!("{kind} — {detail}"), file)
+            }
+            FnOutcome::Incomplete { reasons, .. } => {
+                push(&mut out, "verif.incomplete", "warning", name, &reasons.join("; "), file)
+            }
+            FnOutcome::Skipped { reason } => {
+                push(&mut out, "verif.skipped", "warning", name, reason, file)
+            }
+        }
+    }
+    for m in &report.missing {
+        push(&mut out, "verif.missing", "warning", m, "contract carried, but no MIR body found", file);
+    }
+    out.push_str("]}]}");
     println!("{out}");
 }
 

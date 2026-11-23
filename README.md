@@ -168,8 +168,20 @@ could not run (no compiler, a compile error). A skipped function is *not* a pass
 its contract could not be read, so it was never checked. The binary is a thin
 wrapper over `mir::verify::verify_file_with`, so it decides exactly what the
 library decides. `--format json` is hand-written (the crate is zero-dependency)
-and emits `file`, `outcomes`, `missing` and a `summary`. `--format sarif` and a
-GitHub Action that annotates a PR are the remaining U2 work.
+and emits `file`, `outcomes`, `missing` and a `summary`; `--format sarif` emits a
+SARIF 2.1.0 document (one `result` per non-verified outcome, `error` for a failure
+and `warning` for an incomplete or skipped one, an empty `results` array on a
+clean run) for GitHub code scanning. Wiring it to `github/codeql-action/upload-sarif`
+is a two-step recipe:
+
+```yaml
+- run: cargo install --path . --features std     # or `cargo install verif --features std`
+- run: cargo verif --format sarif --file src/lib.rs > verif.sarif
+  continue-on-error: true                         # upload the report even on a failure
+- uses: github/codeql-action/upload-sarif@<pinned-sha>
+  if: always()
+  with: { sarif_file: verif.sarif }
+```
 
 ---
 

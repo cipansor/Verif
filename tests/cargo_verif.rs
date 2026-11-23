@@ -125,6 +125,43 @@ fn json_output_is_a_single_object_with_a_summary() {
 }
 
 #[test]
+fn sarif_output_is_a_2_1_0_run_with_one_result_per_failure() {
+    if !have_rustc() {
+        eprintln!("cargo_verif: no rustc; skipping");
+        return;
+    }
+    // A failing function: one `error` result naming it, at version 2.1.0.
+    let dir = scratch_crate(TWO_FNS);
+    let lib = dir.join("src").join("lib.rs");
+    let (code, text) = run(&["--format", "sarif"], &lib);
+    assert_eq!(code, 1, "a false contract must exit 1, output:\n{text}");
+    let sarif = text.trim();
+    for key in [
+        "\"version\":\"2.1.0\"",
+        "\"runs\":",
+        "\"results\":",
+        "\"ruleId\":\"verif.failed\"",
+        "\"level\":\"error\"",
+        "\"text\":\"wrong:",
+    ] {
+        assert!(sarif.contains(key), "SARIF must carry {key}:\n{sarif}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // A clean function: `results` is empty, so code scanning has nothing to report.
+    let dir = scratch_crate(TWO_FNS);
+    let lib = dir.join("src").join("lib.rs");
+    let (code, text) = run(&["--format", "sarif", "--function", "id_pos"], &lib);
+    assert_eq!(code, 0, "a true contract must exit 0, output:\n{text}");
+    let sarif = text.trim();
+    assert!(
+        sarif.contains("\"results\":[]"),
+        "a clean run must emit an empty results array:\n{sarif}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_function_filter_ignores_the_broken_sibling() {
     if !have_rustc() {
         eprintln!("cargo_verif: no rustc; skipping");

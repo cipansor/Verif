@@ -1231,7 +1231,15 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     on a throwaway crate: a true contract exits 0, a false one exits 1 and names
     the postcondition, a `--function` filter ignores a broken sibling, and the
     JSON carries the summary.
-  - Remaining: `--format sarif` and the GitHub Action that annotates a PR.
+  - Progress (SARIF): `--format sarif` emits a SARIF 2.1.0 document -- one
+    `result` per non-`verified` outcome, `error` for a failure and `warning` for
+    an incomplete/skipped/missing function, each located at the file, and an empty
+    `results` array on a clean run -- so `github/codeql-action/upload-sarif` can
+    annotate a pull request. Pinned by
+    `sarif_output_is_a_2_1_0_run_with_one_result_per_failure`.
+  - Remaining: the reusable GitHub Action that wires `--format sarif` to
+    `upload-sarif` (a workflow file, which cannot be exercised in this container,
+    so it is documented as a recipe in the README rather than shipped untested).
   - Exit: `cargo verif --format json|sarif` plus a GitHub Action that annotates a
     PR.
   - Move: **build**.
