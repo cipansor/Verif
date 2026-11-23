@@ -1836,8 +1836,11 @@ build-script forwarding, custom source path, action ref, literal-masking replay 
 `source_arg` option-value parsing.
 
 **Tracked (open):**
-- Executor/iterator: `iterator_const_len` pin reuse, composed `rev`/`step_by`/`skip`/`take`/
-  `nth` adapters. (`all`/`any` audited — they consume
+- Executor/iterator: `iterator_const_len` pin reuse; cross-adapter chains (`rev().step_by()`, …).
+  **Same-adapter chaining is verified composing** (round 20): `take` by `min`, `skip`
+  additively, `step_by` multiplicatively -- `take(2).take(3)` yields 2, not 3 -- pinned by
+  `chained_same_adapters_compose` (the `== 3` twin is refuted). The audit's "chained
+  same-adapter overwrite" is not a bug. (`all`/`any` audited — they consume
   the iterator by removing the cursor, which is correct.)
 - Spec multi-file: `#[path]`/nested external modules (silent skip); method matching after
   external declarations (synthetic line coordinates); `--emit-test` for module functions.

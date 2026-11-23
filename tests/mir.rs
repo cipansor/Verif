@@ -14695,3 +14695,23 @@ fn a_mapped_symbolic_sum_does_not_include_the_padding() {
         "the sum is 1 at len 1, so == 0 must be refuted, got {bad}"
     );
 }
+
+/// Chained same-adapter calls compose: `take` by `min`, `skip` additively, `step_by`
+/// multiplicatively. `take(2).take(3)` must yield 2 elements (the minimum), not 3 (the
+/// second `take`'s count) -- so a "second take overwrites the end" model is refuted by
+/// the false twin. This pins the audit's "chained same-adapter overwrite" concern as
+/// resolved (the model composes; the adapters do not clobber each other).
+#[test]
+fn chained_same_adapters_compose() {
+    let ok = |name: &str, body: &str, n: u64| {
+        verify_src(name, &format!("/// requires: xs.len() == 5\n/// ensures: ret == {n}\npub fn {name}(xs: &[u8]) -> usize {{ {body} }}"))
+    };
+    // take composes by min: 2, and the 3 is refuted (the teeth).
+    assert!(ok("ct", "xs.iter().take(2).take(3).count()", 2).is_some_and(|o| o.is_verified()));
+    assert!(matches!(ok("ctf", "xs.iter().take(2).take(3).count()", 3), Some(FnOutcome::Failed { .. })));
+    // skip composes additively: skip 3 of 5 -> 2.
+    assert!(ok("cs", "xs.iter().skip(1).skip(2).count()", 2).is_some_and(|o| o.is_verified()));
+    // step_by composes multiplicatively: step 6 of len 6 -> index 0 only -> 1.
+    let step = verify_src("cst", "/// requires: xs.len() == 6\n/// ensures: ret == 1\npub fn cst(xs: &[u8]) -> usize { xs.iter().step_by(2).step_by(3).count() }");
+    assert!(step.as_ref().is_some_and(|o| o.is_verified()), "step_by(2).step_by(3) of len 6 is 1 element, got {step:?}");
+}
