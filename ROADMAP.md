@@ -1044,8 +1044,12 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     unrepresentable glue (`Rc<u8>`, a user `Drop`) is refused. Fixtures:
     `array_iter_count`, `array_iter_sum`, `explicit_drop_box`,
     `explicit_drop_string` and their two tripwires, pinned by
-    `a_slice_iter_and_explicit_drop_decide`; `realistic.rs` 660/1204 →
-    664/1210.
+    `a_slice_iter_and_explicit_drop_decide`. The same fix unlocked the rest of
+    the already-modelled `slice::Iter` surface on a constant-length array --
+    `.max()`, `.min()`, `.last()`, `.nth(k)` (`array_iter_max`, `array_iter_min`,
+    `array_iter_last`, `array_iter_nth` and three tripwires) -- and the total
+    `clear` methods (`Vec::clear`, `String::clear`) are modelled as a length
+    reset. `realistic.rs` 660/1204 → **670/1219**.
   - Progress (`pop`, `is_empty`): `Vec::is_empty` reads the tracked length;
     `Vec::pop` returns `None` iff the length is zero and decrements it on the
     non-empty path; on a constant-length vector the popped element is the payload.
