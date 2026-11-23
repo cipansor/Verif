@@ -1850,7 +1850,13 @@ build-script forwarding, custom source path, action ref, literal-masking replay 
   than paired (a wrong pairing would be a false proof). A `#[cfg]` line does not leak the
   contract onto the next function. A probe confirmed the pre/post behaviour (a `#[cfg(any())]`
   fn is reported `missing`, and its `requires` does not reach the next fn).
-- CLI: `cargo verif` (non-wrapper) still uses mtime-ranked `crate_options`, so workspace/
-  custom-target/renamed-dependency resolution is fixed only for the wrapper.
+**Round 19 — `cargo verif` (CLI) dependency resolution (renamed deps + target dir; FIXED).**
+`crate_options` read only the `[dependencies]` *key* and searched `<crate_root>/target`, so a
+renamed dependency (`foo = { package = "bar" }`, rlib `libbar-*.rlib`) was missed, and a
+custom `[build] target-dir`/`CARGO_TARGET_DIR`/workspace `target/` was never searched. It now
+returns `(extern_key, package)` pairs (`dependency_packages`) and links the rlib by *package*
+name as `--extern key=…`, and resolves the target directory via `CARGO_TARGET_DIR` then
+`cargo metadata`'s `target_directory` (falling back to `<crate_root>/target`). Pinned by
+`dependency_packages_reads_a_rename` and `target_directory_from_metadata_reads_the_field`.
 - Docs/tooling: SARIF module paths, iterator differential harness, `checked_ilog` base
   (audited — `checked_ilog(base)` is refused, not mis-modelled).

@@ -265,7 +265,7 @@ pub fn crate_options(file: &Path) -> MirOptions {
     let Ok(text) = std::fs::read_to_string(&manifest) else {
         return MirOptions::default();
     };
-    let deps = dependency_names(&text);
+    let deps = dependency_packages(&text);
     if deps.is_empty() {
         return MirOptions::default();
     }
@@ -273,9 +273,12 @@ pub fn crate_options(file: &Path) -> MirOptions {
     // `<profile>/build/<pkg>/<hash>/out` (a build-script output, which some toolchains
     // and this container's cargo use for a path dependency too). Searching both is the
     // same set `build_script_roots` walks for a build script.
+    // The real target directory: a custom `[build] target-dir`, `CARGO_TARGET_DIR`,
+    // or a workspace's shared `target/`, none of which is `<crate_root>/target`.
+    let target_dir = target_dir_for(&crate_root);
     let mut dirs: Vec<PathBuf> = Vec::new();
     for profile in ["debug", "release"] {
-        let base = crate_root.join("target").join(profile);
+        let base = target_dir.join(profile);
         let deps = base.join("deps");
         if deps.is_dir() {
             dirs.push(deps);
@@ -298,9 +301,12 @@ pub fn crate_options(file: &Path) -> MirOptions {
     }
     let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
     let mut externs: Vec<(String, PathBuf)> = Vec::new();
-    for name in &deps {
-        let us = extern_name(name);
-        let prefix = format!("lib{us}-");
+    for (key, pkg) in &deps {
+        // The extern name is the `[dependencies]` key (what the source `use`s); the
+        // rlib is named after the *package* -- a renamed dep (`foo = { package =
+        // "bar" }`) links `libbar-*.rlib` as `--extern foo=...`.
+        let us = extern_name(key);
+        let prefix = format!("lib{}-", extern_name(pkg));
         let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
         for d in &dirs {
             let Ok(entries) = std::fs::read_dir(d) else {
@@ -351,8 +357,20 @@ fn extern_name(dep: &str) -> String {
     dep.replace('-', "_")
 }
 
+#[cfg(test)]
 fn dependency_names(text: &str) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
+    dependency_packages(text).into_iter().map(|(k, _)| k).collect()
+}
+
+/// The `[dependencies]` table as `(extern_key, package_name)` pairs.
+///
+/// The extern name is the manifest key (what the source `use`s); the *package* is what
+/// the rlib is named after. For a plain dependency the two agree; for a renamed one
+/// (`foo = { package = "bar" }`) they differ, and the rlib is `libbar-*.rlib` linked as
+/// `--extern foo=...`. Reading only the key searched for `libfoo-*.rlib`, found nothing,
+/// and dropped the extern -- a lost proof for any renamed dependency.
+fn dependency_packages(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
     let mut in_deps = false;
     for raw in text.lines() {
         let line = strip_toml_comment(raw).trim();
@@ -363,10 +381,9 @@ fn dependency_names(text: &str) -> Vec<String> {
             let inner = line.trim_start_matches('[').trim_end_matches(']').trim();
             in_deps = inner == "dependencies";
             if let Some(rest) = inner.strip_prefix("dependencies.") {
-                // A sub-table key may be quoted (`[dependencies."dep"]`) or dotted.
                 let name = rest.trim().trim_matches('"').trim_matches('\'').trim();
                 if !name.is_empty() {
-                    names.push(name.to_string());
+                    out.push((name.to_string(), name.to_string()));
                 }
                 in_deps = false;
             }
@@ -374,9 +391,6 @@ fn dependency_names(text: &str) -> Vec<String> {
         }
         if in_deps {
             if let Some(eq) = line.find('=') {
-                // A dotted key (`dep.path = "../dep"`) names the dependency `dep`;
-                // only the first segment is the crate. Split *before* stripping
-                // quotes, so a quoted segment (`"dep".path`) is stripped correctly.
                 let name = line[..eq]
                     .split('.')
                     .next()
@@ -386,14 +400,96 @@ fn dependency_names(text: &str) -> Vec<String> {
                     .trim_matches('\'')
                     .trim();
                 if !name.is_empty() {
-                    names.push(name.to_string());
+                    let pkg = rename_target(&line[eq + 1..]).unwrap_or_else(|| name.to_string());
+                    out.push((name.to_string(), pkg));
                 }
             }
         }
     }
-    names.sort();
-    names.dedup();
-    names
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The `package = "name"` of a renamed dependency's inline table, or `None`. The
+/// `package` word must be a standalone key (preceded by `{`, `,` or whitespace, not a
+/// letter) so a value that merely contains `package` is not misread.
+fn rename_target(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = value[from..].find("package") {
+        let at = from + rel;
+        let boundary = at == 0 || !bytes[at - 1].is_ascii_alphanumeric() && bytes[at - 1] != b'_';
+        if boundary {
+            let after = value[at + "package".len()..].trim_start();
+            if let Some(after) = after.strip_prefix('=') {
+                let after = after.trim_start();
+                for q in ['"', '\''] {
+                    if let Some(rest) = after.strip_prefix(q) {
+                        if let Some(end) = rest.find(q) {
+                            return Some(rest[..end].to_string());
+                        }
+                    }
+                }
+            }
+        }
+        from = at + "package".len();
+    }
+    None
+}
+
+/// The target directory for `crate_root`: `CARGO_TARGET_DIR` if set (cargo's own
+/// precedence), else what `cargo metadata` reports (a custom `[build] target-dir` or a
+/// workspace's shared `target/`), else the conventional `<crate_root>/target`.
+#[cfg(feature = "std")]
+fn target_dir_for(crate_root: &Path) -> PathBuf {
+    if let Ok(t) = std::env::var("CARGO_TARGET_DIR") {
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
+    cargo_target_directory(crate_root).unwrap_or_else(|| crate_root.join("target"))
+}
+
+#[cfg(feature = "std")]
+fn cargo_target_directory(crate_root: &Path) -> Option<PathBuf> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let out = std::process::Command::new(cargo)
+        .arg("metadata")
+        .arg("--format-version=1")
+        .arg("--no-deps")
+        .current_dir(crate_root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    target_directory_from_metadata(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The `"target_directory":"…"` field of a `cargo metadata --format-version=1` blob,
+/// with the JSON string escapes (`\\`, `\"`, `\n`, `\t`) decoded.
+#[cfg(feature = "std")]
+fn target_directory_from_metadata(metadata: &str) -> Option<PathBuf> {
+    let key = "\"target_directory\":";
+    let i = metadata.find(key)?;
+    let rest = metadata[i + key.len()..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(PathBuf::from(out)),
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => out.push(other),
+                None => return None,
+            },
+            other => out.push(other),
+        }
+    }
+    None
 }
 
 /// A compiler *identity*, so two spellings of one compiler compare equal.
@@ -2644,5 +2740,37 @@ mod render_tests {
             !names.iter().any(|n| n.contains('.') || n.contains('"')),
             "no dots or quotes may survive, got {names:?}"
         );
+    }
+
+    /// A renamed dependency's rlib is named after the *package*, not the manifest key:
+    /// `foo = { package = "bar" }` links `libbar-*.rlib` as `--extern foo=...`. Reading
+    /// only the key searched for `libfoo-*.rlib` and dropped the extern.
+    #[test]
+    fn dependency_packages_reads_a_rename() {
+        let toml = "[dependencies]\nserde = \"1\"\nfoo = { package = \"bar\", path = \"../bar\" }\nsub = { version = \"1\" }\n";
+        let mut got = super::dependency_packages(toml);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("foo".to_string(), "bar".to_string()),
+                ("serde".to_string(), "serde".to_string()),
+                ("sub".to_string(), "sub".to_string()),
+            ]
+        );
+    }
+
+    /// `cargo metadata`'s `target_directory` is the authority for a custom `[build]
+    /// target-dir` or a workspace's shared `target/`; the extractor reads just that field.
+    #[cfg(feature = "std")]
+    #[test]
+    fn target_directory_from_metadata_reads_the_field() {
+        use std::path::PathBuf;
+        let m = r#"{"packages":[],"target_directory":"/tmp/ws/target","version":1}"#;
+        assert_eq!(super::target_directory_from_metadata(m), Some(PathBuf::from("/tmp/ws/target")));
+        // A Windows-style path is JSON-escaped (`\\`), so the decoded value is `C:\ws\target`.
+        let m2 = r#"{"target_directory":"C:\\ws\\target"}"#;
+        assert_eq!(super::target_directory_from_metadata(m2), Some(PathBuf::from(r"C:\ws\target")));
+        assert_eq!(super::target_directory_from_metadata("{}"), None);
     }
 }
