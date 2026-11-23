@@ -398,6 +398,8 @@ pub enum Intrinsic {
     SliceSkip,
     /// `Iterator::step_by(n)` on a cursor: advances the position by `n` each step.
     SliceStepBy,
+    /// `Iterator::take(n)` on a cursor: caps the effective end at `pos + n`.
+    SliceTake,
     /// `Iterator::count` on a slice/array cursor: `len - pos`.
     ///
     /// The cursor is a concrete position, so the remaining count is the length
@@ -1560,6 +1562,9 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if short == "step_by" && names_slice_iter_ty(name) {
         return Some(Intrinsic::SliceStepBy);
     }
+    if short == "take" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceTake);
+    }
     if short == "count" && names_slice_iter_ty(name) {
         return Some(Intrinsic::SliceCount);
     }
@@ -2004,7 +2009,9 @@ fn is_cursor_ty(ty: &str) -> bool {
         || head == "Skip"
         || head.ends_with("::Skip")
         || head == "StepBy"
-        || head.ends_with("::StepBy");
+        || head.ends_with("::StepBy")
+        || head == "Take"
+        || head.ends_with("::Take");
     is_adapter && (ty.contains("slice::Iter") || ty.contains("array::IntoIter"))
 }
 
@@ -2380,6 +2387,7 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         | Intrinsic::SliceRev
         | Intrinsic::SliceSkip
         | Intrinsic::SliceStepBy
+        | Intrinsic::SliceTake
         | Intrinsic::SliceCount
         | Intrinsic::SliceSum
         | Intrinsic::SliceIterLast
@@ -2623,6 +2631,7 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             | Intrinsic::SliceRev
             | Intrinsic::SliceSkip
             | Intrinsic::SliceStepBy
+            | Intrinsic::SliceTake
             | Intrinsic::SliceCount
             | Intrinsic::SliceSum
             | Intrinsic::SliceIterLast
@@ -2696,6 +2705,7 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         | Intrinsic::SliceRev
         | Intrinsic::SliceSkip
         | Intrinsic::SliceStepBy
+        | Intrinsic::SliceTake
         | Intrinsic::SliceCount
         | Intrinsic::SliceSum
         | Intrinsic::SliceIterLast
@@ -6524,6 +6534,14 @@ mod tests {
         assert_eq!(
             classify("<std::iter::StepBy<std::slice::Iter<'_, u8>> as Iterator>::count"),
             Some(Intrinsic::SliceCount)
+        );
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::take"),
+            Some(Intrinsic::SliceTake)
+        );
+        assert_eq!(
+            classify("<std::iter::Take<std::slice::Iter<'_, u8>> as Iterator>::last"),
+            Some(Intrinsic::SliceIterLast)
         );
         assert_eq!(
             classify("<std::slice::Iter<'_, u8> as Iterator>::count"),

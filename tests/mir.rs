@@ -13014,6 +13014,36 @@ fn an_iterator_can_be_skipped_and_stepped() {
     );
 }
 
+/// C11 iteration: `Iterator::take` caps the cursor's end at `pos + n`. It needs a
+/// constant length so the cap is constant; `last`/`count`/`sum`/`nth` read it.
+#[test]
+fn an_iterator_can_be_taken() {
+    let names = [
+        "array_iter_take_last",
+        "array_iter_take_last_tripwire",
+        "array_iter_take_count",
+        "array_iter_take_over",
+        "array_iter_take_nth",
+        "array_iter_take_sum",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in [
+        "array_iter_take_last",
+        "array_iter_take_count",
+        "array_iter_take_over",
+        "array_iter_take_nth",
+        "array_iter_take_sum",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let o = outcome(&report, "array_iter_take_last_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`array_iter_take_last_tripwire` claims past the cap and must be refuted, got: {o}"
+    );
+}
+
 /// C11 containers: `Vec::clear`/`String::clear` reset the tracked length to zero,
 /// and the tripwire that claims the pre-clear length is refuted.
 #[test]

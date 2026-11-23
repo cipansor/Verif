@@ -688,6 +688,9 @@ struct IterState {
     rev: bool,
     /// `Iterator::step_by`'s stride (1 unless a `step_by` was applied).
     step: u64,
+    /// `Iterator::take`'s absolute end (exclusive), or `None` for the slice's own
+    /// length. A `take` needs a constant length so the effective end is constant.
+    end: Option<u64>,
 }
 
 /// Local-to-symbolic environment, with side maps for aggregate parts.
@@ -5798,7 +5801,7 @@ fn slice_iter(
             if s.elem_w == 0 {
                 return Err(format!("`{name}` on a slice whose element width is not modelled"));
             }
-            env.iters.insert(dest.local, IterState { base: recv.local, pos: 0, rev: false, step: 1 });
+            env.iters.insert(dest.local, IterState { base: recv.local, pos: 0, rev: false, step: 1, end: None });
             Ok(Vec::new())
         }
         // `copied()` wraps the cursor in an adapter that yields `T` instead of `&T`.
@@ -5841,6 +5844,27 @@ fn slice_iter(
             env.iters.insert(dest.local, next);
             Ok(Vec::new())
         }
+        // `take(n)` caps the effective end at `pos + n`. It needs a constant length
+        // so the end is a constant (a symbolic length would make it symbolic).
+        Intrinsic::SliceTake => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            let Some(k) = constant_operand(cx.args.get(1), env) else {
+                return Err(format!("`{name}` needs a constant argument"));
+            };
+            let const_len = env
+                .indexed
+                .get(&it.base)
+                .is_some_and(|s| iterator_const_len(s, cx.pins).is_some());
+            if !const_len {
+                return Err(format!("`{name}` on a slice whose length is not a constant"));
+            }
+            let cap = it.pos.saturating_add(k);
+            let end = Some(it.end.map_or(cap, |e| e.min(cap)));
+            env.iters.insert(dest.local, IterState { end, ..it });
+            Ok(Vec::new())
+        }
         Intrinsic::SliceNext => {
             let Some(it) = env.iters.get(&recv.local).copied() else {
                 return Err(format!(
@@ -5862,11 +5886,25 @@ fn slice_iter(
                         "`{name}` with `rev` on a slice whose length is not a constant"
                     ));
                 };
-                if pos < n {
+                let hi = it.end.map_or(n, |e| e.min(n));
+                if pos < hi {
                     (n - 1 - pos, smt::word(intrinsics::SOME_TAG, 1))
                 } else {
                     (0, smt::word(0, 1))
                 }
+            } else if let Some(e) = it.end {
+                // A `take` cursor: `Some` iff `pos < min(len, end)`, which is a
+                // constant because `take` needs a constant length.
+                let Some(n) = iterator_const_len(s, cx.pins) else {
+                    return Err(format!("`{name}` on a `take`d slice whose length is not a constant"));
+                };
+                let hi = e.min(n);
+                let tag = if pos < hi {
+                    smt::word(intrinsics::SOME_TAG, 1)
+                } else {
+                    smt::word(0, 1)
+                };
+                (pos, tag)
             } else {
                 // `None` exactly when `pos >= len` (a concrete `pos`); `Some`
                 // otherwise. The tag is one bit like `first`/`get`.
@@ -5914,14 +5952,15 @@ fn slice_iter(
             };
             let len = s.len;
             let w = smt::bits(len);
-            let count = if it.step != 1 {
-                // A stride needs a *constant* length to count the positions exactly.
+            let count = if it.step != 1 || it.end.is_some() {
+                // A stride or a `take` needs a *constant* length to count exactly.
                 let Some(n) = iterator_const_len(s, cx.pins) else {
                     return Err(format!(
-                        "`{name}` with `step_by` on a slice whose length is not a constant"
+                        "`{name}` with `step_by`/`take` on a slice whose length is not a constant"
                     ));
                 };
-                let c = if it.pos < n { (n - 1 - it.pos) / it.step + 1 } else { 0 };
+                let hi = it.end.map_or(n, |e| e.min(n));
+                let c = if it.pos < hi { (hi - 1 - it.pos) / it.step + 1 } else { 0 };
                 smt::word(c, w)
             } else if it.pos == 0 {
                 // `len - pos`, guarded so a cursor already advanced past the end (a
@@ -5971,10 +6010,11 @@ fn slice_iter(
             } else {
                 let idx = match iterator_const_len(s, cx.pins) {
                     Some(0) => 0,
-                    Some(n) if it.pos < n => {
-                        // The last index the stride reaches from `pos`: `pos + m*step`
-                        // with `m = (n-1-pos)/step`. For `step == 1` that is `n-1`.
-                        it.pos + ((n - 1 - it.pos) / it.step) * it.step
+                    Some(n) if it.pos < it.end.map_or(n, |e| e.min(n)) => {
+                        // The last index the stride reaches from `pos`, capped by a
+                        // `take` end: `pos + m*step`, `m = (hi-1-pos)/step`.
+                        let hi = it.end.map_or(n, |e| e.min(n));
+                        it.pos + ((hi - 1 - it.pos) / it.step) * it.step
                     }
                     Some(_) => 0,
                     None => LAST_INDEX,
@@ -6009,14 +6049,16 @@ fn slice_iter(
                 ));
             };
             let j = it.pos.saturating_add(k.saturating_mul(it.step));
-            let (idx, tag) = if it.rev {
+            let (idx, tag) = if it.rev || it.end.is_some() {
                 let Some(n) = iterator_const_len(s, cx.pins) else {
                     return Err(format!(
-                        "`{name}` with `rev` on a slice whose length is not a constant"
+                        "`{name}` on a `rev`/`take`d slice whose length is not a constant"
                     ));
                 };
-                if j < n {
-                    (n - 1 - j, smt::word(intrinsics::SOME_TAG, 1))
+                let hi = it.end.map_or(n, |e| e.min(n));
+                if j < hi {
+                    let idx = if it.rev { n - 1 - j } else { j };
+                    (idx, smt::word(intrinsics::SOME_TAG, 1))
                 } else {
                     (0, smt::word(0, 1))
                 }
@@ -6109,20 +6151,25 @@ fn slice_extreme(
         return Err(format!("`{name}` over {n} elements is past the {MAX_SUM_LEN}-element limit"));
     }
     let sign = Sign::of_bool(elem_signed);
-    let tag = smt::ite(
-        smt::ule_const(len, it.pos),
-        smt::word(0, 1),
-        smt::word(intrinsics::SOME_TAG, 1),
-    );
+    let hi = it.end.map_or(n, |e| e.min(n));
+    let tag = if it.end.is_some() {
+        smt::word(if it.pos < hi { intrinsics::SOME_TAG } else { 0 }, 1)
+    } else {
+        smt::ite(
+            smt::ule_const(len, it.pos),
+            smt::word(0, 1),
+            smt::word(intrinsics::SOME_TAG, 1),
+        )
+    };
     env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
-    if it.pos < n {
+    if it.pos < hi {
         let (first, _) = env
             .index_elem(it.base, it.pos)
             .ok_or_else(|| format!("`{name}` on an iterator whose elements are not modelled"))?;
         let mut acc = first;
         let mut tree = ElemId::Leaf((it.base, it.pos));
         let mut k = it.pos + it.step;
-        while k < n {
+        while k < hi {
             let (elem, _) = env.index_elem(it.base, k).ok_or_else(|| {
                 format!("`{name}` on an iterator whose elements are not modelled")
             })?;
@@ -6210,10 +6257,11 @@ fn slice_sum(
         return Err(format!("`{name}` over {n} elements is past the {MAX_SUM_LEN}-element limit"));
     }
     let sign = Sign::of_bool(elem_signed);
+    let hi = it.end.map_or(n, |e| e.min(n));
     let mut acc = smt::word(0, dest_w);
     let mut obligations = Vec::new();
     let mut k = it.pos;
-    while k < n {
+    while k < hi {
         let Some((elem, _)) = env.index_elem(it.base, k) else {
             return Err(format!("`{name}` on an iterator whose elements are not modelled"));
         };
@@ -6965,6 +7013,7 @@ fn try_intrinsic(
                 | intrinsics::Intrinsic::SliceRev
                 | intrinsics::Intrinsic::SliceSkip
                 | intrinsics::Intrinsic::SliceStepBy
+                | intrinsics::Intrinsic::SliceTake
                 | intrinsics::Intrinsic::SliceCount
                 | intrinsics::Intrinsic::SliceSum
                 | intrinsics::Intrinsic::SliceIterLast
@@ -7097,6 +7146,7 @@ fn try_intrinsic(
             | intrinsics::Intrinsic::SliceRev
             | intrinsics::Intrinsic::SliceSkip
             | intrinsics::Intrinsic::SliceStepBy
+            | intrinsics::Intrinsic::SliceTake
             | intrinsics::Intrinsic::SliceCount
             | intrinsics::Intrinsic::SliceSum
             | intrinsics::Intrinsic::SliceIterLast

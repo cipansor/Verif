@@ -14343,6 +14343,61 @@ pub fn array_iter_step_sum(xs: &[u8; 4]) -> u8 {
     xs.iter().copied().step_by(2).sum()
 }
 
+spec! {
+    requires: true,
+    ensures: ret == xs[1],
+}
+/// `xs.iter().take(2).last()` names the element at the end of the capped prefix.
+pub fn array_iter_take_last(xs: &[u8; 4]) -> u8 {
+    *xs.iter().take(2).last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[2],
+}
+/// The same body claiming the element past the `take` must be refuted.
+pub fn array_iter_take_last_tripwire(xs: &[u8; 4]) -> u8 {
+    *xs.iter().take(2).last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
+/// `take(2).count()` is the capped prefix length.
+pub fn array_iter_take_count(xs: &[u8; 4]) -> u32 {
+    xs.iter().take(2).count() as u32
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
+/// `take(10)` over four elements yields all four (the cap exceeds the length).
+pub fn array_iter_take_over(xs: &[u8; 4]) -> u32 {
+    xs.iter().take(10).count() as u32
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[0],
+}
+/// `take(2).nth(0)` names the first element of the prefix.
+pub fn array_iter_take_nth(xs: &[u8; 4]) -> u8 {
+    *xs.iter().take(2).nth(0).unwrap()
+}
+
+spec! {
+    requires: xs[0] <= 100,
+    requires: xs[1] <= 100,
+    ensures: ret == xs[0] + xs[1],
+}
+/// `take(2).sum()` folds the two elements of the prefix.
+pub fn array_iter_take_sum(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().take(2).sum()
+}
+
 // ---------------------------------------------------------------------------
 // A scalar reference argument named in a contract (C9)
 //
