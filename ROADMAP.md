@@ -1801,6 +1801,15 @@ already a commit-SHA placeholder. Regressions:
   null-deref assert), so the pinned invariant is the soundness one
   (`a_write_through_a_box_pointer_is_seen_by_a_later_read`).
 
+**KNOWN FALSE PROOF (tracked, highest priority): mutable-`Vec` postcondition length.**
+`pub fn f(v: &mut Vec<u8>) { v.push(1); }` with `requires: v.len() == 0` /
+`ensures: v.len() == 0` is **Verified** (the real length after `push` is 1), and the true
+`ensures: v.len() == 1` is refuted: a `&mut Vec`'s *contract* length reads the entry value, not
+the post-state. A `&Vec`/`&[T]` (immutable) length is unchanged by the body and is correct.
+The fix mirrors the scalar-ref `ref_final`: capture each `&mut Vec` argument's final length at
+the root `return` and rebind the contract's `v.len()` in the `post` evaluation. Until then it
+is a known false proof, recorded rather than hidden.
+
 **Tracked (open):**
 - Executor: compound iterator closures (`closure_map`/`closure_binop`/`closure_filter`
   read an intermediate as the result), `Vec::clear`/drops of user-`Drop` elements,
