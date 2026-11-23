@@ -1836,6 +1836,10 @@ build-script forwarding, custom source path, action ref, literal-masking replay 
 `source_arg` option-value parsing.
 
 **Tracked (open):**
+- **Round 23 (fixed):** the MIR check now passes CI (the null-pointer panic is normalised on
+  both sides); `cargo metadata`'s path is read as one string (not per byte) and escaped quotes
+  no longer end it early; `take(k).rev()` reverses the taken prefix; a valid crate-name test;
+  the reusable-action example names a release tag.
 - Executor/iterator: `iterator_const_len` pin reuse; cross-adapter chains (`rev().step_by()`, …).
   **Same-adapter chaining is verified composing** (round 20): `take` by `min`, `skip`
   additively, `step_by` multiplicatively -- `take(2).take(3)` yields 2, not 3 -- pinned by
