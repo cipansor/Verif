@@ -7785,6 +7785,82 @@ pub fn sum_symbolic(xs: &[u8]) -> u8 { xs.iter().sum() }
     );
 }
 
+/// Iterator consumers `last`, `nth`, `max` and `min` on a slice/array cursor.
+///
+/// `last`/`nth` name the exact element when the length is known (an array's type
+/// length, or a slice the precondition pinned); `max`/`min` are folds of
+/// comparisons, so they need a constant length too. The signed cases are pinned
+/// because `i8::MIN` is the *smallest* signed value but the largest unsigned byte,
+/// so an unsigned comparison would pick the wrong element.
+#[test]
+fn a_slice_iterator_extremes_and_offsets_are_modelled() {
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! { requires: xs.len() == 2, ensures: ret == xs[1], }
+pub fn last_slice(xs: &[u8]) -> u8 { *xs.iter().last().unwrap() }
+
+spec! { requires: xs.len() == 2, ensures: ret == xs[0], }
+pub fn last_slice_bad(xs: &[u8]) -> u8 { *xs.iter().last().unwrap() }
+
+spec! { requires: xs.len() == 3, ensures: ret == xs[2], }
+pub fn nth_slice(xs: &[u8]) -> u8 { *xs.iter().nth(2).unwrap() }
+
+spec! { requires: xs.len() == 3, ensures: ret == xs[0], }
+pub fn nth_slice_bad(xs: &[u8]) -> u8 { *xs.iter().nth(2).unwrap() }
+
+spec! { requires: a[0] <= a[1], requires: a[1] <= a[2], ensures: ret == a[2], }
+pub fn max_arr(a: [u8; 3]) -> u8 { a.into_iter().max().unwrap() }
+
+spec! { requires: a[0] <= a[1], requires: a[1] <= a[2], ensures: ret == a[0], }
+pub fn max_arr_bad(a: [u8; 3]) -> u8 { a.into_iter().max().unwrap() }
+
+spec! { requires: a[0] <= a[1], requires: a[1] <= a[2], ensures: ret == a[0], }
+pub fn min_arr(a: [u8; 3]) -> u8 { a.into_iter().min().unwrap() }
+
+spec! { requires: a[0] <= a[1], requires: a[1] <= a[2], ensures: ret == a[2], }
+pub fn min_arr_bad(a: [u8; 3]) -> u8 { a.into_iter().min().unwrap() }
+
+spec! { requires: a[0] <= a[1], requires: a[1] <= a[2], ensures: ret == a[2], }
+pub fn smax_arr(a: [i8; 3]) -> i8 { a.into_iter().max().unwrap() }
+
+spec! { requires: a[0] <= a[1], requires: a[1] <= a[2], ensures: ret == a[0], }
+pub fn smax_arr_bad(a: [i8; 3]) -> i8 { a.into_iter().max().unwrap() }
+
+spec! { requires: xs.len() == 2, requires: xs[0] <= xs[1], ensures: ret == xs[1], }
+pub fn max_ref(xs: &[u8]) -> u8 { match xs.iter().max() { Some(&m) => m, None => 0 } }
+
+spec! { requires: true, ensures: true, }
+pub fn max_symbolic(xs: &[u8]) -> u8 { *xs.iter().max().unwrap() }
+"#;
+    for name in ["last_slice", "nth_slice", "max_arr", "min_arr", "smax_arr", "max_ref"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    for name in [
+        "last_slice_bad",
+        "nth_slice_bad",
+        "max_arr_bad",
+        "min_arr_bad",
+        "smax_arr_bad",
+    ] {
+        let Some(o) = verify_src(name, src) else { return };
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "`{name}` must fail on its postcondition; got `{kind}`"
+            ),
+            other => panic!("`{name}` is a false claim and must be refuted, got: {other}"),
+        }
+    }
+    // `max` over a symbolic-length slice has no fixed comparison count and is refused.
+    let Some(o) = verify_src("max_symbolic", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Incomplete { .. }),
+        "a symbolic-length `max` must be refused, got: {o}"
+    );
+}
+
+
 /// A user type spelled `Vec` is not the container, and its *methods* are answered
 /// by their own bodies.
 ///

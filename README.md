@@ -2537,7 +2537,12 @@ says "I could not decide" is worth more than one that guesses.
    discharges the additions and verifies. A `sum` over a *symbolic*-length slice is
    refused (there is no fixed number of addends to build a term from); an array's
    type length, or a slice the precondition pins (`requires: xs.len() == N`), is a
-   constant and is summed. What is *not* modelled is an **iterator chain**
+   constant and is summed. `last`, `nth(k)`, `max` and `min` ride the same cursor:
+   `last`/`nth` name the exact element when the length is known (an array's type
+   length, or a slice the precondition pinned) and fall back to a fresh variable for
+   a symbolic-length slice, and `max`/`min` are folds of *signedness-aware*
+   comparisons (so `i8::MIN` is the least, not the greatest), needing a constant
+   length like `sum`. What is *not* modelled is an **iterator chain**
    (`fold`, `map`, `filter`, `.enumerate()`, `for (i, x) in xs.iter().enumerate()`);
    those are reported `incomplete` with the unmodelled call named, so the gap is visible
    rather than silent. A `Vec`'s *elements* are modelled — `v[k]`, `v.first()`,

@@ -10463,6 +10463,36 @@ the standard library's `Iterator`/`IntoIterator` trait, so a user iterator is
 refused; the `sum` tail carries its type argument (`sum::<u8>`), which `short`
 strips.
 
+## `last`/`nth`/`max`/`min`: exact index where the length is known, a fold otherwise
+
+Three more consumers ride the same cursor:
+
+- **`last`/`nth` name an *exact* element when the length is known.** `last` is
+  `s[n-1]` and `nth(k)` is `s[pos+k]`, the same variables a contract's `xs[len-1]`/
+  `xs[pos+k]` name -- so `requires: xs.len() == 2, ensures: ret == xs[1]` verifies
+  for `xs.iter().last()`. The length is "known" when it is an array's type length
+  or a slice the precondition pinned (`requires: xs.len() == N`); a *symbolic*-length
+  slice falls back to the single fresh `LAST_INDEX` variable (the `slice::last`
+  over-approximation), which is a lost proof, never a false one. `nth(k)` needs a
+  *constant* `k` -- a symbolic offset names no single index -- and advances the
+  cursor past the returned element (`nth` consumes it).
+- **`max`/`min` are folds of comparisons**, so (like `sum`) they need a constant
+  length. The running extreme is `ite(keep, acc, elem)`; the payload is that word.
+  For a *reference* payload (`Option<&T>`, a bare `slice::Iter`) the body derefs, so
+  the element identity is built in lockstep as an `ElemId::Select` tree over the
+  same elements -- `eval_elem_id` folds it to the identical `ite`, so the payload and
+  a deref of it agree by construction rather than by a second computation.
+- **The comparison is `slt`/`ult` by the element's sign.** `i8::MIN` (`0x80`) is the
+  smallest signed value but the largest unsigned byte, so an unsigned `max` would
+  pick it as the greatest; the corpus's `iter_max_signed_array` and the
+  `smax_arr_bad` witness (`v4 = 128`) pin the signed reading.
+
+The `sum`/`max`/`min` constant-length boundary is one boundary, not three: `count`
+and `last`/`nth` need only the length as a *term*, but `sum`/`max`/`min` must
+*enumerate* it, so they refuse a symbolic length with a message naming the missing
+`requires: xs.len() == N`.
+
+
 
 ## A qualified type name must not resolve to a bare layout
 

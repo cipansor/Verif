@@ -410,6 +410,29 @@ pub enum Intrinsic {
     /// concrete index, so the sum is over the same variables a contract's `xs[k]`
     /// names.
     SliceSum,
+    /// `Iterator::last` on a slice/array cursor: `Option<&T>` -- `Some` of the last
+    /// remaining element when the cursor has not run out, `None` otherwise.
+    ///
+    /// An array's length is a constant, so the element is the exact `s[N-1]`; a
+    /// slice's length is symbolic, so the element is a single fresh variable per
+    /// slice (keyed by a sentinel), the same over-approximation `slice::last` uses.
+    SliceIterLast,
+    /// `Iterator::nth(k)` on a slice/array cursor: `Option<&T>` of the element `k`
+    /// places past the cursor, advancing it.
+    ///
+    /// `k` must be a *constant*: a slice's length is symbolic, so a symbolic offset
+    /// names no single index and reading "some element" would be a wrong value. The
+    /// element is the store's element at `pos + k`, the same variable a contract's
+    /// `s[pos + k]` names.
+    SliceNth,
+    /// `Iterator::max` / `Iterator::min` on a slice/array cursor: `Option<T>` /
+    /// `Option<&T>` of the extreme remaining element.
+    ///
+    /// A fold of comparisons over the remaining elements, so (like `sum`) it needs
+    /// a *constant* length. The payload is the extreme *value*; for a reference
+    /// payload the element identity is a `Select` tree over the elements, so a
+    /// deref reads the same value. A slice of symbolic length is refused.
+    SliceExtreme(ExtremeKind),
     /// A method on a `Vec<T>`: `new`, `push` or `len`.
     ///
     /// A `Vec` has no bit-vector value (its fields -- a heap pointer, a length
@@ -698,6 +721,15 @@ pub enum VecMethod {
     Deref,
     /// `Vec::as_slice(&self) -> &[T]`, the explicit spelling of [`Self::Deref`].
     AsSlice,
+}
+
+/// Which extreme `Iterator::max`/`Iterator::min` computes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtremeKind {
+    /// `Iterator::max`: the greatest remaining element.
+    Max,
+    /// `Iterator::min`: the least remaining element.
+    Min,
 }
 
 /// A method on a `for`-loop range.
@@ -1427,6 +1459,18 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     }
     if short == "sum" && names_slice_iter_ty(name) {
         return Some(Intrinsic::SliceSum);
+    }
+    if short == "last" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceIterLast);
+    }
+    if short == "nth" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceNth);
+    }
+    if short == "max" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceExtreme(ExtremeKind::Max));
+    }
+    if short == "min" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceExtreme(ExtremeKind::Min));
     }
     // `Try::branch` and `FromResidual::from_residual`, the two calls the `?`
     // operator's desugaring makes. Both are *trait* methods -- the dump spells
@@ -2160,7 +2204,10 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         | Intrinsic::SliceNext
         | Intrinsic::SliceCopied
         | Intrinsic::SliceCount
-        | Intrinsic::SliceSum => true,
+        | Intrinsic::SliceSum
+        | Intrinsic::SliceIterLast
+        | Intrinsic::SliceNth
+        | Intrinsic::SliceExtreme(_) => true,
         // The `Vec` methods. Like the slice shapes they read a length the
         // executor tracks rather than an operand term, so there is no width or
         // sign to check here; `eval` never sees them and the executor answers
@@ -2392,6 +2439,9 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             | Intrinsic::SliceCopied
             | Intrinsic::SliceCount
             | Intrinsic::SliceSum
+            | Intrinsic::SliceIterLast
+            | Intrinsic::SliceNth
+            | Intrinsic::SliceExtreme(_)
     ) {
         return None;
     }
@@ -2440,7 +2490,10 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         | Intrinsic::SliceNext
         | Intrinsic::SliceCopied
         | Intrinsic::SliceCount
-        | Intrinsic::SliceSum => {
+        | Intrinsic::SliceSum
+        | Intrinsic::SliceIterLast
+        | Intrinsic::SliceNth
+        | Intrinsic::SliceExtreme(_) => {
             unreachable!("slice iteration is answered from the executor's cursor store")
         }
         // Answered by the executor's `enum_method` from the discriminant/payload

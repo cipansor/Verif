@@ -15469,6 +15469,94 @@ pub fn iter_sum_may_overflow_is_a_panic(xs: &[u8]) -> u8 {
     xs.iter().sum()
 }
 
+spec! {
+    requires: xs.len() == 2,
+    ensures: ret == xs[1],
+}
+/// `xs.iter().last()` is the last element; with the length pinned the model names
+/// the exact `xs[len-1]`.
+pub fn iter_last_slice(xs: &[u8]) -> u8 {
+    *xs.iter().last().unwrap()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    ensures: ret == xs[0],
+}
+/// The false twin: `last` is not `first`.
+pub fn iter_last_slice_cannot_prove_this(xs: &[u8]) -> u8 {
+    *xs.iter().last().unwrap()
+}
+
+spec! {
+    requires: xs.len() == 3,
+    ensures: ret == xs[2],
+}
+/// `xs.iter().nth(2)` is the element two places past the cursor (here the third).
+pub fn iter_nth_slice(xs: &[u8]) -> u8 {
+    *xs.iter().nth(2).unwrap()
+}
+
+spec! {
+    requires: xs.len() == 3,
+    ensures: ret == xs[0],
+}
+/// The false twin: `nth(2)` is not the first element.
+pub fn iter_nth_slice_cannot_prove_this(xs: &[u8]) -> u8 {
+    *xs.iter().nth(2).unwrap()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= xs[1],
+    ensures: ret == xs[1],
+}
+/// `max` over a sorted slice is its last element.
+pub fn iter_max_slice(xs: &[u8]) -> u8 {
+    *xs.iter().max().unwrap()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= xs[1],
+    ensures: ret == xs[0],
+}
+/// The false twin: the max of an ascending slice is not its first element.
+pub fn iter_max_slice_cannot_prove_this(xs: &[u8]) -> u8 {
+    *xs.iter().max().unwrap()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= xs[1],
+    ensures: ret == xs[0],
+}
+/// `min` over a sorted slice is its first element.
+pub fn iter_min_slice(xs: &[u8]) -> u8 {
+    *xs.iter().min().unwrap()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= xs[1],
+    ensures: ret == xs[1],
+}
+/// The false twin: the min of an ascending slice is not its last element.
+pub fn iter_min_slice_cannot_prove_this(xs: &[u8]) -> u8 {
+    *xs.iter().min().unwrap()
+}
+
+spec! {
+    requires: a[0] <= a[1],
+    requires: a[1] <= a[2],
+    ensures: ret == a[2],
+}
+/// `max` on a *signed* array reads the signed order: `i8::MIN` is the smallest, not
+/// the largest, so an unsigned comparison would pick the wrong element.
+pub fn iter_max_signed_array(a: [i8; 3]) -> i8 {
+    a.into_iter().max().unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // Chained `Option` combinators: the element identity must compose
 // ---------------------------------------------------------------------------

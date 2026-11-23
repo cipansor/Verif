@@ -1073,6 +1073,23 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     `a_slice_iterator_sum_and_count_are_modelled` pins four verified, two
     postcondition refutations, the overflow *panic* refutation, and the
     symbolic-length refusal.
+  - Progress (**extremes and offsets**): `Iterator::{last, nth, max, min}` now
+    decide on the cursor. `last`/`nth` name the *exact* element when the length is
+    known (an array's type length, or a slice the precondition pinned) -- the same
+    variable a contract's `xs[len-1]`/`xs[pos+k]` names -- and fall back to the
+    single fresh `LAST_INDEX` variable only for a symbolic-length slice, the same
+    over-approximation `slice::last` uses. `nth(k)` needs a *constant* offset (a
+    symbolic one names no single index) and advances the cursor past the returned
+    element. `max`/`min` are folds of comparisons over the remaining elements, so
+    (like `sum`) they need a constant length; the payload is the extreme *value*,
+    and a reference payload (`Option<&T>`) also carries a `Select` tree over the
+    same elements, so a deref reads the same value a direct `Option<T>` read does.
+    The comparison is `slt`/`ult` by the element's sign -- `i8::MIN` is the
+    smallest signed value but the largest unsigned byte, so an unsigned comparison
+    would pick the wrong element. `realistic.rs` **647/1181 → 652/1190**;
+    `tests/mir.rs` `a_slice_iterator_extremes_and_offsets_are_modelled` pins six
+    verified (incl. signed `i8` and a reference payload), five postcondition
+    refutations, and the symbolic-length refusal.
   - Move: **build**.
 - **C12. A specification language that can say more.** · P1 · in progress · Verus,
   Creusot, Prusti, SPARK

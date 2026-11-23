@@ -5733,6 +5733,8 @@ struct IterCall<'a> {
     f: &'a MirFn,
     pins: &'a [(u32, u64)],
     path: Pred,
+    /// The call's full argument list, so `nth(k)` can read its constant offset.
+    args: &'a [Operand],
 }
 
 /// Model `for x in xs` over a slice: `into_iter`/`iter` starts a cursor, `next`
@@ -5843,14 +5845,189 @@ fn slice_iter(
             Ok(Vec::new())
         }
         Intrinsic::SliceSum => slice_sum(name, &recv, dest, env, cx),
+        Intrinsic::SliceIterLast => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            let Some(s) = env.indexed.get(&it.base) else {
+                return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+            };
+            let (len, elem_w) = (s.len, s.elem_w);
+            // An array's length is a constant, and a slice's is modelled here when the
+            // precondition pinned it (`requires: xs.len() == N`), so in either case the
+            // last element is the exact `s[n-1]` -- the same variable a contract's
+            // `xs[n-1]` names. Only a *symbolic*-length slice falls back to the single
+            // fresh `LAST_INDEX` variable, the same over-approximation `slice::last`
+            // uses. `None` exactly when the cursor has run out (`pos >= len`).
+            let idx = match iterator_const_len(s, cx.pins) {
+                Some(0) => 0,
+                Some(n) => n - 1,
+                None => LAST_INDEX,
+            };
+            let (elem, sign) = env.index_elem(it.base, idx).ok_or_else(|| {
+                format!("`{name}` on an iterator whose elements are not modelled")
+            })?;
+            let tag = smt::ite(
+                smt::ule_const(len, it.pos),
+                smt::word(0, 1),
+                smt::word(intrinsics::SOME_TAG, 1),
+            );
+            env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+            env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(elem, sign), elem_w);
+            env.slice_elem_ref.insert(dest.local, ElemId::Leaf((it.base, idx)));
+            env.iters.remove(&recv.local);
+            Ok(Vec::new())
+        }
+        Intrinsic::SliceNth => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            let Some(s) = env.indexed.get(&it.base) else {
+                return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+            };
+            let (len, elem_w) = (s.len, s.elem_w);
+            let Some(k) = constant_operand(cx.args.get(1), env) else {
+                return Err(format!(
+                    "`{name}` with a non-constant offset is not modelled"
+                ));
+            };
+            let j = it.pos.saturating_add(k);
+            let (elem, sign) = env.index_elem(it.base, j).ok_or_else(|| {
+                format!("`{name}` on an iterator whose elements are not modelled")
+            })?;
+            let tag = smt::ite(
+                smt::ule_const(len, j),
+                smt::word(0, 1),
+                smt::word(intrinsics::SOME_TAG, 1),
+            );
+            env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+            env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(elem, sign), elem_w);
+            env.slice_elem_ref.insert(dest.local, ElemId::Leaf((it.base, j)));
+            // `nth` consumes the returned element, so the cursor advances past it.
+            if let Some(it) = env.iters.get_mut(&recv.local) {
+                it.pos = j.saturating_add(1);
+            }
+            Ok(Vec::new())
+        }
+        Intrinsic::SliceExtreme(kind) => slice_extreme(name, &recv, dest, env, cx, kind),
         _ => Err(format!("`{name}` is not a slice iterator method")),
     }
 }
 
-/// The largest slice length `sum` will unroll. Each addend is one `+` on the
-/// running total, so the term grows with the length; a length past this is refused
-/// rather than turned into a term the solver cannot hold.
+/// The largest slice length `sum`/`max`/`min` will unroll. Each addend (or
+/// comparison) grows the term, so a length past this is refused rather than turned
+/// into a term the solver cannot hold.
 const MAX_SUM_LEN: u64 = 256;
+
+/// A constant `u64` from an operand: a literal, or a local the run pinned to a
+/// constant (a `smt::evaluate` of its value). `None` for anything symbolic, which
+/// the callers refuse rather than guess.
+fn constant_operand(o: Option<&Operand>, env: &Env) -> Option<u64> {
+    match o? {
+        Operand::Const(Const::UInt(v, _)) => u64::try_from(*v).ok(),
+        Operand::Copy(p) | Operand::Move(p) => match env.locals.get(&p.local) {
+            Some(Val::Sym(v, _)) => smt::evaluate(*v, |_| None),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The constant length of a slice/array cursor's base: an array's type length, or a
+/// slice whose length the precondition pinned (`requires: xs.len() == N`). `None`
+/// for a symbolic slice length, which `sum`/`max`/`min` refuse.
+fn iterator_const_len(s: &Indexed, pins: &[(u32, u64)]) -> Option<u64> {
+    match s.fixed_len {
+        Some(n) => Some(n),
+        None => pins.iter().find(|(i, _)| *i == smt::index(s.len)).map(|(_, k)| *k),
+    }
+}
+
+/// `Iterator::max`/`Iterator::min` over a slice/array cursor: a fold of comparisons
+/// over the remaining elements.
+///
+/// Needs a *constant* length (the number of comparisons is the length). The payload
+/// is the extreme *value*; the element identity is a `Select` tree over the same
+/// elements, so a deref of a reference payload (`Option<&T>`) reads the same value a
+/// direct read of `Option<T>` does. `None` exactly when the cursor has run out.
+fn slice_extreme(
+    name: &str,
+    recv: &Place,
+    dest: &Place,
+    env: &mut Env,
+    cx: &IterCall<'_>,
+    kind: intrinsics::ExtremeKind,
+) -> Result<Vec<Obligation>, String> {
+    use intrinsics::ExtremeKind;
+    let Some(it) = env.iters.get(&recv.local).copied() else {
+        return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+    };
+    let Some(s) = env.indexed.get(&it.base) else {
+        return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+    };
+    let (len, elem_w, elem_signed) = (s.len, s.elem_w, s.elem_signed);
+    let Some(n) = iterator_const_len(s, cx.pins) else {
+        return Err(format!(
+            "`{name}` over a slice whose length is not a constant (write \
+             `requires: <slice>.len() == N`)"
+        ));
+    };
+    if n > MAX_SUM_LEN {
+        return Err(format!("`{name}` over {n} elements is past the {MAX_SUM_LEN}-element limit"));
+    }
+    let sign = Sign::of_bool(elem_signed);
+    let tag = smt::ite(
+        smt::ule_const(len, it.pos),
+        smt::word(0, 1),
+        smt::word(intrinsics::SOME_TAG, 1),
+    );
+    env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+    if it.pos < n {
+        let (first, _) = env
+            .index_elem(it.base, it.pos)
+            .ok_or_else(|| format!("`{name}` on an iterator whose elements are not modelled"))?;
+        let mut acc = first;
+        let mut tree = ElemId::Leaf((it.base, it.pos));
+        for k in it.pos + 1..n {
+            let (elem, _) = env.index_elem(it.base, k).ok_or_else(|| {
+                format!("`{name}` on an iterator whose elements are not modelled")
+            })?;
+            // `keep` is "the running extreme beats the new element", so the `ite`
+            // keeps `acc` when true and takes `elem` otherwise -- and the `Select`
+            // tree picks the same branch, so the payload and a deref of it agree.
+            let keep = match kind {
+                ExtremeKind::Max => {
+                    if elem_signed {
+                        smt::slt(elem, acc)
+                    } else {
+                        smt::ult(elem, acc)
+                    }
+                }
+                ExtremeKind::Min => {
+                    if elem_signed {
+                        smt::slt(acc, elem)
+                    } else {
+                        smt::ult(acc, elem)
+                    }
+                }
+            };
+            acc = smt::ite(keep, acc, elem);
+            tree = ElemId::Select(keep, Box::new(tree), Box::new(ElemId::Leaf((it.base, k))));
+        }
+        env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(acc, sign), elem_w);
+        env.slice_elem_ref.insert(dest.local, tree);
+    } else {
+        // Empty remaining: `None`, and the payload is never read.
+        env.set_payload(
+            dest.local,
+            intrinsics::SOME_TAG,
+            Val::Sym(smt::word(0, elem_w), sign),
+            elem_w,
+        );
+    }
+    env.iters.remove(&recv.local);
+    Ok(Vec::new())
+}
 
 /// `Iterator::sum::<T>` over a slice/array cursor: `s[pos] + ... + s[len-1]`.
 ///
@@ -5868,14 +6045,14 @@ fn slice_sum(
     env: &mut Env,
     cx: &IterCall<'_>,
 ) -> Result<Vec<Obligation>, String> {
-    let IterCall { f, pins, path } = *cx;
+    let IterCall { f, pins, path, .. } = *cx;
     let Some(it) = env.iters.get(&recv.local).copied() else {
         return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
     };
     let Some(s) = env.indexed.get(&it.base) else {
         return Err(format!("`{name}` on an iterator whose slice is not modelled"));
     };
-    let (len, elem_w, elem_signed, fixed_len) = (s.len, s.elem_w, s.elem_signed, s.fixed_len);
+    let (elem_w, elem_signed) = (s.elem_w, s.elem_signed);
     let Some(dest_w) = type_of_place(f, dest).and_then(|t| t.width()) else {
         return Err(format!("`{name}` on a destination whose width is not modelled"));
     };
@@ -5886,19 +6063,13 @@ fn slice_sum(
             "`{name}` over `{elem_w}`-bit elements into a `{dest_w}`-bit sum is not modelled"
         ));
     }
-    // The number of addends. An array's length is its type's constant; a slice's is
-    // a symbolic input, modelled only when the precondition pinned it to a constant.
-    let n = match fixed_len {
-        Some(n) => n,
-        None => match pins.iter().find(|(i, _)| *i == smt::index(len)) {
-            Some((_, k)) => *k,
-            None => {
-                return Err(format!(
-                    "`{name}` over a slice whose length is not a constant (write \
-                     `requires: <slice>.len() == N`)"
-                ))
-            }
-        },
+    // The number of addends: an array's type length, or a slice the precondition
+    // pinned. A symbolic slice length has no fixed addend count.
+    let Some(n) = iterator_const_len(s, pins) else {
+        return Err(format!(
+            "`{name}` over a slice whose length is not a constant (write \
+             `requires: <slice>.len() == N`)"
+        ));
     };
     if n > MAX_SUM_LEN {
         return Err(format!("`{name}` over {n} elements is past the {MAX_SUM_LEN}-element limit"));
@@ -6456,6 +6627,9 @@ fn try_intrinsic(
                 | intrinsics::Intrinsic::SliceCopied
                 | intrinsics::Intrinsic::SliceCount
                 | intrinsics::Intrinsic::SliceSum
+                | intrinsics::Intrinsic::SliceIterLast
+                | intrinsics::Intrinsic::SliceNth
+                | intrinsics::Intrinsic::SliceExtreme(_)
         );
     if !name.contains("<impl") && !trait_method {
         return None;
@@ -6568,6 +6742,9 @@ fn try_intrinsic(
             | intrinsics::Intrinsic::SliceCopied
             | intrinsics::Intrinsic::SliceCount
             | intrinsics::Intrinsic::SliceSum
+            | intrinsics::Intrinsic::SliceIterLast
+            | intrinsics::Intrinsic::SliceNth
+            | intrinsics::Intrinsic::SliceExtreme(_)
     ) {
         let p = match first {
             Operand::Copy(p) | Operand::Move(p) => p,
@@ -6579,7 +6756,7 @@ fn try_intrinsic(
             p,
             dest,
             env,
-            &IterCall { f: cur, pins, path },
+            &IterCall { f: cur, pins, path, args },
         ));
     }
     // The standard library's `Option`/`Result` methods. The receiver is an
