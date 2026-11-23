@@ -2542,10 +2542,12 @@ says "I could not decide" is worth more than one that guesses.
    length, or a slice the precondition pinned) and fall back to a fresh variable for
    a symbolic-length slice, and `max`/`min` are folds of *signedness-aware*
    comparisons (so `i8::MIN` is the least, not the greatest), needing a constant
-   length like `sum`. What is *not* modelled is an **iterator chain**
-   (`fold`, `map`, `filter`, `.enumerate()`, `for (i, x) in xs.iter().enumerate()`);
-   those are reported `incomplete` with the unmodelled call named, so the gap is visible
-   rather than silent. A `Vec`'s *elements* are modelled — `v[k]`, `v.first()`,
+   length like `sum`. `enumerate()` is a cursor identity whose `next` yields
+   `Option<(usize, &T)>`: the index is the cursor position and the element is
+   `xs[pos]`, so `for (i, &x) in xs.iter().enumerate()` decides. What is *not*
+   modelled is an iterator chain that must run a closure (`fold`, `map`, `filter`);
+   those are reported `incomplete` with the unmodelled call named, so the gap is
+   visible rather than silent. A `Vec`'s *elements* are modelled — `v[k]`, `v.first()`,
    `v.get(k)` and `pop` read back what `push` wrote, and a `Vec` argument's
    `v.len()`/`v[k]` are symbolic inputs — and `v.iter()` derefs to a slice, so
    `for &x in v.iter()` decides like one over a slice. Two limits of the iteration model

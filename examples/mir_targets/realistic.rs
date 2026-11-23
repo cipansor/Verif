@@ -15557,6 +15557,64 @@ pub fn iter_max_signed_array(a: [i8; 3]) -> i8 {
     a.into_iter().max().unwrap()
 }
 
+spec! {
+    requires: xs.len() == 3,
+    ensures: ret == 3,
+}
+/// `enumerate`'s index is the cursor position, so summing it over a 3-element
+/// slice is `0 + 1 + 2`. The tuple payload is destructured directly from the
+/// `Option`, which needs the nested downcast place to parse whole.
+pub fn iter_enumerate_index_sum(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for (i, _) in xs.iter().enumerate() {
+        s = s.wrapping_add(i as u8);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() == 3,
+    ensures: ret == 1,
+}
+/// The false twin: the index sum is not `1`.
+pub fn iter_enumerate_index_sum_cannot_prove_this(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for (i, _) in xs.iter().enumerate() {
+        s = s.wrapping_add(i as u8);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= 10,
+    requires: xs[1] <= 10,
+    ensures: ret == xs[0] + xs[1],
+}
+/// The element half of `enumerate` is the slice sum.
+pub fn iter_enumerate_value_sum(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for (_, &x) in xs.iter().enumerate() {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= 10,
+    requires: xs[1] <= 10,
+    ensures: ret == xs[0],
+}
+/// The false twin: the element sum is not the first element.
+pub fn iter_enumerate_value_sum_cannot_prove_this(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for (_, &x) in xs.iter().enumerate() {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
 // ---------------------------------------------------------------------------
 // Chained `Option` combinators: the element identity must compose
 // ---------------------------------------------------------------------------

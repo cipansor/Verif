@@ -5811,7 +5811,22 @@ fn slice_iter(
                 smt::word(intrinsics::SOME_TAG, 1),
             );
             env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
-            env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(elem, sign), elem_w);
+            if name.contains("Enumerate") {
+                // `Enumerate::next` yields `Option<(usize, &T)>`. The payload is a
+                // *tuple*: component 0 is the concrete index, component 1 the element.
+                // The body destructures it directly -- `((_7 as Some).0).0` and
+                // `((_7 as Some).0).1` -- so the two components go in the tuple store
+                // (`elems`, the same store a tuple literal writes and a `Field(j)`
+                // read falls back to), and the payload itself is `Val::Agg` so a
+                // whole-payload copy does not read a wrong single word. The element
+                // identity is recorded so `*((_7 as Some).0).1` resolves to `xs[pos]`.
+                env.elems
+                    .insert((dest.local, 0), Val::Sym(smt::word(pos, 64), Sign::Unsigned));
+                env.elems.insert((dest.local, 1), Val::Sym(elem, sign));
+                env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Agg, 0);
+            } else {
+                env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(elem, sign), elem_w);
+            }
             env.slice_elem_ref.insert(dest.local, ElemId::Leaf((base, pos)));
             if let Some(it) = env.iters.get_mut(&recv.local) {
                 it.pos = it.pos.saturating_add(1);

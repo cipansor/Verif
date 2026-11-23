@@ -10492,6 +10492,35 @@ and `last`/`nth` need only the length as a *term*, but `sum`/`max`/`min` must
 *enumerate* it, so they refuse a symbolic length with a message naming the missing
 `requires: xs.len() == N`.
 
+### `enumerate`: a tuple payload, and the nested-downcast place it exposed
+
+`xs.iter().enumerate()` is a cursor identity (`classify` maps `enumerate` to the
+same carry as `copied`), so the cursor reaches the destination unchanged. What
+differs is `next`'s payload: `Enumerate::next` yields `Option<(usize, &T)>`, and the
+body destructures it *directly* -- `((_2 as Some).0).0` for the index, `.1` for the
+element -- so there is no intermediate tuple local to store. `next` writes the
+index (`word(pos, 64)`) and the element into the tuple store (`elems[(dest,0)]`,
+`elems[(dest,1)]`), sets the payload to `Val::Agg`, and records `slice_elem_ref`
+so `*((_2 as Some).0).1` resolves to `xs[pos]`. The `get` loop already walks a
+`[Downcast, Field(0), Field(j)]` chain correctly *if* the place parses -- the
+`Downcast` arm consumes the payload `Field(0)` and the loop's next step is the
+component `Field(j)`, which falls back to `elems`.
+
+The place did **not** parse, and that is the finding. `parse_place`'s paren-group
+arm split the group's inner text on its *last* ` as ` unconditionally. For
+`((_2 as Some).0).0` the outer group's inner is `(_2 as Some).0`, so the split gave
+base `(_2` (no matching paren) and variant `Some).0` -- `parse_place` returned
+`None`, the whole read was `Unknown`, and `enumerate` came back "the return value is
+unknown". The fix uses `find_top_level_as`, which sees only an ` as ` outside any
+nested `<...>`/`(...)`: the outer group is then a plain grouping and the inner
+`(_2 as Some).0` recurses to the real downcast. This is the recurring shape "a
+group's ` as ` can be nested inside another group's ` as `" -- the same family as
+"`const ` lives inside a cast" and "` as ` lives inside a downcast place", one level
+deeper: a *tail* after the downcast group means the outer group is not itself a
+downcast. Pinned by `mir::parse::tests::a_nested_downcast_with_a_tail_parses_whole`
+(no toolchain needed) and `a_slice_iterator_enumerate_carries_the_index_and_element`.
+
+
 
 
 ## A qualified type name must not resolve to a bare layout

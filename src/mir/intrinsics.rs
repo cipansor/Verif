@@ -1457,6 +1457,13 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if short == "count" && names_slice_iter_ty(name) {
         return Some(Intrinsic::SliceCount);
     }
+    // `enumerate()` is a cursor identity, like `copied()`: it wraps the iterator in
+    // `Enumerate<..>` but the cursor (base + position) is unchanged. The payload
+    // *shape* differs -- `next` yields `(usize, &T)` -- and `next` decides that from
+    // the call name.
+    if short == "enumerate" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceCopied);
+    }
     if short == "sum" && names_slice_iter_ty(name) {
         return Some(Intrinsic::SliceSum);
     }

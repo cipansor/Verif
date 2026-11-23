@@ -1013,10 +1013,18 @@ fn parse_place(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Option<Place> {
     if s.starts_with('(') {
         let close = matching_paren(s, 0)?;
         let inner = s.get(1..close)?.trim();
-        let mut place = match inner.rsplit_once(" as ") {
-            Some((base, variant)) => {
-                let mut p = parse_place(base.trim(), enums)?;
-                p.proj.push(Proj::Downcast(variant_index(variant.trim(), enums)?));
+        // A downcast is `base as Variant` with the ` as ` at the *top level* of
+        // the group. Splitting on the last ` as ` unconditionally mis-parsed a
+        // nested place whose group contains a downcast followed by a tail --
+        // `((_2 as Some).0).0`, how an `Option<(usize, &u8)>`'s tuple payload is
+        // destructured -- into base `(_2` and variant `Some).0`, which then failed
+        // to parse and left the whole place unknown. `find_top_level_as` sees only
+        // an ` as ` outside any nested `<...>`/`(...)`, so the outer group here is
+        // a plain grouping and the inner `(_2 as Some).0` recurses to the downcast.
+        let mut place = match find_top_level_as(inner) {
+            Some(i) => {
+                let mut p = parse_place(inner[..i].trim(), enums)?;
+                p.proj.push(Proj::Downcast(variant_index(inner[i + 4..].trim(), enums)?));
                 p
             }
             None => parse_place(inner, enums)?,
@@ -3695,6 +3703,44 @@ fn add(_1: u32, _2: u32) -> u32 {
         let rv = parse_rvalue("&raw mut (fake) (*_2)", &enums);
         let Rvalue::Ref(place) = rv else { panic!("expected a Ref, got {rv:?}") };
         assert_eq!(place, Place { local: 2, proj: vec![Proj::Deref] });
+    }
+
+    /// A nested place whose group holds a downcast *and* a tail parses whole.
+    ///
+    /// An `Option<(usize, &u8)>`'s payload is destructured directly --
+    /// `(((_2 as Some).0: (usize, &u8)).0: usize)` -- so the outer group is a plain
+    /// grouping and the inner `(_2 as Some).0` is the downcast. The first version
+    /// split the outer group on its last ` as ` unconditionally, giving base `(_2`
+    /// and variant `Some).0`; `(_2` has no matching paren, the place parsed to
+    /// `None`, and the read became `Unknown` -- which is how `enumerate`'s tuple
+    /// payload came back unreadable. `find_top_level_as` ignores the nested ` as `,
+    /// so the recursion reaches the real downcast.
+    #[test]
+    fn a_nested_downcast_with_a_tail_parses_whole() {
+        let enums = BTreeMap::new();
+        let rv = parse_rvalue("copy (((_2 as Some).0: (usize, &u8)).0: usize)", &enums);
+        let Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) = rv else {
+            panic!("expected a Use of a place, got {rv:?}")
+        };
+        assert_eq!(
+            place,
+            Place {
+                local: 2,
+                proj: vec![Proj::Downcast(1), Proj::Field(0), Proj::Field(0)]
+            }
+        );
+        // The sibling component (`.1`) parses to the same downcast, field 1.
+        let rv = parse_rvalue("copy (((_2 as Some).0: (usize, &u8)).1: &u8)", &enums);
+        let Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) = rv else {
+            panic!("expected a Use of a place, got {rv:?}")
+        };
+        assert_eq!(
+            place,
+            Place {
+                local: 2,
+                proj: vec![Proj::Downcast(1), Proj::Field(0), Proj::Field(1)]
+            }
+        );
     }
 
     /// A borrow of an enum payload parses as a `Ref`, not as a cast.

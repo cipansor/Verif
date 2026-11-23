@@ -1090,6 +1090,18 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     `tests/mir.rs` `a_slice_iterator_extremes_and_offsets_are_modelled` pins six
     verified (incl. signed `i8` and a reference payload), five postcondition
     refutations, and the symbolic-length refusal.
+  - Progress (**`enumerate`**): `Iterator::enumerate` is a cursor identity whose
+    `next` yields `Option<(usize, &T)>`. `next` writes the concrete index and the
+    element into the tuple store and sets the payload to an aggregate, so the
+    direct `((_2 as Some).0).0` / `.1` destructure reads the index and `xs[pos]`.
+    Modelling it exposed a *parser* bug: a nested place whose group holds a
+    downcast *and* a tail (`((_2 as Some).0).0`) was split on its last ` as ` and
+    came back `None`, so the whole read was unknown. `parse_place` now splits a
+    group only on a *top-level* ` as ` (`find_top_level_as`), so the inner
+    `(_2 as Some).0` recurses to the real downcast. `realistic.rs` **652/1190 →
+    654/1194**; `mir::parse::tests::a_nested_downcast_with_a_tail_parses_whole`
+    pins the parse without a toolchain and
+    `a_slice_iterator_enumerate_carries_the_index_and_element` pins the verdicts.
   - Move: **build**.
 - **C12. A specification language that can say more.** · P1 · in progress · Verus,
   Creusot, Prusti, SPARK

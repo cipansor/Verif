@@ -7861,6 +7861,59 @@ pub fn max_symbolic(xs: &[u8]) -> u8 { *xs.iter().max().unwrap() }
 }
 
 
+/// `enumerate()` is a cursor identity whose `next` yields `Option<(usize, &T)>`.
+///
+/// The tuple payload is the interesting part: the body destructures it directly
+/// (`((_2 as Some).0).0` for the index, `.1` for the element), a *nested place*
+/// whose group holds a downcast and a tail. The first parse split that group on its
+/// last ` as ` and the place came back unknown; the index is the concrete cursor
+/// position and the element is `xs[pos]`, so a sum of indices is `0+1+..+(n-1)` and
+/// a sum of elements is the slice sum. Both directions are pinned, and a symbolic
+/// length is refused because the loop must be unwound to a constant.
+#[test]
+fn a_slice_iterator_enumerate_carries_the_index_and_element() {
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! { requires: xs.len() == 3, ensures: ret == 3, }
+pub fn idx_sum(xs: &[u8]) -> u8 { let mut s = 0u8; for (i, _) in xs.iter().enumerate() { s = s.wrapping_add(i as u8); } s }
+
+spec! { requires: xs.len() == 3, ensures: ret == 1, }
+pub fn idx_sum_bad(xs: &[u8]) -> u8 { let mut s = 0u8; for (i, _) in xs.iter().enumerate() { s = s.wrapping_add(i as u8); } s }
+
+spec! { requires: xs.len() == 2, requires: xs[0] <= 10, requires: xs[1] <= 10, ensures: ret == xs[0] + xs[1], }
+pub fn val_sum(xs: &[u8]) -> u8 { let mut s = 0u8; for (_, &x) in xs.iter().enumerate() { s = s.wrapping_add(x); } s }
+
+spec! { requires: xs.len() == 2, requires: xs[0] <= 10, requires: xs[1] <= 10, ensures: ret == xs[0], }
+pub fn val_sum_bad(xs: &[u8]) -> u8 { let mut s = 0u8; for (_, &x) in xs.iter().enumerate() { s = s.wrapping_add(x); } s }
+
+spec! { requires: xs.len() >= 1, ensures: ret == 0, }
+pub fn first_index(xs: &[u8]) -> u8 { match xs.iter().enumerate().next() { Some((i, _)) => i as u8, None => 0 } }
+
+spec! { requires: true, ensures: true, }
+pub fn idx_symbolic(xs: &[u8]) -> u8 { let mut s = 0u8; for (i, _) in xs.iter().enumerate() { s = s.wrapping_add(i as u8); } s }
+"#;
+    for name in ["idx_sum", "val_sum", "first_index"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    for name in ["idx_sum_bad", "val_sum_bad"] {
+        let Some(o) = verify_src(name, src) else { return };
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "`{name}` must fail on its postcondition; got `{kind}`"
+            ),
+            other => panic!("`{name}` is a false claim and must be refuted, got: {other}"),
+        }
+    }
+    // A symbolic-length enumerate loop must be unwound to a constant and is refused.
+    let Some(o) = verify_src("idx_symbolic", src) else { return };
+    assert!(
+        !o.is_verified(),
+        "a symbolic-length enumerate loop must not be verified, got: {o}"
+    );
+}
+
 /// A user type spelled `Vec` is not the container, and its *methods* are answered
 /// by their own bodies.
 ///
