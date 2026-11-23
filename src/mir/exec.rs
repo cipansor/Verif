@@ -6624,14 +6624,19 @@ fn slice_extreme(
     };
     env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
     if it.pos < hi {
+        // A `rev` cursor yields base `n-1-pos`, `n-1-pos-step`, ...; read the element at
+        // the reversed base so `rev().take(k).max()` folds the reversed prefix, not the
+        // forward one (a false refutation of the true extreme).
+        let base_of = |p: u64| if it.rev { n - 1 - p } else { p };
         let (first, _) = env
-            .index_elem(it.base, it.pos)
+            .index_elem(it.base, base_of(it.pos))
             .ok_or_else(|| format!("`{name}` on an iterator whose elements are not modelled"))?;
         let mut acc = first;
-        let mut tree = ElemId::Leaf((it.base, it.pos));
+        let mut tree = ElemId::Leaf((it.base, base_of(it.pos)));
         let mut k = it.pos + it.step;
         while k < hi {
-            let (elem, _) = env.index_elem(it.base, k).ok_or_else(|| {
+            let idx_k = base_of(k);
+            let (elem, _) = env.index_elem(it.base, idx_k).ok_or_else(|| {
                 format!("`{name}` on an iterator whose elements are not modelled")
             })?;
             // `keep` is "the running extreme beats the new element", so the `ite`
@@ -6654,7 +6659,7 @@ fn slice_extreme(
                 }
             };
             acc = smt::ite(keep, acc, elem);
-            tree = ElemId::Select(keep, Box::new(tree), Box::new(ElemId::Leaf((it.base, k))));
+            tree = ElemId::Select(keep, Box::new(tree), Box::new(ElemId::Leaf((it.base, idx_k))));
             k += it.step;
         }
         env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(acc, sign), elem_w);

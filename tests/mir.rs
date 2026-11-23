@@ -14798,3 +14798,21 @@ fn rev_last_and_take_last_name_the_right_element() {
         "rev().take(2).last() is 40, so == 10 must be refuted"
     );
 }
+
+#[test]
+fn extreme_folds_the_reversed_prefix() {
+    // `rev().take(2).max()` folds [50, 40] -> 50. `slice_extreme` ignored `rev` and
+    // folded the forward prefix [10, 20] -> 20, refuting the true 50 (a false proof of
+    // 20 in the other direction).
+    let f = |name: &str, e: u64, body: &str| {
+        verify_src(name, &format!("/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n/// ensures: ret == {e}\npub fn {name}(xs: &[u8]) -> u8 {{ {body} }}"))
+    };
+    assert!(f("rtm", 50, "xs.iter().rev().take(2).copied().max().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    assert!(f("rtn", 40, "xs.iter().rev().take(2).copied().min().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    assert!(f("rx", 50, "xs.iter().rev().copied().max().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    // Teeth: the pre-fix forward-prefix max was 20, so == 20 must now be refuted.
+    assert!(
+        matches!(f("rtmf", 20, "xs.iter().rev().take(2).copied().max().unwrap_or(0)"), Some(FnOutcome::Failed { .. })),
+        "rev().take(2).max() is 50, so == 20 must be refuted"
+    );
+}
