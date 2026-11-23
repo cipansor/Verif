@@ -143,6 +143,7 @@ fn sarif_output_is_a_2_1_0_run_with_one_result_per_failure() {
         "\"ruleId\":\"verif.failed\"",
         "\"level\":\"error\"",
         "\"text\":\"wrong:",
+        "\"region\":{\"startLine\":",
     ] {
         assert!(sarif.contains(key), "SARIF must carry {key}:\n{sarif}");
     }

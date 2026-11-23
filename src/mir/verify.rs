@@ -1401,6 +1401,13 @@ pub struct FileReport {
     pub edition: Option<Edition>,
     /// One outcome per verified function, in contract order.
     pub outcomes: Vec<(String, FnOutcome)>,
+    /// The `fn` item's source line for each reported function, keyed by the
+    /// report key. A diagnostic convenience -- a report that says `v1:u8 = 224`
+    /// names the variable but not where the function is, and `cargo verif` puts
+    /// the line in its human output and its SARIF `region`. Absent when the
+    /// scanner could not place the function (a method keyed by an impl location,
+    /// say), never a guessed line.
+    pub lines: std::collections::BTreeMap<String, usize>,
     /// Functions that carried a contract but were not found in the MIR. A
     /// non-empty list means the run covered less than the contracts asked for.
     pub missing: Vec<String>,
@@ -1491,8 +1498,16 @@ pub fn verify_file_with_opts(
         ..Default::default()
     };
     for (key, f) in select(&prog, &targets, only) {
+        if let Some(c) = specs.resolve(&f.name) {
+            report.lines.insert(key.clone(), c.line);
+        }
         let outcome = smt::with_fresh(|| verify_function(&prog, f, &specs));
         report.outcomes.push((key, outcome));
+    }
+    for m in &report.missing {
+        if let Some(c) = specs.by_fn.get(m) {
+            report.lines.insert(m.clone(), c.line);
+        }
     }
     Ok(report)
 }

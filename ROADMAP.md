@@ -1261,9 +1261,15 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     [`Obligation::failure_detail_named`]; pinned by
     `a_counterexample_is_rendered_with_source_names`. The README's `mir_demo`
     transcript is regenerated from the run.
-  - What remains: source *line* numbers in the report (the second half of the
-    exit). The stable text dump has none, so this needs the source scanner or the
-    `rustc_public` path; the name half is done.
+  - Progress (lines): the source *line* of each function is now carried out of
+    the scanner (`FileReport::lines`, from `FnContract::line`) and shown by
+    `cargo verif` -- `wrong:3` in the human report and a SARIF
+    `region.startLine` -- so a code-scanning annotation points at the function
+    rather than at the file. The stable text dump has no per-statement spans, so
+    this is the function's `fn` line, not the failing statement; that is the
+    honest granularity the scanner can supply.
+  - What remains: per-*statement* line numbers (a failing statement's line, not
+    just the function's), which needs the `rustc_public` path.
   - Move: **build**.
 - **U5. A test harness that never passes vacuously.** · P0 · done · —
   - Gap: about 21 tests in `tests/mir.rs` use

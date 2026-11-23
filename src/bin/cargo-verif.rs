@@ -107,7 +107,12 @@ fn main() {
 fn print_human(file: &Path, report: &verify::FileReport) {
     println!("verifying {}", file.display());
     for (name, outcome) in &report.outcomes {
-        println!("  {name:<28} {}", describe(outcome));
+        let at = report
+            .lines
+            .get(name)
+            .map(|l| format!("{name}:{l}"))
+            .unwrap_or_else(|| name.clone());
+        println!("  {at:<28} {}", describe(outcome));
     }
     for m in &report.missing {
         println!("  {m:<28} MISSING (contract carried, but no MIR body found)");
@@ -184,7 +189,13 @@ fn print_sarif(file: &Path, report: &verify::FileReport) {
     out.push_str("\"tool\":{\"driver\":{\"name\":\"verif\",\"informationUri\":\"https://github.com/cipansor/verif\",\"rules\":[]}},");
     out.push_str("\"results\":[");
     let mut first = true;
-    let mut push = |out: &mut String, rule: &str, level: &str, name: &str, detail: &str, file: &Path| {
+    let mut push = |out: &mut String,
+                    rule: &str,
+                    level: &str,
+                    name: &str,
+                    detail: &str,
+                    file: &Path,
+                    line: Option<usize>| {
         if !first {
             out.push(',');
         }
@@ -197,24 +208,56 @@ fn print_sarif(file: &Path, report: &verify::FileReport) {
         json_str(out, &format!("{name}: {detail}"));
         out.push_str("},\"locations\":[{\"physicalLocation\":{\"artifactLocation\":{\"uri\":");
         json_str(out, &file.display().to_string());
-        out.push_str("}}}]}");
+        out.push('}');
+        if let Some(l) = line {
+            out.push_str(",\"region\":{\"startLine\":");
+            out.push_str(&l.to_string());
+            out.push('}');
+        }
+        out.push_str("}}]}");
     };
     for (name, outcome) in &report.outcomes {
         match outcome {
             FnOutcome::Verified { .. } => {}
-            FnOutcome::Failed { kind, detail } => {
-                push(&mut out, "verif.failed", "error", name, &format!("{kind} — {detail}"), file)
-            }
-            FnOutcome::Incomplete { reasons, .. } => {
-                push(&mut out, "verif.incomplete", "warning", name, &reasons.join("; "), file)
-            }
-            FnOutcome::Skipped { reason } => {
-                push(&mut out, "verif.skipped", "warning", name, reason, file)
-            }
+            FnOutcome::Failed { kind, detail } => push(
+                &mut out,
+                "verif.failed",
+                "error",
+                name,
+                &format!("{kind} — {detail}"),
+                file,
+                report.lines.get(name).copied(),
+            ),
+            FnOutcome::Incomplete { reasons, .. } => push(
+                &mut out,
+                "verif.incomplete",
+                "warning",
+                name,
+                &reasons.join("; "),
+                file,
+                report.lines.get(name).copied(),
+            ),
+            FnOutcome::Skipped { reason } => push(
+                &mut out,
+                "verif.skipped",
+                "warning",
+                name,
+                reason,
+                file,
+                report.lines.get(name).copied(),
+            ),
         }
     }
     for m in &report.missing {
-        push(&mut out, "verif.missing", "warning", m, "contract carried, but no MIR body found", file);
+        push(
+            &mut out,
+            "verif.missing",
+            "warning",
+            m,
+            "contract carried, but no MIR body found",
+            file,
+            report.lines.get(m).copied(),
+        );
     }
     out.push_str("]}]}");
     println!("{out}");
