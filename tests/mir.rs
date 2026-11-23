@@ -14791,7 +14791,9 @@ fn rev_last_and_take_last_name_the_right_element() {
     };
     assert!(f("rl", 10, "xs.iter().rev().last().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()));
     assert!(f("rtl", 40, "xs.iter().rev().take(2).last().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()));
-    assert!(f("rsl", 10, "xs.iter().rev().step_by(2).last().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    // `rev().step_by(3).last()` = [50,40,30,20,10] stride 3 -> [50,20] -> last 20 (base 1).
+    // A stride of 2 lands on base 0, the same as no stride, so it would not exercise `step`.
+    assert!(f("rsl", 20, "xs.iter().rev().step_by(3).last().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()));
     // Teeth: the pre-fix value of rev().take(2).last() was 10; it is 40, so == 10 is refuted.
     assert!(
         matches!(f("rtlf", 10, "xs.iter().rev().take(2).last().copied().unwrap_or(0)"), Some(FnOutcome::Failed { .. })),
@@ -14834,3 +14836,26 @@ fn all_any_fold_the_reversed_prefix() {
         "rev().take(3).any(==20) is false, so == true must be refuted"
     );
 }
+
+#[test]
+fn take_rev_and_rev_take_reverse_different_prefixes() {
+    // `take(2).rev()` reverses the *taken forward prefix* [10,20] -> [20,10]; `rev().take(2)`
+    // reverses the whole slice then takes -> [50,40]. They collapse to the same cursor state
+    // (`rev, end=Some(2)`), so `base_of` must read the take/rev order (`taken_forward`).
+    let pre = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n";
+    let u8f = |name: &str, e: u64, body: &str| {
+        verify_src(name, &format!("{pre}/// ensures: ret == {e}\npub fn {name}(xs: &[u8]) -> u8 {{ {body} }}"))
+    };
+    // take(2).rev(): [20,10] -> last 10, max 20.
+    assert!(u8f("a1", 10, "xs.iter().take(2).rev().last().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    assert!(u8f("a2", 20, "xs.iter().take(2).rev().copied().max().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    // rev().take(2): [50,40] -> last 40, max 50 (the earlier fix's regression).
+    assert!(u8f("a5", 40, "xs.iter().rev().take(2).last().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    assert!(u8f("a6", 50, "xs.iter().rev().take(2).copied().max().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    // Teeth: take(2).rev().max() is 20, so == 50 (the rev().take(2) answer) must be refuted.
+    assert!(
+        matches!(u8f("a2f", 50, "xs.iter().take(2).rev().copied().max().unwrap_or(0)"), Some(FnOutcome::Failed { .. })),
+        "take(2).rev().max() is 20, so == 50 must be refuted"
+    );
+}
+

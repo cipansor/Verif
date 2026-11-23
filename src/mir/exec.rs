@@ -699,6 +699,28 @@ struct IterState {
     /// `pos - enum_start` (0, 1, ... from the enumerate's own start) rather than the
     /// raw slice position -- `skip(2).enumerate()` must yield index 0 first.
     enum_start: Option<u64>,
+    /// Whether a `take` cap was applied while `rev` was *off* (`take(k).rev()`), so
+    /// the `rev` reverses the *taken forward prefix* (`hi-1-pos`) rather than the whole
+    /// slice (`len-1-pos`). `rev().take(k)` leaves this `false`.
+    taken_forward: bool,
+}
+
+impl IterState {
+    /// The base index a sequence position `p` names. Forward is `p`; a plain `rev`
+    /// (or `rev().take(k)`) is `n-1-p`; a `take(k).rev()` -- which reverses the *taken
+    /// forward prefix* -- is `hi-1-p`, where `hi` is the take cap. Without the last case
+    /// `take(k).rev()` would read the slice's suffix (a false proof).
+    fn base_of(&self, p: u64, n: u64) -> u64 {
+        if self.rev {
+            if self.taken_forward {
+                self.end.map_or(n, |e| e.min(n)).saturating_sub(1).saturating_sub(p)
+            } else {
+                n.saturating_sub(1).saturating_sub(p)
+            }
+        } else {
+            p
+        }
+    }
 }
 
 /// A `map` closure's transform: `|x| x <op> rhs` (or `rhs <op> x`), checked or
@@ -6063,7 +6085,7 @@ fn slice_iter(
             if s.elem_w == 0 {
                 return Err(format!("`{name}` on a slice whose element width is not modelled"));
             }
-            env.iters.insert(dest.local, IterState { base: recv.local, pos: 0, rev: false, step: 1, end: None, map: None, filter: None, enum_start: None });
+            env.iters.insert(dest.local, IterState { base: recv.local, pos: 0, rev: false, step: 1, end: None, map: None, filter: None, enum_start: None, taken_forward: false });
             Ok(Vec::new())
         }
         // `copied()` wraps the cursor in an adapter that yields `T` instead of `&T`.
@@ -6091,6 +6113,12 @@ fn slice_iter(
             let Some(it) = env.iters.get(&recv.local).copied() else {
                 return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
             };
+            // Turning `rev` *off* a cursor that already has a `take` cap
+            // (`rev().take(k).rev()`) is an order the cursor cannot represent, so it is
+            // refused rather than modelled as the forward taken prefix.
+            if it.rev && it.end.is_some() {
+                return Err(format!("`{name}` after a `take` on a reversed cursor is not modelled"));
+            }
             env.iters.insert(dest.local, IterState { rev: !it.rev, ..it });
             Ok(Vec::new())
         }
@@ -6137,7 +6165,11 @@ fn slice_iter(
             // `pos + k*step` -- a bare `pos + k` under-counts after `step_by`.
             let cap = it.pos.saturating_add(k.saturating_mul(it.step));
             let end = Some(it.end.map_or(cap, |e| e.min(cap)));
-            env.iters.insert(dest.local, IterState { end, ..it });
+            // A `take` while `rev` is *off* caps the forward prefix; `rev` then reverses
+            // that prefix (`take(k).rev()`). A `take` while `rev` is *on* caps the reversed
+            // prefix (`rev().take(k)`). `base_of` reads this flag.
+            let taken_forward = !it.rev;
+            env.iters.insert(dest.local, IterState { end, taken_forward, ..it });
             Ok(Vec::new())
         }
         // `fold(init, f)` folds a modelled reducer closure over the cursor:
@@ -6262,7 +6294,7 @@ fn slice_iter(
             // A `rev` cursor yields base `n-1-pos`, `n-1-pos-step`, ...; read the
             // reversed base so `rev().take(k).any/all` folds the reversed prefix, not the
             // forward one (a false proof of the wrong verdict).
-            let base_of = |p: u64| if it.rev { n - 1 - p } else { p };
+            let base_of = |p: u64| it.base_of(p, n);
             let mut k = it.pos;
             while k < hi {
                 let Some((elem, _)) = env.index_elem(it.base, base_of(k)) else {
@@ -6300,7 +6332,7 @@ fn slice_iter(
                 };
                 let hi = it.end.map_or(n, |e| e.min(n));
                 if pos < hi {
-                    (n - 1 - pos, smt::word(intrinsics::SOME_TAG, 1))
+                    (it.base_of(pos, n), smt::word(intrinsics::SOME_TAG, 1))
                 } else {
                     (0, smt::word(0, 1))
                 }
@@ -6448,7 +6480,7 @@ fn slice_iter(
                 let hi = it.end.map_or(n, |e| e.min(n));
                 if it.pos < hi {
                     let last_pos = it.pos + ((hi - 1 - it.pos) / it.step) * it.step;
-                    (n - 1 - last_pos, smt::word(intrinsics::SOME_TAG, 1))
+                    (it.base_of(last_pos, n), smt::word(intrinsics::SOME_TAG, 1))
                 } else {
                     (0, smt::word(0, 1))
                 }
@@ -6517,7 +6549,7 @@ fn slice_iter(
                 };
                 let hi = it.end.map_or(n, |e| e.min(n));
                 if j < hi {
-                    let idx = if it.rev { n - 1 - j } else { j };
+                    let idx = it.base_of(j, n);
                     (idx, smt::word(intrinsics::SOME_TAG, 1))
                 } else {
                     (0, smt::word(0, 1))
@@ -6631,7 +6663,7 @@ fn slice_extreme(
         // A `rev` cursor yields base `n-1-pos`, `n-1-pos-step`, ...; read the element at
         // the reversed base so `rev().take(k).max()` folds the reversed prefix, not the
         // forward one (a false refutation of the true extreme).
-        let base_of = |p: u64| if it.rev { n - 1 - p } else { p };
+        let base_of = |p: u64| it.base_of(p, n);
         let (first, _) = env
             .index_elem(it.base, base_of(it.pos))
             .ok_or_else(|| format!("`{name}` on an iterator whose elements are not modelled"))?;
