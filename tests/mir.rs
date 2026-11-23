@@ -14715,3 +14715,4 @@ fn chained_same_adapters_compose() {
     let step = verify_src("cst", "/// requires: xs.len() == 6\n/// ensures: ret == 1\npub fn cst(xs: &[u8]) -> usize { xs.iter().step_by(2).step_by(3).count() }");
     assert!(step.as_ref().is_some_and(|o| o.is_verified()), "step_by(2).step_by(3) of len 6 is 1 element, got {step:?}");
 }
+

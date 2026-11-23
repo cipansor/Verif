@@ -471,23 +471,75 @@ fn cargo_target_directory(crate_root: &Path) -> Option<PathBuf> {
 /// with the JSON string escapes (`\\`, `\"`, `\n`, `\t`) decoded.
 #[cfg(feature = "std")]
 fn target_directory_from_metadata(metadata: &str) -> Option<PathBuf> {
-    let key = "\"target_directory\":";
-    let i = metadata.find(key)?;
-    let rest = metadata[i + key.len()..].trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let mut out = String::new();
-    let mut chars = rest.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => return Some(PathBuf::from(out)),
-            '\\' => match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some(other) => out.push(other),
-                None => return None,
-            },
-            other => out.push(other),
+    // Read `target_directory` only from the **top-level** object. Cargo prints each
+    // package's user-defined `[package.metadata]` before the root `target_directory`, so a
+    // `target_directory` nested in a package's metadata would otherwise be found first --
+    // and the dependency search would look in the wrong directory. Track the brace depth
+    // (skipping string contents) and accept the key only at depth 1.
+    let bytes = metadata.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let start = i + 1;
+                let end = start + metadata[start..].find('"')?;
+                if depth == 1 && &metadata[start..end] == "target_directory" {
+                    return read_json_string(bytes, end + 1);
+                }
+                // Not the key: skip the whole string (its contents hold no braces).
+                i = end + 1;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth -= 1;
+                i += 1;
+            }
+            _ => i += 1,
         }
+    }
+    None
+}
+
+/// After a key's closing quote at byte `from`, skip whitespace and `:`, then read the
+/// JSON string value, decoding `\\`, `\"`, `\n` and `\t`.
+#[cfg(feature = "std")]
+fn read_json_string(bytes: &[u8], from: usize) -> Option<PathBuf> {
+    let mut j = from;
+    while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+        j += 1;
+    }
+    if j >= bytes.len() || bytes[j] != b':' {
+        return None;
+    }
+    j += 1;
+    while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+        j += 1;
+    }
+    if j >= bytes.len() || bytes[j] != b'"' {
+        return None;
+    }
+    j += 1;
+    let mut out = String::new();
+    while j < bytes.len() {
+        match bytes[j] {
+            b'"' => return Some(PathBuf::from(out)),
+            b'\\' => {
+                j += 1;
+                if j < bytes.len() {
+                    match bytes[j] {
+                        b'n' => out.push('\n'),
+                        b't' => out.push('\t'),
+                        o => out.push(o as char),
+                    }
+                }
+            }
+            o => out.push(o as char),
+        }
+        j += 1;
     }
     None
 }
@@ -2771,6 +2823,10 @@ mod render_tests {
         // A Windows-style path is JSON-escaped (`\\`), so the decoded value is `C:\ws\target`.
         let m2 = r#"{"target_directory":"C:\\ws\\target"}"#;
         assert_eq!(super::target_directory_from_metadata(m2), Some(PathBuf::from(r"C:\ws\target")));
+        // A package's user-defined metadata prints before the root `target_directory`; a
+        // nested `target_directory` must not shadow the real top-level one.
+        let nested = r#"{"packages":[{"metadata":{"target_directory":"/wrong"}}],"target_directory":"/right"}"#;
+        assert_eq!(super::target_directory_from_metadata(nested), Some(PathBuf::from("/right")));
         assert_eq!(super::target_directory_from_metadata("{}"), None);
     }
 }

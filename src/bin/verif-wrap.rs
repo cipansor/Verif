@@ -134,6 +134,14 @@ fn invocation_externs(args: &[OsString]) -> (Vec<(String, PathBuf)>, Vec<PathBuf
             if let Some(v) = it.next() {
                 push_extern(&mut externs, &v.to_string_lossy());
             }
+        } else if s == "-L" {
+            // Cargo may pass `-L dependency=…` as two arguments; the joined form is
+            // `-Ldependency=…`. The two-arg form left `paths` with an empty entry
+            // (from `strip_prefix("-L")` on `-L`), which the MIR emitter then passed
+            // as `-L dependency=` -- rustc rejects it and the build stops.
+            if let Some(v) = it.next() {
+                push_search(&mut paths, &v.to_string_lossy());
+            }
         } else if let Some(v) = s.strip_prefix("-L") {
             push_search(&mut paths, v);
         }
@@ -289,6 +297,30 @@ fn target_refusal(rustc: &str, args: &[OsString]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cargo passes `-L dependency=…` as **two** arguments; the joined `-Ldependency=…` is
+    /// the other form. The two-arg form used to leave `paths` with an empty entry (from
+    /// `strip_prefix("-L")` on a bare `-L`), which the MIR emitter passed as
+    /// `-L dependency=` -- rustc rejects it and the build stops.
+    #[test]
+    fn invocation_externs_reads_two_arg_l_search_paths() {
+        use std::ffi::OsString;
+        let args: Vec<OsString> = [
+            "--crate-name", "app", "-L", "dependency=/tmp/verif-x", "-L", "all=/tmp/verif-y",
+            "-Ldependency=/tmp/verif-z",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        let (_, paths) = invocation_externs(&args);
+        assert!(paths.iter().any(|p| p.ends_with("verif-x")), "two-arg dependency path, got {paths:?}");
+        assert!(paths.iter().any(|p| p.ends_with("verif-y")), "two-arg all path, got {paths:?}");
+        assert!(paths.iter().any(|p| p.ends_with("verif-z")), "joined path, got {paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.as_os_str().is_empty()),
+            "no empty search path may be recorded, got {paths:?}"
+        );
+    }
 
     #[test]
     fn source_arg_skips_a_crate_name_value_that_is_an_existing_file() {
