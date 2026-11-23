@@ -135,7 +135,27 @@ fn classify(msg: &AssertMessage) -> PanicKind {
         AssertMessage::DivisionByZero(_) => PanicKind::DivByZero,
         AssertMessage::RemainderByZero(_) => PanicKind::RemByZero,
         AssertMessage::BoundsCheck { .. } => PanicKind::Bounds,
-        other => PanicKind::Other(format!("{other:?}")),
+        // Normalise the pointer-dereference guards to the same tokens
+        // `PanicKind::from_text_message` emits, so the text and typed shapes agree even
+        // when a nightly re-spells the message. Matching on the Debug *prefix* keeps this
+        // compiling on any nightly -- it does not name the variant, so a nightly that
+        // renames or removes it falls through to the raw `Other` (a visible disagreement,
+        // never a build error).
+        other => {
+            let s = format!("{other:?}");
+            let canon = if s.starts_with("NullPointerDereference") {
+                "NullPointerDereference"
+            } else if s.starts_with("MisalignedPointerDereference") {
+                "MisalignedPointerDereference"
+            } else {
+                ""
+            };
+            if canon.is_empty() {
+                PanicKind::Other(s)
+            } else {
+                PanicKind::Other(canon.to_string())
+            }
+        }
     }
 }
 

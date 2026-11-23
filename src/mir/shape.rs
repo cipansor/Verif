@@ -95,6 +95,13 @@ impl PanicKind {
             PanicKind::ShiftRight
         } else if has("index out of bounds") || has("slice index") {
             PanicKind::Bounds
+        } else if has("misaligned pointer dereference") {
+            // Normalise to the same token the typed side's `classify` emits for
+            // `AssertMessage::MisalignedPointerDereference`, so the two shapes agree
+            // across a toolchain that re-spells the text message.
+            PanicKind::Other("MisalignedPointerDereference".to_string())
+        } else if has("null pointer dereference") {
+            PanicKind::Other("NullPointerDereference".to_string())
         } else if has("{} - {}") {
             PanicKind::OverflowSub
         } else if has("{} + {}") {
@@ -224,6 +231,16 @@ mod tests {
             ("attempt to shift left by `{}`, which would overflow", PanicKind::ShiftLeft),
             ("attempt to shift right by `{}`, which would overflow", PanicKind::ShiftRight),
             ("index out of bounds: the len is {} but the index is {}", PanicKind::Bounds),
+            // Normalised to the token the typed side's `classify` emits, so the two
+            // shapes agree across a nightly that re-spells the pointer-deref message.
+            (
+                "null pointer dereference occurred",
+                PanicKind::Other("NullPointerDereference".to_string()),
+            ),
+            (
+                "misaligned pointer dereference: address must be a multiple of {} but is {}",
+                PanicKind::Other("MisalignedPointerDereference".to_string()),
+            ),
         ];
         for (msg, want) in cases {
             assert_eq!(PanicKind::from_text_message(msg), want, "message: {msg}");
