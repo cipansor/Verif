@@ -686,6 +686,8 @@ struct IterState {
     pos: u64,
     /// `Iterator::rev`. Reverses which base index a sequence position names.
     rev: bool,
+    /// `Iterator::step_by`'s stride (1 unless a `step_by` was applied).
+    step: u64,
 }
 
 /// Local-to-symbolic environment, with side maps for aggregate parts.
@@ -5796,7 +5798,7 @@ fn slice_iter(
             if s.elem_w == 0 {
                 return Err(format!("`{name}` on a slice whose element width is not modelled"));
             }
-            env.iters.insert(dest.local, IterState { base: recv.local, pos: 0, rev: false });
+            env.iters.insert(dest.local, IterState { base: recv.local, pos: 0, rev: false, step: 1 });
             Ok(Vec::new())
         }
         // `copied()` wraps the cursor in an adapter that yields `T` instead of `&T`.
@@ -5817,6 +5819,26 @@ fn slice_iter(
                 return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
             };
             env.iters.insert(dest.local, IterState { rev: !it.rev, ..it });
+            Ok(Vec::new())
+        }
+        // `skip(n)` advances the position by `n`; `step_by(n)` sets the stride.
+        // Both read a *constant* `n` and carry the cursor to the destination.
+        Intrinsic::SliceSkip | Intrinsic::SliceStepBy => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            let Some(n) = constant_operand(cx.args.get(1), env) else {
+                return Err(format!("`{name}` needs a constant argument"));
+            };
+            let next = if matches!(op, Intrinsic::SliceSkip) {
+                IterState { pos: it.pos.saturating_add(n), ..it }
+            } else {
+                if n == 0 {
+                    return Err(format!("`{name}` with a zero step is a panic and is not modelled"));
+                }
+                IterState { step: it.step.saturating_mul(n), ..it }
+            };
+            env.iters.insert(dest.local, next);
             Ok(Vec::new())
         }
         Intrinsic::SliceNext => {
@@ -5879,7 +5901,7 @@ fn slice_iter(
             }
             env.slice_elem_ref.insert(dest.local, ElemId::Leaf((base, idx)));
             if let Some(it) = env.iters.get_mut(&recv.local) {
-                it.pos = it.pos.saturating_add(1);
+                it.pos = it.pos.saturating_add(it.step);
             }
             Ok(Vec::new())
         }
@@ -5892,10 +5914,19 @@ fn slice_iter(
             };
             let len = s.len;
             let w = smt::bits(len);
-            // `len - pos`, guarded so a cursor already advanced past the end (a `next`
-            // that returned `None` still advances the position) counts zero rather
-            // than underflowing. `pos` is concrete, so the guard is one comparison.
-            let count = if it.pos == 0 {
+            let count = if it.step != 1 {
+                // A stride needs a *constant* length to count the positions exactly.
+                let Some(n) = iterator_const_len(s, cx.pins) else {
+                    return Err(format!(
+                        "`{name}` with `step_by` on a slice whose length is not a constant"
+                    ));
+                };
+                let c = if it.pos < n { (n - 1 - it.pos) / it.step + 1 } else { 0 };
+                smt::word(c, w)
+            } else if it.pos == 0 {
+                // `len - pos`, guarded so a cursor already advanced past the end (a
+                // `next` that returned `None` still advances the position) counts
+                // zero rather than underflowing.
                 len
             } else {
                 smt::ite(
@@ -5940,7 +5971,12 @@ fn slice_iter(
             } else {
                 let idx = match iterator_const_len(s, cx.pins) {
                     Some(0) => 0,
-                    Some(n) => n - 1,
+                    Some(n) if it.pos < n => {
+                        // The last index the stride reaches from `pos`: `pos + m*step`
+                        // with `m = (n-1-pos)/step`. For `step == 1` that is `n-1`.
+                        it.pos + ((n - 1 - it.pos) / it.step) * it.step
+                    }
+                    Some(_) => 0,
                     None => LAST_INDEX,
                 };
                 let tag = smt::ite(
@@ -5972,7 +6008,7 @@ fn slice_iter(
                     "`{name}` with a non-constant offset is not modelled"
                 ));
             };
-            let j = it.pos.saturating_add(k);
+            let j = it.pos.saturating_add(k.saturating_mul(it.step));
             let (idx, tag) = if it.rev {
                 let Some(n) = iterator_const_len(s, cx.pins) else {
                     return Err(format!(
@@ -6085,7 +6121,8 @@ fn slice_extreme(
             .ok_or_else(|| format!("`{name}` on an iterator whose elements are not modelled"))?;
         let mut acc = first;
         let mut tree = ElemId::Leaf((it.base, it.pos));
-        for k in it.pos + 1..n {
+        let mut k = it.pos + it.step;
+        while k < n {
             let (elem, _) = env.index_elem(it.base, k).ok_or_else(|| {
                 format!("`{name}` on an iterator whose elements are not modelled")
             })?;
@@ -6110,6 +6147,7 @@ fn slice_extreme(
             };
             acc = smt::ite(keep, acc, elem);
             tree = ElemId::Select(keep, Box::new(tree), Box::new(ElemId::Leaf((it.base, k))));
+            k += it.step;
         }
         env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(acc, sign), elem_w);
         env.slice_elem_ref.insert(dest.local, tree);
@@ -6174,7 +6212,8 @@ fn slice_sum(
     let sign = Sign::of_bool(elem_signed);
     let mut acc = smt::word(0, dest_w);
     let mut obligations = Vec::new();
-    for k in it.pos..n {
+    let mut k = it.pos;
+    while k < n {
         let Some((elem, _)) = env.index_elem(it.base, k) else {
             return Err(format!("`{name}` on an iterator whose elements are not modelled"));
         };
@@ -6196,6 +6235,7 @@ fn slice_sum(
             verdict: find_obligation(smt::and(path, over), pins),
         });
         acc = smt::add(acc, elem);
+        k += it.step;
     }
     env.set(dest, Val::Sym(acc, sign));
     env.iters.remove(&recv.local);
@@ -6923,6 +6963,8 @@ fn try_intrinsic(
                 | intrinsics::Intrinsic::SliceNext
                 | intrinsics::Intrinsic::SliceCopied
                 | intrinsics::Intrinsic::SliceRev
+                | intrinsics::Intrinsic::SliceSkip
+                | intrinsics::Intrinsic::SliceStepBy
                 | intrinsics::Intrinsic::SliceCount
                 | intrinsics::Intrinsic::SliceSum
                 | intrinsics::Intrinsic::SliceIterLast
@@ -7053,6 +7095,8 @@ fn try_intrinsic(
             | intrinsics::Intrinsic::SliceNext
             | intrinsics::Intrinsic::SliceCopied
             | intrinsics::Intrinsic::SliceRev
+            | intrinsics::Intrinsic::SliceSkip
+            | intrinsics::Intrinsic::SliceStepBy
             | intrinsics::Intrinsic::SliceCount
             | intrinsics::Intrinsic::SliceSum
             | intrinsics::Intrinsic::SliceIterLast

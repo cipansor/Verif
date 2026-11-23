@@ -14288,6 +14288,61 @@ pub fn array_iter_rev_count(xs: &[u8; 2]) -> u32 {
     xs.iter().rev().count() as u32
 }
 
+spec! {
+    requires: true,
+    ensures: ret == xs[1],
+}
+/// `xs.iter().skip(1).last()` names the element after the skipped prefix.
+pub fn array_iter_skip_last(xs: &[u8; 2]) -> u8 {
+    *xs.iter().skip(1).last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
+/// `skip` removes elements from the front, so `count` drops by the skip amount.
+pub fn array_iter_skip_count(xs: &[u8; 2]) -> u32 {
+    xs.iter().skip(1).count() as u32
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
+/// `step_by(2)` over four elements visits indices 0 and 2.
+pub fn array_iter_step_count(xs: &[u8; 4]) -> u32 {
+    xs.iter().step_by(2).count() as u32
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[2],
+}
+/// `step_by(2).last()` names the last *strided* index (2, not 3).
+pub fn array_iter_step_last(xs: &[u8; 4]) -> u8 {
+    *xs.iter().step_by(2).last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[1],
+}
+/// The same body claiming the last *un-strided* element must be refuted.
+pub fn array_iter_step_last_tripwire(xs: &[u8; 4]) -> u8 {
+    *xs.iter().step_by(2).last().unwrap()
+}
+
+spec! {
+    requires: xs[0] <= 100,
+    requires: xs[2] <= 100,
+    ensures: ret == xs[0] + xs[2],
+}
+/// `step_by(2).sum()` folds the strided elements `xs[0]` and `xs[2]`.
+pub fn array_iter_step_sum(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().step_by(2).sum()
+}
+
 // ---------------------------------------------------------------------------
 // A scalar reference argument named in a contract (C9)
 //

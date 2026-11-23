@@ -12983,6 +12983,37 @@ fn an_iterator_can_be_reversed() {
     );
 }
 
+/// C11 iteration: `skip` advances the cursor's position and `step_by` sets its
+/// stride. `last`/`count`/`sum` read the stride, so the fixtures pin the mapping
+/// (e.g. `step_by(2).last()` is index 2 of 0..4, not 3).
+#[test]
+fn an_iterator_can_be_skipped_and_stepped() {
+    let names = [
+        "array_iter_skip_last",
+        "array_iter_skip_count",
+        "array_iter_step_count",
+        "array_iter_step_last",
+        "array_iter_step_last_tripwire",
+        "array_iter_step_sum",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in [
+        "array_iter_skip_last",
+        "array_iter_skip_count",
+        "array_iter_step_count",
+        "array_iter_step_last",
+        "array_iter_step_sum",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let o = outcome(&report, "array_iter_step_last_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`array_iter_step_last_tripwire` claims the un-strided last element and must be refuted, got: {o}"
+    );
+}
+
 /// C11 containers: `Vec::clear`/`String::clear` reset the tracked length to zero,
 /// and the tripwire that claims the pre-clear length is refuted.
 #[test]

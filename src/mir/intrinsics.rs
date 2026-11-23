@@ -394,6 +394,10 @@ pub enum Intrinsic {
     SliceCopied,
     /// `Iterator::rev` on a cursor: a direction flag, carried like `copied`.
     SliceRev,
+    /// `Iterator::skip(n)` on a cursor: advances the position by `n`.
+    SliceSkip,
+    /// `Iterator::step_by(n)` on a cursor: advances the position by `n` each step.
+    SliceStepBy,
     /// `Iterator::count` on a slice/array cursor: `len - pos`.
     ///
     /// The cursor is a concrete position, so the remaining count is the length
@@ -1550,6 +1554,12 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if short == "rev" && names_slice_iter_ty(name) {
         return Some(Intrinsic::SliceRev);
     }
+    if short == "skip" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceSkip);
+    }
+    if short == "step_by" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceStepBy);
+    }
     if short == "count" && names_slice_iter_ty(name) {
         return Some(Intrinsic::SliceCount);
     }
@@ -1990,7 +2000,11 @@ fn is_cursor_ty(ty: &str) -> bool {
         || head == "Enumerate"
         || head.ends_with("::Enumerate")
         || head == "Rev"
-        || head.ends_with("::Rev");
+        || head.ends_with("::Rev")
+        || head == "Skip"
+        || head.ends_with("::Skip")
+        || head == "StepBy"
+        || head.ends_with("::StepBy");
     is_adapter && (ty.contains("slice::Iter") || ty.contains("array::IntoIter"))
 }
 
@@ -2364,6 +2378,8 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         | Intrinsic::SliceNext
         | Intrinsic::SliceCopied
         | Intrinsic::SliceRev
+        | Intrinsic::SliceSkip
+        | Intrinsic::SliceStepBy
         | Intrinsic::SliceCount
         | Intrinsic::SliceSum
         | Intrinsic::SliceIterLast
@@ -2605,6 +2621,8 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             | Intrinsic::SliceNext
             | Intrinsic::SliceCopied
             | Intrinsic::SliceRev
+            | Intrinsic::SliceSkip
+            | Intrinsic::SliceStepBy
             | Intrinsic::SliceCount
             | Intrinsic::SliceSum
             | Intrinsic::SliceIterLast
@@ -2676,6 +2694,8 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         | Intrinsic::SliceNext
         | Intrinsic::SliceCopied
         | Intrinsic::SliceRev
+        | Intrinsic::SliceSkip
+        | Intrinsic::SliceStepBy
         | Intrinsic::SliceCount
         | Intrinsic::SliceSum
         | Intrinsic::SliceIterLast
@@ -6491,6 +6511,19 @@ mod tests {
         assert_eq!(
             classify("<std::iter::Rev<std::slice::Iter<'_, u8>> as Iterator>::last"),
             Some(Intrinsic::SliceIterLast)
+        );
+        // `skip`/`step_by` are cursor adapters too; their terminals still classify.
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::skip"),
+            Some(Intrinsic::SliceSkip)
+        );
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::step_by"),
+            Some(Intrinsic::SliceStepBy)
+        );
+        assert_eq!(
+            classify("<std::iter::StepBy<std::slice::Iter<'_, u8>> as Iterator>::count"),
+            Some(Intrinsic::SliceCount)
         );
         assert_eq!(
             classify("<std::slice::Iter<'_, u8> as Iterator>::count"),
