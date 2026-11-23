@@ -10771,3 +10771,22 @@ both print `ok`, so a skipped test is the same "green that checked nothing" as t
 gate that did not run. Where the environment is genuinely absent, say so with
 `eprintln!` and assert on what *was* reachable; where it is present but broken,
 panic rather than return.
+
+## `cargo verif` is a thin wrapper, and the test runs the built binary
+
+U2's command-line entry point is `src/bin/cargo-verif.rs`, a `[[bin]]` with
+`required-features = ["std"]` so `cargo build --no-default-features` (the
+bare-metal gate) skips it. It is a *thin* wrapper over
+`mir::verify::verify_file_with`: it parses `--file`/`--function`/`--format`,
+prints the report (`human` or a hand-written `json`), and maps the result to a
+distinct exit code -- `0` clean, `1` a failure/incomplete/skipped/missing, `2`
+the tool could not run. The codes must stay distinct so a failed proof is never
+confused with a tool that could not start.
+
+`tests/cargo_verif.rs` is the evidence, and it runs the *built* binary through
+`env!("CARGO_BIN_EXE_cargo-verif")` (cargo sets that for an integration test of
+the same package), on a throwaway crate with a real `Cargo.toml` so the edition
+resolves. A library test on `FileReport` would not check the command a user
+actually runs or the exit code a CI step keys on. The file is `#![cfg(feature =
+"std")]` because the bin is `std`-only; the tests skip with a printed message
+when no compiler is reachable (never a silent pass).

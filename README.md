@@ -149,6 +149,28 @@ Building for a microcontroller:
 $ cargo build --target thumbv7em-none-eabihf
 ```
 
+## Verifying a file: `cargo verif`
+
+With the `std` feature on, the crate ships a `cargo-verif` binary, so verifying a
+file's `verif` contracts is one command, the way `cargo kani` is for Kani:
+
+```console
+$ cargo verif                         # verify src/lib.rs (then src/main.rs)
+$ cargo verif --file src/foo.rs       # a specific file
+$ cargo verif --function add          # one function by name
+$ cargo verif --format json           # one machine-readable object for CI
+```
+
+The exit code is the verdict, and the codes are distinct so a script can tell a
+failed proof from a tool that could not run: `0` every contract held, `1` a
+failure / incomplete function / skipped contract / missing body, `2` the frontend
+could not run (no compiler, a compile error). A skipped function is *not* a pass:
+its contract could not be read, so it was never checked. The binary is a thin
+wrapper over `mir::verify::verify_file_with`, so it decides exactly what the
+library decides. `--format json` is hand-written (the crate is zero-dependency)
+and emits `file`, `outcomes`, `missing` and a `summary`. `--format sarif` and a
+GitHub Action that annotates a PR are the remaining U2 work.
+
 ---
 
 ## The idea in one paragraph
@@ -2747,6 +2769,7 @@ is instantaneous while a 12-bit multiplier equality is not.
 │   ├── mir.rs          real-Rust verification, with counterexamples replayed
 │   │                   against the compiled functions
 │   ├── readme.rs       the README's examples, pinned so they cannot rot
+│   ├── cargo_verif.rs  the `cargo verif` binary, run end to end
 │   └── soundness.rs    every fixture the SOUNDNESS.md ledger names must exist
 ├── examples/
 │   ├── flight_control.rs  a realistic actuator path, all obligations discharged

@@ -1,0 +1,212 @@
+//! `cargo verif`: verify a file's `verif` contracts from the command line.
+//!
+//! This is the entry point a user reaches for the way they reach for `cargo
+//! kani`: one command, a report, and an exit code that says whether every
+//! contract held. It is a thin wrapper over `verif::mir::verify::verify_file_with`,
+//! so it decides exactly what the library decides -- it does not re-implement a
+//! single check.
+//!
+//! Usage (cargo passes the subcommand name as the first argument):
+//!
+//! ```console
+//! $ cargo verif                       # verifies src/lib.rs of the current crate
+//! $ cargo verif --file src/foo.rs     # a specific file
+//! $ cargo verif --function add        # one function by name
+//! ```
+//!
+//! Exit codes, kept distinct so a script can tell them apart:
+//!
+//! * `0` -- every contract held (`FileReport::is_clean`).
+//! * `1` -- the frontend ran and found a failure, an incomplete function, a
+//!   skipped contract, or a contracted function missing from the MIR. A skipped
+//!   function is *not* a pass: its contract could not be read, so it was never
+//!   checked.
+//! * `2` -- the tool could not run (a missing compiler, an unreadable file, a
+//!   compile error). "The tool could not run" must never look like "the code is
+//!   wrong", so it is a different code and a different message.
+
+use std::path::{Path, PathBuf};
+
+use verif::mir::verify::{self, FnOutcome};
+
+fn main() {
+    let mut file: Option<PathBuf> = None;
+    let mut function: Option<String> = None;
+    let mut format = String::from("human");
+    // `cargo verif` invokes this binary as `cargo-verif verif [args]`; drop the
+    // subcommand name so a bare `cargo verif --file x` parses.
+    let mut pending = Vec::new();
+    for a in std::env::args().skip(1) {
+        if a == "verif" {
+            continue;
+        }
+        pending.push(a);
+    }
+    let mut it = pending.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--file" | "-f" => file = it.next().map(PathBuf::from),
+            "--function" | "--fn" => function = it.next(),
+            "--format" => format = it.next().unwrap_or_default(),
+            "--help" | "-h" => {
+                println!(
+                    "cargo verif [--file <path>] [--function <name>]\n\
+                     \n\
+                     Verifies the `verif` contracts in a Rust source file.\n\
+                     Default file: src/lib.rs (then src/main.rs).\n\
+                     Set VERIF_RUSTC to choose the compiler the frontend runs."
+                );
+                return;
+            }
+            other if other.starts_with('-') => {
+                eprintln!("cargo-verif: unknown flag `{other}` (try --help)");
+                std::process::exit(2);
+            }
+            other => file = Some(PathBuf::from(other)),
+        }
+    }
+
+    let file = file
+        .or_else(|| {
+            ["src/lib.rs", "src/main.rs"]
+                .iter()
+                .map(PathBuf::from)
+                .find(|p| p.exists())
+        })
+        .unwrap_or_else(|| {
+            eprintln!("cargo-verif: no file given and neither src/lib.rs nor src/main.rs exists");
+            std::process::exit(2);
+        });
+
+    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
+    let only: Vec<String> = function.into_iter().collect();
+    let report = match verify::verify_file_with(&rustc, &file, &only) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cargo-verif: could not verify {}: {e}", file.display());
+            std::process::exit(2);
+        }
+    };
+
+    match format.as_str() {
+        "human" => print_human(&file, &report),
+        "json" => print_json(&file, &report),
+        other => {
+            eprintln!("cargo-verif: unknown --format `{other}` (human | json)");
+            std::process::exit(2);
+        }
+    }
+
+    if !report.is_clean() {
+        std::process::exit(1);
+    }
+}
+
+/// The human report: one line per outcome, then a tally.
+fn print_human(file: &Path, report: &verify::FileReport) {
+    println!("verifying {}", file.display());
+    for (name, outcome) in &report.outcomes {
+        println!("  {name:<28} {}", describe(outcome));
+    }
+    for m in &report.missing {
+        println!("  {m:<28} MISSING (contract carried, but no MIR body found)");
+    }
+    println!(
+        "\n{} verified, {} failed, {} incomplete, {} skipped, {} missing",
+        report.verified(),
+        report.failed(),
+        report.incomplete(),
+        report.skipped(),
+        report.missing.len()
+    );
+    println!(
+        "{}",
+        if report.is_clean() {
+            "all contracts held"
+        } else {
+            "verification did not pass"
+        }
+    );
+}
+
+/// The machine report: a single JSON object, so a CI step can parse it without
+/// scraping the human text. Hand-written (the crate is zero-dependency) with the
+/// two characters JSON needs escaped -- `"` and `\` -- plus control characters.
+fn print_json(file: &Path, report: &verify::FileReport) {
+    let mut out = String::from("{\"file\":");
+    json_str(&mut out, &file.display().to_string());
+    out.push_str(",\"outcomes\":[");
+    for (i, (name, outcome)) in report.outcomes.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"name\":");
+        json_str(&mut out, name);
+        out.push_str(",\"outcome\":");
+        json_str(&mut out, outcome_label(outcome));
+        out.push_str(",\"detail\":");
+        json_str(&mut out, &describe(outcome));
+        out.push('}');
+    }
+    out.push_str("],\"missing\":[");
+    for (i, m) in report.missing.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        json_str(&mut out, m);
+    }
+    out.push_str("],\"summary\":{\"verified\":");
+    out.push_str(&report.verified().to_string());
+    out.push_str(",\"failed\":");
+    out.push_str(&report.failed().to_string());
+    out.push_str(",\"incomplete\":");
+    out.push_str(&report.incomplete().to_string());
+    out.push_str(",\"skipped\":");
+    out.push_str(&report.skipped().to_string());
+    out.push_str(",\"missing\":");
+    out.push_str(&report.missing.len().to_string());
+    out.push_str(",\"clean\":");
+    out.push_str(if report.is_clean() { "true" } else { "false" });
+    out.push_str("}}");
+    println!("{out}");
+}
+
+/// A short machine label for one outcome.
+fn outcome_label(outcome: &FnOutcome) -> &'static str {
+    match outcome {
+        FnOutcome::Verified { .. } => "verified",
+        FnOutcome::Failed { .. } => "failed",
+        FnOutcome::Incomplete { .. } => "incomplete",
+        FnOutcome::Skipped { .. } => "skipped",
+    }
+}
+
+/// Append `s` as a JSON string literal (quoted, with `"`, `\` and control
+/// characters escaped).
+fn json_str(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// One line per outcome, so the `match` lives in a single place.
+fn describe(outcome: &FnOutcome) -> String {
+    match outcome {
+        FnOutcome::Verified { obligations, panics_ruled_out } => {
+            format!("verified ({obligations} obligation(s), {panics_ruled_out} panic(s) ruled out)")
+        }
+        FnOutcome::Failed { kind, detail } => format!("FAILED: {kind} — {detail}"),
+        FnOutcome::Incomplete { reasons, .. } => format!("incomplete: {}", reasons.join("; ")),
+        FnOutcome::Skipped { reason } => format!("skipped: {reason}"),
+    }
+}

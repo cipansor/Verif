@@ -1217,7 +1217,21 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     change.)
   - Exit: `cargo add verif` works. ✅
   - Move: **build**.
-- **U2. `cargo verif`.** · P1 · todo · Kani (`cargo kani`)
+- **U2. `cargo verif`.** · P1 · in progress · Kani (`cargo kani`)
+  - Gap: there was no command-line entry point; a user had to write an example
+    that called `verify_file_with`.
+  - Progress: `src/bin/cargo-verif.rs` (a `[[bin]]` gated on `std`, so the
+    bare-metal build is unaffected) is the entry point. `cargo verif [--file P]
+    [--function N] [--format human|json]` verifies a file (default `src/lib.rs`)
+    and maps the report to a distinct exit code: `0` clean, `1` a failure /
+    incomplete / skipped / missing, `2` the tool could not run. `--format json`
+    emits one machine-readable object (`file`, `outcomes`, `missing`, `summary`)
+    with hand-written escaping (the crate is zero-dependency). Pinned end to end
+    by `tests/cargo_verif.rs`, which runs the *built* binary (`CARGO_BIN_EXE_…`)
+    on a throwaway crate: a true contract exits 0, a false one exits 1 and names
+    the postcondition, a `--function` filter ignores a broken sibling, and the
+    JSON carries the summary.
+  - Remaining: `--format sarif` and the GitHub Action that annotates a PR.
   - Exit: `cargo verif --format json|sarif` plus a GitHub Action that annotates a
     PR.
   - Move: **build**.
