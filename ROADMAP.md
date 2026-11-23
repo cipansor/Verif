@@ -1770,6 +1770,26 @@ neither unbalances the depth nor supplies a signature
 already a commit-SHA placeholder. Regressions:
 `source_arg_finds_a_custom_extension_path`.
 
+**Round 14 (deep fixes):**
+- `verif-wrap` now forwards the invocation's **own** `--extern`/`-L dependency=` to the
+  MIR emit (Cargo's exact artifacts for this target/profile/feature set), instead of
+  re-deriving from `[dependencies]` and ranking rlibs by mtime. This closes *wrapped builds
+  lose resolved dependencies* (a binary's own library), *wrong dependency build*, *missing
+  workspace/custom target artifacts* and *renamed dependencies* — the alias is the `--extern`
+  name, not the artifact basename. Tests: `a_binary_that_imports_its_own_library_builds`.
+- `verif-wrap` forwards a **build script** (`--crate-name build_script_build`) unchanged, so a
+  `[build-dependencies]` script is not verified without its deps. Test:
+  `a_build_script_with_a_build_only_dependency_is_forwarded`.
+- Cached-build isolation is documented (a dedicated `CARGO_TARGET_DIR` per mode) and pinned by
+  `enabling_verification_after_an_unwrapped_build_still_rejects_a_false_contract`.
+- Executor fail-closed guards: `reject_adapters` (a terminal that reads base elements after a
+  `map`/`filter` it does not apply is refused), `closure_op_count` (a closure with more than
+  one operation is refused, so a compound `map` is not read as its first op), reversed checked
+  reductions refused, and `Vec::clear` of an element that may have drop glue refused.
+  `iterator_adapter_shortcuts_are_refused_not_mis_modelled` — `filter(..).next().is_some()` on a
+  zeroed slice was a **false proof** (`Verified`, reporting `false` as `true`); it is now
+  refused (teeth confirmed by disabling the guard). `clearing_a_vec_of_droppable_elements_is_not_proved_panic_free`.
+
 **Tracked (open):**
 - Executor: compound iterator closures (`closure_map`/`closure_binop`/`closure_filter`
   read an intermediate as the result), `Vec::clear`/drops of user-`Drop` elements,

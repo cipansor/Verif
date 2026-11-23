@@ -12,7 +12,7 @@
 //! normal build, with no separate `cargo verif` step to remember.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 fn main() -> ExitCode {
@@ -23,7 +23,7 @@ fn main() -> ExitCode {
     };
     let args: Vec<OsString> = it.collect();
 
-    if std::env::var("CARGO_PRIMARY_PACKAGE").as_deref() == Ok("1") {
+    if std::env::var("CARGO_PRIMARY_PACKAGE").as_deref() == Ok("1") && !is_build_script(&args) {
         if let Some(src) = source_arg(&args) {
             if let Err(code) = verify(&rustc, Path::new(&src), &args) {
                 return code;
@@ -99,6 +99,69 @@ fn takes_value(flag: &str) -> bool {
     )
 }
 
+/// Is this rustc invocation compiling a package's `build.rs`? Cargo names a build
+/// script `build_script_build`, and a build script may use `[build-dependencies]` that
+/// `crate_options` does not resolve, so it is forwarded unchanged rather than verified.
+fn is_build_script(args: &[OsString]) -> bool {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let s = a.to_string_lossy();
+        if s == "--crate-name" {
+            if let Some(v) = it.next() {
+                return v.to_string_lossy().starts_with("build_script");
+            }
+        } else if let Some(v) = s.strip_prefix("--crate-name=") {
+            return v.starts_with("build_script");
+        }
+    }
+    false
+}
+
+/// The invocation's own `--extern`/`-L dependency=` arguments, canonicalised. These are
+/// Cargo's *exact* artifacts for this target, profile and feature set -- the crate's own
+/// library, renamed deps (the alias is the `--extern` name, not the artifact basename),
+/// and a custom or workspace target directory -- so forwarding them beats re-deriving
+/// from `[dependencies]` and ranking rlibs by modification time.
+fn invocation_externs(args: &[OsString]) -> (Vec<(String, PathBuf)>, Vec<PathBuf>) {
+    let mut externs = Vec::new();
+    let mut paths = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let s = a.to_string_lossy();
+        if let Some(v) = s.strip_prefix("--extern=") {
+            push_extern(&mut externs, v);
+        } else if s == "--extern" {
+            if let Some(v) = it.next() {
+                push_extern(&mut externs, &v.to_string_lossy());
+            }
+        } else if let Some(v) = s.strip_prefix("-L") {
+            push_search(&mut paths, v);
+        }
+    }
+    (externs, paths)
+}
+
+fn push_extern(externs: &mut Vec<(String, PathBuf)>, v: &str) {
+    if let Some((name, path)) = v.split_once('=') {
+        externs.push((name.to_string(), canonical(Path::new(path))));
+    }
+}
+
+fn push_search(paths: &mut Vec<PathBuf>, v: &str) {
+    // `-L kind=path` or `-L path`; only dependency search paths matter to the emit.
+    match v.split_once('=') {
+        Some((kind, path)) if kind == "dependency" || kind == "all" => {
+            paths.push(canonical(Path::new(path)))
+        }
+        Some(_) => {}
+        None => paths.push(canonical(Path::new(v))),
+    }
+}
+
+fn canonical(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 /// Run the frontend on `src`. A failed verdict prints the failing functions and
 /// returns exit code 1; a setup error is also a failure, because a wrapper that
 /// silently verified nothing would look like it had.
@@ -122,6 +185,18 @@ fn verify(rustc: &OsString, src: &Path, args: &[OsString]) -> Result<(), ExitCod
         return Err(ExitCode::from(2));
     }
     let mut opts = verif::mir::verify::crate_options(src);
+    // The invocation's own `--extern`/`-L` are Cargo's *exact* artifacts for this
+    // target, profile and feature set (the crate's own library, renamed deps, a custom
+    // or workspace target dir), so forward them rather than re-deriving from
+    // `[dependencies]` and ranking rlibs by mtime.
+    let (externs, search_paths) = invocation_externs(args);
+    if !externs.is_empty() {
+        opts.externs = externs;
+        opts.probed_with = None;
+    }
+    if !search_paths.is_empty() {
+        opts.search_paths = search_paths;
+    }
     // Cargo passes `--cfg feature="..."` (and `--target`) to the real compilation.
     // The MIR emit is a *separate* compilation, so without them a `cfg!(feature=...)`
     // would evaluate the other way and the verifier could approve a contract the

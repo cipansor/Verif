@@ -7035,6 +7035,58 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     o
 }
 
+/// `Vec::clear` destroys its elements; with a panicking `Drop` that is a real panic, so
+/// the reset must be refused rather than reported panic-free.
+#[test]
+fn clearing_a_vec_of_droppable_elements_is_not_proved_panic_free() {
+    let Some(o) = verify_src("reset", r#"
+struct Boom;
+impl Drop for Boom { fn drop(&mut self) { panic!("boom"); } }
+pub fn reset(v: &mut Vec<Boom>) { v.clear(); }
+"#) else { return };
+    assert!(
+        !matches!(o, FnOutcome::Verified { .. }),
+        "clearing a Vec<Boom> must not be reported panic-free, got {o}"
+    );
+}
+
+/// A compound closure and an adapter-before-terminal are refused rather than
+/// mis-modelled. `filter(..).next()` was a *false proof* before the guard: on a
+/// 3-element slice of zeros it is `false`, but the unguarded model read the base length
+/// and returned `true`, so `ensures: ret == true` was proved.
+#[test]
+fn iterator_adapter_shortcuts_are_refused_not_mis_modelled() {
+    let Some(o) = verify_src("pfilt", r#"
+/// requires: xs.len() == 3
+/// ensures: ret == true
+pub fn pfilt(xs: &[u8]) -> bool { xs.iter().filter(|x| **x > 10).next().is_some() }
+"#) else { return };
+    assert!(
+        !matches!(o, FnOutcome::Verified { .. }),
+        "`filter(..).next()` must be refused, got {o}"
+    );
+
+    let Some(o) = verify_src("pmapc", r#"
+/// requires: xs.len() == 2
+/// ensures: ret == xs[0] + xs[1]
+pub fn pmapc(xs: &[u8]) -> u8 { xs.iter().copied().map(|x| { let y = x + 1; y * 2 }).sum::<u8>() }
+"#) else { return };
+    assert!(
+        !matches!(o, FnOutcome::Verified { .. }),
+        "a compound map closure must be refused, got {o}"
+    );
+
+    let Some(o) = verify_src("prev", r#"
+/// requires: xs.len() == 3
+/// ensures: ret == xs[0] + xs[1] + xs[2]
+pub fn prev(xs: &[i8]) -> i8 { xs.iter().rev().copied().sum::<i8>() }
+"#) else { return };
+    assert!(
+        !matches!(o, FnOutcome::Verified { .. }),
+        "a reversed checked sum must be refused, got {o}"
+    );
+}
+
 /// A source file may *name* `verif` -- `use verif::spec;` above an in-code
 /// contract block -- but the frontend runs `rustc` on a single file with no Cargo
 /// graph behind it, so without an `--extern` entry that import is `E0432`. This

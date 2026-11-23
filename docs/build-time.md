@@ -404,7 +404,11 @@ forwards every `rustc` call through it, verifies the *primary* package's contrac
 fails the build on a false one. It forwards `--cfg`/`--target` to its MIR emit (so a
 feature-flipped `cfg!` is the program the build compiles) and **refuses** a cross target
 whose pointer width or endianness the model does not represent (64-bit `usize`, the
-verifier's own byte order) rather than pass a proof about a different layout.
+verifier's own byte order) rather than pass a proof about a different layout. It forwards
+the invocation's **own** `--extern`/`-L dependency=` (Cargo's exact artifacts for this
+target, profile and feature set — a binary's own library, renamed dependencies, a custom or
+workspace target directory), and forwards a **build script** (`build_script_build`)
+unchanged so a `[build-dependencies]` script is not verified without its dependencies.
 
 Two limits are documented, not hidden: it verifies the primary package only (a
 dependency's contracts are not checked), and Cargo calls a wrapper only when it compiles —

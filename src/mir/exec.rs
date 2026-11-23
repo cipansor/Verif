@@ -5843,8 +5843,27 @@ fn closure_fn<'a>(prog: &'a MirProgram, arg: Option<&Operand>) -> Option<&'a Mir
 /// The reducer a `fold` closure denotes: `(op, checked)` for `|acc, x| acc <op> x`.
 /// Only a checked binary op (with its overflow `assert`) or a `wrapping_*` call on
 /// `(_2, _3)` in that order is accepted; anything else is refused.
+/// How many arithmetic operations or call terminators the closure performs. The
+/// iterator model reads *one* operation as the whole closure; a body with more
+/// (`|x| { let y = x + 1; y * 2 }`) would be modelled as its first op, so only a
+/// single-operation body is accepted.
+fn closure_op_count(f: &MirFn) -> usize {
+    let mut n = 0;
+    for b in &f.blocks {
+        for st in &b.stmts {
+            if matches!(st, Stmt::Assign(_, Rvalue::Binary(..) | Rvalue::CheckedBinary(..))) {
+                n += 1;
+            }
+        }
+        if matches!(&b.term, Term::Call { .. }) {
+            n += 1;
+        }
+    }
+    n
+}
+
 fn closure_binop(f: &MirFn) -> Option<(BinOp, bool)> {
-    if f.arg_locals.len() != 3 {
+    if f.arg_locals.len() != 3 || closure_op_count(f) != 1 {
         return None;
     }
     let (acc, x) = (f.arg_locals[1], f.arg_locals[2]);
@@ -5930,7 +5949,7 @@ fn resolve_operand(f: &MirFn, o: &Operand) -> Operand {
 
 /// Read a `map` closure `|x| x <op> k` (or `k <op> x`), checked or `wrapping_*`.
 fn closure_map(f: &MirFn) -> Option<MapOp> {
-    if f.arg_locals.len() != 2 {
+    if f.arg_locals.len() != 2 || closure_op_count(f) != 1 {
         return None;
     }
     let x = f.arg_locals[1];
@@ -5971,7 +5990,7 @@ fn closure_map(f: &MirFn) -> Option<MapOp> {
 
 /// Read a `filter` closure `|x| x <op> k` (or `k <op> x`) as a predicate.
 fn closure_filter(f: &MirFn) -> Option<FilterOp> {
-    if f.arg_locals.len() != 2 {
+    if f.arg_locals.len() != 2 || closure_op_count(f) != 1 {
         return None;
     }
     let x = f.arg_locals[1];
@@ -5992,6 +6011,16 @@ fn closure_filter(f: &MirFn) -> Option<FilterOp> {
         }
     }
     None
+}
+
+/// Refuse a terminal that reads base elements when the cursor still carries a lazy
+/// `map`/`filter` it does not apply, so `map(..).next()` is a refusal rather than the
+/// untransformed element (a wrong value).
+fn reject_adapters(it: &IterState, name: &str) -> Result<(), String> {
+    if it.map.is_some() || it.filter.is_some() {
+        return Err(format!("`{name}` after `map`/`filter` is not modelled"));
+    }
+    Ok(())
 }
 
 fn slice_iter(
@@ -6091,6 +6120,10 @@ fn slice_iter(
             let Some(it) = env.iters.get(&recv.local).copied() else {
                 return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
             };
+            reject_adapters(&it, name)?;
+            if it.rev {
+                return Err(format!("`{name}` over a reversed iterator is not modelled"));
+            }
             let Some(s) = env.indexed.get(&it.base) else {
                 return Err(format!("`{name}` on an iterator whose slice is not modelled"));
             };
@@ -6180,6 +6213,7 @@ fn slice_iter(
             let Some(it) = env.iters.get(&recv.local).copied() else {
                 return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
             };
+            reject_adapters(&it, name)?;
             let Some(s) = env.indexed.get(&it.base) else {
                 return Err(format!("`{name}` on an iterator whose slice is not modelled"));
             };
@@ -6215,6 +6249,7 @@ fn slice_iter(
                     "`{name}` on a receiver that is not a modelled slice iterator"
                 ));
             };
+            reject_adapters(&it, name)?;
             let (base, pos) = (it.base, it.pos);
             let Some(s) = env.indexed.get(&base) else {
                 return Err(format!("`{name}` on an iterator whose slice is not modelled"));
@@ -6666,6 +6701,9 @@ fn slice_sum(
     if it.filter.is_some() {
         return Err(format!("`{name}` over a filtered iterator is not modelled"));
     }
+    if it.rev {
+        return Err(format!("`{name}` over a reversed iterator is not modelled"));
+    }
     // The number of addends. A *constant* length is unrolled exactly. A *symbolic*
     // length is unrolled to a bound `K` and each step is guarded by `k < len`, which
     // is exact exactly when the length is at most `K` -- so the precondition must
@@ -7069,7 +7107,16 @@ fn vec_method(
         }
         VecMethod::Clear => {
             let l = receiver(env)?;
-            let _ = shape(env, l)?;
+            let (_, elem_w, _, _) = shape(env, l)?;
+            // `clear` destroys every element immediately. A glue-free scalar element (a
+            // modelled width) has no destructor, so the reset is exact; an element with
+            // no modelled width may have a `Drop` that panics, so refuse rather than
+            // report the reset panic-free.
+            if elem_w == 0 {
+                return Err(format!(
+                    "`{name}` on a Vec whose element may have drop glue is not modelled"
+                ));
+            }
             if let Some(s) = env.indexed.get_mut(&l) {
                 s.len = smt::word(0, USIZE_WIDTH);
                 s.elems.clear();
