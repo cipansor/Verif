@@ -13044,6 +13044,28 @@ fn an_iterator_can_be_taken() {
     );
 }
 
+/// C11 iteration: `Iterator::all`/`any` fold a predicate to a `bool` -- `all` is
+/// the conjunction over the elements, `any` the disjunction. The tripwires claim
+/// the opposite of what the predicate fold yields.
+#[test]
+fn an_iterator_can_be_tested_with_all_and_any() {
+    let names = [
+        "array_iter_all_lt",
+        "array_iter_all_lt_tripwire",
+        "array_iter_any_gt",
+        "array_iter_any_gt_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in ["array_iter_all_lt", "array_iter_any_gt"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in ["array_iter_all_lt_tripwire", "array_iter_any_gt_tripwire"] {
+        let o = outcome(&report, name);
+        assert!(matches!(o, FnOutcome::Failed { .. }), "`{name}` must be refuted, got: {o}");
+    }
+}
+
 /// C11 iteration: `Iterator::map`/`filter` are lazy transforms the value
 /// terminals apply -- `map(f).sum()` folds the mapped elements, `filter(f).count()`
 /// counts the accepted ones. The tripwire's filter accepts all four elements.

@@ -14488,6 +14488,51 @@ pub fn array_iter_filter_count_tripwire(xs: &[u8; 4]) -> u32 {
     xs.iter().filter(|x| **x > 10).count() as u32
 }
 
+spec! {
+    requires: xs[0] < 10,
+    requires: xs[1] < 10,
+    requires: xs[2] < 10,
+    requires: xs[3] < 10,
+    ensures: ret == true,
+}
+/// `all(|x| *x < 10)` is the conjunction of the predicate over the elements.
+pub fn array_iter_all_lt(xs: &[u8; 4]) -> bool {
+    xs.iter().copied().all(|x| x < 10)
+}
+
+spec! {
+    requires: xs[0] < 10,
+    requires: xs[1] < 10,
+    requires: xs[2] < 10,
+    requires: xs[3] < 10,
+    ensures: ret == false,
+}
+/// All four satisfy the predicate, so `all` is true and a claim of false refutes.
+pub fn array_iter_all_lt_tripwire(xs: &[u8; 4]) -> bool {
+    xs.iter().copied().all(|x| x < 10)
+}
+
+spec! {
+    requires: xs[0] > 10,
+    requires: xs[1] > 10,
+    requires: xs[2] > 10,
+    requires: xs[3] > 10,
+    ensures: ret == true,
+}
+/// `any(|x| *x > 10)` is the disjunction of the predicate over the elements.
+pub fn array_iter_any_gt(xs: &[u8; 4]) -> bool {
+    xs.iter().copied().any(|x| x > 10)
+}
+
+spec! {
+    requires: true,
+    ensures: ret == true,
+}
+/// Without a guard `any` can be false (all zero), so this claim must be refuted.
+pub fn array_iter_any_gt_tripwire(xs: &[u8; 4]) -> bool {
+    xs.iter().copied().any(|x| x > 10)
+}
+
 // ---------------------------------------------------------------------------
 // A scalar reference argument named in a contract (C9)
 //

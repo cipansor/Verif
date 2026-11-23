@@ -406,6 +406,10 @@ pub enum Intrinsic {
     SliceMap,
     /// `Iterator::filter(f)` on a cursor: a lazy element predicate (closure).
     SliceFilter,
+    /// `Iterator::all(f)` on a cursor: true iff the predicate holds for every element.
+    SliceAll,
+    /// `Iterator::any(f)` on a cursor: true iff the predicate holds for some element.
+    SliceAny,
     /// `Iterator::count` on a slice/array cursor: `len - pos`.
     ///
     /// The cursor is a concrete position, so the remaining count is the length
@@ -1580,6 +1584,12 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if short == "filter" && names_slice_iter_ty(name) {
         return Some(Intrinsic::SliceFilter);
     }
+    if short == "all" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceAll);
+    }
+    if short == "any" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceAny);
+    }
     if short == "count" && names_slice_iter_ty(name) {
         return Some(Intrinsic::SliceCount);
     }
@@ -2410,6 +2420,8 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         | Intrinsic::SliceFold
         | Intrinsic::SliceMap
         | Intrinsic::SliceFilter
+        | Intrinsic::SliceAll
+        | Intrinsic::SliceAny
         | Intrinsic::SliceCount
         | Intrinsic::SliceSum
         | Intrinsic::SliceIterLast
@@ -2657,6 +2669,8 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             | Intrinsic::SliceFold
             | Intrinsic::SliceMap
             | Intrinsic::SliceFilter
+            | Intrinsic::SliceAll
+            | Intrinsic::SliceAny
             | Intrinsic::SliceCount
             | Intrinsic::SliceSum
             | Intrinsic::SliceIterLast
@@ -2734,6 +2748,8 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         | Intrinsic::SliceFold
         | Intrinsic::SliceMap
         | Intrinsic::SliceFilter
+        | Intrinsic::SliceAll
+        | Intrinsic::SliceAny
         | Intrinsic::SliceCount
         | Intrinsic::SliceSum
         | Intrinsic::SliceIterLast

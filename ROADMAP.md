@@ -1208,6 +1208,13 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     filter accepts all four, so a count of two is refuted), and `mir::intrinsics`
     pins the classification.
 
+  - Progress (**`all`/`any`**): `all(f)`/`any(f)` fold a predicate closure to a
+    `bool` -- `all` is the conjunction of `pred(x)` over the elements, `any` the
+    disjunction. Reuses the `filter` predicate reader (`closure_filter`); needs a
+    constant length. `tests/mir.rs::an_iterator_can_be_tested_with_all_and_any`
+    pins two verified and two refuted tripwires (all-true claimed false, and an
+    unguarded `any` claimed true).
+
   - Progress (**`enumerate`**): `Iterator::enumerate` is a cursor identity whose
     `next` yields `Option<(usize, &T)>`. `next` writes the concrete index and the
     element into the tuple store and sets the payload to an aggregate, so the

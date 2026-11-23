@@ -6172,6 +6172,43 @@ fn slice_iter(
             env.iters.insert(dest.local, IterState { filter: Some(fl), ..it });
             Ok(Vec::new())
         }
+        // `all(f)` / `any(f)`: a predicate fold to a `bool` -- `all` is the
+        // conjunction of `pred(x)` over the elements, `any` the disjunction. Reuses
+        // the `filter` predicate reader; needs a constant length.
+        Intrinsic::SliceAll | Intrinsic::SliceAny => {
+            let is_all = matches!(op, Intrinsic::SliceAll);
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            let Some(s) = env.indexed.get(&it.base) else {
+                return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+            };
+            let (elem_w, elem_signed) = (s.elem_w, s.elem_signed);
+            let Some(n) = iterator_const_len(s, cx.pins) else {
+                return Err(format!("`{name}` over a slice whose length is not a constant"));
+            };
+            let hi = it.end.map_or(n, |e| e.min(n));
+            let Some(closure) = closure_fn(cx.prog, cx.args.get(1)) else {
+                return Err(format!("`{name}` over a closure that is not modelled"));
+            };
+            let Some(fl) = closure_filter(closure) else {
+                return Err(format!("`{name}` over a predicate this frontend does not model"));
+            };
+            let sign = Sign::of_bool(elem_signed);
+            let mut acc = smt::truth(is_all);
+            let mut k = it.pos;
+            while k < hi {
+                let Some((elem, _)) = env.index_elem(it.base, k) else {
+                    return Err(format!("`{name}` on an iterator whose elements are not modelled"));
+                };
+                let pred = filter_pred(fl, elem, elem_w, sign)?;
+                acc = if is_all { smt::and(acc, pred) } else { smt::or(acc, pred) };
+                k += it.step;
+            }
+            env.set(dest, Val::Bool(acc));
+            env.iters.remove(&recv.local);
+            Ok(Vec::new())
+        }
         Intrinsic::SliceNext => {
             let Some(it) = env.iters.get(&recv.local).copied() else {
                 return Err(format!(
@@ -7405,6 +7442,8 @@ fn try_intrinsic(
                 | intrinsics::Intrinsic::SliceFold
                 | intrinsics::Intrinsic::SliceMap
                 | intrinsics::Intrinsic::SliceFilter
+                | intrinsics::Intrinsic::SliceAll
+                | intrinsics::Intrinsic::SliceAny
                 | intrinsics::Intrinsic::SliceCount
                 | intrinsics::Intrinsic::SliceSum
                 | intrinsics::Intrinsic::SliceIterLast
@@ -7541,6 +7580,8 @@ fn try_intrinsic(
             | intrinsics::Intrinsic::SliceFold
             | intrinsics::Intrinsic::SliceMap
             | intrinsics::Intrinsic::SliceFilter
+            | intrinsics::Intrinsic::SliceAll
+            | intrinsics::Intrinsic::SliceAny
             | intrinsics::Intrinsic::SliceCount
             | intrinsics::Intrinsic::SliceSum
             | intrinsics::Intrinsic::SliceIterLast
