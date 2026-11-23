@@ -475,34 +475,30 @@ fn extern_compiles(rustc: &str, opts: &MirOptions) -> bool {
     let dir = std::env::temp_dir().join(format!("verif-extern-probe-{}-{seq}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let src = dir.join("probe.rs");
-    // `extern crate` rather than `use`, so this works on every edition and does not
-    // depend on the crate exporting any particular path.
-    // Every extern, not just the first: rustc can leave a later `--extern` path
-    // unloaded until the source uses it, so probing only the first would accept a
-    // broken second artifact.
-    let crates: String = opts
-        .externs
-        .iter()
-        .map(|(n, _)| format!("extern crate {n};\n"))
-        .collect();
-    // `no_std`, so the probe does not inject `std` into the dependency graph: a
-    // `no_std` crate linking a `panic_halt`-style dependency would otherwise have two
-    // panic handlers and the probe would reject a valid artifact set.
-    let body = format!("#![no_std]\n#![allow(unused_extern_crates)]\n{crates}");
-    if std::fs::write(&src, body).is_err() {
-        return false;
-    }
     let mut cmd = Command::new(rustc);
     cmd.arg("--edition=2021")
         .arg("--crate-type=lib")
         .arg("--emit=metadata")
         .arg("-o")
         .arg(dir.join("probe.rmeta"));
-    for (n, p) in &opts.externs {
-        cmd.arg("--extern").arg(format!("{}={}", n, p.display()));
+    // Every extern, not just the first (rustc can leave a later path unloaded until
+    // used), and under a *synthetic* alias: an artifact named `core`/`std`/`alloc`
+    // passed as `--extern core=…` would redirect the probe's implicit prelude lookup.
+    // The real MIR emit keeps the real names, so only the probe is aliased.
+    let mut crates = String::new();
+    for (i, (_, p)) in opts.externs.iter().enumerate() {
+        let syn = format!("__verif_probe_{i}");
+        crates.push_str(&format!("extern crate {syn};\n"));
+        cmd.arg("--extern").arg(format!("{syn}={}", p.display()));
     }
     for d in &opts.search_paths {
         cmd.arg("-L").arg(format!("dependency={}", d.display()));
+    }
+    // `no_std` so the probe does not inject `std` (a `panic_halt`-style dependency
+    // would otherwise clash); the synthetic aliases keep `core` free for the prelude.
+    let body = format!("#![no_std]\n#![allow(unused_extern_crates)]\n{crates}");
+    if std::fs::write(&src, body).is_err() {
+        return false;
     }
     let ok = cmd.arg(&src).output().map(|o| o.status.success()).unwrap_or(false);
     let _ = std::fs::remove_dir_all(&dir);

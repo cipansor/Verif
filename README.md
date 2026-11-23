@@ -191,9 +191,14 @@ clean run) for GitHub code scanning.
 the pull request like a compiler error:
 
 ```yaml
-- uses: cipansor/verif/.github/actions/verif@main   # or ./.github/actions/verif
+- uses: cipansor/verif/.github/actions/verif@<commit-sha>   # a full commit SHA; or ./.github/actions/verif
   with: { file: src/lib.rs }
 ```
+
+Pin the `uses:` ref to a **full commit SHA** (immutable), not a branch: a mutable
+`@main` lets anyone with write access change the action code your workflow runs,
+without a change in your repository. A release tag (`verif-vX.Y.Z`) is also
+immutable once one contains `.github/actions/verif`.
 
 It builds `cargo-verif` from its own checkout (`GITHUB_ACTION_PATH`), runs it with
 `--format sarif`, uploads the report (`upload: false` to skip, for a fork without

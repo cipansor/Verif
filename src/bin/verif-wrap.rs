@@ -40,14 +40,15 @@ fn main() -> ExitCode {
     }
 }
 
-/// The crate's source file among rustc's arguments: the one positional argument
-/// that ends in `.rs`. A flag *value* (`--crate-name foo`, `--out-dir dir`) does
-/// not end in `.rs`, so the input file is the only match.
+/// The crate's source file among rustc's arguments: the positional argument that is an
+/// existing file. A flag *value* (`--crate-name foo`, `--out-dir dir`) is not an existing
+/// file, and a custom target path (`src/library.rust`) has no `.rs` suffix, so `is_file`
+/// is the right test where `ends_with(".rs")` skipped the custom path unchecked.
 fn source_arg(args: &[OsString]) -> Option<OsString> {
     args.iter()
         .find(|a| {
             let s = a.to_string_lossy();
-            !s.starts_with('-') && s.ends_with(".rs")
+            !s.starts_with('-') && Path::new(a.as_os_str()).is_file()
         })
         .cloned()
 }

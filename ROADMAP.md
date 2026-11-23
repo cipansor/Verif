@@ -1753,6 +1753,14 @@ directory; the README action ref is `@main`. Regressions:
 `a_function_filter_accepts_a_module_function_by_its_short_name`,
 `function_params_ignores_a_nested_block_comment`.
 
+**Round 12 (also fixed):** the README action ref is a commit-SHA placeholder (no mutable
+`@main`); the extern probe aliases each artifact with a synthetic name (`__verif_probe_N`),
+so a dependency named `core`/`std` no longer redirects the probe's prelude; `verif-wrap`'s
+`source_arg` finds a custom target path by `is_file()` (not a `.rs` suffix); `code_of_line`
+carries string/char/raw-string state across lines, so a multiline literal containing `/*`
+no longer leaves the scanner in a comment. Regression:
+`function_params_tolerates_a_multiline_string_with_comment_tokens`.
+
 **Tracked (open):**
 - Executor: compound iterator closures (`closure_map`/`closure_binop`/`closure_filter`
   read an intermediate as the result), `Vec::clear`/drops of user-`Drop` elements,

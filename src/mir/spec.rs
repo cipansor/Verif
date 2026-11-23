@@ -3182,12 +3182,12 @@ pub fn function_params(source: &str, name: &str) -> Option<Vec<(String, Ty)>> {
     }
     let needle = format!("fn {name}(");
     let mut depth: i32 = 0;
-    let mut block = 0i32;
+    let mut lex = Lex { block: 0, lit: Lit::None };
     for line in source.lines() {
         // Comments (line and block, the latter across lines) are removed first, so a
         // `// fn bad(b, a)` or a `/* … { … */` above the real declaration neither
         // matches nor unbalances the brace count.
-        let code = code_of_line(line, &mut block);
+        let code = code_of_line(line, &mut lex);
         if let Some(pos) = code.find(&needle) {
             // A *top-level* declaration only: a `fn` inside `impl`/`trait` is a method
             // and inside `mod` is a module item, neither callable as a bare name.
@@ -3208,62 +3208,147 @@ pub fn function_params(source: &str, name: &str) -> Option<Vec<(String, Ty)>> {
     None
 }
 
-/// The code part of a line: string/char literals kept, line comments and block
-/// comments removed. `block` is the block-comment *depth*, carried across lines and
-/// **nested** (`/* /* */ */` stays inside until the outer `*/`), because Rust block
-/// comments nest and stopping at the first `*/` would expose an inner example as code.
-fn code_of_line(line: &str, block: &mut i32) -> String {
+/// The carried lexer state for [`code_of_line`]: block-comment depth and the open literal.
+#[derive(Clone, Copy)]
+struct Lex {
+    block: i32,
+    lit: Lit,
+}
+
+#[derive(Clone, Copy)]
+enum Lit {
+    None,
+    Str,
+    Chr,
+    Raw(usize),
+}
+
+/// The code part of a line: string/char literals kept, line comments and block comments
+/// removed. The `Lex` state is carried across lines so a **nested** block comment
+/// (`/* /* */ */`) and a **multiline** literal (a `/*` inside a string) are handled:
+/// comment delimiters are recognised only outside a literal, literal delimiters only
+/// outside a comment.
+fn code_of_line(line: &str, lex: &mut Lex) -> String {
     let chars: Vec<char> = line.chars().collect();
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
-    let mut in_str = false;
-    let mut in_chr = false;
     while i < chars.len() {
         let c = chars[i];
-        if *block > 0 {
-            if c == '*' && chars.get(i + 1) == Some(&'/') {
-                *block -= 1;
+        if lex.block > 0 {
+            if c == '/' && chars.get(i + 1) == Some(&'*') {
+                lex.block += 1;
                 i += 2;
-            } else if c == '/' && chars.get(i + 1) == Some(&'*') {
-                *block += 1;
+            } else if c == '*' && chars.get(i + 1) == Some(&'/') {
+                lex.block -= 1;
                 i += 2;
             } else {
                 i += 1;
             }
             continue;
         }
-        if in_str || in_chr {
-            out.push(c);
-            if c == '\\' {
-                if let Some(n) = chars.get(i + 1) {
-                    out.push(*n);
-                    i += 2;
+        match lex.lit {
+            Lit::Str => {
+                out.push(c);
+                if c == '\\' {
+                    if let Some(n) = chars.get(i + 1) {
+                        out.push(*n);
+                        i += 2;
+                        continue;
+                    }
+                } else if c == '"' {
+                    lex.lit = Lit::None;
+                }
+                i += 1;
+                continue;
+            }
+            Lit::Chr => {
+                out.push(c);
+                if c == '\\' {
+                    if let Some(n) = chars.get(i + 1) {
+                        out.push(*n);
+                        i += 2;
+                        continue;
+                    }
+                } else if c == '\'' {
+                    lex.lit = Lit::None;
+                }
+                i += 1;
+                continue;
+            }
+            Lit::Raw(n) => {
+                out.push(c);
+                if c == '"' && (1..=n).all(|k| chars.get(i + k) == Some(&'#')) {
+                    out.extend(&chars[i + 1..=i + n]);
+                    i += n + 1;
+                    lex.lit = Lit::None;
                     continue;
                 }
-            } else if (in_str && c == '"') || (in_chr && c == '\'') {
-                in_str = false;
-                in_chr = false;
+                i += 1;
+                continue;
             }
-            i += 1;
-            continue;
+            Lit::None => {}
         }
         if c == '/' && chars.get(i + 1) == Some(&'/') {
             break;
         }
         if c == '/' && chars.get(i + 1) == Some(&'*') {
-            *block = 1;
+            lex.block = 1;
+            i += 2;
+            continue;
+        }
+        // A raw string `r#*"..."#*` (or `br#*"..."#*`), which may span lines.
+        let raw_from = if c == 'r' {
+            Some(i + 1)
+        } else if c == 'b' && chars.get(i + 1) == Some(&'r') {
+            Some(i + 2)
+        } else {
+            None
+        };
+        if let Some(from) = raw_from {
+            let mut h = from;
+            while chars.get(h) == Some(&'#') {
+                h += 1;
+            }
+            if chars.get(h) == Some(&'"') {
+                out.extend(&chars[i..=h]);
+                lex.lit = Lit::Raw(h - from);
+                i = h + 1;
+                continue;
+            }
+        }
+        if c == 'b' && chars.get(i + 1) == Some(&'"') {
+            out.push('b');
+            out.push('"');
+            lex.lit = Lit::Str;
             i += 2;
             continue;
         }
         if c == '"' {
-            in_str = true;
-        } else if c == '\'' {
-            in_chr = true;
+            lex.lit = Lit::Str;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '\'' && is_char_literal_start(&chars, i) {
+            lex.lit = Lit::Chr;
+            out.push(c);
+            i += 1;
+            continue;
         }
         out.push(c);
         i += 1;
     }
     out
+}
+
+/// Is the `'` at `i` the start of a char literal (`'x'`, `'\n'`) rather than a lifetime
+/// (`'a`, `'static`)? A lifetime has no closing `'` a couple of chars on.
+fn is_char_literal_start(chars: &[char], i: usize) -> bool {
+    match chars.get(i + 1) {
+        Some('\\') => true,
+        Some(_) => chars.get(i + 2) == Some(&'\''),
+        None => false,
+    }
 }
 
 /// The net `{` minus `}` count of a line, ignoring braces inside string/char
@@ -8974,6 +9059,20 @@ mod tests {
         // A block comment with an unmatched `{` above the declaration must not leave
         // the scanner at depth > 0 (which would make the real `fn` look nested).
         let src = "/* match the delimiter { */\npub fn bad(a: u8, b: u8) -> u8 { 0 }\n";
+        let names: Vec<String> = super::function_params(src, "bad")
+            .expect("a free function")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["a", "b"]);
+    }
+
+    #[test]
+    fn function_params_tolerates_a_multiline_string_with_comment_tokens() {
+        // A raw string whose content has two `/*` and one `*/` must not leave the
+        // scanner inside a comment when the real declaration follows.
+        let src = "const S: &str = r#\"\na /* b /* c */\n\"#;\n\n\
+                   pub fn bad(a: u8, b: u8) -> u8 { 0 }\n";
         let names: Vec<String> = super::function_params(src, "bad")
             .expect("a free function")
             .into_iter()
