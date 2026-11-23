@@ -1840,14 +1840,26 @@ build-script forwarding, custom source path, action ref, literal-masking replay 
   both sides); `cargo metadata`'s path is read as one string (not per byte) and escaped quotes
   no longer end it early; `take(k).rev()` reverses the taken prefix; a valid crate-name test;
   the reusable-action example names a release tag.
+- **Round 24 (review findings):** fixed three executor false proofs -- `skip(n).take(k).rev()` /
+  `skip(n).rev()` (the single-`pos` cursor mis-windowed; now refused), a rebound `&[T]`/`&mut Vec`
+  reading the replacement's length (now the caller's entry length), and `map(f).map(g)` modelled as
+  `g` alone (now refused). `take(k).rev().rev()` now cancels to the forward `take(k)`. Stale (already
+  refusals, pinned): compound closures, `Vec::clear` on a drop-glue element, a `*b = v` Box write,
+  `map().next()`, `all()` then `next()`, `rev().sum()`. `#[path]` on an external `mod` is now honoured;
+  a method contract in an external module is a visible `missing` (a lost proof, never a false proof);
+  `iterator_chain_differential_agrees_with_rustc` checks every `Verified` chain against real execution.
 - Executor/iterator: `iterator_const_len` pin reuse; cross-adapter chains (`rev().step_by()`, …).
   **Same-adapter chaining is verified composing** (round 20): `take` by `min`, `skip`
   additively, `step_by` multiplicatively -- `take(2).take(3)` yields 2, not 3 -- pinned by
   `chained_same_adapters_compose` (the `== 3` twin is refuted). The audit's "chained
   same-adapter overwrite" is not a bug. (`all`/`any` audited — they consume
   the iterator by removing the cursor, which is correct.)
-- Spec multi-file: `#[path]`/nested external modules (silent skip); method matching after
-  external declarations (synthetic line coordinates); `--emit-test` for module functions.
+- Spec multi-file: `#[path]` on an external `mod` is now inlined
+  (`extract_crate_honours_a_path_attribute`). Still open: a `mod child;` *inside* an inline
+  `mod parent { … }` (line-based scanner, not brace-aware); method matching after external
+  declarations (the inlined line != the MIR's `impl at FILE:L:C`, a visible `missing` pinned by
+  `a_multifile_method_contract_is_reported_missing_not_verified` -- needs a line map); and
+  `--emit-test` for a module-qualified function (`function_params` returns `None` for a `::`).
 - `verif-wrap`: nested Cargo wrappers, cached-build invalidation (documented, not fixed).
   Inactive `#[cfg]` contracts are a *deliberate* conservative choice, not a bug: the scanner
   reads text (it cannot evaluate an arbitrary `cfg`), so a contract in a `#[cfg]`-disabled
@@ -1865,5 +1877,5 @@ returns `(extern_key, package)` pairs (`dependency_packages`) and links the rlib
 name as `--extern key=…`, and resolves the target directory via `CARGO_TARGET_DIR` then
 `cargo metadata`'s `target_directory` (falling back to `<crate_root>/target`). Pinned by
 `dependency_packages_reads_a_rename` and `target_directory_from_metadata_reads_the_field`.
-- Docs/tooling: SARIF module paths, iterator differential harness, `checked_ilog` base
+- Docs/tooling: SARIF module paths (open); iterator differential harness (`iterator_chain_differential_agrees_with_rustc`, added round 24); `checked_ilog` base
   (audited — `checked_ilog(base)` is refused, not mis-modelled).
