@@ -190,7 +190,7 @@ pub fn extern_options_with(rustc: &str, name: &str) -> Option<MirOptions> {
             let Some(f) = p.file_name().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if f.starts_with(&prefix) && f.ends_with(".rlib") {
+            if f.starts_with(&prefix) && (f.ends_with(".rlib") || f.ends_with(".rmeta")) {
                 found.push(p);
             }
         }
@@ -228,8 +228,11 @@ pub fn extern_options_with(rustc: &str, name: &str) -> Option<MirOptions> {
 ///
 /// The rlibs live in the crate's own `target/<profile>/deps`; the crate names come
 /// from the manifest's `[dependencies]` table (dev/build deps are not linked by the
-/// verified source, so they are skipped). Each name's newest `lib<name>-*.rlib` is
-/// picked and the whole set is *probed* with the emitting compiler (`extern_compiles`);
+/// verified source, so they are skipped). Each name's newest `lib<name>-*.rlib` (or
+/// `*.rmeta` -- cargo's pipelined build writes a dependency's `.rmeta` before its
+/// `.rlib`, and a dependent crate compiles against either, so a `RUSTC_WRAPPER` that
+/// verifies mid-build must accept both or race the `.rlib`) is picked and the whole
+/// set is *probed* with the emitting compiler (`extern_compiles`);
 /// if the probe fails -- no rlib built yet, or a stale one from another toolchain --
 /// this returns `MirOptions::default()`, so the caller falls back to a compile error
 /// that names the unresolved import rather than a guessed path. A guessed rlib is
@@ -290,7 +293,7 @@ pub fn crate_options(file: &Path) -> MirOptions {
                 let Some(f) = p.file_name().and_then(|s| s.to_str()) else {
                     continue;
                 };
-                if f.starts_with(&prefix) && f.ends_with(".rlib") {
+                if f.starts_with(&prefix) && (f.ends_with(".rlib") || f.ends_with(".rmeta")) {
                     if let Ok(mt) = std::fs::metadata(&p).and_then(|m| m.modified()) {
                         if best.as_ref().map(|(_, b)| mt > *b).unwrap_or(true) {
                             best = Some((p, mt));
