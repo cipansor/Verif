@@ -485,7 +485,10 @@ fn extern_compiles(rustc: &str, opts: &MirOptions) -> bool {
         .iter()
         .map(|(n, _)| format!("extern crate {n};\n"))
         .collect();
-    let body = format!("#![allow(unused_extern_crates)]\n{crates}");
+    // `no_std`, so the probe does not inject `std` into the dependency graph: a
+    // `no_std` crate linking a `panic_halt`-style dependency would otherwise have two
+    // panic handlers and the probe would reject a valid artifact set.
+    let body = format!("#![no_std]\n#![allow(unused_extern_crates)]\n{crates}");
     if std::fs::write(&src, body).is_err() {
         return false;
     }

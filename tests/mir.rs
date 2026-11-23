@@ -1234,20 +1234,22 @@ fn the_independent_corpus_does_not_regress() {
     for gap in ["div_unwrap", "sum_iter", "tri"] {
         let o = outcome_of(gap);
         // These three are *completeness* limits today (`Incomplete`), not soundness
-        // ones: their contracts are sound (`sum_iter` promises `true`, `tri` bounds
-        // `n`, `div_unwrap` guards the divisor), so a future `Verified` is a *good*
-        // outcome, not a false proof. What must never happen is a *refutation* of a
-        // true contract, so the pin is "not `Failed`".
-        let contract_failure = matches!(
-            o,
-            FnOutcome::Failed { kind, .. }
-                if !(kind.starts_with("panic") || kind.starts_with("reachable"))
-        );
+        // ones: their contracts are sound, so a future `Verified` is a *good* outcome.
+        // `sum_iter` has no precondition, so it can legitimately overflow (a panic
+        // finding is fine there); `tri` and `div_unwrap` are panic-free under their
+        // declared preconditions, so *any* failure there would be a false finding.
+        let false_finding = match gap {
+            "sum_iter" => matches!(
+                o,
+                FnOutcome::Failed { kind, .. }
+                    if !(kind.starts_with("panic") || kind.starts_with("reachable"))
+            ),
+            _ => matches!(o, FnOutcome::Failed { .. }),
+        };
         assert!(
-            !contract_failure,
-            "`{gap}` has a sound contract, so a *contract* failure would be a false \
-             refutation (a panic finding is legitimate -- `sum_iter` overflows on \
-             `[u32::MAX, 1]`), got: {o}"
+            !false_finding,
+            "`{gap}` has a sound contract; a contract failure (or, for the panic-free \
+             `tri`/`div_unwrap`, a panic finding) would be a false finding, got: {o}"
         );
     }
     for companion in ["div_unwrap_byte", "sum_iter_bounded", "tri_bounded"] {

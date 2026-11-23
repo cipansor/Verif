@@ -3182,12 +3182,12 @@ pub fn function_params(source: &str, name: &str) -> Option<Vec<(String, Ty)>> {
     }
     let needle = format!("fn {name}(");
     let mut depth: i32 = 0;
-    let mut in_block = false;
+    let mut block = 0i32;
     for line in source.lines() {
         // Comments (line and block, the latter across lines) are removed first, so a
         // `// fn bad(b, a)` or a `/* … { … */` above the real declaration neither
         // matches nor unbalances the brace count.
-        let code = code_of_line(line, &mut in_block);
+        let code = code_of_line(line, &mut block);
         if let Some(pos) = code.find(&needle) {
             // A *top-level* declaration only: a `fn` inside `impl`/`trait` is a method
             // and inside `mod` is a module item, neither callable as a bare name.
@@ -3209,8 +3209,10 @@ pub fn function_params(source: &str, name: &str) -> Option<Vec<(String, Ty)>> {
 }
 
 /// The code part of a line: string/char literals kept, line comments and block
-/// comments (including a block comment that spans lines, via `in_block`) removed.
-fn code_of_line(line: &str, in_block: &mut bool) -> String {
+/// comments removed. `block` is the block-comment *depth*, carried across lines and
+/// **nested** (`/* /* */ */` stays inside until the outer `*/`), because Rust block
+/// comments nest and stopping at the first `*/` would expose an inner example as code.
+fn code_of_line(line: &str, block: &mut i32) -> String {
     let chars: Vec<char> = line.chars().collect();
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
@@ -3218,9 +3220,12 @@ fn code_of_line(line: &str, in_block: &mut bool) -> String {
     let mut in_chr = false;
     while i < chars.len() {
         let c = chars[i];
-        if *in_block {
+        if *block > 0 {
             if c == '*' && chars.get(i + 1) == Some(&'/') {
-                *in_block = false;
+                *block -= 1;
+                i += 2;
+            } else if c == '/' && chars.get(i + 1) == Some(&'*') {
+                *block += 1;
                 i += 2;
             } else {
                 i += 1;
@@ -3246,7 +3251,7 @@ fn code_of_line(line: &str, in_block: &mut bool) -> String {
             break;
         }
         if c == '/' && chars.get(i + 1) == Some(&'*') {
-            *in_block = true;
+            *block = 1;
             i += 2;
             continue;
         }
@@ -8975,6 +8980,20 @@ mod tests {
             .map(|(n, _)| n)
             .collect();
         assert_eq!(names, ["a", "b"]);
+    }
+
+    #[test]
+    fn function_params_ignores_a_nested_block_comment() {
+        // Rust block comments nest; stopping at the first `*/` would expose the inner
+        // `fn bad(b, a)` example as the declaration and swap the replay arguments.
+        let src = "/* Example /* draft */ fn bad(b: u8, a: u8) {} */\n\
+                   pub fn bad(a: u8, b: u8) -> u8 { 0 }\n";
+        let names: Vec<String> = super::function_params(src, "bad")
+            .expect("a free function")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["a", "b"], "the nested-comment example must not be read");
     }
 
     #[test]

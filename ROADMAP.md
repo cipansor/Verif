@@ -1742,6 +1742,17 @@ evidence = panic replay, input-selection trust). Regressions:
 `dependency_names_reads_dotted_and_quoted_keys`,
 `a_32_bit_target_is_refused_and_the_host_is_not`.
 
+**Round 11 (also fixed):** `--function`/`--emit-test` accepts a module function by its
+short name (the unmatched-name guard tail-matches, like `select`); the action fails on any
+exit other than 0/1 (a `cargo-verif`-not-on-PATH 101 is no longer a pass); `code_of_line`
+tracks **nested** block comments (`/* /* */ */`); the extern probe is `#![no_std]` (a
+panic-handler dependency no longer clashes with the probe's std); the `sum_iter` panic
+exception is scoped to `sum_iter` alone (`tri`/`div_unwrap` are panic-free under their
+preconditions); the TCB path check gates on `[workspace]` in the manifest, not a missing
+directory; the README action ref is `@main`. Regressions:
+`a_function_filter_accepts_a_module_function_by_its_short_name`,
+`function_params_ignores_a_nested_block_comment`.
+
 **Tracked (open):**
 - Executor: compound iterator closures (`closure_map`/`closure_binop`/`closure_filter`
   read an intermediate as the result), `Vec::clear`/drops of user-`Drop` elements,

@@ -130,8 +130,16 @@ fn main() {
     // A requested name that produced no outcome and is not `missing` is a typo, not a
     // clean run: an unmatched `--function`/`--emit-test` would otherwise exit 0.
     for want in &only {
-        let named = report.outcomes.iter().any(|(n, _)| n == want)
-            || report.missing.iter().any(|m| m == want);
+        // Mirror `select`'s matching: the exact label, a `::`-qualified label, or a
+        // bare tail. `--function clampish` selects the report's `a::clampish`, so the
+        // guard must accept a tail match, not only the exact string.
+        let matches = |label: &str| {
+            label == want
+                || label.ends_with(&format!("::{want}"))
+                || label.rsplit("::").next() == Some(want.as_str())
+        };
+        let named =
+            report.outcomes.iter().any(|(n, _)| matches(n)) || report.missing.iter().any(|m| matches(m));
         if !named {
             eprintln!(
                 "cargo-verif: `{want}` is not a function in {} (no contract and no body)",

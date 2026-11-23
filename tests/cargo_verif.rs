@@ -217,6 +217,34 @@ fn a_multi_module_crate_is_verified_through_its_root() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--function clampish` selects the report's `a::clampish`; the unmatched-name guard
+/// must accept that tail match rather than exit 2 without printing the verdict.
+#[test]
+fn a_function_filter_accepts_a_module_function_by_its_short_name() {
+    if !have_rustc() {
+        eprintln!("skipping a_function_filter_accepts_a_module_function_by_its_short_name: no rustc");
+        return;
+    }
+    let dir = scratch_crate("pub mod a;\n");
+    let lib = dir.join("src").join("lib.rs");
+    let module = dir.join("src").join("a.rs");
+    std::fs::write(
+        &module,
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n\
+         spec! { requires: x <= 100, ensures: ret <= 100, }\n\
+         pub fn clampish(x: u8) -> u8 { if x > 100 { 100 } else { x } }\n",
+    )
+    .expect("write module");
+
+    let (code, out) = run(&["--function", "clampish"], &lib);
+    assert_eq!(code, 0, "--function clampish must accept the module function: {out}");
+    assert!(out.contains("a::clampish"), "the verdict must be printed: {out}");
+
+    let (code, out) = run(&["--function", "a::clampish"], &lib);
+    assert_eq!(code, 0, "--function a::clampish must work too: {out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A crate that `use`s a *path dependency*: `cargo verif` finds the dependency's rlib
 /// in the crate's own `target` and passes it as `--extern`, so the file compiles and
 /// its contract is checked. Without this the frontend's `rustc` fails `E0432`

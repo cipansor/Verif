@@ -191,7 +191,7 @@ clean run) for GitHub code scanning.
 the pull request like a compiler error:
 
 ```yaml
-- uses: cipansor/verif/.github/actions/verif@v0.2.0   # or ./.github/actions/verif
+- uses: cipansor/verif/.github/actions/verif@main   # or ./.github/actions/verif
   with: { file: src/lib.rs }
 ```
 

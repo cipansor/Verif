@@ -434,12 +434,15 @@ mod helpers {
 /// vacuously.
 #[test]
 fn the_tcb_names_files_that_exist() {
-    // `tools/mir-oracle` is a nested package, so Cargo omits it from the published
-    // `.crate`; its absence means we are inside a packaged build, where the
-    // repository paths the table names are not all present. The check is a
-    // repository invariant, so it is skipped there rather than failing.
-    if !root().join("tools/mir-oracle").exists() {
-        eprintln!("soundness: packaged crate (no tools/mir-oracle); skipping the TCB path check");
+    // The table names repository paths (including the excluded `tools/mir-oracle`),
+    // so the check is a *repository* invariant. Cargo strips `[workspace]` from a
+    // packaged manifest, so its absence means we are inside a `.crate` and the check
+    // is skipped. Gating on the manifest rather than on a directory means a renamed
+    // or removed oracle in the *repository* is still caught (the `[workspace]` is
+    // there, so the full check runs and fails on the stale path).
+    let manifest = std::fs::read_to_string(root().join("Cargo.toml")).unwrap_or_default();
+    if !manifest.contains("[workspace]") {
+        eprintln!("soundness: packaged crate (no [workspace]); skipping the TCB path check");
         return;
     }
     let doc = std::fs::read_to_string(root().join("docs/tcb.md"))
