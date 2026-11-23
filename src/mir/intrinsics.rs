@@ -734,6 +734,10 @@ pub enum VecMethod {
     /// is non-zero, and the element at the old `len - 1` is the payload when the
     /// length is a constant the model can pin.
     Pop,
+    /// `Vec::clear(&mut self)` -> an empty vector, length `0`. Total (no panic),
+    /// so it is a plain length reset; the elements become unreachable, which the
+    /// bounds check already enforces.
+    Clear,
     /// `<Vec<T> as Index<usize>>::index(&self, i) -> &T`, the call `v[i]` lowers
     /// to. The element is the store's own `i`-th variable, and the result is a
     /// *reference* to it, recorded in `slice_elem_ref` so a later `*` reads the
@@ -771,6 +775,8 @@ pub enum StringMethod {
     Len,
     /// `String::is_empty(&self) -> bool` -> the length is zero.
     IsEmpty,
+    /// `String::clear(&mut self)` -> an empty string, length `0`. Total (no panic).
+    Clear,
 }
 
 /// The one `Box` method modelled: `Box::new`.
@@ -1424,6 +1430,7 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             "is_empty" => return Some(Intrinsic::VecMethod(VecMethod::IsEmpty)),
             "pop" => return Some(Intrinsic::VecMethod(VecMethod::Pop)),
             "as_slice" => return Some(Intrinsic::VecMethod(VecMethod::AsSlice)),
+            "clear" => return Some(Intrinsic::VecMethod(VecMethod::Clear)),
             _ => {}
         }
     }
@@ -1436,6 +1443,7 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             "push_str" => return Some(Intrinsic::StringMethod(StringMethod::PushStr)),
             "len" => return Some(Intrinsic::StringMethod(StringMethod::Len)),
             "is_empty" => return Some(Intrinsic::StringMethod(StringMethod::IsEmpty)),
+            "clear" => return Some(Intrinsic::StringMethod(StringMethod::Clear)),
             _ => {}
         }
     }

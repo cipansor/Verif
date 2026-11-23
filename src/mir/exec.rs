@@ -6328,6 +6328,14 @@ fn string_method(
             }
             Ok(Vec::new())
         }
+        StringMethod::Clear => {
+            let l = receiver(env)?;
+            let _ = length(env, l)?;
+            if let Some(s) = env.indexed.get_mut(&l) {
+                s.len = smt::word(0, USIZE_WIDTH);
+            }
+            Ok(Vec::new())
+        }
         StringMethod::Len => {
             let l = receiver(env)?;
             let len = length(env, l)?;
@@ -6449,6 +6457,15 @@ fn vec_method(
                     s.elems.clear();
                     s.poisoned = true;
                 }
+            }
+            Ok(Vec::new())
+        }
+        VecMethod::Clear => {
+            let l = receiver(env)?;
+            let _ = shape(env, l)?;
+            if let Some(s) = env.indexed.get_mut(&l) {
+                s.len = smt::word(0, USIZE_WIDTH);
+                s.elems.clear();
             }
             Ok(Vec::new())
         }

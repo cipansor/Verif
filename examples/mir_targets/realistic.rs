@@ -14139,6 +14139,41 @@ pub fn explicit_drop_string(s: String) -> u8 {
 }
 
 spec! {
+    requires: true,
+    ensures: ret == 0,
+}
+/// `Vec::clear` resets the length to zero.
+pub fn vec_clear_reads_zero() -> usize {
+    let mut v = Vec::new();
+    v.push(9u8);
+    v.clear();
+    v.len()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
+/// The same body claiming the pre-clear length must be refuted.
+pub fn vec_clear_tripwire() -> usize {
+    let mut v = Vec::new();
+    v.push(9u8);
+    v.clear();
+    v.len()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
+/// `String::clear` resets the length to zero.
+pub fn string_clear_reads_zero() -> usize {
+    let mut s = String::from("hello");
+    s.clear();
+    s.len()
+}
+
+spec! {
     requires: xs[0] <= xs[1],
     ensures: ret == xs[1],
 }

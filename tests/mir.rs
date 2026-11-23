@@ -12952,6 +12952,27 @@ fn a_slice_iter_and_explicit_drop_decide() {
     }
 }
 
+/// C11 containers: `Vec::clear`/`String::clear` reset the tracked length to zero,
+/// and the tripwire that claims the pre-clear length is refuted.
+#[test]
+fn container_clear_resets_the_length() {
+    let names = [
+        "vec_clear_reads_zero",
+        "vec_clear_tripwire",
+        "string_clear_reads_zero",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in ["vec_clear_reads_zero", "string_clear_reads_zero"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let o = outcome(&report, "vec_clear_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`vec_clear_tripwire` claims the pre-clear length and must be refuted, got: {o}"
+    );
+}
+
 /// C1, on the corpus: the `Drop` fixtures decide, and the false ones are refuted.
 ///
 /// The review's exit criterion is stated on `guard_guarded` (verifies) and
