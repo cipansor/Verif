@@ -1841,9 +1841,15 @@ build-script forwarding, custom source path, action ref, literal-masking replay 
   the iterator by removing the cursor, which is correct.)
 - Spec multi-file: `#[path]`/nested external modules (silent skip); method matching after
   external declarations (synthetic line coordinates); `--emit-test` for module functions.
-- `verif-wrap`: nested Cargo wrappers, cached-build invalidation (documented, not fixed),
-  inactive `#[cfg]` contracts (audited — a `#[cfg]` line clears `pending`, so a disabled
-  fn's contract does not leak onto the next function).
+- `verif-wrap`: nested Cargo wrappers, cached-build invalidation (documented, not fixed).
+  Inactive `#[cfg]` contracts are a *deliberate* conservative choice, not a bug: the scanner
+  reads text (it cannot evaluate an arbitrary `cfg`), so a contract in a `#[cfg]`-disabled
+  branch is collected and its (absent) body is reported `missing` -- *visible*, so it is never
+  silently verified. `a_cfg_excluded_contract_does_not_steal_a_compiled_body` pins the stronger
+  part: when an excluded contract could suffix-match a *compiled* body, both are refused rather
+  than paired (a wrong pairing would be a false proof). A `#[cfg]` line does not leak the
+  contract onto the next function. A probe confirmed the pre/post behaviour (a `#[cfg(any())]`
+  fn is reported `missing`, and its `requires` does not reach the next fn).
 - CLI: `cargo verif` (non-wrapper) still uses mtime-ranked `crate_options`, so workspace/
   custom-target/renamed-dependency resolution is fixed only for the wrapper.
 - Docs/tooling: SARIF module paths, iterator differential harness, `checked_ilog` base
