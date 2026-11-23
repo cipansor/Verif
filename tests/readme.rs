@@ -3,7 +3,7 @@
 //! The README is the crate's page on crates.io, so an example there that no
 //! longer compiles is the documentation lying to every reader who never opens
 //! the source. A doc comment would catch it if the README were included as one,
-//! but it is a 2600-line document with its own structure, so the example is
+//! but it is a long document with its own structure, so the example is
 //! pinned here instead: this file is the compile check, and the assertion is the
 //! behaviour check.
 //!

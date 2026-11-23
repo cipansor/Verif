@@ -219,10 +219,9 @@ def check_tree(path: Path) -> list[str]:
     exhaustive listing -- but a file the tree *names* and that is absent is the
     defect this catches, and it is the one that misleads.
 
-    Only `README.md` carries the tree; other documents are skipped.
+    The tree lives in `docs/layout.md`; any document that carries a tree block is
+    checked, so moving the block cannot quietly drop the check.
     """
-    if path.name != "README.md":
-        return []
     lines = path.read_text(encoding="utf-8").splitlines()
     # Find the tree: the fenced block that contains a `├── ` line.
     start = None
@@ -274,8 +273,9 @@ def default_paths() -> list[Path]:
     without anyone remembering to add it to the gate.
     """
     docs = sorted(p for p in ROOT.glob("*.md") if p.is_file())
+    nested = sorted(p for p in ROOT.glob("docs/*.md") if p.is_file())
     readme = ROOT / "README.md"
-    return [readme] + [p for p in docs if p != readme]
+    return [readme] + [p for p in docs if p != readme] + nested
 
 
 def main(argv: list[str]) -> int:

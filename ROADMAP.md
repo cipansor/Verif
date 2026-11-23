@@ -1420,10 +1420,21 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     tests run either way. ✅
   - Exit: `cargo test --features std` never passes vacuously.
   - Move: **build**.
-- **U6. Documentation size.** · P1 · todo · —
-  - Gap: the README is ~166 KB and `AGENTS.md` ~586 KB. Split into a short README,
+- **U6. Documentation size.** · P1 · **done** · —
+  - Gap: the README was ~166 KB and `AGENTS.md` ~586 KB. Split into a short README,
     a user guide, `ROADMAP.md` (this file), `SOUNDNESS.md`, and design notes.
-  - Exit: a README under ~30 KB with links to the rest.
+  - Done: the README is now **25.7 KB** (under the ~30 KB exit). The long sections
+    moved verbatim into `docs/` — `internals.md` (verification conditions + the
+    engine-honesty war stories), `mir.md` (the MIR frontend), `layout.md`,
+    `testing.md`, `comparison.md`, `build-time.md` — each linked from the README's
+    contents, each headed with a back-link. `scripts/check_doc_links.py` was
+    extended to check `docs/*.md` too, and its file-tree check now runs on
+    `docs/layout.md` (where the tree moved) rather than only `README.md`; both
+    were teeth-checked (a broken anchor and a bogus tree entry each fail). The
+    `README.md`-anchored tests (`tests/readme.rs`) still read the sections that
+    stayed (`Installation`).
+  - `AGENTS.md` is deliberately **not** split: it is the agent-facing record, not a
+    published page, and the exit names the README.
   - Move: **build**.
 - **U7. Proof caching.** · P1 · todo · —
   - Exit: unchanged MIR plus unchanged contracts reuses the verdict across runs.
