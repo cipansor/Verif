@@ -6445,7 +6445,8 @@ fn slice_iter(
                 };
                 (idx, tag)
             } else {
-                let idx = match iterator_const_len(s, cx.pins) {
+                let const_n = iterator_const_len(s, cx.pins);
+                let idx = match const_n {
                     Some(0) => 0,
                     Some(n) if it.pos < it.end.map_or(n, |e| e.min(n)) => {
                         // The last index the stride reaches from `pos`, capped by a
@@ -6456,11 +6457,25 @@ fn slice_iter(
                     Some(_) => 0,
                     None => LAST_INDEX,
                 };
-                let tag = smt::ite(
-                    smt::ule_const(len, it.pos),
-                    smt::word(0, 1),
-                    smt::word(intrinsics::SOME_TAG, 1),
-                );
+                // `Some` iff the cursor has a remaining element: `pos < hi`, with a
+                // `take` cap folded into `hi`. A constant length decides this; a
+                // symbolic one (no take cap) stays `len <= pos -> None`. A bare
+                // `pos < len` ignored the cap, so `take(0).last()` wrongly returned `Some`.
+                let tag = match const_n {
+                    Some(n) => {
+                        let hi = it.end.map_or(n, |e| e.min(n));
+                        if it.pos < hi {
+                            smt::word(intrinsics::SOME_TAG, 1)
+                        } else {
+                            smt::word(0, 1)
+                        }
+                    }
+                    None => smt::ite(
+                        smt::ule_const(len, it.pos),
+                        smt::word(0, 1),
+                        smt::word(intrinsics::SOME_TAG, 1),
+                    ),
+                };
                 (idx, tag)
             };
             let (elem, sign) = env.index_elem(it.base, idx).ok_or_else(|| {

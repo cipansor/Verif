@@ -14743,3 +14743,23 @@ fn step_by_composes_with_skip_and_take() {
     );
 }
 
+
+#[test]
+fn take_cap_is_respected_by_last_and_count() {
+    let last = |name: &str, body: &str, b: bool| {
+        verify_src(name, &format!("/// requires: xs.len() == 5\n/// ensures: ret == {b}\npub fn {name}(xs: &[u8]) -> bool {{ {body} }}"))
+    };
+    let cnt = |name: &str, body: &str, n: u64| {
+        verify_src(name, &format!("/// requires: xs.len() == 5\n/// ensures: ret == {n}\npub fn {name}(xs: &[u8]) -> usize {{ {body} }}"))
+    };
+    // take(0) exhausts the cursor: last() is None, count() is 0. `last`'s tag used
+    // `pos < len` and ignored the take cap, so `is_none() == false` was a false proof.
+    assert!(last("l0", "xs.iter().take(0).last().is_none()", true).is_some_and(|o| o.is_verified()));
+    assert!(
+        matches!(last("l0f", "xs.iter().take(0).last().is_none()", false), Some(FnOutcome::Failed { .. })),
+        "take(0).last() is None, so is_none()==false must be refuted (was a false proof)"
+    );
+    assert!(last("l2", "xs.iter().take(2).last().is_some()", true).is_some_and(|o| o.is_verified()));
+    assert!(cnt("c0", "xs.iter().take(0).count()", 0).is_some_and(|o| o.is_verified()));
+    assert!(cnt("c2", "xs.iter().take(2).count()", 2).is_some_and(|o| o.is_verified()));
+}
