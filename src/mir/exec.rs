@@ -6104,7 +6104,10 @@ fn slice_iter(
                 return Err(format!("`{name}` needs a constant argument"));
             };
             let next = if matches!(op, Intrinsic::SliceSkip) {
-                IterState { pos: it.pos.saturating_add(n), ..it }
+                // `skip(n)` skips n *yielded* elements, each `step` apart in the base
+                // index -- so the base advance is `n*step`, not `n` (which under-skips
+                // after `step_by`). With `step == 1` (skip before step_by) it is `n`.
+                IterState { pos: it.pos.saturating_add(n.saturating_mul(it.step)), ..it }
             } else {
                 if n == 0 {
                     return Err(format!("`{name}` with a zero step is a panic and is not modelled"));
@@ -6130,7 +6133,9 @@ fn slice_iter(
             if !const_len {
                 return Err(format!("`{name}` on a slice whose length is not a constant"));
             }
-            let cap = it.pos.saturating_add(k);
+            // `take(k)` takes k *yielded* elements, each `step` apart, so the base cap is
+            // `pos + k*step` -- a bare `pos + k` under-counts after `step_by`.
+            let cap = it.pos.saturating_add(k.saturating_mul(it.step));
             let end = Some(it.end.map_or(cap, |e| e.min(cap)));
             env.iters.insert(dest.local, IterState { end, ..it });
             Ok(Vec::new())

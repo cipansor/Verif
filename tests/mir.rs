@@ -14716,3 +14716,30 @@ fn chained_same_adapters_compose() {
     assert!(step.as_ref().is_some_and(|o| o.is_verified()), "step_by(2).step_by(3) of len 6 is 1 element, got {step:?}");
 }
 
+
+#[test]
+fn step_by_composes_with_skip_and_take() {
+    // `skip(n)`/`take(k)` count *yielded* elements, each `step` apart; a bare
+    // `pos + n` / `pos + k` under-counts after `step_by` (a false refutation of a true
+    // count). All of `xs.len() == 10`.
+    let ok = |name: &str, body: &str, n: u64| {
+        verify_src(name, &format!("/// requires: xs.len() == 10\n/// ensures: ret == {n}\npub fn {name}(xs: &[u8]) -> usize {{ {body} }}"))
+    };
+    assert!(ok("st", "xs.iter().step_by(3).take(2).count()", 2).is_some_and(|o| o.is_verified()));
+    assert!(ok("ss", "xs.iter().step_by(3).skip(2).count()", 2).is_some_and(|o| o.is_verified()));
+    assert!(ok("ts", "xs.iter().take(2).step_by(3).count()", 1).is_some_and(|o| o.is_verified()));
+    assert!(ok("sk", "xs.iter().skip(2).step_by(3).count()", 3).is_some_and(|o| o.is_verified()));
+    assert!(ok("rst", "xs.iter().rev().step_by(3).take(2).count()", 2).is_some_and(|o| o.is_verified()));
+    assert!(ok("rss", "xs.iter().rev().step_by(3).skip(2).count()", 2).is_some_and(|o| o.is_verified()));
+    // Teeth: before the fix (base offset) `step_by(3).take(2)` of len 10 counted 1, so
+    // `== 1` verified and `== 2` was refuted. Now the reverse: `== 1` is the refutation.
+    assert!(
+        matches!(ok("stf", "xs.iter().step_by(3).take(2).count()", 1), Some(FnOutcome::Failed { .. })),
+        "step_by(3).take(2) of len 10 is 2, so == 1 must be refuted"
+    );
+    assert!(
+        matches!(ok("ssf", "xs.iter().step_by(3).skip(2).count()", 3), Some(FnOutcome::Failed { .. })),
+        "step_by(3).skip(2) of len 10 is 2, so == 3 must be refuted"
+    );
+}
+
