@@ -3193,7 +3193,7 @@ pub fn function_params(source: &str, name: &str) -> Option<Vec<(String, Ty)>> {
             // and inside `mod` is a module item, neither callable as a bare name.
             // Depth is taken *at the `fn`*, not at the line start, so a one-line
             // `impl S { fn m(..) {} }` is seen as nested.
-            let at_top = depth + brace_delta(&code[..pos]) == 0;
+            let at_top = depth + count_braces(&code[..pos]) == 0;
             let word_before =
                 code[..pos].chars().last().is_some_and(|c| c.is_alphanumeric() || c == '_');
             if at_top && !word_before {
@@ -3203,7 +3203,7 @@ pub fn function_params(source: &str, name: &str) -> Option<Vec<(String, Ty)>> {
                 return slots.map(|_| params);
             }
         }
-        depth = (depth + brace_delta(&code)).max(0);
+        depth = (depth + count_braces(&code)).max(0);
     }
     None
 }
@@ -3356,25 +3356,20 @@ fn is_char_literal_start(chars: &[char], i: usize) -> bool {
     }
 }
 
-/// The net `{` minus `}` count of a line, ignoring braces inside string/char
-/// literals and after a `//` comment. Approximate but never *over*-counts a block
-/// opener, so a depth-0 check is conservative (it can refuse, never accept a
-/// method as a free function).
-fn brace_delta(line: &str) -> i32 {
+/// The net `{` minus `}` count of a `code_of_line`-masked line.
+///
+/// `code_of_line` has already replaced string/char literal contents and comments with
+/// spaces, so every `{`/`}` left in `code` is structural and a direct count is correct.
+/// Re-interpreting quotes here is not: a lifetime (`&'static str`) has an apostrophe that
+/// a quote scanner mistakes for a char literal's opening delimiter, masking the `{` after
+/// it -- which mis-counted the depth and let a same-named function in the wrong scope
+/// supply the signature (a panic replay with the wrong arguments).
+fn count_braces(code: &str) -> i32 {
     let mut d = 0i32;
-    let mut chars = line.chars().peekable();
-    let mut in_str = false;
-    let mut in_chr = false;
-    while let Some(c) = chars.next() {
+    for c in code.chars() {
         match c {
-            '\\' if in_str || in_chr => {
-                chars.next();
-            }
-            '"' if !in_chr => in_str = !in_str,
-            '\'' if !in_str => in_chr = !in_chr,
-            '/' if !in_str && !in_chr && chars.peek() == Some(&'/') => break,
-            '{' if !in_str && !in_chr => d += 1,
-            '}' if !in_str && !in_chr => d -= 1,
+            '{' => d += 1,
+            '}' => d -= 1,
             _ => {}
         }
     }
@@ -9133,6 +9128,29 @@ mod tests {
             .map(|(n, _)| n)
             .collect();
         assert_eq!(names, ["a", "b"], "the nested-comment example must not be read");
+    }
+
+    #[test]
+    fn function_params_sees_past_a_lifetime_and_raw_string_to_the_root_fn() {
+        // A nested helper returning `&'static str` whose body is a multiline raw string,
+        // then a same-named `fn bad()` in the module and the real `pub fn bad(n)` at the
+        // crate root. The lifetime's apostrophe must not be read as a char-literal
+        // delimiter (which masked the helper's `{` and mis-counted the depth), so the root
+        // `bad(n)` -- not the module's `bad()` -- supplies the replay signature.
+        let src = "#[cfg(test)]\nmod tests {\n    \
+                   fn banner() -> &'static str { r#\"first\nsecond\"# }\n    \
+                   fn bad() {}\n}\n\n\
+                   pub fn bad(n: u8) -> u8 { 100 / (n - 5) }\n";
+        let names: Vec<String> = super::function_params(src, "bad")
+            .expect("the root free function")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(
+            names,
+            ["n"],
+            "the root `bad(n)` must supply the signature, not the module's `bad()`"
+        );
     }
 
     #[test]
