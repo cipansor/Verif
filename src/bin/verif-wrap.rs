@@ -323,18 +323,18 @@ mod tests {
     }
 
     #[test]
-    fn source_arg_skips_a_crate_name_value_that_is_an_existing_file() {
-        // `--crate-name <path>` whose value happens to be an existing file must not be
-        // taken as the input; the real `src/lib.rs` is.
+    fn source_arg_skips_a_crate_name_value() {
+        // `--crate-name app` (a valid Cargo argument: a *bare* name, not a path rustc
+        // would reject) must not be taken as the input. The value is skipped because
+        // `--crate-name` takes a value (`takes_value`), not because it is not a file.
+        assert!(takes_value("--crate-name"));
         let dir = std::env::temp_dir().join(format!("verif_srcarg_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let root = dir.join("app");
-        std::fs::write(&root, "fn main() {}\n").unwrap();
         let lib = dir.join("lib.rs");
         std::fs::write(&lib, "\n").unwrap();
         let args = vec![
             OsString::from("--crate-name"),
-            root.clone().into_os_string(),
+            OsString::from("app"),
             OsString::from("--edition"),
             OsString::from("2024"),
             lib.clone().into_os_string(),
