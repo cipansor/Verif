@@ -1696,3 +1696,50 @@ gap table (§6), and the phased exit criteria (§7). The comparison to Kani, Ver
 Prusti, Creusot, Coq/Rocq, Lean, SPARK, Flux, VeriFast/RefinedRust/ESBMC and the
 `contracts` crate is in §6 of that review and is summarised in the **Competitor**
 field of each item.
+
+## Review findings (round 9): fixed and tracked
+
+A soundness-focused review of the C8/U3/U7 work and the MIR frontend raised ~50 items.
+The false-proof / false-pass ones and the cheap tooling ones are fixed with regressions;
+the deep executor and multi-file ones are tracked here.
+
+**Fixed (regression test named):**
+- Cache keyed on the root source, not the inlined module text → a contract-only edit in
+  a module reused a stale verdict. Now keyed on `Specs::snapshot`
+  (`a_contract_only_edit_in_a_module_invalidates_the_cache`).
+- Cache keyed by the report label, so two trait impls of one method shared a verdict.
+  Now keyed by the MIR definition name
+  (`two_trait_impls_of_one_method_get_distinct_cached_verdicts`).
+- `verif-wrap` did not forward `--cfg`, so a feature-flipped `cfg!` could pass the build.
+  `MirOptions.rustc_args` forwards `--cfg`/`--target`
+  (`a_feature_that_flips_a_cfg_makes_the_contract_fail`).
+- `--emit-test` replay used a comment declaration / swapped args, and emitted `0` for
+  `false`, `255` for `-1i8`. `function_params` reads a real top-level `fn` (skips
+  comments and methods) and `render_arg` types each value
+  (`a_replay_call_uses_the_real_declaration_not_a_comment`,
+  `function_params_ignores_a_comment_declaration`, `function_params_refuses_a_method`,
+  `render_arg_types_a_counterexample_value`).
+- `cargo verif --emit-test` requires a name, strips `verif` only as the subcommand, and
+  requests verification of its target.
+- `scoreboard.py --check --write-floor` checks before writing (no silent downgrade).
+- `dependency_names` handles dotted keys and quoted sub-tables.
+- `build.rs` includes `TARGET` in the engine hash (endianness-dependent `to_be`/`to_le`).
+- external-demo always rebuilds, asserts `clamp_percent ... verified`, and gives each
+  fixture an explicit target dir.
+- The `everyday.rs` "wall" pin no longer rejects a *sound* `Verified` (the contracts are
+  sound; only a false `Failed` is forbidden).
+
+**Tracked (open):**
+- Executor: compound iterator closures (`closure_map`/`closure_binop`/`closure_filter`
+  read an intermediate as the result), `Vec::clear`/drops of user-`Drop` elements,
+  `*b = v` through a `Box` (stale payload), mutable-`Vec` postcondition length, adapter
+  chains (`next`/`fold`/`all`/`any`/`last`/`nth` after `map`/`filter`/`rev`/`skip`/`take`/
+  `step_by`/`enumerate`), reversed reductions, padded mapped sums.
+- Spec multi-file: `#[path]`/nested external modules; method matching after external
+  declarations (synthetic line coordinates).
+- `verif-wrap`: forward the real `--extern`/`-L` (own lib, workspace/custom target dir,
+  renamed/custom-name deps), build-script targets, nested wrappers, cached-build
+  invalidation, custom source paths.
+- Docs/tooling: qualification determinism (per-function verdict equality, not a count),
+  TCB/MIR-evidence wording, CLI dependency docs, SARIF module paths, unknown `--function`,
+  report-only exit codes, action ref, iterator differential harness.

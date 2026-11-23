@@ -75,13 +75,8 @@ def main(argv: list[str]) -> int:
     for name, verified, total in rows:
         print(f"| `{name}` | {verified} | {total} | {100 * verified // total}% |")
 
-    if "--write-floor" in argv:
-        with open(FLOOR, "w") as handle:
-            for name, verified, _ in rows:
-                handle.write(f"{name} {verified}\n")
-        print(f"\nwrote {FLOOR}")
-        return 0
-
+    # `--check` runs *before* `--write-floor`, so `--check --write-floor` cannot
+    # silently lower the baseline: a drop fails (exit 1) without opening the file.
     if "--check" in argv:
         floors = read_floor()
         dropped = [
@@ -97,6 +92,12 @@ def main(argv: list[str]) -> int:
                 )
             return 1
         print("\nscoreboard: every corpus is at or above its floor")
+
+    if "--write-floor" in argv:
+        with open(FLOOR, "w") as handle:
+            for name, verified, _ in rows:
+                handle.write(f"{name} {verified}\n")
+        print(f"\nwrote {FLOOR}")
     return 0
 
 

@@ -1231,12 +1231,17 @@ fn the_independent_corpus_does_not_regress() {
             .map(|(_, o)| o)
             .unwrap_or_else(|| panic!("`{name}` must be reported by `everyday.rs`"))
     };
-    for wall in ["div_unwrap", "sum_iter", "tri"] {
-        let o = outcome_of(wall);
+    for gap in ["div_unwrap", "sum_iter", "tri"] {
+        let o = outcome_of(gap);
+        // These three are *completeness* limits today (`Incomplete`), not soundness
+        // ones: their contracts are sound (`sum_iter` promises `true`, `tri` bounds
+        // `n`, `div_unwrap` guards the divisor), so a future `Verified` is a *good*
+        // outcome, not a false proof. What must never happen is a *refutation* of a
+        // true contract, so the pin is "not `Failed`".
         assert!(
-            !o.is_verified(),
-            "`{wall}` is an undecidable wall (C7 u32 divider / C11 unbounded sum / \
-             C12 nonlinear invariant); a `verified` here would be a false proof, got: {o}"
+            !matches!(o, FnOutcome::Failed { .. }),
+            "`{gap}` has a sound contract, so a `Failed` here would be a false \
+             refutation, got: {o}"
         );
     }
     for companion in ["div_unwrap_byte", "sum_iter_bounded", "tri_bounded"] {
@@ -14410,5 +14415,117 @@ fn the_proof_cache_reuses_a_decided_verdict_and_a_change_is_a_miss() {
         "a changed source is a cache miss, so the real verdict returns (not the tampered one)"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A1: a contract-only edit in an external module must invalidate the cache.
+///
+/// The contract lives in the *inlined module text*, not the root source and not the
+/// MIR, so keying the cache on the root source alone would let the edit reuse the
+/// old verdict — a false proof. The key fingerprints the combined snapshot.
+#[test]
+fn a_contract_only_edit_in_a_module_invalidates_the_cache() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif_modcache_{}_{seq}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let cache = dir.join("cache");
+    let lib = dir.join("lib.rs");
+    let math = dir.join("math.rs");
+    std::fs::write(&lib, "pub mod math;\n").expect("root");
+    std::fs::write(&math, "/// ensures: ret == 7\npub fn seven() -> u8 { 7 }\n").expect("math");
+    let mut opts = probe_opts();
+    opts.cache = Some(cache.clone());
+
+    fn seven(r: &verify::FileReport) -> Option<&FnOutcome> {
+        r.outcomes.iter().find(|(k, _)| k == "math::seven" || k == "seven").map(|(_, o)| o)
+    }
+    let r1 = verify::verify_file_with_opts(&rustc, &lib, &[], &opts).expect("verify");
+    assert!(
+        matches!(seven(&r1), Some(FnOutcome::Verified { .. })),
+        "cold: the module contract holds; got {:?}",
+        r1.outcomes
+    );
+    // Edit *only* the module's contract. The MIR is unchanged; the snapshot is not.
+    std::fs::write(&math, "/// ensures: ret == 8\npub fn seven() -> u8 { 7 }\n").expect("math2");
+    let r2 = verify::verify_file_with_opts(&rustc, &lib, &[], &opts).expect("verify");
+    assert!(
+        matches!(seven(&r2), Some(FnOutcome::Failed { .. })),
+        "a contract-only module edit must invalidate the cache (else a stale `verified` \
+         proves a false contract); got {:?}",
+        r2.outcomes
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A2: two trait impls of one method share a *report label* (`S::check`) but must
+/// keep *distinct* cache entries — keyed by the MIR definition name, not the label.
+#[test]
+fn two_trait_impls_of_one_method_get_distinct_cached_verdicts() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif_traitcache_{}_{seq}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let cache = dir.join("cache");
+    let file = dir.join("lib.rs");
+    let src = "pub struct S;\n\
+               pub trait A { fn check(&self) -> u8; }\n\
+               pub trait B { fn check(&self) -> u8; }\n\
+               impl A for S {\n    /// ensures: ret == 9\n    fn check(&self) -> u8 { 1 }\n}\n\
+               impl B for S {\n    /// ensures: ret == 1\n    fn check(&self) -> u8 { 1 }\n}\n";
+    std::fs::write(&file, src).expect("fixture");
+    let mut opts = probe_opts();
+    opts.cache = Some(cache.clone());
+
+    let tally = |r: &verify::FileReport| {
+        let (mut v, mut f) = (0, 0);
+        for (k, o) in &r.outcomes {
+            if k == "S::check" {
+                match o {
+                    FnOutcome::Verified { .. } => v += 1,
+                    FnOutcome::Failed { .. } => f += 1,
+                    _ => {}
+                }
+            }
+        }
+        (v, f)
+    };
+    let r1 = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    assert_eq!(tally(&r1), (1, 1), "cold: one pass, one fail; got {:?}", r1.outcomes);
+    let r2 = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    assert_eq!(
+        tally(&r2),
+        (1, 1),
+        "warm: the two impls must keep their own verdicts, not share one; got {:?}",
+        r2.outcomes
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// U3/finding 3: the emitted replay call uses the *real* declaration's parameter
+/// order, not a comment above it that reads the parameters the other way round.
+#[test]
+fn a_replay_call_uses_the_real_declaration_not_a_comment() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif_replay_{}_{seq}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let file = dir.join("f.rs");
+    // The comment swaps the order; the real declaration is (a, b). `requires: b == 1`
+    // makes the panic happen at `a == 0, b == 1`, so the right call is `bad(0, 1)`.
+    std::fs::write(
+        &file,
+        "// fn bad(b: u8, a: u8)\n/// requires: b == 1\npub fn bad(a: u8, b: u8) -> u8 { 100 / a }\n",
+    )
+    .expect("fixture");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts()).expect("verify");
+    let emitted = verify::emit_test_source(&file, &report, "bad").expect("a panic counterexample");
+    assert!(
+        emitted.contains("bad(0, 1)"),
+        "the real parameter order (a, b) must be used, not the comment's; got:\n{emitted}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

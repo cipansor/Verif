@@ -139,3 +139,60 @@ fn a_dependencys_false_contract_does_not_fail_the_build() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Build `dir` with `verif-wrap` and extra cargo arguments.
+fn build_with_wrapper_args(dir: &Path, extra: &[&str]) -> (i32, String) {
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build").arg("--quiet").args(extra).current_dir(dir);
+    cmd.env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_verif-wrap"));
+    cmd.env("CARGO_TARGET_DIR", dir.join("target"));
+    if let Ok(rustc) = std::env::var("VERIF_RUSTC") {
+        cmd.env("VERIF_RUSTC", rustc);
+    }
+    let out = cmd.output().expect("run cargo build");
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    (out.status.code().unwrap_or(-1), text)
+}
+
+/// C9: the wrapper must forward Cargo's `--cfg feature=...` to the MIR emit, or a
+/// contract that holds without a feature and fails with it would pass the build.
+///
+/// `!cfg!(feature = "fast")` is `true` without the feature and `false` with it. The
+/// verifier emits its *own* MIR, so without forwarding `--cfg` it always sees the
+/// feature off and approves `ensures: ret == true` even for the `--features fast`
+/// build, whose artifact returns `false`.
+#[test]
+fn a_feature_that_flips_a_cfg_makes_the_contract_fail() {
+    if !have_cargo() {
+        eprintln!("rustc_wrapper: no cargo; skipping");
+        return;
+    }
+    let dir = scratch_dir();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"wrap_feat\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
+         [features]\nfast = []\n",
+    )
+    .expect("write manifest");
+    std::fs::write(
+        dir.join("src").join("lib.rs"),
+        "/// ensures: ret == true\npub fn is_slow() -> bool { !cfg!(feature = \"fast\") }\n",
+    )
+    .expect("write lib.rs");
+
+    // Without the feature the contract holds and the build passes.
+    let (code0, t0) = build_with_wrapper(&dir);
+    assert_eq!(code0, 0, "without `fast` the contract holds, output:\n{t0}");
+
+    // With `fast` the body returns `false`, so `ret == true` is false and the build
+    // must fail -- which it only can if the wrapper forwarded `--cfg feature=fast`.
+    let (code1, t1) = build_with_wrapper_args(&dir, &["--features", "fast"]);
+    assert_ne!(
+        code1, 0,
+        "with `fast` the contract is false, so the build must fail; the wrapper must \
+         forward `--cfg feature=fast` to the MIR emit, output:\n{t1}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

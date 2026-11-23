@@ -254,6 +254,13 @@ pub struct Specs {
     /// contract, which means "check panic freedom on every input" rather than
     /// "skip it".
     pub by_fn: BTreeMap<String, FnContract>,
+    /// The combined source text this `Specs` was read from -- the root file with
+    /// every external module inlined. This is the *contract input*, and it is what
+    /// the proof cache fingerprints: a module's contract lives here and not in the
+    /// root source or the MIR, so keying on the root source alone would let a
+    /// contract-only edit in a module reuse a stale verdict (a false proof). Empty
+    /// for a `Specs` built by [`extract`] directly (tests), which have no cache.
+    pub snapshot: String,
     /// Struct layouts read from the same source, keyed by struct name.
     ///
     /// A contract that names a field (`c.lo`) needs two things the MIR dump does
@@ -2017,7 +2024,9 @@ pub fn extract_crate(root: &Path, root_src: &str) -> Specs {
     let dir = root.parent().unwrap_or_else(|| Path::new("."));
     let mut seen: Vec<PathBuf> = Vec::new();
     let inlined = inline_external_modules(root_src, dir, &mut seen);
-    extract(&inlined)
+    let mut specs = extract(&inlined);
+    specs.snapshot = inlined;
+    specs
 }
 
 /// Replace each `mod name;` line with an inline `mod name { <file contents> }`.
@@ -3172,15 +3181,61 @@ pub fn function_params(source: &str, name: &str) -> Option<Vec<(String, Ty)>> {
         return None;
     }
     let needle = format!("fn {name}(");
+    let mut depth: i32 = 0;
     for line in source.lines() {
-        if let Some(pos) = line.find(&needle) {
-            // `fn_signature_full` returns `None` slots for a list it could not read
-            // whole; an empty-but-readable list is `Some(vec![])` (`fn f()`).
-            let (params, _ret, slots) = fn_signature_full(&line[pos..]);
-            return slots.map(|_| params);
+        let trimmed = line.trim_start();
+        let is_comment =
+            trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*");
+        // A *top-level* declaration only: a `fn` inside `impl`/`trait` is a method and
+        // inside `mod` is a module item, neither callable as a bare name. A comment
+        // that happens to read `// fn bad(b, a)` must not be mistaken for the
+        // declaration, or the emitted call swaps the arguments.
+        if !is_comment {
+            if let Some(pos) = line.find(&needle) {
+                // Depth *at the `fn`*, not at the line start: a one-line
+                // `impl S { fn m(..) {} }` opens and closes on the same line, so the
+                // line-start depth is 0 while the `fn` is inside the impl.
+                let at_top = depth + brace_delta(&line[..pos]) == 0;
+                let word_before = line[..pos]
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                if at_top && !word_before {
+                    // `fn_signature_full` returns `None` slots for a list it could not
+                    // read whole; an empty-but-readable list is `Some(vec![])`.
+                    let (params, _ret, slots) = fn_signature_full(&line[pos..]);
+                    return slots.map(|_| params);
+                }
+            }
         }
+        depth = (depth + brace_delta(line)).max(0);
     }
     None
+}
+
+/// The net `{` minus `}` count of a line, ignoring braces inside string/char
+/// literals and after a `//` comment. Approximate but never *over*-counts a block
+/// opener, so a depth-0 check is conservative (it can refuse, never accept a
+/// method as a free function).
+fn brace_delta(line: &str) -> i32 {
+    let mut d = 0i32;
+    let mut chars = line.chars().peekable();
+    let mut in_str = false;
+    let mut in_chr = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if in_str || in_chr => {
+                chars.next();
+            }
+            '"' if !in_chr => in_str = !in_str,
+            '\'' if !in_str => in_chr = !in_chr,
+            '/' if !in_str && !in_chr && chars.peek() == Some(&'/') => break,
+            '{' if !in_str && !in_chr => d += 1,
+            '}' if !in_str && !in_chr => d -= 1,
+            _ => {}
+        }
+    }
+    d
 }
 
 /// The signature reader, keeping the *positions*.
@@ -8850,6 +8905,25 @@ pub fn arg_name_of(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn function_params_ignores_a_comment_declaration() {
+        let src = "// fn bad(b: u8, a: u8)\npub fn bad(a: u8, b: u8) -> u8 { 0 }\n";
+        let names: Vec<String> = super::function_params(src, "bad")
+            .expect("a free function")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["a", "b"], "the real declaration, not the comment above it");
+    }
+
+    #[test]
+    fn function_params_refuses_a_method() {
+        let src = "impl S { fn m(&self, x: u8) {} }\n";
+        assert!(
+            super::function_params(src, "m").is_none(),
+            "a method is not callable as a bare name, so replay must refuse it"
+        );
+    }
     /// A multi-file crate: `mod a;` in the root is inlined from `a.rs`, so a
     /// contract written in the module file is read and keyed `a::f` -- the path
     /// rustc prints for it. Without this, a crate's modules verified *nothing* and

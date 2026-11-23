@@ -23,6 +23,15 @@ fn main() {
             }
         }
     }
+    // The verified *target* matters too: `to_be`/`to_le` are modelled with the
+    // verifier's own endianness, so a host build and a cross build model different
+    // functions. `TARGET` is set by Cargo for the crate being built.
+    if let Ok(target) = std::env::var("TARGET") {
+        for b in target.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
     let mut s = String::new();
     let _ = write!(s, "{h:016x}");
     println!("cargo:rustc-env=VERIF_ENGINE_HASH={s}");

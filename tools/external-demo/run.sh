@@ -17,11 +17,13 @@ export PATH="$HOME/.cargo/bin:$PATH"
 
 command -v cargo >/dev/null 2>&1 || { echo "external-demo: no cargo; skipping"; exit 2; }
 
+# Always build: Cargo reuses unchanged artifacts, so an edit to the verifier is
+# picked up on the next run (a `[ -x "$BIN" ]` guard tested a stale binary).
+# An explicit target dir, so a configured `CARGO_TARGET_DIR` cannot leave the
+# launch path pointing at a different (or stale) binary.
 BIN="$ROOT/target/debug/cargo-verif"
-if [ ! -x "$BIN" ]; then
-    ( cd "$ROOT" && cargo build -q --features std --bin cargo-verif ) \
-        || { echo "external-demo: could not build cargo-verif"; exit 2; }
-fi
+( cd "$ROOT" && cargo build -q --features std --bin cargo-verif --target-dir "$ROOT/target" ) \
+    || { echo "external-demo: could not build cargo-verif"; exit 2; }
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -69,12 +71,12 @@ ok=1
 for name in true false; do
     d="$WORK/$name"
     if [ "$name" = true ]; then write_crate "$d" "$TRUE_BODY"; else write_crate "$d" "$FALSE_BODY"; fi
-    ( cd "$d" && cargo build -q ) >/dev/null 2>&1 \
+    ( cd "$d" && CARGO_TARGET_DIR="$d/target" cargo build -q ) >/dev/null 2>&1 \
         || { echo "external-demo: could not fetch/build embedded-hal (no network?)"; exit 2; }
     out=$("$BIN" --file "$d/src/lib.rs" 2>&1)
     code=$?
     if [ "$name" = true ]; then
-        if [ "$code" -eq 0 ] && printf '%s' "$out" | grep -q "verified"; then
+        if [ "$code" -eq 0 ] && printf '%s' "$out" | grep -Eq 'clamp_percent(:[0-9]+)?[[:space:]]+verified'; then
             echo "external-demo: true contract verified (exit 0)"
         else
             echo "external-demo: TRUE CONTRACT NOT VERIFIED (exit $code)"

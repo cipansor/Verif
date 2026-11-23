@@ -36,21 +36,25 @@ fn main() {
     let mut emit_test: Option<String> = None;
     let mut cache_dir: Option<PathBuf> = None;
     // `cargo verif` invokes this binary as `cargo-verif verif [args]`; drop the
-    // subcommand name so a bare `cargo verif --file x` parses.
-    let mut pending = Vec::new();
-    for a in std::env::args().skip(1) {
-        if a == "verif" {
-            continue;
-        }
-        pending.push(a);
+    // subcommand name so a bare `cargo verif --file x` parses. Only the *first*
+    // token is stripped, so a value that happens to be `verif` (a cache directory,
+    // a function name) survives.
+    let mut it = std::env::args().skip(1).peekable();
+    if it.peek().is_some_and(|a| a == "verif") {
+        it.next();
     }
-    let mut it = pending.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--file" | "-f" => file = it.next().map(PathBuf::from),
             "--function" | "--fn" => function = it.next(),
             "--format" => format = it.next().unwrap_or_default(),
-            "--emit-test" => emit_test = it.next(),
+            "--emit-test" => match it.next() {
+                Some(n) => emit_test = Some(n),
+                None => {
+                    eprintln!("cargo-verif: --emit-test requires a function name");
+                    std::process::exit(2);
+                }
+            },
             "--cache" => cache_dir = it.next().map(PathBuf::from),
             "--help" | "-h" => {
                 println!(
@@ -88,7 +92,13 @@ fn main() {
         });
 
     let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
-    let only: Vec<String> = function.into_iter().collect();
+    // `--emit-test <fn>` verifies *that* function (even if it has no contract), so
+    // replay has a verdict to turn into a test -- an unannotated target would
+    // otherwise be skipped and reported as "no counterexample".
+    let only: Vec<String> = match &emit_test {
+        Some(t) => vec![t.clone()],
+        None => function.into_iter().collect(),
+    };
     // Make the crate's own dependencies resolvable, so a file that `use`s another
     // crate compiles (C8). `crate_options` returns the default when the crate has no
     // deps or they are not built, so this changes nothing for a single-file file.

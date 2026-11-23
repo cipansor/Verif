@@ -132,6 +132,16 @@ pub struct MirOptions {
     /// change to the program or the engine is a miss — never a stale hit. Only the
     /// library-side option is here; `cargo verif` sets it from `--cache`.
     pub cache: Option<PathBuf>,
+    /// Extra arguments passed verbatim to the MIR-emitting `rustc` invocation.
+    ///
+    /// The `RUSTC_WRAPPER` entry point fills this with the *semantic* flags Cargo
+    /// passes the real compilation -- `--cfg` and `--target` -- so the MIR it emits
+    /// is the program Cargo is actually building. Without them, `cfg!(feature =
+    /// "fast")` would evaluate to `false` during verification and `true` in the
+    /// artifact, and the verifier could approve a contract the build violates (a
+    /// false pass). Edition and `--extern` are handled separately (they are part of
+    /// [`MirOptions`] proper).
+    pub rustc_args: Vec<String>,
 }
 
 /// Everything a build script needs to let its own source name a crate: the
@@ -353,7 +363,8 @@ fn dependency_names(text: &str) -> Vec<String> {
             let inner = line.trim_start_matches('[').trim_end_matches(']').trim();
             in_deps = inner == "dependencies";
             if let Some(rest) = inner.strip_prefix("dependencies.") {
-                let name = rest.trim();
+                // A sub-table key may be quoted (`[dependencies."dep"]`) or dotted.
+                let name = rest.trim().trim_matches('"').trim_matches('\'').trim();
                 if !name.is_empty() {
                     names.push(name.to_string());
                 }
@@ -364,8 +375,11 @@ fn dependency_names(text: &str) -> Vec<String> {
         if in_deps {
             if let Some(eq) = line.find('=') {
                 let key = line[..eq].trim().trim_matches('"').trim_matches('\'').trim();
-                if !key.is_empty() {
-                    names.push(key.to_string());
+                // A dotted key (`dep.path = "../dep"`) names the dependency `dep`;
+                // only the first segment is the crate.
+                let name = key.split('.').next().unwrap_or("").trim();
+                if !name.is_empty() {
+                    names.push(name.to_string());
                 }
             }
         }
@@ -882,6 +896,9 @@ pub fn emit_mir_with_opts(
     }
     for dir in &opts.search_paths {
         cmd.arg("-L").arg(format!("dependency={}", dir.display()));
+    }
+    for a in &opts.rustc_args {
+        cmd.arg(a);
     }
     let out = cmd
         .arg(file)
@@ -1655,7 +1672,7 @@ pub fn verify_file_with_opts(
     let cache_key = opts
         .cache
         .as_ref()
-        .map(|_| super::cache::file_key(&mir, &text, &format!("{edition:?}")));
+        .map(|_| super::cache::file_key(&mir, &specs.snapshot, &format!("{edition:?}")));
     let cached = match (&opts.cache, &cache_key) {
         (Some(dir), Some(k)) => super::cache::load(dir, k),
         _ => super::cache::Entries::new(),
@@ -1665,12 +1682,16 @@ pub fn verify_file_with_opts(
         if let Some(c) = specs.resolve(&f.name) {
             report.lines.insert(key.clone(), c.line);
         }
-        let outcome = match cached.get(&key) {
+        // Keyed by the MIR definition name (`f.name`), which is unique per function
+        // -- two trait impls of one method share a *report label* (`S::check`) but not
+        // a definition name (their impl locations differ). Keying on the label would
+        // let one impl's verdict stand in for the other (a false proof).
+        let outcome = match cached.get(&f.name) {
             Some(c) => c.to_outcome(),
             None => smt::with_fresh(|| verify_function(&prog, f, &specs)),
         };
         if let Some(c) = super::cache::Cached::of(&outcome) {
-            fresh.insert(key.clone(), c);
+            fresh.insert(f.name.clone(), c);
         }
         report.outcomes.push((key, outcome));
     }
@@ -2026,18 +2047,12 @@ pub fn emit_test_source(
         .collect();
     let mut args = Vec::new();
     for (pname, ty) in &params {
-        if ty.width().is_none() {
-            return Err(format!(
-                "`{name}` takes a non-scalar argument `{pname}`; only integer arguments \
-                 can be synthesised from a counterexample"
-            ));
-        }
         let Some((_, v)) = values.iter().find(|(n, _)| n == pname) else {
             return Err(format!(
                 "the counterexample does not assign `{pname}`, so the call cannot be built"
             ));
         };
-        args.push((*v).to_string());
+        args.push(render_arg(pname, ty, v)?);
     }
     let sanitized: String = name
         .chars()
@@ -2051,6 +2066,42 @@ pub fn emit_test_source(
          let _ = {name}({});\n}}\n",
         args.join(", ")
     ))
+}
+
+/// Render one counterexample value as a Rust argument for a parameter of type `ty`.
+///
+/// The counterexample stores *bit patterns* -- a `bool` `false` is `0`, an `i8` `-1`
+/// is `255` -- so the value is typed back before it is passed: `false`/`true` for a
+/// `bool`, sign-extended for a signed integer, the unsigned value otherwise. Emitting
+/// the raw decimal would give `bad(0)` for a `bool` and `bad(255)` for an `i8`: an
+/// uncompilable call, or one that does not reproduce the counterexample. The literal
+/// is emitted unsuffixed so it takes the parameter's own type by inference.
+fn render_arg(pname: &str, ty: &super::parse::Ty, raw: &str) -> Result<String, String> {
+    let v: i128 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("the counterexample value `{raw}` for `{pname}` is not an integer"))?;
+    if matches!(ty, super::parse::Ty::Bool) {
+        return Ok(if v != 0 { "true".into() } else { "false".into() });
+    }
+    let Some(w) = ty.width() else {
+        return Err(format!(
+            "`{pname}` is not a scalar type the emitter can synthesise a value for"
+        ));
+    };
+    let w = u32::from(w);
+    if w == 0 || w > 64 {
+        return Err(format!("`{pname}` has an unsupported width {w}"));
+    }
+    let mask: u128 = if w == 64 { u128::MAX } else { (1u128 << w) - 1 };
+    let bits = (v as u128) & mask;
+    if ty.is_signed() {
+        let signed =
+            if (bits >> (w - 1)) & 1 == 1 { bits as i128 - (1i128 << w) } else { bits as i128 };
+        Ok(format!("{signed}"))
+    } else {
+        Ok(format!("{bits}"))
+    }
 }
 
 #[cfg(test)]
@@ -2535,5 +2586,22 @@ mod extern_probe_tests {
             "stable ({a_path}) and 1.85 ({b_path}) are different builds and must not \
              share an identity"
         );
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    #[test]
+    fn render_arg_types_a_counterexample_value() {
+        use super::parse::Ty;
+        assert_eq!(render_arg("b", &Ty::Bool, "0").unwrap(), "false");
+        assert_eq!(render_arg("b", &Ty::Bool, "1").unwrap(), "true");
+        assert_eq!(render_arg("x", &Ty::I8, "255").unwrap(), "-1");
+        assert_eq!(render_arg("x", &Ty::I8, "128").unwrap(), "-128");
+        assert_eq!(render_arg("x", &Ty::U8, "255").unwrap(), "255");
+        assert_eq!(render_arg("x", &Ty::I8, "127").unwrap(), "127");
+        assert!(render_arg("x", &Ty::Other("S".into()), "0").is_err());
     }
 }
