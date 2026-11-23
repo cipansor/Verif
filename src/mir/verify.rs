@@ -483,7 +483,11 @@ fn target_directory_from_metadata(metadata: &str) -> Option<PathBuf> {
         match bytes[i] {
             b'"' => {
                 let start = i + 1;
-                let end = start + metadata[start..].find('"')?;
+                // Scan to the next *unescaped* quote: a JSON string may contain `\"`,
+                // and a `[`/`]`/`{`/`}` between two escaped quotes (in a package
+                // description) would otherwise change the depth and hide the root
+                // `target_directory`.
+                let end = json_string_end(bytes, start)?;
                 if depth == 1 && &metadata[start..end] == "target_directory" {
                     return read_json_string(bytes, end + 1);
                 }
@@ -504,40 +508,73 @@ fn target_directory_from_metadata(metadata: &str) -> Option<PathBuf> {
     None
 }
 
+/// The byte index of the `"` that closes the JSON string whose opening quote is just
+/// before `start`, skipping `\X` escape pairs so an escaped quote (`\"`) does not end
+/// the string early.
+#[cfg(feature = "std")]
+fn json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut k = start;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'\\' => k += 2,
+            b'"' => return Some(k),
+            _ => k += 1,
+        }
+    }
+    None
+}
+
 /// After a key's closing quote at byte `from`, skip whitespace and `:`, then read the
-/// JSON string value, decoding `\\`, `\"`, `\n` and `\t`.
+/// JSON string value, decoding `\\`, `\"`, `\n`, `\t`, `\r`, `\/` and `\uXXXX`.
+///
+/// The decoded bytes are collected and validated as UTF-8 at the end: a non-ASCII
+/// character is several bytes, and decoding each byte with `byte as char` would turn
+/// `artefácts` into `artefÃ¡cts`, so the dependency search would look in the wrong
+/// directory.
 #[cfg(feature = "std")]
 fn read_json_string(bytes: &[u8], from: usize) -> Option<PathBuf> {
     let mut j = from;
-    while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
         j += 1;
     }
     if j >= bytes.len() || bytes[j] != b':' {
         return None;
     }
     j += 1;
-    while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
         j += 1;
     }
     if j >= bytes.len() || bytes[j] != b'"' {
         return None;
     }
     j += 1;
-    let mut out = String::new();
+    let mut out: Vec<u8> = Vec::new();
     while j < bytes.len() {
         match bytes[j] {
-            b'"' => return Some(PathBuf::from(out)),
+            b'"' => return String::from_utf8(out).ok().map(PathBuf::from),
             b'\\' => {
                 j += 1;
                 if j < bytes.len() {
                     match bytes[j] {
-                        b'n' => out.push('\n'),
-                        b't' => out.push('\t'),
-                        o => out.push(o as char),
+                        b'n' => out.push(b'\n'),
+                        b't' => out.push(b'\t'),
+                        b'r' => out.push(b'\r'),
+                        b'u' => {
+                            if j + 4 < bytes.len() {
+                                let hex = std::str::from_utf8(&bytes[j + 1..j + 5]).ok()?;
+                                let cp = u32::from_str_radix(hex, 16).ok()?;
+                                let ch = char::from_u32(cp)?;
+                                let mut buf = [0u8; 4];
+                                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                                j += 4;
+                            }
+                        }
+                        // `\"`, `\\`, `\/` decode to the escaped byte itself.
+                        o => out.push(o),
                     }
                 }
             }
-            o => out.push(o as char),
+            o => out.push(o),
         }
         j += 1;
     }
@@ -2827,6 +2864,17 @@ mod render_tests {
         // nested `target_directory` must not shadow the real top-level one.
         let nested = r#"{"packages":[{"metadata":{"target_directory":"/wrong"}}],"target_directory":"/right"}"#;
         assert_eq!(super::target_directory_from_metadata(nested), Some(PathBuf::from("/right")));
+        // A non-ASCII path is multi-byte; each byte must decode as one char, not as a
+        // separate Latin-1 char (`artefácts` must stay `artefácts`, not `artefÃ¡cts`).
+        let unicode = r#"{"target_directory":"artefácts"}"#;
+        assert_eq!(super::target_directory_from_metadata(unicode), Some(PathBuf::from("artefácts")));
+        // A `\uXXXX` escape decodes to the code point (`\u00e1` is `á`).
+        let esc = r#"{"target_directory":"a\u00e1b"}"#;
+        assert_eq!(super::target_directory_from_metadata(esc), Some(PathBuf::from("aáb")));
+        // A `[` between two escaped quotes in a preceding description must not change
+        // the brace depth and hide the root `target_directory`.
+        let quoted = r#"{"packages":[{"description":"Parses the quoted \"[\" token"}],"target_directory":"/x/target"}"#;
+        assert_eq!(super::target_directory_from_metadata(quoted), Some(PathBuf::from("/x/target")));
         assert_eq!(super::target_directory_from_metadata("{}"), None);
     }
 }
