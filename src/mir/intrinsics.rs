@@ -402,6 +402,10 @@ pub enum Intrinsic {
     SliceTake,
     /// `Iterator::fold(init, f)` on a cursor: folds a modelled reducer closure.
     SliceFold,
+    /// `Iterator::map(f)` on a cursor: a lazy element transform (closure).
+    SliceMap,
+    /// `Iterator::filter(f)` on a cursor: a lazy element predicate (closure).
+    SliceFilter,
     /// `Iterator::count` on a slice/array cursor: `len - pos`.
     ///
     /// The cursor is a concrete position, so the remaining count is the length
@@ -1570,6 +1574,12 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if short == "fold" && names_slice_iter_ty(name) {
         return Some(Intrinsic::SliceFold);
     }
+    if short == "map" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceMap);
+    }
+    if short == "filter" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceFilter);
+    }
     if short == "count" && names_slice_iter_ty(name) {
         return Some(Intrinsic::SliceCount);
     }
@@ -2016,7 +2026,11 @@ fn is_cursor_ty(ty: &str) -> bool {
         || head == "StepBy"
         || head.ends_with("::StepBy")
         || head == "Take"
-        || head.ends_with("::Take");
+        || head.ends_with("::Take")
+        || head == "Map"
+        || head.ends_with("::Map")
+        || head == "Filter"
+        || head.ends_with("::Filter");
     is_adapter && (ty.contains("slice::Iter") || ty.contains("array::IntoIter"))
 }
 
@@ -2394,6 +2408,8 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         | Intrinsic::SliceStepBy
         | Intrinsic::SliceTake
         | Intrinsic::SliceFold
+        | Intrinsic::SliceMap
+        | Intrinsic::SliceFilter
         | Intrinsic::SliceCount
         | Intrinsic::SliceSum
         | Intrinsic::SliceIterLast
@@ -2639,6 +2655,8 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             | Intrinsic::SliceStepBy
             | Intrinsic::SliceTake
             | Intrinsic::SliceFold
+            | Intrinsic::SliceMap
+            | Intrinsic::SliceFilter
             | Intrinsic::SliceCount
             | Intrinsic::SliceSum
             | Intrinsic::SliceIterLast
@@ -2714,6 +2732,8 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         | Intrinsic::SliceStepBy
         | Intrinsic::SliceTake
         | Intrinsic::SliceFold
+        | Intrinsic::SliceMap
+        | Intrinsic::SliceFilter
         | Intrinsic::SliceCount
         | Intrinsic::SliceSum
         | Intrinsic::SliceIterLast
@@ -6554,6 +6574,14 @@ mod tests {
         assert_eq!(
             classify("<std::slice::Iter<'_, u8> as Iterator>::fold"),
             Some(Intrinsic::SliceFold)
+        );
+        assert_eq!(
+            classify("<Copied<std::slice::Iter<'_, u8>> as Iterator>::map::<u8, {closure@a}>"),
+            Some(Intrinsic::SliceMap)
+        );
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::filter::<{closure@a}>"),
+            Some(Intrinsic::SliceFilter)
         );
         assert_eq!(
             classify("<std::slice::Iter<'_, u8> as Iterator>::count"),

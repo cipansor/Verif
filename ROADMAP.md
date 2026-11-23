@@ -1195,6 +1195,19 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     (checked sum, `wrapping_add`, a non-zero init) and one refuted tripwire (an
     unguarded fold overflows), and `mir::intrinsics` pins the classification.
 
+  - Progress (**`map`/`filter`**): `map(f)`/`filter(f)` are lazy: they set a
+    transform/predicate on the cursor and carry it. `sum` applies the transform
+    per element (with the transform's own overflow obligation, checked or
+    `wrapping_*`), and `count` counts the elements the predicate accepts
+    (`Σ ite(pred(x), 1, 0)`). The closure is resolved by `closure_fn`; the
+    transform/predicate is read by `closure_map`/`closure_filter`, which follow
+    the body's `_3 = copy (*_2)` copies (`resolve_operand`) to the element and a
+    constant. Needs a constant length; anything else is refused.
+    `tests/mir.rs::an_iterator_can_be_mapped_and_filtered` pins three verified
+    (checked map, `wrapping_mul` map, filter-count) and one refuted tripwire (the
+    filter accepts all four, so a count of two is refuted), and `mir::intrinsics`
+    pins the classification.
+
   - Progress (**`enumerate`**): `Iterator::enumerate` is a cursor identity whose
     `next` yields `Option<(usize, &T)>`. `next` writes the concrete index and the
     element into the tuple store and sets the payload to an aggregate, so the

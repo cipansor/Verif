@@ -13044,6 +13044,29 @@ fn an_iterator_can_be_taken() {
     );
 }
 
+/// C11 iteration: `Iterator::map`/`filter` are lazy transforms the value
+/// terminals apply -- `map(f).sum()` folds the mapped elements, `filter(f).count()`
+/// counts the accepted ones. The tripwire's filter accepts all four elements.
+#[test]
+fn an_iterator_can_be_mapped_and_filtered() {
+    let names = [
+        "array_iter_map_sum",
+        "array_iter_map_wrapping_sum",
+        "array_iter_filter_count",
+        "array_iter_filter_count_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in ["array_iter_map_sum", "array_iter_map_wrapping_sum", "array_iter_filter_count"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let o = outcome(&report, "array_iter_filter_count_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`array_iter_filter_count_tripwire` must be refuted, got: {o}"
+    );
+}
+
 /// C11 iteration: `Iterator::fold(init, f)` folds a modelled reducer closure
 /// (`|acc, x| acc <op> x`, checked or `wrapping_*`). The checked reducer raises a
 /// panic obligation per step; the tripwire's unguarded fold can overflow.

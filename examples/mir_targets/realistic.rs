@@ -14440,6 +14440,54 @@ pub fn array_iter_fold_tripwire(xs: &[u8; 4]) -> u8 {
     xs.iter().copied().fold(0u8, |a, x| a + x)
 }
 
+spec! {
+    requires: xs[0] <= 30,
+    requires: xs[1] <= 30,
+    requires: xs[2] <= 30,
+    requires: xs[3] <= 30,
+    ensures: ret == xs[0] * 2 + xs[1] * 2 + xs[2] * 2 + xs[3] * 2,
+}
+/// `map(|x| x * 2).sum()` applies the transform then sums the results.
+pub fn array_iter_map_sum(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().map(|x| x * 2).sum()
+}
+
+spec! {
+    requires: xs[0] <= 30,
+    requires: xs[1] <= 30,
+    requires: xs[2] <= 30,
+    requires: xs[3] <= 30,
+    ensures: ret == xs[0] * 2 + xs[1] * 2 + xs[2] * 2 + xs[3] * 2,
+}
+/// A `wrapping_mul` transform has no overflow obligation.
+pub fn array_iter_map_wrapping_sum(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().map(|x| x.wrapping_mul(2)).sum()
+}
+
+spec! {
+    requires: xs[0] > 10,
+    requires: xs[1] > 10,
+    requires: xs[2] > 10,
+    requires: xs[3] > 10,
+    ensures: ret == 4,
+}
+/// `filter(|x| *x > 10).count()` counts the accepted elements.
+pub fn array_iter_filter_count(xs: &[u8; 4]) -> u32 {
+    xs.iter().filter(|x| **x > 10).count() as u32
+}
+
+spec! {
+    requires: xs[0] > 10,
+    requires: xs[1] > 10,
+    requires: xs[2] > 10,
+    requires: xs[3] > 10,
+    ensures: ret == 2,
+}
+/// The filter accepts all four, so a claim of two must be refuted.
+pub fn array_iter_filter_count_tripwire(xs: &[u8; 4]) -> u32 {
+    xs.iter().filter(|x| **x > 10).count() as u32
+}
+
 // ---------------------------------------------------------------------------
 // A scalar reference argument named in a contract (C9)
 //

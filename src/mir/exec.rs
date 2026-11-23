@@ -691,6 +691,28 @@ struct IterState {
     /// `Iterator::take`'s absolute end (exclusive), or `None` for the slice's own
     /// length. A `take` needs a constant length so the effective end is constant.
     end: Option<u64>,
+    /// `Iterator::map`'s lazy element transform, or `None`.
+    map: Option<MapOp>,
+    /// `Iterator::filter`'s lazy element predicate, or `None`.
+    filter: Option<FilterOp>,
+}
+
+/// A `map` closure's transform: `|x| x <op> rhs` (or `rhs <op> x`), checked or
+/// `wrapping_*`.
+#[derive(Clone, Copy, Debug)]
+struct MapOp {
+    op: BinOp,
+    checked: bool,
+    rhs: u64,
+    rhs_left: bool,
+}
+
+/// A `filter` closure's predicate: `|x| x <op> rhs` (or `rhs <op> x`).
+#[derive(Clone, Copy, Debug)]
+struct FilterOp {
+    op: BinOp,
+    rhs: u64,
+    rhs_left: bool,
 }
 
 /// Local-to-symbolic environment, with side maps for aggregate parts.
@@ -5854,6 +5876,124 @@ fn closure_binop(f: &MirFn) -> Option<(BinOp, bool)> {
     None
 }
 
+/// A constant operand's value, if it is a numeric literal.
+fn const_val(o: &Operand) -> Option<u64> {
+    match o {
+        Operand::Const(Const::UInt(v, _)) => Some(*v as u64),
+        _ => None,
+    }
+}
+
+/// The local a `Copy`/`Move` operand reads, treating one leading `Deref` as
+/// transparent (a reference is modelled as its referent).
+fn arg_local(o: &Operand) -> Option<u32> {
+    match o {
+        Operand::Copy(p) | Operand::Move(p)
+            if p.proj.is_empty() || (p.proj.len() == 1 && matches!(p.proj[0], Proj::Deref)) =>
+        {
+            Some(p.local)
+        }
+        _ => None,
+    }
+}
+
+/// Follow `Use` assignments so a local that is only copied from another (the
+/// `_3 = copy (*_2)` indirection a closure body introduces) resolves to its source.
+fn assign_source(f: &MirFn, local: u32) -> Option<Operand> {
+    for b in &f.blocks {
+        for st in &b.stmts {
+            if let Stmt::Assign(pl, Rvalue::Use(src)) = st {
+                if pl.local == local && pl.proj.is_empty() {
+                    return Some(src.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve an operand through `Use` copies (deref-transparent) to the constant or
+/// argument it ultimately reads.
+fn resolve_operand(f: &MirFn, o: &Operand) -> Operand {
+    let mut cur = o.clone();
+    for _ in 0..32 {
+        let Some(l) = arg_local(&cur) else {
+            return cur;
+        };
+        match assign_source(f, l) {
+            Some(src) => cur = src,
+            None => return cur,
+        }
+    }
+    cur
+}
+
+/// Read a `map` closure `|x| x <op> k` (or `k <op> x`), checked or `wrapping_*`.
+fn closure_map(f: &MirFn) -> Option<MapOp> {
+    if f.arg_locals.len() != 2 {
+        return None;
+    }
+    let x = f.arg_locals[1];
+    let op_from = |op: BinOp, a: &Operand, b: &Operand| -> Option<MapOp> {
+        let (ra, rb) = (resolve_operand(f, a), resolve_operand(f, b));
+        if arg_local(&ra) == Some(x) {
+            const_val(&rb).map(|rhs| MapOp { op, checked: true, rhs, rhs_left: false })
+        } else if arg_local(&rb) == Some(x) {
+            const_val(&ra).map(|rhs| MapOp { op, checked: true, rhs, rhs_left: true })
+        } else {
+            None
+        }
+    };
+    for b in &f.blocks {
+        for st in &b.stmts {
+            if let Stmt::Assign(_, Rvalue::CheckedBinary(op, a, c)) = st {
+                if let Some(m) = op_from(*op, a, c) {
+                    return Some(m);
+                }
+            }
+        }
+        if let Term::Call { callee: Callee::Name(n), args, .. } = &b.term {
+            if let (Some(a), Some(c)) = (args.first(), args.get(1)) {
+                let op = match n.rsplit("::").next().unwrap_or(n.as_str()) {
+                    "wrapping_add" => BinOp::Add,
+                    "wrapping_sub" => BinOp::Sub,
+                    "wrapping_mul" => BinOp::Mul,
+                    _ => continue,
+                };
+                if let Some(m) = op_from(op, a, c) {
+                    return Some(MapOp { checked: false, ..m });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read a `filter` closure `|x| x <op> k` (or `k <op> x`) as a predicate.
+fn closure_filter(f: &MirFn) -> Option<FilterOp> {
+    if f.arg_locals.len() != 2 {
+        return None;
+    }
+    let x = f.arg_locals[1];
+    for b in &f.blocks {
+        for st in &b.stmts {
+            if let Stmt::Assign(_, Rvalue::Binary(op, a, c)) = st {
+                let (ra, rb) = (resolve_operand(f, a), resolve_operand(f, c));
+                if arg_local(&ra) == Some(x) {
+                    if let Some(rhs) = const_val(&rb) {
+                        return Some(FilterOp { op: *op, rhs, rhs_left: false });
+                    }
+                } else if arg_local(&rb) == Some(x) {
+                    if let Some(rhs) = const_val(&ra) {
+                        return Some(FilterOp { op: *op, rhs, rhs_left: true });
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn slice_iter(
     name: &str,
     op: intrinsics::Intrinsic,
@@ -5878,7 +6018,7 @@ fn slice_iter(
             if s.elem_w == 0 {
                 return Err(format!("`{name}` on a slice whose element width is not modelled"));
             }
-            env.iters.insert(dest.local, IterState { base: recv.local, pos: 0, rev: false, step: 1, end: None });
+            env.iters.insert(dest.local, IterState { base: recv.local, pos: 0, rev: false, step: 1, end: None, map: None, filter: None });
             Ok(Vec::new())
         }
         // `copied()` wraps the cursor in an adapter that yields `T` instead of `&T`.
@@ -6003,6 +6143,35 @@ fn slice_iter(
             env.iters.remove(&recv.local);
             Ok(obligations)
         }
+        // `map(f)` / `filter(f)` are lazy: they set a transform/predicate on the
+        // cursor and carry it. The value terminals apply it (`sum` the transform,
+        // `count` the predicate); anything else is a refusal.
+        Intrinsic::SliceMap => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            let Some(closure) = closure_fn(cx.prog, cx.args.get(1)) else {
+                return Err(format!("`{name}` over a closure that is not modelled"));
+            };
+            let Some(m) = closure_map(closure) else {
+                return Err(format!("`{name}` over a transform this frontend does not model"));
+            };
+            env.iters.insert(dest.local, IterState { map: Some(m), ..it });
+            Ok(Vec::new())
+        }
+        Intrinsic::SliceFilter => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            let Some(closure) = closure_fn(cx.prog, cx.args.get(1)) else {
+                return Err(format!("`{name}` over a closure that is not modelled"));
+            };
+            let Some(fl) = closure_filter(closure) else {
+                return Err(format!("`{name}` over a predicate this frontend does not model"));
+            };
+            env.iters.insert(dest.local, IterState { filter: Some(fl), ..it });
+            Ok(Vec::new())
+        }
         Intrinsic::SliceNext => {
             let Some(it) = env.iters.get(&recv.local).copied() else {
                 return Err(format!(
@@ -6090,6 +6259,30 @@ fn slice_iter(
             };
             let len = s.len;
             let w = smt::bits(len);
+            // `filter(pred).count()` counts the elements the predicate accepts.
+            if let Some(fl) = it.filter {
+                let (elem_w, elem_signed) = (s.elem_w, s.elem_signed);
+                let Some(n) = iterator_const_len(s, cx.pins) else {
+                    return Err(format!(
+                        "`{name}` over a filtered slice whose length is not a constant"
+                    ));
+                };
+                let hi = it.end.map_or(n, |e| e.min(n));
+                let sign = Sign::of_bool(elem_signed);
+                let mut acc = smt::word(0, w);
+                let mut k = it.pos;
+                while k < hi {
+                    let Some((elem, _)) = env.index_elem(it.base, k) else {
+                        return Err(format!("`{name}` on an iterator whose elements are not modelled"));
+                    };
+                    let pred = filter_pred(fl, elem, elem_w, sign)?;
+                    acc = smt::add(acc, smt::ite(pred, smt::word(1, w), smt::word(0, w)));
+                    k += it.step;
+                }
+                env.set(dest, Val::Sym(acc, Sign::Unsigned));
+                env.iters.remove(&recv.local);
+                return Ok(Vec::new());
+            }
             let count = if it.step != 1 || it.end.is_some() {
                 // A stride or a `take` needs a *constant* length to count exactly.
                 let Some(n) = iterator_const_len(s, cx.pins) else {
@@ -6358,6 +6551,52 @@ fn slice_extreme(
 /// `Add::add`, which panics on overflow in a debug build, so each partial sum
 /// raises a reachable-panic obligation -- a model that summed with a silent wrap
 /// would hide a panic, which this frontend must never do.
+/// Apply a `map` transform to one element, returning the mapped value and any
+/// overflow obligation the transform itself raises.
+fn apply_map(
+    m: MapOp,
+    elem: Var,
+    w: u8,
+    sign: Sign,
+    path: Pred,
+    pins: &[(u32, u64)],
+) -> Result<(Var, Vec<Obligation>), String> {
+    let rhs = smt::word(m.rhs, w);
+    let (a, b) = if m.rhs_left {
+        (Val::Sym(rhs, sign), Val::Sym(elem, sign))
+    } else {
+        (Val::Sym(elem, sign), Val::Sym(rhs, sign))
+    };
+    let mut obs = Vec::new();
+    if m.checked {
+        let Some(over) = overflow_pred(m.op, a, b, w) else {
+            return Err("`map` overflow predicate is not modelled".into());
+        };
+        obs.push(Obligation {
+            kind: ObligationKind::Panic { message: "`map` closure overflows".into() },
+            verdict: find_obligation(smt::and(path, over), pins),
+        });
+    }
+    match eval_binary(m.op, a, b, Some(w)) {
+        Val::Sym(v, _) => Ok((v, obs)),
+        _ => Err("`map` step is not modelled".into()),
+    }
+}
+
+/// Evaluate a `filter` predicate on one element.
+fn filter_pred(fl: FilterOp, elem: Var, w: u8, sign: Sign) -> Result<Pred, String> {
+    let rhs = smt::word(fl.rhs, w);
+    let (a, b) = if fl.rhs_left {
+        (Val::Sym(rhs, sign), Val::Sym(elem, sign))
+    } else {
+        (Val::Sym(elem, sign), Val::Sym(rhs, sign))
+    };
+    match eval_binary(fl.op, a, b, Some(w)) {
+        Val::Bool(p) => Ok(p),
+        _ => Err("`filter` predicate is not modelled".into()),
+    }
+}
+
 fn slice_sum(
     name: &str,
     recv: &Place,
@@ -6394,6 +6633,9 @@ fn slice_sum(
     if n > MAX_SUM_LEN {
         return Err(format!("`{name}` over {n} elements is past the {MAX_SUM_LEN}-element limit"));
     }
+    if it.filter.is_some() {
+        return Err(format!("`{name}` over a filtered iterator is not modelled"));
+    }
     let sign = Sign::of_bool(elem_signed);
     let hi = it.end.map_or(n, |e| e.min(n));
     let mut acc = smt::word(0, dest_w);
@@ -6402,6 +6644,14 @@ fn slice_sum(
     while k < hi {
         let Some((elem, _)) = env.index_elem(it.base, k) else {
             return Err(format!("`{name}` on an iterator whose elements are not modelled"));
+        };
+        // A `map` transform is applied to each element before it is summed.
+        let elem = if let Some(m) = it.map {
+            let (v, obs) = apply_map(m, elem, elem_w, sign, path, pins)?;
+            obligations.extend(obs);
+            v
+        } else {
+            elem
         };
         // `Add::add` panics on overflow in a debug build, so each step is a
         // reachable-panic obligation, exactly as the `overflowing_*` family's own
@@ -7153,6 +7403,8 @@ fn try_intrinsic(
                 | intrinsics::Intrinsic::SliceStepBy
                 | intrinsics::Intrinsic::SliceTake
                 | intrinsics::Intrinsic::SliceFold
+                | intrinsics::Intrinsic::SliceMap
+                | intrinsics::Intrinsic::SliceFilter
                 | intrinsics::Intrinsic::SliceCount
                 | intrinsics::Intrinsic::SliceSum
                 | intrinsics::Intrinsic::SliceIterLast
@@ -7287,6 +7539,8 @@ fn try_intrinsic(
             | intrinsics::Intrinsic::SliceStepBy
             | intrinsics::Intrinsic::SliceTake
             | intrinsics::Intrinsic::SliceFold
+            | intrinsics::Intrinsic::SliceMap
+            | intrinsics::Intrinsic::SliceFilter
             | intrinsics::Intrinsic::SliceCount
             | intrinsics::Intrinsic::SliceSum
             | intrinsics::Intrinsic::SliceIterLast
