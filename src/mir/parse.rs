@@ -2700,6 +2700,21 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
     if t.contains("::") && !has_top_level_space(t) && !t.contains('(') {
         return Rvalue::Use(Operand::Const(Const::Other(t.to_string())));
     }
+    // `AlignOf(T)` — the alignment of `T` in bytes. The MSRV (1.85) emits this
+    // for a `Box` deref's alignment check (`_6 = AlignOf(u32)`); current stable
+    // const-folds it into a `SizedTypeProperties::SIZE` literal. For every
+    // primitive Rust's alignment *is* its size in bytes (`u8`..`u64`, `i8`..`i64`,
+    // `usize`, `bool`, `char`), so the alignment is the width rounded up to bytes.
+    // A type whose width the model does not hold stays `Unknown`, which refuses the
+    // assert rather than guessing an alignment.
+    if let Some(inner) = t.strip_prefix("AlignOf(").and_then(|r| r.strip_suffix(')')) {
+        if let Some(w) = Ty::parse(inner.trim()).width() {
+            let bytes = (w + 7) / 8;
+            if bytes > 0 {
+                return Rvalue::Use(Operand::Const(Const::UInt(u128::from(bytes), Some(Ty::U64))));
+            }
+        }
+    }
     Rvalue::Unknown(t.to_string())
 }
 

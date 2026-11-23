@@ -7817,15 +7817,6 @@ where
                     }
                 }
                 st.env.set(dest, v);
-                // A `Box`'s pointer: `_5 = (_2.0) as *const u8` names box `_2`'s
-                // field 0, so `*_5` reads the boxed value. Recorded *after* `set`,
-                // because a whole-place write forgets the destination's parts (and
-                // this mapping with them).
-                if let Rvalue::Cast(Operand::Copy(q) | Operand::Move(q), _) = rv {
-                    if q.proj.as_slice() == [Proj::Field(0)] && st.env.boxed.contains_key(&q.local) {
-                        st.env.box_refs.insert(dest.local, q.local);
-                    }
-                }
                 // A promoted `&[&str]` constant (`_4 = const f::promoted[0]`) is the
                 // format-piece array a `panic!`/`assert!` message is built from on
                 // edition 2024. Its pieces are recorded *here*, after `set`, because
@@ -7882,6 +7873,46 @@ where
                             st.env.rebase_elem_parts(q, dest.local, k);
                         }
                     }
+                }
+                // A `Box`'s pointer, recorded *last* in the arm because every step
+                // above may forget the destination's parts (`set` drops them, and
+                // `rebase_parts` drops them again) -- and `forget_parts` also clears
+                // `box_refs`. Two spellings name the box's pointer, and both must
+                // link `dest -> box` so a later `*dest` reads the boxed value:
+                //
+                // * current stable: `_3 = (_2.0) as *const u8` (`BoxDerefTransmute`);
+                // * the MSRV (1.85): `_3 = copy (((_2.0).0).0)` -- `Box`'s
+                //   `Unique`/`NonNull`/`*const` fields walked one by one, no cast.
+                //
+                // An all-field chain rooted at a boxed local is that pointer
+                // whichever spelling reaches it. Without the `Use` form the MSRV's
+                // `box_new_reads_its_value` was `incomplete` (the return value was
+                // not known) while stable verified it -- a toolchain-shaped gap gate
+                // 14 (the suite on 1.85) caught.
+                match rv {
+                    Rvalue::Cast(Operand::Copy(q) | Operand::Move(q), _)
+                        if q.proj.as_slice() == [Proj::Field(0)] =>
+                    {
+                        if st.env.boxed.contains_key(&q.local) {
+                            st.env.box_refs.insert(dest.local, q.local);
+                        }
+                    }
+                    Rvalue::Use(Operand::Copy(q) | Operand::Move(q))
+                        if st.env.boxed.contains_key(&q.local)
+                            && !q.proj.is_empty()
+                            && q.proj.iter().all(|p| matches!(p, Proj::Field(_))) =>
+                    {
+                        // The MSRV also emits an *alignment* assert (`AlignOf`,
+                        // `BitAnd`, `Eq`) reading the pointer's address, so `dest`
+                        // needs the pointer token's *value* (not just the deref link)
+                        // or the check is `unmodelled assert condition`. The token is
+                        // the box's field 0.
+                        if let Some(tok) = st.env.fields.get(&(q.local, 0)).copied() {
+                            st.env.set(dest, tok);
+                        }
+                        st.env.box_refs.insert(dest.local, q.local);
+                    }
+                    _ => {}
                 }
             }
         }
