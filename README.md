@@ -60,6 +60,7 @@ all obligations discharged
 - [What is in the box](#what-is-in-the-box)
 - [Two ways to use the verifier: at build time, or on the target](#two-ways-to-use-the-verifier-at-build-time-or-on-the-target)
 - [Building and testing](#building-and-testing)
+- [Coverage scoreboard](#coverage-scoreboard)
 - [Layout](#layout)
 
 **[Proving a program](#verification-conditions-are-generated-not-hand-written)**
@@ -3637,6 +3638,30 @@ Read the table with these caveats, each of which is the honest part:
   documented above, and the mature competitors have higher coverage (pointers, aliasing,
   concurrency, unbounded induction). The reason to choose `verif` is *embeddability and no
   external toolchain*, not raw speed.
+
+## Coverage scoreboard
+
+`scripts/scoreboard.py` runs `mir_coverage` on the three MIR corpora and prints how many
+functions come back **verified**, with `--check` failing if any corpus drops below the
+floor in `scripts/scoreboard-floor.txt`:
+
+```console
+$ python3 scripts/scoreboard.py
+| corpus | verified | total | share |
+|---|---|---|---|
+| `everyday.rs` | 21 | 24 | 87% |
+| `actuator.rs` | 18 | 33 | 54% |
+| `realistic.rs` | 694 | 1252 | 55% |
+```
+
+The floor is a **regression** floor, not a target: the corpora's verdicts are stable
+across the toolchains the gate runs, so a drop means a change made a function that used
+to verify stop verifying -- the kind of regression a coverage number catches and a green
+test suite does not. `--write-floor` records the current counts, which a PR that raises
+coverage does deliberately. The three functions still `incomplete` in `everyday.rs`
+(`div_unwrap`, `sum_iter`, `tri`) are the documented hard ones -- the u32 divider BDD
+wall, an unbounded-length sum, and a nonlinear inductive invariant -- and are tracked in
+[`ROADMAP.md`](ROADMAP.md) as C7, C11 and C12.
 
 ## Documentation
 

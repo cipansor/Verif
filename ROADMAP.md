@@ -1428,9 +1428,19 @@ Exit: one real `no_std` crate with a dependency verified end to end with
 - **U7. Proof caching.** · P1 · todo · —
   - Exit: unchanged MIR plus unchanged contracts reuses the verdict across runs.
   - Move: **build**.
-- **U8. A public scoreboard.** · P1 · todo · Kani
+- **U8. A public scoreboard.** · P1 · in progress · Kani
   - Exit: `everyday.rs`, an SV-COMP-style set, and `verify-rust-std` functions
     scored for verif **and** Kani on the same inputs, updated by CI.
+  - Progress (the verif half, done): `scripts/scoreboard.py` runs `mir_coverage` on
+    the three MIR corpora and prints a markdown table of verified/total, with
+    `--check` failing if a corpus drops below `scripts/scoreboard-floor.txt`
+    (a *regression* floor: verdicts are stable across the gate's toolchains, so a
+    drop means a change un-verified a function). `--write-floor` records a raised
+    count. Current: everyday 21/24, actuator 18/33, realistic 694/1252. The
+    everyday `div_unwrap`/`sum_iter`/`tri` are C7/C11/C12.
+  - Remaining: the Kani column on the *same* inputs (Kani is already an oracle in
+    `examples/kanidiff.rs`, but not a per-function coverage score), an SV-COMP-style
+    set, and `verify-rust-std` functions; and running it in CI.
   - Move: **build**.
 - **U9. Contracts written in the code, not only in doc comments.** · P1 · done · —
   - Gap: a `///` clause is unchecked prose. A typo in a *keyword* is now refused
