@@ -15050,6 +15050,177 @@ pub fn vec_pop_one_is_some_cannot_prove_this() -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// `Vec` elements: the pushed value can be read back (C11)
+// ---------------------------------------------------------------------------
+//
+// A `Vec` is an `indexed` store like a slice, so a `push`ed value is read back by
+// `v[k]`, `v.first()` and `v.get(k)`. The false twins claim a *different* value,
+// which only refutes if the store holds the pushed one.
+
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
+/// `v[0]` reads the pushed value.
+pub fn vec_index_reads_pushed() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(3u8);
+    v[0]
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
+/// The false twin: the pushed value is `3`, not `4`.
+pub fn vec_index_reads_pushed_cannot_prove_this() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(3u8);
+    v[0]
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
+/// Two pushes keep their indices distinct.
+pub fn vec_index_second_pushed() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(3u8);
+    v.push(7u8);
+    v[1]
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
+/// The false twin: index 1 is the second push (`7`), not the first (`3`).
+pub fn vec_index_second_pushed_cannot_prove_this() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(3u8);
+    v.push(7u8);
+    v[1]
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
+/// `v.first()` reads the same element `v[0]` does, through `Deref`.
+pub fn vec_first_reads_pushed() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(9u8);
+    *v.first().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 8,
+}
+/// The false twin: the first element is `9`, not `8`.
+pub fn vec_first_reads_pushed_cannot_prove_this() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(9u8);
+    *v.first().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
+/// `v.get(0)` reads the pushed element.
+pub fn vec_get_reads_pushed() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(4u8);
+    v.push(8u8);
+    *v.get(0).unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
+/// The false twin: `get(0)` is `4`, not `5`.
+pub fn vec_get_reads_pushed_cannot_prove_this() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(4u8);
+    v.push(8u8);
+    *v.get(0).unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
+/// `pop` returns the *last* pushed value, not the first.
+pub fn vec_pop_reads_pushed() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(3u8);
+    v.push(5u8);
+    v.pop().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
+/// The false twin: `pop` returns `5` (the last), not `3`.
+pub fn vec_pop_reads_pushed_cannot_prove_this() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(3u8);
+    v.push(5u8);
+    v.pop().unwrap()
+}
+
+spec! {
+    requires: v.len() > 0,
+    ensures: ret == v[0],
+}
+/// A `Vec` *argument*'s element is a symbolic input, so a contract that names it
+/// agrees with the body's `v[0]` read.
+pub fn vec_arg_index_matches_contract(v: &Vec<u8>) -> u8 {
+    v[0]
+}
+
+spec! {
+    requires: v.len() > 0,
+    ensures: ret == v[0] + 1,
+}
+/// The false twin: `v[0]` is not `v[0] + 1` (in `u8` this is false at `255`).
+pub fn vec_arg_index_matches_contract_cannot_prove_this(v: &Vec<u8>) -> u8 {
+    v[0]
+}
+
+spec! {
+    requires: v.len() > 0,
+    ensures: ret == v[0],
+}
+/// `v.first()` on a `Vec` argument agrees with `v[0]`, through `Deref`.
+pub fn vec_arg_first_matches_contract(v: &Vec<u8>) -> u8 {
+    *v.first().unwrap()
+}
+
+spec! {
+    requires: v.len() > 0,
+    ensures: ret == v[0] + 1,
+}
+/// The false twin: `first()` is `v[0]`, not `v[0] + 1`.
+pub fn vec_arg_first_matches_contract_cannot_prove_this(v: &Vec<u8>) -> u8 {
+    *v.first().unwrap()
+}
+
+spec! {
+    requires: v.len() == 0,
+    ensures: true,
+}
+/// An index on a `Vec` the precondition proves empty is a *panic*, refuted with a
+/// witness -- `v[0]` on an empty vector unwinds, and the model must say so.
+pub fn vec_index_empty_is_a_panic(v: &Vec<u8>) -> u8 {
+    v[0]
+}
+
+// ---------------------------------------------------------------------------
 // Chained `Option` combinators: the element identity must compose
 // ---------------------------------------------------------------------------
 

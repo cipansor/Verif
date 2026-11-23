@@ -983,7 +983,9 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     exposed through contracts for `Vec::{new, push, pop, len, get, index}`.
   - Exit: `make` verified. **Met** — `make` verifies (18 of 21 in `everyday.rs`).
   - Done: the **length** half. `Vec::{new, push, len}` are modelled from a
-    per-local length the executor tracks (`Env::vec_len`), since a `Vec`'s fields
+    per-local length the executor tracks (now the `indexed` store's `len`, with
+    `len_mutable` set for a `Vec`; it began as a separate `Env::vec_len` and was
+    folded into `Indexed` when the element model landed), since a `Vec`'s fields
     (a heap pointer, a length, a capacity) are not printed by the dump. The
     length is `usize` and `push` is `+ 1`, which cannot overflow at 64 bits, so it
     is exact rather than saturating. `drop` of a `Vec<T>` is a no-op exactly when
@@ -1001,14 +1003,35 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     no longer reads the entry length at the exit (`ret == 0` for `ret == 3`); and
     a `Vec` move (`let w = v`) and a returned vector transfer the length to the
     destination rather than dropping it.
-  - Remaining: the **element** model (`get`/`index`, so a `push`ed value can be
-    read back), `String`, `Box`, and symbolic-length slices. (`pop` and `is_empty`
-    are done — see the progress note below.)
+  - Remaining: `String`, `Box`, symbolic-length slices, and *iteration* (`Vec`/
+    slice `iter`, so `vec_iter_sum`/`for_over_slice` still stop at
+    `slice::iter`). (`pop`, `is_empty` and the **element** model are done — see
+    the progress notes below.)
   - Progress (`pop`, `is_empty`): `Vec::is_empty` reads the tracked length;
     `Vec::pop` returns `None` iff the length is zero and decrements it on the
-    non-empty path (the popped element is not modelled, so no payload is
-    fabricated). Fixtures `vec_is_empty_new`, `vec_not_empty_after_push`,
+    non-empty path; on a constant-length vector the popped element is the payload.
+    Fixtures `vec_is_empty_new`, `vec_not_empty_after_push`,
     `vec_pop_empty_then_len`, `vec_pop_one_is_some` and their twins.
+  - Progress (the **element** model, C11's last hard half): a `Vec` is now an
+    `Indexed` store exactly as a slice is — `len_mutable` distinguishes it from a
+    slice/array, and `push` records the pushed value at the *current* length. The
+    element is read back by `v[k]` (`<Vec as Index>::index`), `v.first()`/
+    `v.get(k)` (`<Vec as Deref>::deref` and `as_slice`), and `pop`. A `Vec`
+    *argument* binds a symbolic length (`v.len()` in a contract) and a distinct
+    element per index, so `v[0]` in a contract agrees with the body's `v[0]`.
+    Three soundness points pin it: `push` records an element only at a *constant*
+    length (a symbolic one poisons the elements rather than pinning a wrong
+    index), `v[k]` emits the `core` bounds panic as a reachable-failure obligation
+    (`v[0]` on a vector the precondition proves empty is refuted as a *panic*,
+    with the length in the witness), and the store crosses a call boundary and a
+    loop havoc exactly as the length does. Fixtures: the `vec_index_reads_pushed`
+    / `vec_first_reads_pushed` / `vec_get_reads_pushed` / `vec_pop_reads_pushed` /
+    `vec_arg_{index,first}_matches_contract` families and their `_cannot_prove_this`
+    twins, plus `vec_index_empty_is_a_panic`. `realistic.rs` **630/1148 →
+    637/1163**; `tests/mir.rs` `a_vec_element_is_read_back_through_index_first_get_and_pop`
+    pins every direction, and the `Vec` argument's length moving from a refusal to
+    a symbolic input is pinned by `arg_len_reflexive` (verifies) against
+    `arg_len_refused` (now a refutation, not a refusal).
   - Move: **build**.
 - **C12. A specification language that can say more.** · P1 · in progress · Verus,
   Creusot, Prusti, SPARK

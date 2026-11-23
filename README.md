@@ -2528,7 +2528,11 @@ says "I could not decide" is worth more than one that guesses.
    over a slice or array (it lowers to `<&[u8] as IntoIterator>::into_iter`, which is a
    different impl) and any iterator chain (`fold`, `map`, `sum`, `.iter()`); those are
    reported `incomplete` with the unmodelled call named, so the gap is visible rather
-   than silent. Two things are worth knowing about the range form: an `invariant:` that
+   than silent. A `Vec`'s *elements* are modelled — `v[k]`, `v.first()`, `v.get(k)` and
+   `pop` read back what `push` wrote, and a `Vec` argument's `v.len()`/`v[k]` are
+   symbolic inputs — but `v.iter()` derefs to a slice and stops at the same
+   `slice::iter` gap, so a `for` or iterator chain over a `Vec` is `incomplete` like one
+   over a slice. Two things are worth knowing about the range form: an `invariant:` that
    *names* the loop element (`s <= i`) is refused as `unknown name i`, because the
    element is a `debug` binding that is genuinely not live at the loop header — write
    the invariant over the loop's *carried* state (`s <= 5050`) — and the invariant must

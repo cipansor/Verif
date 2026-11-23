@@ -7297,6 +7297,12 @@ pub fn arg_len_refused(v: &Vec<u8>) -> usize { v.len() }
 
 spec! {
     requires: true,
+    ensures: ret == v.len(),
+}
+pub fn arg_len_reflexive(v: &Vec<u8>) -> usize { v.len() }
+
+spec! {
+    requires: true,
     ensures: ret == 1,
 }
 pub fn is_empty_new_ok() -> u8 { Vec::<u8>::new().is_empty() as u8 }
@@ -7387,19 +7393,108 @@ pub fn pop_nonempty_is_some_bad() -> u8 { let mut v = Vec::<u8>::new(); v.push(9
              not proved; got: {o}"
         );
     }
-    // A `Vec` argument's length is not a value the run holds, so a `len` on it is
-    // a refusal -- never an invented number.
+    // A `Vec` argument's length is a symbolic input -- the caller chose it -- so
+    // `len == 0` is refuted with a witness rather than refused, and a contract
+    // that relates the length to itself verifies. Before the element model the
+    // length was tracked only for a *local* vector, so `v.len()` on an argument
+    // was a refusal; now it is a real input.
     let Some(o) = verify_src("arg_len_refused", src) else { return };
     assert!(
-        !o.is_verified(),
-        "a `Vec` argument's length is unmodelled and must not verify; got: {o}"
+        matches!(o, FnOutcome::Failed { .. }),
+        "a `Vec` argument's length is a symbolic input, so `len == 0` must be \
+         refuted with a witness; got: {o}"
     );
+    let Some(o) = verify_src("arg_len_reflexive", src) else { return };
+    assert!(o.is_verified(), "`v.len() == v.len()` must verify; got: {o}");
+}
+
+/// The `Vec` *element* model: a pushed value is read back by `v[k]`, `v.first()`,
+/// `v.get(k)` and `pop`.
+///
+/// Each true direction has a false twin that claims a *different* value, so a model
+/// that stored the wrong element (or a constant) would refute the true one or prove
+/// the false one. The empty-index case is a *panic*, and it must be reported as one:
+/// `v[0]` on a vector the precondition proves empty unwinds, and a model that
+/// skipped `core`'s bounds check would call it panic-free.
+#[test]
+fn a_vec_element_is_read_back_through_index_first_get_and_pop() {
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! { requires: true, ensures: ret == 3, }
+pub fn index_ok() -> u8 { let mut v = Vec::new(); v.push(3u8); v[0] }
+
+spec! { requires: true, ensures: ret == 4, }
+pub fn index_bad() -> u8 { let mut v = Vec::new(); v.push(3u8); v[0] }
+
+spec! { requires: true, ensures: ret == 7, }
+pub fn second_ok() -> u8 { let mut v = Vec::new(); v.push(3u8); v.push(7u8); v[1] }
+
+spec! { requires: true, ensures: ret == 3, }
+pub fn second_bad() -> u8 { let mut v = Vec::new(); v.push(3u8); v.push(7u8); v[1] }
+
+spec! { requires: true, ensures: ret == 9, }
+pub fn first_ok() -> u8 { let mut v = Vec::new(); v.push(9u8); *v.first().unwrap() }
+
+spec! { requires: true, ensures: ret == 8, }
+pub fn first_bad() -> u8 { let mut v = Vec::new(); v.push(9u8); *v.first().unwrap() }
+
+spec! { requires: true, ensures: ret == 4, }
+pub fn get_ok() -> u8 { let mut v = Vec::new(); v.push(4u8); v.push(8u8); *v.get(0).unwrap() }
+
+spec! { requires: true, ensures: ret == 5, }
+pub fn get_bad() -> u8 { let mut v = Vec::new(); v.push(4u8); v.push(8u8); *v.get(0).unwrap() }
+
+spec! { requires: true, ensures: ret == 5, }
+pub fn pop_ok() -> u8 { let mut v = Vec::new(); v.push(3u8); v.push(5u8); v.pop().unwrap() }
+
+spec! { requires: true, ensures: ret == 3, }
+pub fn pop_bad() -> u8 { let mut v = Vec::new(); v.push(3u8); v.push(5u8); v.pop().unwrap() }
+
+spec! { requires: true, ensures: ret == 3, }
+pub fn as_slice_ok() -> u8 { let mut v = Vec::new(); v.push(3u8); let s = v.as_slice(); s[0] }
+
+spec! { requires: v.len() > 0, ensures: ret == v[0], }
+pub fn arg_index_ok(v: &Vec<u8>) -> u8 { v[0] }
+
+spec! { requires: v.len() > 0, ensures: ret == v[0] + 1, }
+pub fn arg_index_bad(v: &Vec<u8>) -> u8 { v[0] }
+
+spec! { requires: v.len() > 0, ensures: ret == v[0], }
+pub fn arg_first_ok(v: &Vec<u8>) -> u8 { *v.first().unwrap() }
+
+spec! { requires: v.len() > 0, ensures: ret == v[0] + 1, }
+pub fn arg_first_bad(v: &Vec<u8>) -> u8 { *v.first().unwrap() }
+
+spec! { requires: v.len() == 0, ensures: true, }
+pub fn index_empty_panics(v: &Vec<u8>) -> u8 { v[0] }
+"#;
+    for name in ["index_ok", "second_ok", "first_ok", "get_ok", "pop_ok", "as_slice_ok", "arg_index_ok", "arg_first_ok"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    for name in ["index_bad", "second_bad", "first_bad", "get_bad", "pop_bad", "arg_index_bad", "arg_first_bad"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` claims an element the vector does not hold and must be refuted; got: {o}"
+        );
+    }
+    // `v[0]` on a vector the precondition proves empty is a real panic, not a proof.
+    let Some(o) = verify_src("index_empty_panics", src) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.starts_with("panic"),
+            "an out-of-bounds `v[0]` must fail as a panic; got kind `{kind}`"
+        ),
+        other => panic!("an out-of-bounds `v[0]` must be refuted with a panic; got: {other}"),
+    }
 }
 
 /// Three soundness holes in the `Vec` length model, each a *false proof*.
 ///
-/// The model tracks a length per local (`Env::vec_len`). Each of these had the
-/// length survive a place it should not, so a false postcondition was proved:
+/// The model tracks a length per local in the `indexed` store (a `Vec` is an
+/// `Indexed` with `len_mutable`). Each of these had the length survive a place it
+/// should not, so a false postcondition was proved:
 ///
 /// * **A user `Vec` is not the container.** A local `struct Vec<T>` whose `Drop`
 ///   panics was treated as glue-free (the model matched the bare `Vec`), so the

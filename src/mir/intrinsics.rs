@@ -635,10 +635,23 @@ pub enum VecMethod {
     /// `Vec::is_empty(&self) -> bool` -> the length is zero.
     IsEmpty,
     /// `Vec::pop(&mut self) -> Option<T>` -> the length decreases by one when it
-    /// is non-zero. The *popped element* is not modelled (the dump prints no
-    /// elements), so the `Some` payload stays unknown while the tag and the new
-    /// length are exact.
+    /// is non-zero, and the element at the old `len - 1` is the payload when the
+    /// length is a constant the model can pin.
     Pop,
+    /// `<Vec<T> as Index<usize>>::index(&self, i) -> &T`, the call `v[i]` lowers
+    /// to. The element is the store's own `i`-th variable, and the result is a
+    /// *reference* to it, recorded in `slice_elem_ref` so a later `*` reads the
+    /// element rather than the reference local. A constant index is exact; a
+    /// symbolic one is refused (the store has no chain for a `Vec`).
+    Index,
+    /// `<Vec<T> as Deref>::deref(&self) -> &[T]`, which `v.first()`/`v.get(k)`/
+    /// `v.len()` (when not the inherent method) go through. The destination is the
+    /// same `indexed` store as the vector -- a *copy* of it, sharing the element
+    /// variables that exist at the point of the deref, so `v.first()` and `v[0]`
+    /// name one element.
+    Deref,
+    /// `Vec::as_slice(&self) -> &[T]`, the explicit spelling of [`Self::Deref`].
+    AsSlice,
 }
 
 /// A method on a `for`-loop range.
@@ -1268,8 +1281,23 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             "len" => return Some(Intrinsic::VecMethod(VecMethod::Len)),
             "is_empty" => return Some(Intrinsic::VecMethod(VecMethod::IsEmpty)),
             "pop" => return Some(Intrinsic::VecMethod(VecMethod::Pop)),
+            "as_slice" => return Some(Intrinsic::VecMethod(VecMethod::AsSlice)),
             _ => {}
         }
+    }
+    // `v[i]` and `v.first()`/`v.get(k)` reach `Vec` through a *trait* projection
+    // (`<Vec<u8> as Index<usize>>::index`, `<Vec<u8> as Deref>::deref`), which
+    // carries no `vec::Vec` path, so the bare-`Vec` head is matched separately and
+    // only on the standard library's trait (`Index`/`Deref`) to keep a user type
+    // spelled `Vec` from being read as the container.
+    if short == "index" && names_vec_trait(name, "Index") {
+        return Some(Intrinsic::VecMethod(VecMethod::Index));
+    }
+    if short == "deref" && names_vec_trait(name, "Deref") {
+        return Some(Intrinsic::VecMethod(VecMethod::Deref));
+    }
+    if short == "as_slice" && names_vec_trait_head(name) {
+        return Some(Intrinsic::VecMethod(VecMethod::AsSlice));
     }
     // The standard library's `Option`/`Result` methods. Like the slice shapes
     // these read the receiver's own state rather than a bit-vector operand -- the
@@ -1711,6 +1739,41 @@ pub fn names_str_impl(name: &str) -> bool {
 /// with a `Vec` length they do not have.
 pub fn names_vec_impl(name: &str) -> bool {
     name.contains("vec::Vec") || name.starts_with("Vec::")
+}
+
+/// The head of a type spelled `<Vec<T> …>` is the standard container.
+///
+/// rustc prints a `Vec`'s *trait* call with the bare type (`<Vec<u8> as
+/// Deref>::deref`) or the full path (`<std::vec::Vec<u8> as …>`), never a user
+/// type's module-qualified name (`<m::Vec<u8> as …>`, which has a `::` in the
+/// head and is refused). The same-dump lookup answers a local `Vec`'s own body
+/// first, so this only has to keep a *bodiless* user `Vec` from being answered by
+/// the model.
+fn vec_head_is_std(ty: &str) -> bool {
+    let head = ty.split('<').next().unwrap_or(ty).trim();
+    head == "Vec" || head.ends_with("vec::Vec")
+}
+
+/// True for `<Vec<T> as Trait<…>>::method`, with the standard library's `Trait`.
+fn names_vec_trait(name: &str, tr: &str) -> bool {
+    let Some(inner) = name.strip_prefix('<') else { return false };
+    let Some((ty, rest)) = inner.split_once(" as ") else { return false };
+    if !vec_head_is_std(ty) {
+        return false;
+    }
+    let trait_path = rest.split(['<', '>']).next().unwrap_or(rest).trim();
+    trait_path == tr || trait_path.ends_with(&format!("::{tr}"))
+}
+
+/// True for an `as_slice`-style call whose head is the standard `Vec`, whether it
+/// is printed as `Vec::<u8>::as_slice` or `<Vec<u8>>::as_slice`.
+fn names_vec_trait_head(name: &str) -> bool {
+    if names_vec_impl(name) {
+        return true;
+    }
+    let Some(inner) = name.strip_prefix('<') else { return false };
+    let ty = inner.split('>').next().unwrap_or(inner);
+    vec_head_is_std(ty)
 }
 
 /// True when a call names an inherent method on the standard library's `Option`.
@@ -5881,8 +5944,36 @@ mod tests {
         assert_eq!(classify("Vec::<u8>::len"), Some(Intrinsic::VecMethod(VecMethod::Len)));
         assert_eq!(classify("Vec::<u8>::new"), Some(Intrinsic::VecMethod(VecMethod::New)));
         assert_eq!(classify("Vec::<u8>::push"), Some(Intrinsic::VecMethod(VecMethod::Push)));
+        // The trait calls `v[i]`, `v.first()` and `v.as_slice()` lower to. The head
+        // is a *bare* `Vec`, so the trait path is what distinguishes the standard
+        // container from a user type spelled `Vec`.
+        assert_eq!(
+            classify("<Vec<u8> as Index<usize>>::index"),
+            Some(Intrinsic::VecMethod(VecMethod::Index))
+        );
+        assert_eq!(
+            classify("<Vec<u8> as std::ops::Index<usize>>::index"),
+            Some(Intrinsic::VecMethod(VecMethod::Index))
+        );
+        assert_eq!(
+            classify("<Vec<u8> as Deref>::deref"),
+            Some(Intrinsic::VecMethod(VecMethod::Deref))
+        );
+        assert_eq!(
+            classify("<Vec<u8> as core::ops::Deref>::deref"),
+            Some(Intrinsic::VecMethod(VecMethod::Deref))
+        );
+        assert_eq!(
+            classify("Vec::<u8>::as_slice"),
+            Some(Intrinsic::VecMethod(VecMethod::AsSlice))
+        );
         // A user type spelled `Vec` in a local module is not the standard one.
         assert!(classify("m::Vec::<u8>::len").is_none());
+        assert!(classify("<m::Vec<u8> as Index<usize>>::index").is_none());
+        // `Vec` is not `Index` of any other trait, and `index` of a slice is not the
+        // `Vec` model.
+        assert!(classify("<Vec<u8> as MyIndex<usize>>::index").is_none());
+        assert!(classify("<[u8] as Index<usize>>::index").is_none());
         // `String`/`str` also spell `len` and have neither `vec::Vec` nor a bare
         // `Vec::` head, so they are not answered by the `Vec` model.
         assert!(classify("str::len").is_none());

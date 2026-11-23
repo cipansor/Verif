@@ -4025,7 +4025,7 @@ impl FieldEnv {
     ) -> Option<Var> {
         // `elem_w == 0` is the unmodelled-width sentinel (a generic `&[T]`): the
         // length is still a value, so it is bound, but no element can be, which is
-        // what keeps `v.len()`/`v.is_empty()` answerable while `v[0]` stays refused.
+        // what keeps `v.len()` answerable while `v[0]` stays refused.
         if elem_w != 0 && !(1..=64).contains(&elem_w) {
             return None;
         }
@@ -8457,6 +8457,27 @@ pub fn field_env_named(
                 env.bind_array_len(l, &arg, w, elem.is_signed(), *n);
             }
             continue;
+        }
+        // A `Vec<T>` argument: like a slice, its length is a symbolic input and its
+        // elements are distinct inputs per index -- the caller chose the length and
+        // the contents. Binding the length is what makes `v.len()` and `v[0]` in a
+        // contract readable, and what the executor's `Index` bounds check needs to
+        // be discharged rather than refused. The container identity is the *full*
+        // standard path (`std::vec::Vec` / `alloc::vec::Vec`), so a user type
+        // spelled `Vec` falls through to the struct path and is never read as the
+        // container.
+        if let Ty::Other(name) = base {
+            if let Some(elem) = crate::mir::exec::vec_elem_ty_loose(name) {
+                match elem.width() {
+                    Some(w) => {
+                        env.bind_indexed_len(l, &arg, w, elem.is_signed());
+                    }
+                    None => {
+                        env.bind_indexed_len(l, &arg, 0, false);
+                    }
+                }
+                continue;
+            }
         }
         let Ty::Other(name) = base else { continue };
         // An enum argument: its tag is a symbolic input with the enum's arity as

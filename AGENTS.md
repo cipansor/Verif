@@ -10338,6 +10338,39 @@ teeth are a mutation: making `push` a no-op (keeping the length) turns
 `make_ok`/`two_ok` red and leaves the false twins refuted, so the test observes the
 length the `push` produces, not merely that the function decides.
 
+**Follow-up: the element model, and the length folded into `Indexed`.** The
+"length and nothing else" and "a `Vec` argument is a refusal" statements above are
+the *first* version. A `Vec` is now an `Indexed` store exactly as a slice is --
+the separate `Env::vec_len` map is gone, and `Indexed::len_mutable` (true for a
+`Vec`, false for a slice/array) is the only distinction. That buys three things
+the length-only model could not:
+
+- **`push` records the pushed value, and `v[k]`/`v.first()`/`v.get(k)`/`pop`
+  read it back.** The trait calls `v[i]` (`<Vec as Index>::index`) and
+  `v.first()` (`<Vec as Deref>::deref`, plus `as_slice`) are classified on the
+  *bare* `Vec` head with the standard trait path, and the `Index` result is a
+  reference modelled as its element with `slice_elem_ref` recorded -- the same
+  store a slice's `first`/`get` use.
+- **A `Vec` argument's length is a symbolic input, not a refusal.** The binder
+  calls `bind_indexed_len` (loose `Vec` parse, because the dump prints the type
+  bare), so `v.len()` in a contract is a fresh `usize` and `v[0]` a fresh element;
+  `v[0]` in the contract and in the body name one variable. `arg_len_refused`
+  (`len == 0`) moved from *refused* to *refuted*, which is the honest answer.
+- **`v[k]` emits `core`'s bounds panic.** The check is inside `std`, not the dump,
+  so a model that skipped it would report an out-of-bounds read panic-free. The
+  obligation is `find_obligation(path && len <= k)`, and `v[0]` under
+  `requires: v.len() == 0` is `Failed` with a *panic* witness (`len = 0`) --
+  the exact failure the model must not hide.
+
+Two limits are stated rather than papered over. `push` records an element only at
+a *constant* length (a symbolic one poisons the elements, since the store cannot
+pin the index -- a wrong element would be worse than none). And an element first
+created by a deref'd read is not the one a later `v[k]` creates, so
+`v.first() == v[0]` is a *lost* proof in that ordering (never a false one); a
+contract that names `v[0]`, or a body that reads `v[0]` first, shares the element.
+`String`, `Box`, symbolic-length slices and *iteration* (`slice::iter`, so
+`vec_iter_sum`/`for_over_slice`) remain open.
+
 Two collision guards matter. A user type spelled `Vec` in a local module
 (`m::Vec`) is not the standard one: `classify` refuses a path that is neither
 `vec::Vec` nor a bare `Vec::` head, and the same-dump lookup answers a local body

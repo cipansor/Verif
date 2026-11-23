@@ -845,21 +845,25 @@ struct Env {
     /// [`crate::mir::parse::MirProgram::promoted_strs`] so `eval_rvalue` can read
     /// a `const NAME::promoted[0]` operand without the whole program in hand.
     promoted: BTreeMap<String, Vec<String>>,
-    /// The tracked length of a `Vec<T>` local, keyed by local.
-    ///
-    /// A `Vec`'s fields are not printed by the dump, so the only thing the model
-    /// can hold is the length `Vec::new`/`Vec::push` set and `Vec::len` reads.
-    /// The element type is not stored: no element operation is modelled, so
-    /// there is nothing to size.
-    vec_len: BTreeMap<u32, Var>,
 }
 
-/// A modelled value with a length and elements: a slice or an array.
+/// A modelled value with a length and elements: a slice, an array, or a `Vec`.
 #[derive(Clone, Debug)]
 struct Indexed {
     /// The length. A symbolic input for a slice, the type's constant for an
     /// array; the executor only needs it to be a word of `usize` width.
     len: Var,
+    /// Whether the length can change (`Vec::push`/`pop`) rather than being fixed
+    /// by the type or by the caller (`[T; N]`, `&[T]`).
+    ///
+    /// This is what a `Vec` adds to the slice model, and it is load-bearing in two
+    /// places. The loop-header havoc must replace a mutable length with a fresh
+    /// `usize` -- a loop that pushes changes the length, and leaving the entry
+    /// length at the exit edge is a *false proof* (`ret == 0` for a real `ret == 3`,
+    /// the hole the length havoc exists for). A whole-value write must *drop* a
+    /// mutable length rather than poison it -- poisoning keeps the length, so
+    /// `v = other; v.len()` would read the old one.
+    len_mutable: bool,
     /// The width of one element, which is the *referent's* width (`u8` for
     /// `&[u8]` or `[u8; 4]`), not the length's. Taking it from `len` would make
     /// every element 64 bits wide and mis-size every read.
@@ -935,7 +939,6 @@ impl Env {
             piece_sets: BTreeMap::new(),
             tmpl_bytes: BTreeMap::new(),
             promoted: BTreeMap::new(),
-            vec_len: BTreeMap::new(),
         }
     }
 
@@ -1389,11 +1392,9 @@ impl Env {
             self.payloads.iter().filter(|((l, _), _)| *l == s).map(|((_, k), v)| (*k, *v)).collect();
         let disc = self.discriminants.get(&s).copied();
         let indexed = self.indexed.get(&s).cloned();
-        // A tracked `Vec` length is part of the value too: `let w = v` moves the
-        // vector, so the destination has to inherit the length or `w.len()` reads a
-        // receiver with no modelled length. The length is a `usize` word, so it
-        // copies like a part rather than being dropped.
-        let vec_len = self.vec_len.get(&s).copied();
+        // A `Vec` is an `indexed` entry like a slice, so a move (`let w = v`)
+        // carries its length *and* elements with the `indexed` copy above -- the
+        // same transfer a slice's store gets. Nothing extra is needed here.
         // Nested paths are parts too, keyed by the local *and* the chain. A copy
         // that moved only the single-field parts would leave `c`'s own `c.i.v`
         // seed in place after `c = d`, so a later `c.i.v` would read `c`'s
@@ -1430,8 +1431,7 @@ impl Env {
             || !path_elems.is_empty()
             || !elem_parts.is_empty()
             || disc.is_some()
-            || indexed.is_some()
-            || vec_len.is_some();
+            || indexed.is_some();
         self.forget_parts(dst);
         for (k, chain, v) in elem_parts {
             self.elem_parts.insert((dst, k, chain), v);
@@ -1456,9 +1456,6 @@ impl Env {
         }
         if let Some(ix) = indexed {
             self.indexed.insert(dst, ix);
-        }
-        if let Some(len) = vec_len {
-            self.vec_len.insert(dst, len);
         }
         any
     }
@@ -2001,16 +1998,17 @@ impl Env {
         self.payloads.retain(|(l, _), _| *l != local);
         self.discriminants.remove(&local);
         self.tag_widths.remove(&local);
-        // A tracked `Vec` length is part of the value the header havocs, so it is
-        // replaced by a fresh `usize`. Leaving it at the entry length would let the
-        // *exit* edge read a length the loop no longer has: an inductive loop that
-        // pushes three times would prove `ret == 0` for the real `ret == 3` -- a
-        // false proof. The fresh variable is the "arbitrary length at the header"
-        // the invariant did not constrain.
-        if let Some(len) = self.vec_len.get_mut(&local) {
-            *len = smt::var(USIZE_WIDTH);
-        }
+        // A mutable-length container (`Vec`) has its length refreshed to a fresh
+        // `usize`, and its elements dropped. The header is an arbitrary state, so a
+        // loop that pushes must not let the *exit* edge read the entry length: an
+        // inductive loop that pushes three times would otherwise prove `ret == 0`
+        // for the real `ret == 3`. A slice's or array's length is fixed by the
+        // caller or the type, so it is left alone -- refreshing it would be a
+        // needless loss of information.
         if let Some(s) = self.indexed.get_mut(&local) {
+            if s.len_mutable {
+                s.len = smt::var(USIZE_WIDTH);
+            }
             s.elems.clear();
             s.poisoned = true;
         }
@@ -2035,15 +2033,20 @@ impl Env {
         self.piece_sets.remove(&local);
         self.tmpl_bytes.remove(&local);
         // A `Vec` local overwritten as a whole place is no longer the value the
-        // length was tracking, so the length is dropped rather than kept: a
-        // `v = other_vec` must not leave the old length readable.
-        self.vec_len.remove(&local);
-        if let Some(s) = self.indexed.get_mut(&local) {
-            s.elems.clear();
-            // The seeded elements are gone, so a later read must not find them.
-            // Poisoning is the honest state: the store cannot say what the
-            // elements are now, only that it does not know.
-            s.poisoned = true;
+        // length and elements were tracking, so the whole entry is dropped rather
+        // than kept: `v = other_vec` must not leave the old length readable. A
+        // slice's entry is kept but poisoned -- its length is fixed by the caller,
+        // so only its elements became unknown.
+        match self.indexed.get(&local) {
+            Some(s) if s.len_mutable => {
+                self.indexed.remove(&local);
+            }
+            Some(_) => {
+                let s = self.indexed.get_mut(&local).expect("checked above");
+                s.elems.clear();
+                s.poisoned = true;
+            }
+            None => {}
         }
     }
 
@@ -2934,10 +2937,18 @@ where
         // The two are separate lists because they mean different things: the first
         // is proved, the second is a fact about the type.
         let slice_steps = seeds.slice_steps.iter().find(|(l, _)| *l == local).map(|(_, n)| *n);
+        // A `Vec` argument's length is mutable (`push`/`pop` change it); a slice's
+        // or an array's is fixed. The type is the only place the distinction lives,
+        // so it is read here rather than carried in a second seed list.
+        let len_mutable = f
+            .ty_of(local)
+            .map(|t| matches!(t.referent(), Ty::Other(n) if vec_elem_ty_loose(n).is_some()))
+            .unwrap_or(false);
         env.indexed.insert(
             local,
             Indexed {
                 len,
+                len_mutable,
                 elem_w,
                 elem_signed,
                 elems: BTreeMap::new(),
@@ -5688,7 +5699,7 @@ fn slice_element(
 ///
 /// `None` for a name that is not the standard `Vec`, or one whose arguments
 /// cannot be read.
-fn vec_elem_ty(name: &str) -> Option<Ty> {
+pub(crate) fn vec_elem_ty(name: &str) -> Option<Ty> {
     // The head before the generic arguments is the path; the standard container's
     // is `std::vec::Vec` or `alloc::vec::Vec`. A bare `Vec` is a user type (rustc
     // always qualifies the standard one), so it is refused.
@@ -5699,76 +5710,147 @@ fn vec_elem_ty(name: &str) -> Option<Ty> {
     crate::mir::spec::angle_inner(name).map(Ty::parse)
 }
 
-/// The `Vec<T>` length model: `new` sets the length to zero, `push` adds one,
-/// `len` reads it.
+/// Like [`vec_elem_ty`], but also accepts the *bare* `Vec<T>` spelling.
 ///
-/// A `Vec`'s fields (a heap pointer, a length, a capacity) are not printed by
-/// the dump, so the length is all the model holds (see `Env::vec_len`).
-/// `new`/`push`/`len` are the calls the corpus uses; every other `Vec` method
-/// stays unmodelled rather than being guessed.
+/// rustc prints a `Vec` local's type by its shortest crate-unique path, which is
+/// the bare `Vec<u8>` when nothing shadows it, and only the `drop`-glue identity
+/// check needs the full path (a user `struct Vec` must not be treated as the
+/// container and skipped). For the *length and element* model a bare `Vec` is the
+/// standard one unless a same-dump body answers first: reading its length as a
+/// fresh input and its `v[0]` as a fresh element is an over-approximation, so a
+/// user `Vec` mis-read here would be a lost proof, never a false one.
+pub(crate) fn vec_elem_ty_loose(name: &str) -> Option<Ty> {
+    let head = name.split('<').next().unwrap_or(name).trim();
+    if head != "Vec" && head != "std::vec::Vec" && head != "alloc::vec::Vec" {
+        return None;
+    }
+    crate::mir::spec::angle_inner(name).map(Ty::parse)
+}
+
+/// The `Vec<T>` model: a length plus the elements, an `indexed` store exactly as a
+/// slice has.
 ///
-/// The receiver of `push`/`len` is a reference, so the length lives on the
+/// A `Vec`'s fields (a heap pointer, a length, a capacity) are not printed by the
+/// dump, so the model holds the length the calls set and the elements they wrote.
+/// `new`/`push`/`len`/`is_empty`/`pop` are the inherent methods; `Index` and
+/// `Deref`/`as_slice` are the trait calls `v[i]` and `v.first()`/`v.get(k)` lower
+/// to, so a pushed value can be read back -- the half of C11 the length-only model
+/// left out.
+///
+/// The receiver of `push`/`len`/`pop` is a reference, so the state lives on the
 /// *referent* local -- `pointee` follows `&mut v`/`&v` to the storage the caller
-/// owns, which is the same local `new` wrote. A receiver whose length the run
-/// never set (a `Vec` argument, or one built by an unmodelled call) is refused,
-/// never given an invented number.
+/// owns, the same local `new` wrote. A receiver whose store the run never set (a
+/// `Vec` argument that was never bound) is refused, never given an invented value.
+///
+/// Three soundness points:
+///
+/// * `push` records the pushed value at the *current* length only when that length
+///   is a constant. A symbolic length (a `Vec` argument) means the store cannot pin
+///   the index, so it poisons the elements -- a stale element would be a wrong
+///   value, not a missing one. The length still advances exactly.
+/// * `Index` emits the bounds panic (`k >= len`) as a reachable-failure obligation.
+///   `v[k]` panics inside `core`, not in the dump, so a model that skipped it would
+///   report an out-of-bounds read panic-free -- a false proof.
+/// * `Deref` copies the store to the destination, sharing the element variables
+///   that exist at that point, so `v.first()` and `v[0]` name one element. A push
+///   *after* a deref is not seen by the deref'd slice, which is correct: Rust does
+///   not let a `&[T]` borrow coexist with a `&mut Vec`. An element the *contract*
+///   named (or one `v[k]` created before the deref) is shared; an element first
+///   created by a deref'd read is not the one a later `v[k]` creates, so
+///   `v.first() == v[0]` is a lost proof in that one ordering -- never a false one.
+#[allow(clippy::too_many_arguments)]
 fn vec_method(
     name: &str,
     kind: intrinsics::VecMethod,
     args: &[Operand],
     dest: &Place,
     env: &mut Env,
+    path: Pred,
+    pins: &[(u32, u64)],
+    f: &MirFn,
 ) -> Result<Vec<Obligation>, String> {
     use intrinsics::VecMethod;
     // The storage the receiver names, following one reference. `new` is the
-    // exception: it is an associated function with no receiver, so its length is
-    // written to the destination.
+    // exception: it is an associated function with no receiver.
     let receiver = |env: &Env| -> Result<u32, String> {
         match args.first() {
             Some(Operand::Copy(p)) | Some(Operand::Move(p)) => Ok(env.pointee(p).local),
             _ => Err(format!("unmodelled receiver for `{name}`")),
         }
     };
+    // The vector's `(length, element width, element sign, poisoned)`.
+    let shape = |env: &Env, l: u32| -> Result<(Var, u8, bool, bool), String> {
+        match env.indexed.get(&l) {
+            Some(s) => Ok((s.len, s.elem_w, s.elem_signed, s.poisoned)),
+            None => Err(format!("`{name}` on a receiver whose length is not modelled")),
+        }
+    };
     match kind {
         VecMethod::New => {
-            env.vec_len.insert(dest.local, smt::word(0, USIZE_WIDTH));
+            let ty = f.ty_of(dest.local).cloned().unwrap_or(Ty::Other("?".into()));
+            let ty = match ty {
+                Ty::Ref(inner) => *inner,
+                other => other,
+            };
+            let elem = match &ty {
+                Ty::Other(s) => vec_elem_ty_loose(s),
+                _ => None,
+            }
+            .ok_or_else(|| format!("`{name}` on a type whose element is not modelled"))?;
+            env.indexed.insert(
+                dest.local,
+                Indexed {
+                    len: smt::word(0, USIZE_WIDTH),
+                    len_mutable: true,
+                    elem_w: elem.width().unwrap_or(0),
+                    elem_signed: elem.is_signed(),
+                    elems: BTreeMap::new(),
+                    fixed_len: None,
+                    slice_steps: None,
+                    poisoned: false,
+                },
+            );
             Ok(Vec::new())
         }
         VecMethod::Push => {
             let l = receiver(env)?;
-            let Some(len) = env.vec_len.get(&l).copied() else {
-                return Err(format!("`{name}` on a receiver whose length is not modelled"));
+            let (len, elem_w, _, poisoned) = shape(env, l)?;
+            let pushed = match args.get(1).map(|a| operand(env, a)) {
+                Some(Val::Sym(v, _)) => Some(v),
+                Some(Val::Bool(p)) => Some(smt::ite(p, smt::word(1, 1), smt::word(0, 1))),
+                _ => None,
             };
-            // The length is a `usize` and `+ 1` cannot overflow at 64 bits for any
-            // vector a program can build, so this is exact rather than saturating.
-            env.vec_len.insert(l, smt::add(len, smt::word(1, USIZE_WIDTH)));
+            // The index the push writes is the length *before* the increment. Only a
+            // constant length pins it; a symbolic one cannot be recorded per index.
+            let k = smt::evaluate(len, |_| None);
+            let s = env.indexed.get_mut(&l).expect("checked by `shape`");
+            s.len = smt::add(len, smt::word(1, USIZE_WIDTH));
+            match (k, pushed) {
+                (Some(k), Some(v)) if elem_w != 0 && smt::bits(v) == elem_w && !poisoned => {
+                    s.elems.insert(k, v);
+                }
+                _ => {
+                    s.elems.clear();
+                    s.poisoned = true;
+                }
+            }
             Ok(Vec::new())
         }
         VecMethod::Len => {
             let l = receiver(env)?;
-            let Some(len) = env.vec_len.get(&l).copied() else {
-                return Err(format!("`{name}` on a receiver whose length is not modelled"));
-            };
+            let (len, ..) = shape(env, l)?;
             env.set(dest, Val::Sym(len, Sign::Unsigned));
             Ok(Vec::new())
         }
         VecMethod::IsEmpty => {
             let l = receiver(env)?;
-            let Some(len) = env.vec_len.get(&l).copied() else {
-                return Err(format!("`{name}` on a receiver whose length is not modelled"));
-            };
+            let (len, ..) = shape(env, l)?;
             env.set(dest, Val::Bool(smt::eq_const(len, 0)));
             Ok(Vec::new())
         }
         VecMethod::Pop => {
             let l = receiver(env)?;
-            let Some(len) = env.vec_len.get(&l).copied() else {
-                return Err(format!("`{name}` on a receiver whose length is not modelled"));
-            };
-            // `pop` returns `None` exactly when the vector is empty, and decrements
-            // the length otherwise. The popped element is not modelled (the dump
-            // prints no elements), so no payload is recorded: a `Some` payload read
-            // downstream is unknown, never a fabricated element.
+            let (len, elem_w, _, poisoned) = shape(env, l)?;
             let empty = smt::eq_const(len, 0);
             let nonempty = smt::not(empty);
             env.set_discriminant(
@@ -5782,8 +5864,82 @@ fn vec_method(
                     Sign::Unsigned,
                 ),
             );
-            env.vec_len
-                .insert(l, smt::ite(nonempty, smt::sub(len, smt::word(1, USIZE_WIDTH)), len));
+            // The popped element is the last one, so it can be pinned only when the
+            // length is a constant. `pop` removes it, so the record goes too.
+            if let Some(k) = smt::evaluate(len, |_| None) {
+                if k > 0 && !poisoned {
+                    if let Some((elem, sign)) = env.index_elem(l, k - 1) {
+                        env.set_payload(
+                            dest.local,
+                            intrinsics::SOME_TAG,
+                            Val::Sym(elem, sign),
+                            elem_w,
+                        );
+                    }
+                    if let Some(s) = env.indexed.get_mut(&l) {
+                        s.elems.remove(&(k - 1));
+                    }
+                }
+            }
+            if let Some(s) = env.indexed.get_mut(&l) {
+                s.len = smt::ite(nonempty, smt::sub(len, smt::word(1, USIZE_WIDTH)), len);
+            }
+            Ok(Vec::new())
+        }
+        VecMethod::Index => {
+            let l = receiver(env)?;
+            let (len, ..) = shape(env, l)?;
+            // `v[i]` — the index must be a constant. A `Vec` has no finite domain to
+            // enumerate (its length is a tracked term, not a type constant), so a
+            // symbolic index has no chain to build and is refused.
+            let k = match args.get(1) {
+                Some(Operand::Const(Const::UInt(v, _))) => u64::try_from(*v).ok(),
+                Some(Operand::Copy(p) | Operand::Move(p)) => match env.locals.get(&p.local) {
+                    Some(Val::Sym(v, _)) => smt::evaluate(*v, |_| None),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(k) = k else {
+                return Err(format!("`{name}` with an index that is not a constant is not modelled"));
+            };
+            let (elem, sign) = env
+                .index_elem(l, k)
+                .ok_or_else(|| format!("`{name}` on a receiver whose elements are not modelled"))?;
+            // `v[k]` returns `&T`; model the reference as its referent and record the
+            // element identity so a later `*` reads the element.
+            env.set(dest, Val::Sym(elem, sign));
+            env.slice_elem_ref.insert(dest.local, ElemId::Leaf((l, k)));
+            // The bounds check `k < len` is `core`'s, not the dump's, so the model
+            // must emit it: an out-of-range index panics, and a model that skipped
+            // the check would call it panic-free.
+            let out_of_bounds = smt::ule_const(len, k);
+            Ok(vec![Obligation {
+                kind: ObligationKind::Panic {
+                    message: format!("index out of bounds: the index is {k}"),
+                },
+                verdict: find_obligation(smt::and(path, out_of_bounds), pins),
+            }])
+        }
+        VecMethod::Deref | VecMethod::AsSlice => {
+            let l = receiver(env)?;
+            let s = env
+                .indexed
+                .get(&l)
+                .cloned()
+                .ok_or_else(|| format!("`{name}` on a receiver whose length is not modelled"))?;
+            // The destination is the same store viewed as a slice: the element
+            // variables are shared (same `Var`s), and the length is the vector's
+            // current length, fixed for this borrow.
+            env.indexed.insert(
+                dest.local,
+                Indexed {
+                    len_mutable: false,
+                    fixed_len: None,
+                    slice_steps: None,
+                    ..s
+                },
+            );
             Ok(Vec::new())
         }
     }
@@ -6082,14 +6238,15 @@ fn try_intrinsic(
     if let intrinsics::Intrinsic::Conversion(kind) = op {
         return Some(convert(name, kind, args, dest, env).map(|()| Vec::new()));
     }
-    // The `Vec` methods. They read a length the executor tracks, not a bit-vector
-    // operand, so they are answered before the generic operand read below -- a
-    // `Vec` receiver has no width to read, and `Vec::new()` has *no* argument at
-    // all, so it must run before the `args.first()?` that the operand read needs.
-    if let intrinsics::Intrinsic::VecMethod(kind) = op {
-        return Some(vec_method(name, kind, args, dest, env));
-    }
+    // The `Vec` methods. They read a length and elements the executor tracks, not a
+    // bit-vector operand, so they are answered before the generic operand read
+    // below -- a `Vec` receiver has no width to read, and `Vec::new()` has *no*
+    // argument at all, so it must run before the `args.first()?` that the operand
+    // read needs.
     let cur = &prog.fns[func];
+    if let intrinsics::Intrinsic::VecMethod(kind) = op {
+        return Some(vec_method(name, kind, args, dest, env, path, pins, cur));
+    }
     // The operand width, from the first argument's declared type. It is not the
     // destination's: `checked_add` on a `u8` writes an `Option<u8>`, and taking
     // the width from there would ask the engine for a 64-bit overflow test.
@@ -6670,13 +6827,9 @@ fn seed_callee_env(
             if let Some(store) = caller_env.indexed.get(&sl).cloned() {
                 env.indexed.insert(l, store);
             }
-            // A `Vec` argument's tracked length, carried in for the same reason
-            // the element store is: a helper that reads `v.len()` through its
-            // argument (`&Vec<u8>`) must see the caller's length. Without this the
-            // callee read `Unknown` and its contract was unreadable.
-            if let Some(len) = caller_env.vec_len.get(&sl).copied() {
-                env.vec_len.insert(l, len);
-            }
+            // A `Vec` is an `indexed` entry, so the clone above already carried its
+            // length and elements in; nothing extra is needed for a helper that
+            // reads `v.len()` or `v[0]` through its argument.
             for ((l0, f), v) in caller_env.fields.iter() {
                 if *l0 == sl {
                     env.fields.insert((l, *f), *v);
@@ -7232,16 +7385,6 @@ where
                                 env.indexed.insert(cl, s.clone());
                             }
                         }
-                        // A `Vec` length the callee changed through a reference
-                        // (`push(&mut v)`). Only a *whole-local* target: a sub-place
-                        // target (`&mut v.len()`) is not a shape a `Vec` length is
-                        // ever handed over as, and re-keying an unrepresentable
-                        // length would invent a key.
-                        if rest.is_empty() {
-                            if let Some(len) = st.env.vec_len.get(cal).copied() {
-                                env.vec_len.insert(cl, len);
-                            }
-                        }
                         // A whole-referent write (`*v = x`). The whole place was
                         // replaced, so the caller's derived parts are dropped
                         // before the callee's value is copied in -- otherwise a
@@ -7527,23 +7670,19 @@ where
                             }
                         }
                         env.set(dest, ret);
-                        // A returned `Vec` carries its tracked length in the
-                        // callee's `_0`, and the value itself is `Val::Unknown`
-                        // (a `Vec`'s fields are not printed), so this is *not*
-                        // inside the `Val::Agg` guard below. Without the transfer
-                        // `let v = mk(); v.len()` reads a receiver with no modelled
-                        // length -- the same hole the move path (`copy_parts`) had.
-                        // Only a whole-local destination can hold a `Vec`, and a
-                        // returned value replaces what the destination held, so the
-                        // destination's old length is dropped rather than kept.
+                        // A returned `Vec` carries its length and elements in the
+                        // callee's `_0` as an `indexed` entry, and the value itself
+                        // is `Val::Unknown` (a `Vec`'s fields are not printed), so
+                        // this is *not* inside the `Val::Agg` guard below. Without
+                        // the transfer `let v = mk(); v.len()` reads a receiver with
+                        // no modelled length -- the same hole the move path
+                        // (`copy_parts`) had. Only a whole-local destination can hold
+                        // a `Vec`, and a returned value replaces what the destination
+                        // held, so the destination's old entry is dropped first.
                         if dest.proj.is_empty() {
-                            match st.env.vec_len.get(&0).copied() {
-                                Some(len) => {
-                                    env.vec_len.insert(dest.local, len);
-                                }
-                                None => {
-                                    env.vec_len.remove(&dest.local);
-                                }
+                            env.forget_parts(dest.local);
+                            if let Some(s) = st.env.indexed.get(&0) {
+                                env.indexed.insert(dest.local, s.clone());
                             }
                         }
                         // A tuple return has components, and the callee stored
@@ -10972,6 +11111,7 @@ fn count_via_helper(_1: u8) -> u8 {
                 2,
                 Indexed {
                     len,
+                    len_mutable: false,
                     elem_w: 8,
                     elem_signed: false,
                     elems,
