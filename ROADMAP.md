@@ -1153,8 +1153,8 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     order-independent and unchanged. `rev` needs a *constant* length so the index
     is a constant (a symbolic-length reversed cursor is refused, the honest
     direction); `is_cursor_ty` accepts the `Rev` adapter, so the reversed cursor's
-    terminals still classify. `realistic.rs` **654/1194 → 660/1200**;
-    `tests/mir.rs::an_iterator_can_be_reversed` pins five verified (`last`/`nth`/
+    terminals still classify. `tests/mir.rs::an_iterator_can_be_reversed` pins five
+    verified (`last`/`nth`/
     `for`/`rev().rev()`/`count`) and one refuted tripwire, and
     `mir::intrinsics` pins the classification without a toolchain.
 
@@ -1177,10 +1177,10 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     stops at `min(len, end)`, `count` is `(hi-1-pos)/step + 1`, `last` names the
     last strided index below `hi`, `nth(k)` is valid iff `pos+k < hi`, and
     `sum`/`max`/`min` fold `pos..hi`. `is_cursor_ty` accepts the `Take` adapter.
-    `realistic.rs` **666/1207 → 672/1214**;
     `tests/mir.rs::an_iterator_can_be_taken` pins five verified (incl. `take(10)`
     over four elements = all four) and one refuted tripwire, and `mir::intrinsics`
-    pins the classification without a toolchain.
+    pins the classification without a toolchain. Measured after all three adapter
+    increments (rev, skip/step_by, take): `realistic.rs` **685 of 1237**.
 
   - Progress (**`enumerate`**): `Iterator::enumerate` is a cursor identity whose
     `next` yields `Option<(usize, &T)>`. `next` writes the concrete index and the
