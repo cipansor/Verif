@@ -10790,3 +10790,51 @@ resolves. A library test on `FileReport` would not check the command a user
 actually runs or the exit code a CI step keys on. The file is `#![cfg(feature =
 "std")]` because the bin is `std`-only; the tests skip with a printed message
 when no compiler is reachable (never a silent pass).
+
+## The MSRV lowering of a `Box` deref: a field chain, not a cast, plus an alignment assert
+
+The `Box` model worked on current stable and was `incomplete` on the 1.85 floor, and
+the gate that saw it is gate 14 (the MIR suite on the MSRV) — nothing on stable did.
+The two lowerings differ in two ways, both toolchain-shaped:
+
+```text
+stable:  _3 = (_2.0: Unique<u8>) as *const u8 (BoxDerefTransmute);
+1.85:    _3 = copy (((_2.0: Unique<u8>).0: NonNull<u8>).0: *const u8);   // no cast
+```
+
+So the pointer is reached by an *all-field chain* rooted at the boxed local, not a
+cast of field 0. `box_refs` (the `dest -> box` link that makes `*dest` read the
+boxed value) was recorded only for the cast form, so on 1.85 `_3` had no link and
+the deref read `Unknown`.
+
+The second difference is the assert. For a type wider than one byte the MSRV also
+emits an **alignment** check that current stable const-folds away:
+
+```text
+_6 = AlignOf(u32); _7 = _6 - 1; _8 = _5 & _7; _9 = _8 == 0;
+assert(_9, "misaligned pointer dereference: …");
+```
+
+`AlignOf` was an unmodelled rvalue, so `_6` was `Unknown`, the assert's condition was
+`Unknown`, and the function was `incomplete` with "unmodelled assert condition" — a
+*lost* proof, not a wrong one, but the same gate failure. `parse_rvalue` now reads
+`AlignOf(T)` as the alignment constant: for every primitive Rust's alignment *is* its
+size in bytes, so it is `T`'s width rounded up to bytes (`w.div_ceil(8)` — not
+`(w+7)/8`, which clippy's `manual_div_ceil` rejects under `-D warnings`). A type whose
+width the model does not hold stays `Unknown`, which refuses the assert rather than
+guessing an alignment.
+
+Two mechanical points, both easy to get wrong again:
+
+- **Record the `box_refs` link *last* in the `Stmt::Assign` arm.** `set` and
+  `rebase_parts` both call `forget_parts`, which clears `box_refs` for the
+  destination; a link recorded before them is erased. The `Use` form also `set`s the
+  destination to the box's field-0 token so the alignment arithmetic (`token & (align-1)`)
+  folds to `0` and the assert discharges.
+- **An `Rvalue::Use` of an all-`Field` chain rooted at a boxed local is the pointer,
+  whatever its depth.** `_2.0`, `_2.0.0`, `_2.0.0.0` all name the same pointer; the
+  guard is "boxed root and only `Field` projections", not a fixed depth.
+
+The lesson is the one the `Len`/`PtrMetadata` and `RangeInclusive` sections already
+record, a third time: a predicate that keys on a *printed lowering shape* is a claim
+about a toolchain, and only running the floor toolchain's suite proves it holds there.

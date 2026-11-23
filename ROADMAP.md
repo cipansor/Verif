@@ -1027,6 +1027,15 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     `a_box_new_deref_decides`. An explicit `std::mem::drop(b)` call and a
     symbolic-length `sum` remain refusals (honest incompletenesses); `realistic.rs`
     656/1198 → 660/1204.
+    - **MSRV fix.** On the 1.85 floor the deref lowers differently -- the pointer
+      is reached by a *field chain* `_3 = copy (((_2.0).0).0)` (no cast) and an
+      *alignment* assert is emitted (`AlignOf`/`BitAnd`/`Eq`) that current stable
+      const-folds away. The `box_refs` link now records for either spelling (a
+      cast of `_2.0` or an all-`Field` chain rooted at a boxed local) and is
+      recorded *last* in the `Stmt::Assign` arm (`set`/`rebase_parts` clear it), and
+      `parse_rvalue` reads `AlignOf(T)` as the alignment constant (a primitive's
+      alignment is its byte size). Both box fixtures verify on 1.85 *and* stable;
+      gate 14 (the suite on the MSRV) went red→green. See the AGENTS.md section.
   - Progress (**iterator method form** and **explicit drop**): `xs.iter()` on a
     `&[T; N]` now starts the same cursor the `for` desugaring does. The unsize
     coercion `xs as &[u8]` is a reference cast, and the cast arm carried the
