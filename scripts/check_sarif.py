@@ -48,13 +48,16 @@ def main(argv: list[str]) -> int:
         return fail(f"tool.driver.name is {driver.get('name')!r}, expected 'verif'")
 
     names: set[str] = set()
+    levels: dict[str, set[str]] = {}
     for index, result in enumerate(run.get("results", [])):
         if result.get("level") not in ("error", "warning", "note"):
             return fail(f"result {index} has no valid `level`")
         text = result.get("message", {}).get("text")
         if not text:
             return fail(f"result {index} has no message text")
-        names.add(text.split(":", 1)[0].strip())
+        name = text.split(":", 1)[0].strip()
+        names.add(name)
+        levels.setdefault(name, set()).add(result.get("level"))
         locations = result.get("locations")
         if not locations:
             return fail(f"result {index} has no location")
@@ -67,6 +70,16 @@ def main(argv: list[str]) -> int:
     missing = [name for name in expected if name not in names]
     if missing:
         return fail(f"the report does not name {missing}; it names {sorted(names)}")
+
+    # An expected function must be reported as an *error* (a refutation). A skipped
+    # or undecided function is a `note`/`warning`, and accepting one would let the
+    # smoke test pass without the verifier refuting anything.
+    for name in expected:
+        if "error" not in levels.get(name, set()):
+            return fail(
+                f"`{name}` is reported at level {sorted(levels.get(name, set()))}, not "
+                f"`error`; a skipped/undecided function must not pass as a refutation"
+            )
 
     print(f"sarif: {len(run.get('results', []))} result(s), naming {sorted(names)}")
     return 0

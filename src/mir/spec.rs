@@ -3182,35 +3182,83 @@ pub fn function_params(source: &str, name: &str) -> Option<Vec<(String, Ty)>> {
     }
     let needle = format!("fn {name}(");
     let mut depth: i32 = 0;
+    let mut in_block = false;
     for line in source.lines() {
-        let trimmed = line.trim_start();
-        let is_comment =
-            trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*");
-        // A *top-level* declaration only: a `fn` inside `impl`/`trait` is a method and
-        // inside `mod` is a module item, neither callable as a bare name. A comment
-        // that happens to read `// fn bad(b, a)` must not be mistaken for the
-        // declaration, or the emitted call swaps the arguments.
-        if !is_comment {
-            if let Some(pos) = line.find(&needle) {
-                // Depth *at the `fn`*, not at the line start: a one-line
-                // `impl S { fn m(..) {} }` opens and closes on the same line, so the
-                // line-start depth is 0 while the `fn` is inside the impl.
-                let at_top = depth + brace_delta(&line[..pos]) == 0;
-                let word_before = line[..pos]
-                    .chars()
-                    .last()
-                    .is_some_and(|c| c.is_alphanumeric() || c == '_');
-                if at_top && !word_before {
-                    // `fn_signature_full` returns `None` slots for a list it could not
-                    // read whole; an empty-but-readable list is `Some(vec![])`.
-                    let (params, _ret, slots) = fn_signature_full(&line[pos..]);
-                    return slots.map(|_| params);
-                }
+        // Comments (line and block, the latter across lines) are removed first, so a
+        // `// fn bad(b, a)` or a `/* … { … */` above the real declaration neither
+        // matches nor unbalances the brace count.
+        let code = code_of_line(line, &mut in_block);
+        if let Some(pos) = code.find(&needle) {
+            // A *top-level* declaration only: a `fn` inside `impl`/`trait` is a method
+            // and inside `mod` is a module item, neither callable as a bare name.
+            // Depth is taken *at the `fn`*, not at the line start, so a one-line
+            // `impl S { fn m(..) {} }` is seen as nested.
+            let at_top = depth + brace_delta(&code[..pos]) == 0;
+            let word_before =
+                code[..pos].chars().last().is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if at_top && !word_before {
+                // `fn_signature_full` returns `None` slots for a list it could not
+                // read whole; an empty-but-readable list is `Some(vec![])`.
+                let (params, _ret, slots) = fn_signature_full(&code[pos..]);
+                return slots.map(|_| params);
             }
         }
-        depth = (depth + brace_delta(line)).max(0);
+        depth = (depth + brace_delta(&code)).max(0);
     }
     None
+}
+
+/// The code part of a line: string/char literals kept, line comments and block
+/// comments (including a block comment that spans lines, via `in_block`) removed.
+fn code_of_line(line: &str, in_block: &mut bool) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    let mut in_str = false;
+    let mut in_chr = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if *in_block {
+            if c == '*' && chars.get(i + 1) == Some(&'/') {
+                *in_block = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if in_str || in_chr {
+            out.push(c);
+            if c == '\\' {
+                if let Some(n) = chars.get(i + 1) {
+                    out.push(*n);
+                    i += 2;
+                    continue;
+                }
+            } else if (in_str && c == '"') || (in_chr && c == '\'') {
+                in_str = false;
+                in_chr = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            break;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            *in_block = true;
+            i += 2;
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+        } else if c == '\'' {
+            in_chr = true;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
 }
 
 /// The net `{` minus `}` count of a line, ignoring braces inside string/char

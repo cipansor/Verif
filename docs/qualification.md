@@ -19,8 +19,11 @@ of the risk it removes.
 DO-330 assigns a Tool Qualification Level (TQL-1 the strictest … TQL-5 the least) by how
 much the tool's output can *mask* a failure:
 
-- **TQL-5**: the tool's output is reviewed and can be independently checked, so the tool
-  itself needs tool *validation* but not full tool qualification.
+- **TQL-5**: the tool's output is reviewed and can be independently checked. This is the
+  *least* level, and it is not "no objectives": a TQL-5 tool still carries DO-330 tool
+  *validation* objectives (requirements, a validation plan, evidence) — independent
+  checking of the output is what makes TQL-5 the appropriate level, not what removes the
+  objectives.
 - **TQL-1..4**: the tool's output is relied on without review, so the tool must be
   qualified with requirements, design, verification, and so on.
 

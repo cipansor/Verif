@@ -374,10 +374,17 @@ fn dependency_names(text: &str) -> Vec<String> {
         }
         if in_deps {
             if let Some(eq) = line.find('=') {
-                let key = line[..eq].trim().trim_matches('"').trim_matches('\'').trim();
                 // A dotted key (`dep.path = "../dep"`) names the dependency `dep`;
-                // only the first segment is the crate.
-                let name = key.split('.').next().unwrap_or("").trim();
+                // only the first segment is the crate. Split *before* stripping
+                // quotes, so a quoted segment (`"dep".path`) is stripped correctly.
+                let name = line[..eq]
+                    .split('.')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .trim();
                 if !name.is_empty() {
                     names.push(name.to_string());
                 }
@@ -460,9 +467,9 @@ fn check_probe_compiler(rustc: &str, opts: &MirOptions) -> Result<(), String> {
 /// without parsing rustc's metadata format.
 #[cfg(feature = "std")]
 fn extern_compiles(rustc: &str, opts: &MirOptions) -> bool {
-    let Some((name, _)) = opts.externs.first() else {
+    if opts.externs.is_empty() {
         return false;
-    };
+    }
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("verif-extern-probe-{}-{seq}", std::process::id()));
@@ -470,7 +477,15 @@ fn extern_compiles(rustc: &str, opts: &MirOptions) -> bool {
     let src = dir.join("probe.rs");
     // `extern crate` rather than `use`, so this works on every edition and does not
     // depend on the crate exporting any particular path.
-    let body = format!("#![allow(unused_extern_crates)]\nextern crate {name};\n");
+    // Every extern, not just the first: rustc can leave a later `--extern` path
+    // unloaded until the source uses it, so probing only the first would accept a
+    // broken second artifact.
+    let crates: String = opts
+        .externs
+        .iter()
+        .map(|(n, _)| format!("extern crate {n};\n"))
+        .collect();
+    let body = format!("#![allow(unused_extern_crates)]\n{crates}");
     if std::fs::write(&src, body).is_err() {
         return false;
     }

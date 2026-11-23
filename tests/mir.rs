@@ -1238,10 +1238,16 @@ fn the_independent_corpus_does_not_regress() {
         // `n`, `div_unwrap` guards the divisor), so a future `Verified` is a *good*
         // outcome, not a false proof. What must never happen is a *refutation* of a
         // true contract, so the pin is "not `Failed`".
+        let contract_failure = matches!(
+            o,
+            FnOutcome::Failed { kind, .. }
+                if !(kind.starts_with("panic") || kind.starts_with("reachable"))
+        );
         assert!(
-            !matches!(o, FnOutcome::Failed { .. }),
-            "`{gap}` has a sound contract, so a `Failed` here would be a false \
-             refutation, got: {o}"
+            !contract_failure,
+            "`{gap}` has a sound contract, so a *contract* failure would be a false \
+             refutation (a panic finding is legitimate -- `sum_iter` overflows on \
+             `[u32::MAX, 1]`), got: {o}"
         );
     }
     for companion in ["div_unwrap_byte", "sum_iter_bounded", "tri_bounded"] {

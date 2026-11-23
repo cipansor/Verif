@@ -18,15 +18,19 @@ holds it.
 | **`rustc`'s MIR** (`--emit=mir`) | the frontend reads the MIR rustc lowers the source to; if rustc mis-lowers, the proof is about the wrong program | `tools/mir-oracle` compares the text parser's reading against `rustc_public`'s typed MIR (structural shape: blocks + panic guards); the crate's own tests run under several toolchains |
 | **the MIR text parser** (`src/mir/parse.rs`) | it is the only reader of the dump | a 20 000-input mutation fuzz (`no_input_panics_the_reader`) pins totality; the oracle above pins the reading; a nightly/stable/MSRV matrix pins toolchain-shaped spellings |
 | **the contract scanner** (`src/mir/spec.rs`) | contracts come from the *source text* (a `///` clause or a `spec! { … }` block), not from MIR | the same mutation fuzz on `spec::extract`; a clause-shaped line it does not take is *refused*, never ignored |
-| **the symbolic executor** (`src/mir/exec.rs`) | it turns a function's MIR into obligations | a differential harness (`tests/modular_differential.rs`) checks `verified ⇒ no concrete execution violates the postcondition`, in both directions |
+| **the symbolic executor** (`src/mir/exec.rs`) | it turns a function's MIR into obligations | the panic replay (`tests/mir.rs`) feeds each reported MIR counterexample back into the *compiled* function and requires the panic; the corpus-wide `no_cannot_prove_entry_is_ever_verified`. (`tests/modular_differential.rs` checks the *wp* layer, `wp::Stmt`/`wp::Proc`, not the MIR executor.) |
 | **the BDD bit-blaster** (`src/smt.rs`) | bit-vectors are blasted into a Reduced Ordered BDD; the verdict is `Valid`/`Counterexample` from it | the differential oracles (`z3diff`, `kanidiff`, `verusdiff`) check the formulas against independent tools; `tests/op_differential.rs` checks the blaster against the term folder per operator |
 | **the CDCL fallback** (`src/bitblast.rs` + `src/sat.rs`) | when the BDD arena fills, the *same* term graph is blasted to CNF and solved | `src/bitblast.rs`'s own tests drive the CNF blaster directly and compare against Rust's arithmetic over every input pair at 1–4 bits; `tests/sat_engine.rs` checks the solver against brute force |
 | **the SMT-LIB2 exporter** (`src/smtscript.rs`) | it lets an *independent* solver re-check a query | the exported text is parsed by an independent reader (`tests/differential.rs`) and by z3 (`examples/z3diff.rs`, a corpus of tautologies per operator) |
 
 Everything **outside** that table is untrusted and must not be load-bearing for a
-verdict. In particular the `cargo verif` driver, the human/JSON/SARIF renderers
-and the scoreboard are presentation: they read a `FileReport` that the executor
-produced, and a bug there can mislabel a verdict but cannot change it.
+verdict — with one exception that is easy to miss: **`cargo-verif`'s input
+selection is not presentation.** Choosing the source, the compiler, the
+`--extern`/`-L` options and the edition (`crate_options`) decides *which program*
+the proof covers, so a wrong choice there is a proof about a different program,
+not a mislabelled verdict. The *renderers* (human/JSON/SARIF) and the scoreboard
+are presentation: they read a `FileReport` the executor produced, and a bug there
+can mislabel a verdict but cannot change it.
 
 ## The semantics of the supported MIR subset
 

@@ -127,6 +127,20 @@ fn main() {
         }
     }
 
+    // A requested name that produced no outcome and is not `missing` is a typo, not a
+    // clean run: an unmatched `--function`/`--emit-test` would otherwise exit 0.
+    for want in &only {
+        let named = report.outcomes.iter().any(|(n, _)| n == want)
+            || report.missing.iter().any(|m| m == want);
+        if !named {
+            eprintln!(
+                "cargo-verif: `{want}` is not a function in {} (no contract and no body)",
+                file.display()
+            );
+            std::process::exit(2);
+        }
+    }
+
     match format.as_str() {
         "human" => print_human(&file, &report),
         "json" => print_json(&file, &report),

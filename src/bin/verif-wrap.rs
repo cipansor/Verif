@@ -63,6 +63,17 @@ fn verify(rustc: &OsString, src: &Path, args: &[OsString]) -> Result<(), ExitCod
     // canonicalise first, or the dependency rlibs are never found.
     let src = std::fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
     let src = src.as_path();
+    // A cross target with a different pointer width or endianness is a program the
+    // model does not represent (it hardcodes 64-bit `usize` and its own byte order),
+    // so a proof would be about a different layout -- refuse rather than pass.
+    if let Some(reason) = target_refusal(&rustc, args) {
+        eprintln!(
+            "verif-wrap: refusing to verify for this target: {reason}. The executor models \
+             `usize` at 64 bits and `to_be`/`to_le` at its own endianness; build without the \
+             wrapper for a target it does not model."
+        );
+        return Err(ExitCode::from(2));
+    }
     let mut opts = verif::mir::verify::crate_options(src);
     // Cargo passes `--cfg feature="..."` (and `--target`) to the real compilation.
     // The MIR emit is a *separate* compilation, so without them a `cfg!(feature=...)`
@@ -109,4 +120,46 @@ fn semantic_args(args: &[OsString]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Why the model cannot represent the `--target` in `args`, if it cannot.
+fn target_refusal(rustc: &str, args: &[OsString]) -> Option<String> {
+    let mut target: Option<String> = None;
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        let s = a.to_string_lossy();
+        if s == "--target" {
+            target = it.next().map(|v| v.to_string_lossy().into_owned());
+        } else if let Some(t) = s.strip_prefix("--target=") {
+            target = Some(t.to_string());
+        }
+    }
+    let target = target?;
+    let out = Command::new(rustc)
+        .args(["--print", "cfg", "--target", &target])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (mut ptr, mut endian) = (None, None);
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("target_pointer_width=") {
+            ptr = Some(v.trim_matches('"').to_string());
+        }
+        if let Some(v) = line.strip_prefix("target_endian=") {
+            endian = Some(v.trim_matches('"').to_string());
+        }
+    }
+    let host_endian = if cfg!(target_endian = "little") { "little" } else { "big" };
+    let mut reasons = Vec::new();
+    if let Some(p) = &ptr {
+        if p != "64" {
+            reasons.push(format!("pointer width {p}, but the model is 64-bit"));
+        }
+    }
+    if let Some(e) = &endian {
+        if e != host_endian {
+            reasons.push(format!("endianness {e}, but the model is {host_endian}"));
+        }
+    }
+    if reasons.is_empty() { None } else { Some(reasons.join("; ")) }
 }

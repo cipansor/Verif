@@ -174,7 +174,11 @@ failure / incomplete function / skipped contract / missing body, `2` the fronten
 could not run (no compiler, a compile error). A skipped function is *not* a pass:
 its contract could not be read, so it was never checked. The binary is a thin
 wrapper over `mir::verify::verify_file_with`, so it decides exactly what the
-library decides. `--format json` is hand-written (the crate is zero-dependency)
+library decides — but it first resolves the file's dependencies (`crate_options`
+reads the manifest's `[dependencies]` and probes the built rlibs), so **build the
+dependencies first** (`cargo build`) or an import they provide is `E0432`. A
+dependency in a custom or workspace target directory, or a renamed one, is not
+found yet (tracked in `ROADMAP.md`). `--format json` is hand-written (the crate is zero-dependency)
 and emits `file`, `outcomes`, `missing` and a `summary`; `--format sarif` emits a
 SARIF 2.1.0 document (one `result` per non-verified outcome, `error` for a failure
 and `warning` for an incomplete or skipped one, an empty `results` array on a

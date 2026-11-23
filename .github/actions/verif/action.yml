@@ -82,8 +82,17 @@ runs:
       with:
         sarif_file: ${{ inputs.sarif-file }}
 
+    - name: Fail on a setup error (exit 2)
+      # A setup error (no compiler, a bad file, a compile error) is never suppressed
+      # by `fail-on-findings`: an empty report must not read as a clean run.
+      if: ${{ steps.run.outputs.code == '2' }}
+      shell: bash
+      run: |
+        echo "::error::verif could not run (exit 2); see the log above"
+        exit 1
+
     - name: Fail on findings
-      if: ${{ inputs.fail-on-findings == 'true' && steps.run.outputs.code != '0' }}
+      if: ${{ inputs.fail-on-findings == 'true' && steps.run.outputs.code == '1' }}
       shell: bash
       run: |
         echo "::error::verif reported findings (exit ${{ steps.run.outputs.code }}); see ${{ inputs.sarif-file }}"

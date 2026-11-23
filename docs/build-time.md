@@ -396,3 +396,18 @@ Read the table with these caveats, each of which is the honest part:
   documented above, and the mature competitors have higher coverage (pointers, aliasing,
   concurrency, unbounded induction). The reason to choose `verif` is *embeddability and no
   external toolchain*, not raw speed.
+
+### Shape C — verify as part of `cargo build` (`verif-wrap`)
+
+`verif-wrap` is a `RUSTC_WRAPPER`: `RUSTC_WRAPPER=/path/to/verif-wrap cargo build`
+forwards every `rustc` call through it, verifies the *primary* package's contracts, and
+fails the build on a false one. It forwards `--cfg`/`--target` to its MIR emit (so a
+feature-flipped `cfg!` is the program the build compiles) and **refuses** a cross target
+whose pointer width or endianness the model does not represent (64-bit `usize`, the
+verifier's own byte order) rather than pass a proof about a different layout.
+
+Two limits are documented, not hidden: it verifies the primary package only (a
+dependency's contracts are not checked), and Cargo calls a wrapper only when it compiles —
+so after an unwrapped build, enabling the wrapper can reuse a cached, unchecked artifact.
+Build verified and unchecked artifacts in **separate target directories** (e.g.
+`CARGO_TARGET_DIR=target/verif`) so a cached build cannot bypass the check.
