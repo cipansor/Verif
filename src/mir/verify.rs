@@ -1943,6 +1943,82 @@ pub fn decide(p: crate::smt::Pred) -> Verdict {
 /// Re-exported so a caller can name the error type without reaching into `spec`.
 pub type ContractError = SpecError;
 
+/// Emit a `#[test]` that reproduces a **panic** counterexample (U3).
+///
+/// A counterexample is the verifier's evidence; a test makes it executable. The
+/// *values* come from the counterexample, the argument *order* from the source's
+/// parameter list ([`spec::function_params`]), so the emitted call is the one the
+/// verifier refuted. While the bug exists the call panics and the test fails;
+/// fixing the function makes it pass -- the "failing-then-fixed" shape U3's exit
+/// criterion asks for.
+///
+/// Only a *panic* with a concrete witness is emitted. A postcondition failure has
+/// no panic to reproduce, and emitting a test for it would need the postcondition
+/// re-stated in Rust, which the frontend does not model; the refusal is the honest
+/// answer rather than a guessed test.
+pub fn emit_test_source(
+    file: &std::path::Path,
+    report: &FileReport,
+    name: &str,
+) -> Result<String, String> {
+    let outcome = report.outcomes.iter().find(|(n, _)| n == name).map(|(_, o)| o);
+    let Some(FnOutcome::Failed { kind, detail }) = outcome else {
+        return Err(format!(
+            "`{name}` did not fail with a counterexample, so there is nothing to \
+             reproduce (only a `Failed` outcome becomes a test)"
+        ));
+    };
+    if !kind.starts_with("panic") {
+        return Err(format!(
+            "`{name}` failed on `{kind}`, not a panic; a non-panic failure has no call \
+             to reproduce, so it is not emitted as a test"
+        ));
+    }
+    let src = std::fs::read_to_string(file)
+        .map_err(|e| format!("could not read {}: {e}", file.display()))?;
+    let params = spec::function_params(&src, name).ok_or_else(|| {
+        format!(
+            "could not read `{name}`'s parameter list (a method, or a signature the \
+             scanner cannot read whole); refusing to guess the call order"
+        )
+    })?;
+    // `a = 1, b = 2` -> (a, 1), (b, 2). The value is emitted verbatim: an integer
+    // literal infers the parameter's type, and one that does not fit fails to
+    // compile rather than silently changing the input.
+    let values: Vec<(&str, &str)> = detail
+        .split(", ")
+        .filter_map(|p| p.split_once(" = "))
+        .map(|(n, v)| (n.trim(), v.trim()))
+        .collect();
+    let mut args = Vec::new();
+    for (pname, ty) in &params {
+        if ty.width().is_none() {
+            return Err(format!(
+                "`{name}` takes a non-scalar argument `{pname}`; only integer arguments \
+                 can be synthesised from a counterexample"
+            ));
+        }
+        let Some((_, v)) = values.iter().find(|(n, _)| n == pname) else {
+            return Err(format!(
+                "the counterexample does not assign `{pname}`, so the call cannot be built"
+            ));
+        };
+        args.push((*v).to_string());
+    }
+    let sanitized: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    Ok(format!(
+        "#[test]\nfn {sanitized}_reproduces_the_counterexample() {{\n    \
+         // `verif` refuted `{name}`: {kind} at `{detail}`.\n    \
+         // While the bug exists this call panics, so the test fails; fix the\n    \
+         // function and it passes.\n    \
+         let _ = {name}({});\n}}\n",
+        args.join(", ")
+    ))
+}
+
 #[cfg(test)]
 mod edition_tests {
     use super::*;

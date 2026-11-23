@@ -164,6 +164,7 @@ $ cargo verif                         # verify src/lib.rs (then src/main.rs)
 $ cargo verif --file src/foo.rs       # a specific file
 $ cargo verif --function add          # one function by name
 $ cargo verif --format json           # one machine-readable object for CI
+$ cargo verif --emit-test add         # a `#[test]` that reproduces a panic counterexample
 ```
 
 The exit code is the verdict, and the codes are distinct so a script can tell a

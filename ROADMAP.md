@@ -1415,13 +1415,24 @@ Exit: one real `no_std` crate with a dependency verified end to end with
   - Exit: `cargo verif --format json|sarif` plus a GitHub Action that annotates a
     PR.
   - Move: **build**.
-- **U3. A counterexample becomes a test.** · P1 · in progress · Kani (concrete
+- **U3. A counterexample becomes a test.** · P1 · **done** · Kani (concrete
     playback)
   - Gap: the replay machinery exists in `tests/mir.rs`; make it a user feature
     that emits a `#[test]`.
+  - Progress (done): `cargo verif --emit-test <fn>` prints a `#[test]` that calls the
+    refuted function at the counterexample's inputs (`mir::verify::emit_test_source`).
+    The *values* come from the rendered counterexample (`n = 0`), the argument *order*
+    from the source's parameter list (`mir::spec::function_params`), so the emitted
+    call is the one the verifier refuted. It is deliberately scoped to a **panic**
+    obligation with a concrete witness: a postcondition failure has no call to
+    reproduce, and re-stating the postcondition in Rust is not modelled, so it is
+    refused (exit 2) rather than guessed. A method, a non-scalar (reference)
+    argument, or a counterexample that does not assign a parameter is refused too.
   - Exit: a reported counterexample is emitted as a compiling, failing-then-fixed
-    `#[test]`.
-  - Move: **build**.
+    `#[test]`. **Met** -- `tests/mir.rs::a_counterexample_becomes_a_failing_then_fixed_test`
+    compiles the emitted test, runs it against the buggy body (it fails, the call
+    panics) and against the fixed body (it passes).
+  - Move: **done**.
 - **U4. Readable counterexamples.** · P1 · in progress · —
   - Gap: a report says `v1:u8 = 224`, not `x = 224`. The `debug x => _1` names
     exist; the stable text dump has no per-statement spans, so line numbers come

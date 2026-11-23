@@ -33,6 +33,7 @@ fn main() {
     let mut file: Option<PathBuf> = None;
     let mut function: Option<String> = None;
     let mut format = String::from("human");
+    let mut emit_test: Option<String> = None;
     // `cargo verif` invokes this binary as `cargo-verif verif [args]`; drop the
     // subcommand name so a bare `cargo verif --file x` parses.
     let mut pending = Vec::new();
@@ -48,12 +49,16 @@ fn main() {
             "--file" | "-f" => file = it.next().map(PathBuf::from),
             "--function" | "--fn" => function = it.next(),
             "--format" => format = it.next().unwrap_or_default(),
+            "--emit-test" => emit_test = it.next(),
             "--help" | "-h" => {
                 println!(
                     "cargo verif [--file <path>] [--function <name>]\n\
+                     cargo verif [--file <path>] --emit-test <fn>\n\
                      \n\
                      Verifies the `verif` contracts in a Rust source file.\n\
                      Default file: src/lib.rs (then src/main.rs).\n\
+                     --emit-test <fn> prints a `#[test]` that reproduces a panic\n\
+                     counterexample (it fails while the bug exists, passes once fixed).\n\
                      Set VERIF_RUSTC to choose the compiler the frontend runs."
                 );
                 return;
@@ -91,6 +96,21 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    // U3: a counterexample becomes a test. Handled before the format dispatch,
+    // because it *replaces* the report with a source file.
+    if let Some(name) = emit_test {
+        match verify::emit_test_source(&file, &report, &name) {
+            Ok(text) => {
+                print!("{text}");
+                std::process::exit(0);
+            }
+            Err(reason) => {
+                eprintln!("cargo-verif --emit-test: {reason}");
+                std::process::exit(2);
+            }
+        }
+    }
 
     match format.as_str() {
         "human" => print_human(&file, &report),

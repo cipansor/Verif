@@ -3158,6 +3158,31 @@ fn fn_signature(line: &str) -> (Vec<(String, Ty)>, Option<Ty>) {
 /// three-element tuple at each use. See [`fn_signature_full`].
 type SourceSignature = (Vec<(String, Ty)>, Option<Ty>, Option<Vec<ParamSlot>>);
 
+/// The parameter list of a **free** function in `source`, by its report name.
+///
+/// Used by `cargo verif --emit-test` (U3) to build a call to a refuted function
+/// from a counterexample: the *values* come from the counterexample, the *order*
+/// from this. `None` for a method (a report key containing `::` -- the receiver
+/// makes the positional call ambiguous), for a name not found, or for a list the
+/// reader cannot read whole. A caller must refuse on `None` rather than guess an
+/// order: a call with the wrong argument order is a test that does not reproduce
+/// the counterexample.
+pub fn function_params(source: &str, name: &str) -> Option<Vec<(String, Ty)>> {
+    if name.contains("::") {
+        return None;
+    }
+    let needle = format!("fn {name}(");
+    for line in source.lines() {
+        if let Some(pos) = line.find(&needle) {
+            // `fn_signature_full` returns `None` slots for a list it could not read
+            // whole; an empty-but-readable list is `Some(vec![])` (`fn f()`).
+            let (params, _ret, slots) = fn_signature_full(&line[pos..]);
+            return slots.map(|_| params);
+        }
+    }
+    None
+}
+
 /// The signature reader, keeping the *positions*.
 ///
 /// [`fn_signature`] is the call route's view: it drops a receiver, because a

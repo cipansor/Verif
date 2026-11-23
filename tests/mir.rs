@@ -14270,3 +14270,71 @@ fn a_comment_and_a_non_ascii_name_cannot_smuggle_a_false_proof() {
         );
     }
 }
+
+/// U3: a counterexample becomes a compiling, failing-then-fixed `#[test]`.
+///
+/// The emitted test calls the refuted function at the counterexample's inputs.
+/// While the bug exists the call panics, so the test **fails**; fixing the body
+/// makes the *same* test **pass** -- which is what makes it a regression test and
+/// not a restatement of the bug. The two halves are the point: a test that passes
+/// on both versions proves nothing.
+#[test]
+fn a_counterexample_becomes_a_failing_then_fixed_test() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif_emit_test_{}_{seq}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    let buggy = "/// ensures: ret <= 100\n\
+                 pub fn bad(n: u8) -> u8 {\n    100 / (n - 5)\n}\n";
+    let file = dir.join("buggy.rs");
+    std::fs::write(&file, buggy).expect("write fixture");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts())
+        .expect("verify the fixture");
+    let emitted = verify::emit_test_source(&file, &report, "bad")
+        .expect("a panic counterexample must become a test");
+    assert!(emitted.contains("#[test]"), "must be a `#[test]`:\n{emitted}");
+    assert!(
+        emitted.contains("bad(0)"),
+        "must call at the counterexample input (`n = 0`):\n{emitted}"
+    );
+
+    // The buggy body: the emitted test compiles and *fails* (the call panics).
+    let buggy_src = format!("{buggy}\n{emitted}");
+    let buggy_bin = dir.join("buggy_test");
+    compile_emitted_test(&rustc, &dir, "buggy_test.rs", &buggy_src, &buggy_bin);
+    let out = std::process::Command::new(&buggy_bin).output().expect("run the test binary");
+    assert!(
+        !out.status.success(),
+        "the emitted test must FAIL on the buggy function (it panics), but it passed"
+    );
+
+    // The fixed body: the *same* test passes.
+    let fixed = "/// ensures: ret <= 100\n\
+                 pub fn bad(n: u8) -> u8 {\n    if n < 5 { 0 } else { 100 / (n - 5) }\n}\n";
+    let fixed_src = format!("{fixed}\n{emitted}");
+    let fixed_bin = dir.join("fixed_test");
+    compile_emitted_test(&rustc, &dir, "fixed_test.rs", &fixed_src, &fixed_bin);
+    let out = std::process::Command::new(&fixed_bin).output().expect("run the test binary");
+    assert!(
+        out.status.success(),
+        "the same test must PASS on the fixed function, got:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Compile a `#[test]`-bearing source with `rustc --test` into an executable.
+fn compile_emitted_test(rustc: &str, dir: &std::path::Path, name: &str, src: &str, out: &std::path::Path) {
+    let path = dir.join(name);
+    std::fs::write(&path, src).expect("write test source");
+    let status = std::process::Command::new(rustc)
+        .args(["--test", "--edition", "2024", "-o"])
+        .arg(out)
+        .arg(&path)
+        .status()
+        .expect("spawn rustc");
+    assert!(status.success(), "the emitted test must compile: {}", path.display());
+}
