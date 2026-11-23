@@ -14859,3 +14859,108 @@ fn take_rev_and_rev_take_reverse_different_prefixes() {
     );
 }
 
+
+
+#[test]
+fn skip_or_take_with_rev_is_refused_not_mis_windowed() {
+    // The cursor stores one `pos` (a skipped count forward, a distance-from-end under
+    // `rev`), so `skip(n).take(k).rev()` and `skip(n).rev()` cannot be represented and
+    // are refused -- before the fix `skip(1).take(2).rev().next()` read the slice edge
+    // (a false refutation of the true 30).
+    let pre = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n";
+    for (n, body) in [
+        ("sk_take_rev", "xs.iter().skip(1).take(2).rev().next().copied().unwrap_or(0)"),
+        ("sk_rev", "xs.iter().skip(1).rev().next().copied().unwrap_or(0)"),
+    ] {
+        let src = format!("{pre}/// ensures: ret == 30\npub fn {n}(xs: &[u8]) -> u8 {{ {body} }}");
+        let o = verify_src(n, &src).expect("an outcome");
+        assert!(matches!(o, FnOutcome::Incomplete { .. }), "`{n}` must be refused (Incomplete), got {o:?}");
+    }
+}
+
+#[test]
+fn a_rebound_slice_reads_the_callers_entry_length() {
+    // `mut xs: &[u8]; xs = ys` changes which slice the *body* sees, not the caller's
+    // one-element slice -- so `xs.len()` is the entry length (1), not `ys`'s (2).
+    let pre = "/// requires: xs.len() == 1 && ys.len() == 2\n";
+    let t = format!("{pre}/// ensures: xs.len() == 1\npub fn rb_true<'a>(mut xs: &'a [u8], ys: &'a [u8]) -> u8 {{ xs = ys; 0 }}");
+    assert!(verify_src("rb_true", &t).is_some_and(|o| o.is_verified()), "the caller's slice keeps length 1");
+    let f = format!("{pre}/// ensures: xs.len() == 2\npub fn rb_false<'a>(mut xs: &'a [u8], ys: &'a [u8]) -> u8 {{ xs = ys; 0 }}");
+    assert!(matches!(verify_src("rb_false", &f), Some(FnOutcome::Failed { .. })), "the caller's slice is still length 1, so == 2 must be refuted");
+}
+
+#[test]
+fn a_rebound_vec_reads_the_callers_entry_length_but_push_is_seen() {
+    // A `&mut Vec` the body pushes to has a final length (push is seen); a `&mut Vec`
+    // that is *rebound* (`v = w`) leaves the caller's Vec untouched, so `v.len()` is the
+    // entry length. Before the fix the rebound case read `w`'s length (a false proof).
+    let pre = "/// requires: v.len() == 1 && w.len() == 2\n";
+    let t = format!("{pre}/// ensures: v.len() == 1\npub fn vr_true<'a>(mut v: &'a mut Vec<u8>, w: &'a mut Vec<u8>) -> u8 {{ v = w; 0 }}");
+    assert!(verify_src("vr_true", &t).is_some_and(|o| o.is_verified()), "a rebound &mut Vec keeps the caller's entry length");
+    let f = format!("{pre}/// ensures: v.len() == 2\npub fn vr_false<'a>(mut v: &'a mut Vec<u8>, w: &'a mut Vec<u8>) -> u8 {{ v = w; 0 }}");
+    assert!(matches!(verify_src("vr_false", &f), Some(FnOutcome::Failed { .. })), "the caller's Vec is still length 1, so == 2 must be refuted");
+    // The push case is still seen (the entry length 0 becomes 1).
+    let p = "/// requires: v.len() == 0\n/// ensures: ret == 1\npub fn vp(v: &mut Vec<u8>) -> usize { v.push(1); v.len() }";
+    assert!(verify_src("vp", p).is_some_and(|o| o.is_verified()), "a push must be reflected in the final length");
+}
+
+#[test]
+fn chained_map_and_filter_are_refused() {
+    // A single `map` is modelled; a second (or mixed) adapter is refused, because
+    // `map(f).map(g)` was modelled as `g` alone (a false proof: it returned 6, not 7).
+    let single = "/// requires: xs.len() == 1 && xs[0] == 5\n/// ensures: ret == 6\npub fn single_map(xs: &[u8]) -> u8 { xs.iter().copied().map(|x| x.wrapping_add(1)).sum::<u8>() }";
+    assert!(verify_src("single_map", single).is_some_and(|o| o.is_verified()), "a single map is still modelled");
+    for (n, e) in [("mm_true", 7u64), ("mm_false", 6u64)] {
+        let src = format!("/// requires: xs.len() == 1 && xs[0] == 5\n/// ensures: ret == {e}\npub fn {n}(xs: &[u8]) -> u8 {{ xs.iter().copied().map(|x| x.wrapping_add(1)).map(|x| x.wrapping_add(1)).sum::<u8>() }}");
+        let o = verify_src(n, &src).expect("an outcome");
+        assert!(matches!(o, FnOutcome::Incomplete { .. }), "`{n}` must be refused (Incomplete), got {o:?}");
+    }
+}
+
+#[test]
+fn take_rev_rev_cancels_to_the_forward_take() {
+    // `take(k).rev().rev()` is the forward `take(k)` again; a third `rev` is
+    // `take(k).rev()`. Refusing it (the old behaviour) lost a proof.
+    let pre = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n";
+    let v = |n: &str, e: u64, body: &str| verify_src(n, &format!("{pre}/// ensures: ret == {e}\npub fn {n}(xs: &[u8]) -> u8 {{ {body} }}"));
+    assert!(v("trr2", 10, "xs.iter().take(2).rev().rev().next().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()), "take(2).rev().rev() is the forward take(2), first 10");
+    assert!(v("trr3", 20, "xs.iter().take(2).rev().rev().rev().next().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()), "a third rev is take(2).rev(), first 20");
+    // Teeth: == 20 on the double-rev (which is 10) must be refuted.
+    assert!(matches!(v("trr2f", 20, "xs.iter().take(2).rev().rev().next().copied().unwrap_or(0)"), Some(FnOutcome::Failed { .. })), "take(2).rev().rev() is 10, so == 20 must be refuted");
+}
+
+#[test]
+fn compound_closures_and_rev_folds_are_refused() {
+    // Pins the *stale* review findings: these shapes are already refusals, never a
+    // false proof, so the fix is the regression test, not a code change.
+    let pre = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n";
+    for (n, body) in [
+        ("cm", "xs.iter().copied().map(|x| (x + 1) * 2).sum::<u8>()"),
+        ("rs", "xs.iter().rev().copied().sum::<u8>()"),
+    ] {
+        let src = format!("{pre}/// ensures: ret == 0\npub fn {n}(xs: &[u8]) -> u8 {{ {body} }}");
+        let o = verify_src(n, &src).expect("an outcome");
+        assert!(matches!(o, FnOutcome::Incomplete { .. }), "`{n}` must be refused (Incomplete), got {o:?}");
+    }
+}
+
+#[test]
+fn vec_clear_with_drop_glue_and_box_write_are_refused() {
+    // A `Vec::clear` on an element with drop glue would run the destructor (which may
+    // panic); resetting the length alone would be a false proof. And `*b = v` on a Box
+    // hits the null-check refusal before the store, so neither can be verified.
+    let vc = "pub struct Boom;\nimpl Drop for Boom { fn drop(&mut self) { assert!(false); } }\n/// requires: v.len() == 1\n/// ensures: ret == 0\npub fn vc(v: &mut Vec<Boom>) -> usize { v.clear(); v.len() }";
+    assert!(matches!(verify_src("vc", vc), Some(FnOutcome::Incomplete { .. })), "Vec::clear on a drop-glue element must be refused");
+    let bw = "/// requires: true\n/// ensures: ret == 7\npub fn bw() -> u8 { let mut b = Box::new(3u8); *b = 7; *b }";
+    assert!(!verify_src("bw", bw).is_some_and(|o| o.is_verified()), "a Box write must never be verified");
+}
+
+#[test]
+fn map_or_all_then_a_terminal_is_refused() {
+    // `map().next()` and `all()` followed by `next()` on the same iterator are refused
+    // (the terminal consumes or discards the cursor), never mis-modelled.
+    let mn = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n/// ensures: ret == 11\npub fn mn(xs: &[u8]) -> u8 { xs.iter().copied().map(|x| x.wrapping_add(1)).next().unwrap_or(0) }";
+    assert!(matches!(verify_src("mn", mn), Some(FnOutcome::Incomplete { .. })), "map().next() must be refused");
+    let an = "/// requires: xs.len() == 5\n/// ensures: ret == 10\npub fn an(xs: &[u8]) -> u8 { let mut it = xs.iter(); let _ = it.all(|x| *x < 100); it.next().copied().unwrap_or(0) }";
+    assert!(matches!(verify_src("an", an), Some(FnOutcome::Incomplete { .. })), "all() then next() must be refused");
+}

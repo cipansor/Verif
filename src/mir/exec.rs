@@ -6107,19 +6107,39 @@ fn slice_iter(
             env.iters.insert(dest.local, next);
             Ok(Vec::new())
         }
-        // `rev()` flips the cursor's direction, carried to the destination like
-        // `copied`. `rev().rev()` is the identity, so the flag toggles.
+        // `rev()` flips the cursor's direction. `rev().rev()` on a *plain* cursor is the
+        // identity; `take(k).rev().rev()` cancels back to the forward `take(k)`.
+        //
+        // The cursor stores one `pos`, which means a skipped count forward but a
+        // distance-from-the-end under `rev`. So two orders cannot be represented and are
+        // refused rather than mis-modelled:
+        //   * `skip(n).rev()` -- `pos` is the skipped count, which `rev` would read as a
+        //     distance from the end (so it read the wrong element, or a window edge).
+        //   * `rev().take(k).rev()` -- the take capped the *reversed* prefix, which
+        //     cancelling to a forward take would silently turn into the forward prefix.
         Intrinsic::SliceRev => {
             let Some(it) = env.iters.get(&recv.local).copied() else {
                 return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
             };
-            // Turning `rev` *off* a cursor that already has a `take` cap
-            // (`rev().take(k).rev()`) is an order the cursor cannot represent, so it is
-            // refused rather than modelled as the forward taken prefix.
-            if it.rev && it.end.is_some() {
-                return Err(format!("`{name}` after a `take` on a reversed cursor is not modelled"));
+            if it.rev {
+                // Turning `rev` off.
+                if it.end.is_some() && !it.taken_forward {
+                    return Err(format!(
+                        "`{name}` after a `take` on a reversed cursor is not modelled"
+                    ));
+                }
+                // `take(k).rev().rev()` -> forward `take(k)` (keep `taken_forward`, so a
+                // further `rev` is `take(k).rev()` again, not `rev().take(k)`).
+                env.iters.insert(dest.local, IterState { rev: false, ..it });
+            } else {
+                // Turning `rev` on: a preceding `skip` cannot be represented.
+                if it.pos > 0 {
+                    return Err(format!(
+                        "`{name}` after a `skip` is not modelled (a skipped cursor cannot be reversed)"
+                    ));
+                }
+                env.iters.insert(dest.local, IterState { rev: true, ..it });
             }
-            env.iters.insert(dest.local, IterState { rev: !it.rev, ..it });
             Ok(Vec::new())
         }
         // `skip(n)` advances the position by `n`; `step_by(n)` sets the stride.
@@ -6244,6 +6264,12 @@ fn slice_iter(
             let Some(it) = env.iters.get(&recv.local).copied() else {
                 return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
             };
+            // A second `map` (or a `map` after `filter`) would overwrite or mix adapters
+            // the consumers read one at a time -- `map(f).map(g)` was modelled as `g`
+            // alone (a false proof), so any second/mixed adapter is refused.
+            if it.map.is_some() || it.filter.is_some() {
+                return Err(format!("`{name}` after `map`/`filter` is not modelled"));
+            }
             let Some(closure) = closure_fn(cx.prog, cx.args.get(1)) else {
                 return Err(format!("`{name}` over a closure that is not modelled"));
             };
@@ -6257,6 +6283,9 @@ fn slice_iter(
             let Some(it) = env.iters.get(&recv.local).copied() else {
                 return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
             };
+            if it.map.is_some() || it.filter.is_some() {
+                return Err(format!("`{name}` after `map`/`filter` is not modelled"));
+            }
             let Some(closure) = closure_fn(cx.prog, cx.args.get(1)) else {
                 return Err(format!("`{name}` over a closure that is not modelled"));
             };
@@ -8836,7 +8865,13 @@ where
                             // this is a no-op for it.
                             let pointee = st.env.pointee(&Place::new(l)).local;
                             if let Some(s) = st.env.indexed.get(&pointee) {
-                                ref_final.push((l, s.len));
+                                // Only a `Vec`'s length can change (`push`/`pop`), so only a
+                                // Vec rebinds to the final length -- and only when the argument
+                                // was *not* rebound (`v = w` leaves the caller's Vec untouched,
+                                // so the caller reads its entry length, not `w`'s).
+                                if s.len_mutable && !st.env.whole_writes.contains(&l) {
+                                    ref_final.push((l, s.len));
+                                }
                                 continue;
                             }
                             // A reference-to-scalar argument: its *value* is the
