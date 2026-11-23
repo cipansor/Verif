@@ -1027,6 +1027,25 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     `a_box_new_deref_decides`. An explicit `std::mem::drop(b)` call and a
     symbolic-length `sum` remain refusals (honest incompletenesses); `realistic.rs`
     656/1198 → 660/1204.
+  - Progress (**iterator method form** and **explicit drop**): `xs.iter()` on a
+    `&[T; N]` now starts the same cursor the `for` desugaring does. The unsize
+    coercion `xs as &[u8]` is a reference cast, and the cast arm carried the
+    address only when the *source* was already `addressed`; a reference
+    *argument* is modelled as its referent and is not, so the cast fell through
+    and the `iter` receiver had no elements. The cast now falls back to
+    `pointee(src)` (the referent), which is what a reference cast preserves. With
+    that, `xs.iter().count()` and `xs.iter().copied().sum()` over a constant-length
+    array decide (`sum` carries its real overflow obligation, so it verifies only
+    under guards that rule the overflow out, and refutes otherwise). The
+    `map`/`filter`/`fold` adapters are still unmodelled: their bodies live in
+    `core`, not the dump, so they need closure execution the leaf intrinsic
+    handlers cannot do. `std::mem::drop::<T>` is now modelled: a glue-free `T`
+    (`Box<u8>`, `String`, `Vec<u8>`, a scalar) is a no-op, and a `T` with
+    unrepresentable glue (`Rc<u8>`, a user `Drop`) is refused. Fixtures:
+    `array_iter_count`, `array_iter_sum`, `explicit_drop_box`,
+    `explicit_drop_string` and their two tripwires, pinned by
+    `a_slice_iter_and_explicit_drop_decide`; `realistic.rs` 660/1204 →
+    664/1210.
   - Progress (`pop`, `is_empty`): `Vec::is_empty` reads the tracked length;
     `Vec::pop` returns `None` iff the length is zero and decrements it on the
     non-empty path; on a constant-length vector the popped element is the payload.

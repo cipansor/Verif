@@ -14078,6 +14078,66 @@ pub fn owns_box_glue_free(b: Box<u8>) -> u8 {
     1
 }
 
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
+/// `xs.iter().count()` on a constant-length array: the cursor starts at the
+/// array's elements and `count` reads the length.
+pub fn array_iter_count(xs: &[u8; 2]) -> u32 {
+    xs.iter().count() as u32
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
+/// The same body claiming the wrong count must be refuted.
+pub fn array_iter_count_tripwire(xs: &[u8; 2]) -> u32 {
+    xs.iter().count() as u32
+}
+
+spec! {
+    requires: xs[0] < 128,
+    requires: xs[1] < 128,
+    ensures: ret == xs[0] + xs[1],
+}
+/// `xs.iter().copied().sum()` on a constant-length array: the sum is unrolled and
+/// the guards rule out the overflow it would otherwise be refuted for.
+pub fn array_iter_sum(xs: &[u8; 2]) -> u8 {
+    xs.iter().copied().sum()
+}
+
+spec! {
+    requires: xs[0] < 128,
+    requires: xs[1] < 128,
+    ensures: ret == xs[0] + xs[1] + 1,
+}
+/// The same body claiming the wrong sum must be refuted.
+pub fn array_iter_sum_tripwire(xs: &[u8; 2]) -> u8 {
+    xs.iter().copied().sum()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
+/// An explicit `std::mem::drop` of a glue-free `Box<u8>` is a no-op.
+pub fn explicit_drop_box(b: Box<u8>) -> u8 {
+    drop(b);
+    1
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
+/// An explicit `std::mem::drop` of a `String` is a no-op (glue-free).
+pub fn explicit_drop_string(s: String) -> u8 {
+    drop(s);
+    1
+}
+
 // ---------------------------------------------------------------------------
 // A scalar reference argument named in a contract (C9)
 //

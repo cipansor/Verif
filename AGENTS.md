@@ -10592,6 +10592,18 @@ with a destructor is not read as glue-free. An explicit `std::mem::drop(b)` call
 still refused (it lowers to a `std::mem::drop::<T>` call, not the `drop(_2)`
 terminator). Pinned by `a_box_new_deref_decides` (four verified, two refuted).
 
+A follow-up modelled the explicit drop and the iterator *method* form:
+`std::mem::drop::<T>` is `Intrinsic::MemDrop` -- a glue-free `T` is a no-op, a
+`T` with unrepresentable glue is refused (the handler has `callees.structs()`, so
+the bare-name shadow check is the same one the drop terminator uses). And
+`xs.iter()` on a `&[T; N]` now starts the cursor the `for` desugaring starts: the
+unsize coercion `xs as &[u8]` is a *reference cast*, and the cast arm carried the
+address only when the source was already `addressed`; a reference *argument* is
+modelled as its referent (not `addressed`), so the cast fell through and `iter`
+found no elements. The cast now falls back to `pointee(src)`. `xs.iter().count()`
+and `xs.iter().copied().sum()` over a constant-length array decide; `map`/
+`filter`/`fold` remain unmodelled (their bodies are in `core`, not the dump).
+
 
 ## A qualified type name must not resolve to a bare layout
 

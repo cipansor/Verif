@@ -12902,6 +12902,41 @@ fn a_box_new_deref_decides() {
     }
 }
 
+/// C11 iteration: `xs.iter().count()` and `xs.iter().copied().sum()` over a
+/// constant-length array decide (the cursor starts at the array's elements), and
+/// an explicit `std::mem::drop` of a glue-free container is a no-op.
+///
+/// The true directions must verify and the tripwires must be refuted, so a model
+/// that read a constant or a wrong element would fail one of them.
+#[test]
+fn a_slice_iter_and_explicit_drop_decide() {
+    let names = [
+        "array_iter_count",
+        "array_iter_count_tripwire",
+        "array_iter_sum",
+        "array_iter_sum_tripwire",
+        "explicit_drop_box",
+        "explicit_drop_string",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in [
+        "array_iter_count",
+        "array_iter_sum",
+        "explicit_drop_box",
+        "explicit_drop_string",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in ["array_iter_count_tripwire", "array_iter_sum_tripwire"] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` claims a false result and must be refuted, got: {o}"
+        );
+    }
+}
+
 /// C1, on the corpus: the `Drop` fixtures decide, and the false ones are refuted.
 ///
 /// The review's exit criterion is stated on `guard_guarded` (verifies) and

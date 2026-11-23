@@ -6190,38 +6190,33 @@ pub(crate) fn box_elem_ty(name: &str) -> Option<Ty> {
     crate::mir::spec::angle_inner(name).map(Ty::parse)
 }
 
-/// The `Vec<T>` model: a length plus the elements, an `indexed` store exactly as a
-/// slice has.
+/// `std::mem::drop::<T>(v)`: consume `v`. A glue-free `T` runs no destructor, so
+/// the call is a no-op; a `T` whose drop glue the tool cannot represent is
+/// *refused* rather than assumed inert (a panicking destructor would be hidden).
 ///
-/// A `Vec`'s fields (a heap pointer, a length, a capacity) are not printed by the
-/// dump, so the model holds the length the calls set and the elements they wrote.
-/// `new`/`push`/`len`/`is_empty`/`pop` are the inherent methods; `Index` and
-/// `Deref`/`as_slice` are the trait calls `v[i]` and `v.first()`/`v.get(k)` lower
-/// to, so a pushed value can be read back -- the half of C11 the length-only model
-/// left out.
-///
-/// The receiver of `push`/`len`/`pop` is a reference, so the state lives on the
-/// *referent* local -- `pointee` follows `&mut v`/`&v` to the storage the caller
-/// owns, the same local `new` wrote. A receiver whose store the run never set (a
-/// `Vec` argument that was never bound) is refused, never given an invented value.
-///
-/// Three soundness points:
-///
-/// * `push` records the pushed value at the *current* length only when that length
-///   is a constant. A symbolic length (a `Vec` argument) means the store cannot pin
-///   the index, so it poisons the elements -- a stale element would be a wrong
-///   value, not a missing one. The length still advances exactly.
-/// * `Index` emits the bounds panic (`k >= len`) as a reachable-failure obligation.
-///   `v[k]` panics inside `core`, not in the dump, so a model that skipped it would
-///   report an out-of-bounds read panic-free -- a false proof.
-/// * `Deref` copies the store to the destination, sharing the element variables
-///   that exist at that point, so `v.first()` and `v[0]` name one element. A push
-///   *after* a deref is not seen by the deref'd slice, which is correct: Rust does
-///   not let a `&[T]` borrow coexist with a `&mut Vec`. An element the *contract*
-///   named (or one `v[k]` created before the deref) is shared; an element first
-///   created by a deref'd read is not the one a later `v[k]` creates, so
-///   `v.first() == v[0]` is a lost proof in that one ordering -- never a false one.
-#[allow(clippy::too_many_arguments)]
+/// The type is read from the call's own name (`drop::<T>`), the same source the
+/// `Box` model uses for its element. A *bare* container name (`Box<u8>`,
+/// `String`) is the standard type only when the crate declares no struct of that
+/// name -- `std_container_glue_free` takes the layouts, so a shadowing user type
+/// with a destructor is refused rather than read as glue-free.
+fn mem_drop(
+    name: &str,
+    structs: &BTreeMap<String, spec::StructDef>,
+) -> Result<Vec<Obligation>, String> {
+    let ty = crate::mir::spec::angle_inner(name)
+        .map(Ty::parse)
+        .unwrap_or(Ty::Unit);
+    if drop_is_noop(&ty) || std_container_glue_free(&ty, structs) {
+        return Ok(Vec::new());
+    }
+    Err(format!(
+        "`{name}` destroys a value whose drop glue is not modelled"
+    ))
+}
+
+/// The `Box<T>` model: `Box::<T>::new` stores the boxed value and a nonzero token
+/// pointer, so the compiler's null and alignment checks are discharged and `*b`
+/// reads the stored value (see the `Box` section of `AGENTS.md`).
 fn box_method(
     name: &str,
     kind: intrinsics::BoxMethod,
@@ -6348,6 +6343,37 @@ fn string_method(
     }
 }
 
+/// The `Vec<T>` model: a length plus the elements, an `indexed` store exactly as a
+/// slice has.
+///
+/// A `Vec`'s fields (a heap pointer, a length, a capacity) are not printed by the
+/// dump, so the model holds the length the calls set and the elements they wrote.
+/// `new`/`push`/`len`/`is_empty`/`pop` are the inherent methods; `Index` and
+/// `Deref`/`as_slice` are the trait calls `v[i]` and `v.first()`/`v.get(k)` lower
+/// to, so a pushed value can be read back -- the half of C11 the length-only model
+/// left out.
+///
+/// The receiver of `push`/`len`/`pop` is a reference, so the state lives on the
+/// *referent* local -- `pointee` follows `&mut v`/`&v` to the storage the caller
+/// owns, the same local `new` wrote. A receiver whose store the run never set (a
+/// `Vec` argument that was never bound) is refused, never given an invented value.
+///
+/// Three soundness points:
+///
+/// * `push` records the pushed value at the *current* length only when that length
+///   is a constant. A symbolic length (a `Vec` argument) means the store cannot pin
+///   the index, so it poisons the elements -- a stale element would be a wrong
+///   value, not a missing one. The length still advances exactly.
+/// * `Index` emits the bounds panic (`k >= len`) as a reachable-failure obligation.
+///   `v[k]` panics inside `core`, not in the dump, so a model that skipped it would
+///   report an out-of-bounds read panic-free -- a false proof.
+/// * `Deref` copies the store to the destination, sharing the element variables
+///   that exist at that point, so `v.first()` and `v[0]` name one element. A push
+///   *after* a deref is not seen by the deref'd slice, which is correct: Rust does
+///   not let a `&[T]` borrow coexist with a `&mut Vec`. An element the *contract*
+///   named (or one `v[k]` created before the deref) is shared; an element first
+///   created by a deref'd read is not the one a later `v[k]` creates, so
+///   `v.first() == v[0]` is a lost proof in that one ordering -- never a false one.
 #[allow(clippy::too_many_arguments)]
 fn vec_method(
     name: &str,
@@ -6802,6 +6828,9 @@ fn try_intrinsic(
                 // accepts it only for the standard `Box` path (`names_box_impl`),
                 // and the same-dump lookup answers a real body first.
                 | intrinsics::Intrinsic::BoxMethod(_)
+                // `std::mem::drop::<T>` carries no `<impl`, so it needs the
+                // exception too; `classify` accepts only the standard path.
+                | intrinsics::Intrinsic::MemDrop
                 // Slice iteration is a *trait* call too (`<&[u8] as
                 // IntoIterator>::into_iter`, `<slice::Iter as Iterator>::next`), so
                 // it has no `<impl`. `classify` accepts it only for a `[T]` head or
@@ -6873,6 +6902,9 @@ fn try_intrinsic(
     // pointer token; the deref reads it back (see `get`'s `Deref` arm).
     if let intrinsics::Intrinsic::BoxMethod(kind) = op {
         return Some(box_method(name, kind, args, dest, env));
+    }
+    if let intrinsics::Intrinsic::MemDrop = op {
+        return Some(mem_drop(name, callees.structs()));
     }
     // The operand width, from the first argument's declared type. It is not the
     // destination's: `checked_add` on a `u8` writes an `Option<u8>`, and taking
@@ -9611,9 +9643,20 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             if matches!(ty, Ty::Ref(_)) {
                 if let Operand::Copy(q) | Operand::Move(q) = o {
                     let target = env.resolve(q);
-                    if let Some(p) = env.addressed.get(&target.local).cloned() {
-                        env.addressed.insert(dest.local, p);
-                    }
+                    // A reference cast preserves the *address*, which is what the
+                    // source points at. When the source is itself an `addressed`
+                    // reference the target is recorded; otherwise the source is a
+                    // reference *argument* (modelled as its referent, so `pointee`
+                    // is the argument itself), and the destination must point at it
+                    // too. Without this, `let s = xs as &[u8]` (an unsize coercion)
+                    // left `s` with no address, so `xs.iter()`/`s.len()` on the
+                    // array argument could not reach the array's elements.
+                    let p = env
+                        .addressed
+                        .get(&target.local)
+                        .cloned()
+                        .unwrap_or_else(|| env.pointee(&target));
+                    env.addressed.insert(dest.local, p);
                 }
             }
             let v = operand(env, o);

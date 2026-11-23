@@ -467,6 +467,12 @@ pub enum Intrinsic {
     /// `*b` reads the stored value. A `Box<T>`'s drop glue is `T`'s, so a
     /// `Box<u8>` is glue-free while a `Box<PanicOnDrop>` is not.
     BoxMethod(BoxMethod),
+    /// `std::mem::drop::<T>(v)`: the explicit drop. A glue-free `T` has no
+    /// observable destructor, so the call is a no-op; a `T` with drop glue the
+    /// tool cannot run is refused (a no-op would hide a panicking destructor).
+    /// Answered by the executor (see `mem_drop`), which holds the declared
+    /// layouts the bare-name check needs.
+    MemDrop,
     /// `iN::abs_diff`: the absolute difference of two operands, as the type.
     ///
     /// Its result is *unsigned* even on a signed type -- `i8::abs_diff(-128, 127)`
@@ -1437,6 +1443,9 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if names_box_impl(name) && short == "new" {
         return Some(Intrinsic::BoxMethod(BoxMethod::New));
     }
+    if names_mem_drop(name) {
+        return Some(Intrinsic::MemDrop);
+    }
     // `v[i]` and `v.first()`/`v.get(k)` reach `Vec` through a *trait* projection
     // (`<Vec<u8> as Index<usize>>::index`, `<Vec<u8> as Deref>::deref`), which
     // carries no `vec::Vec` path, so the bare-`Vec` head is matched separately and
@@ -2080,6 +2089,13 @@ pub fn names_string_impl(name: &str) -> bool {
 /// or a bare `Box::` head. A user type spelled `Box` in a local module is
 /// `m::Box::new`, which has neither, and the same-dump lookup answers a real body
 /// first regardless.
+/// `std::mem::drop::<T>` / `core::mem::drop::<T>`: the explicit drop. A bare
+/// `drop` is a user function and is refused, so only the standard paths match.
+pub fn names_mem_drop(name: &str) -> bool {
+    let head = name.split("::<").next().unwrap_or(name);
+    head == "std::mem::drop" || head == "core::mem::drop"
+}
+
 pub fn names_box_impl(name: &str) -> bool {
     name.contains("boxed::Box") || name.starts_with("Box::")
 }
@@ -2348,6 +2364,8 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         Intrinsic::StringMethod(_) => true,
         // The `Box` model is store-based, answered by the executor.
         Intrinsic::BoxMethod(_) => true,
+        // The explicit drop is answered by the executor (glue check).
+        Intrinsic::MemDrop => true,
         // The `Option` methods. They read the receiver's tag and payload, which
         // live in the executor's stores rather than in an operand term, so there is
         // no width or sign to check here -- `eval` never sees them and the
@@ -2594,6 +2612,9 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
     if matches!(op, Intrinsic::BoxMethod(_)) {
         return None;
     }
+    if matches!(op, Intrinsic::MemDrop) {
+        return None;
+    }
     // The `Option` methods read the receiver's tag and payload from the executor's
     // stores, not from an operand term, so `eval` has nothing to compute for them
     // either. The executor answers them (see `enum_method`).
@@ -2624,6 +2645,7 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         // the early return above keeps it from reaching here.
         Intrinsic::StringMethod(_) => unreachable!("String methods are answered by the executor"),
         Intrinsic::BoxMethod(_) => unreachable!("Box methods are answered by the executor"),
+        Intrinsic::MemDrop => unreachable!("the explicit drop is answered by the executor"),
         // Answered by `eval_slice` from the executor's length variable; the early
         // return above keeps them from reaching here.
         Intrinsic::SliceLen
