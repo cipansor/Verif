@@ -1166,7 +1166,6 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     `(n-1-pos)/step + 1` (both need a *constant* length, which `skip` does not),
     and `sum`/`max`/`min` fold the strided positions. A zero step is a Rust panic
     and is refused. `is_cursor_ty` accepts the `Skip`/`StepBy` adapters.
-    `realistic.rs` **660/1200 → 666/1207**;
     `tests/mir.rs::an_iterator_can_be_skipped_and_stepped` pins five verified
     (`skip`/`step_by` over `last`/`count`/`sum`) and one refuted tripwire, and
     `mir::intrinsics` pins the classification without a toolchain.
