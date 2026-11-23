@@ -87,6 +87,11 @@ name = "cargo-verif"
 path = "src/bin/cargo-verif.rs"
 required-features = ["std"]
 
+[[bin]]
+name = "verif-wrap"
+path = "src/bin/verif-wrap.rs"
+required-features = ["std"]
+
 [[example]]
 name = "bare_metal"
 crate-type = ["lib"]

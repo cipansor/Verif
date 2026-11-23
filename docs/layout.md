@@ -42,6 +42,7 @@ Part of the [`verif` README](../README.md).
 │   ├── smtscript.rs    SMT-LIB2 export for independent checking
 │   ├── mem.rs          bounded symbolic memory + frame condition
 │   ├── quant.rs        bounded forall/exists, expanded to finite form
+│   ├── bin/            the `cargo verif` and `verif-wrap` drivers
 │   └── mir/            the real-Rust frontend (`std` only)
 │       ├── parse.rs    rustc's textual MIR -> a small IR, failing closed
 │       ├── exec.rs     symbolic execution of that IR, with a frame stack for calls

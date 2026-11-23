@@ -973,9 +973,18 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     Pinned by `dependency_names_reads_the_dependencies_table_only` (the parser) and
     `a_crate_with_a_dependency_is_verified` (a path-dep crate verifies; a false
     contract is still refuted, so the dependency did not hide the check).
+  - Progress (RUSTC_WRAPPER, done): `src/bin/verif-wrap.rs` is a `RUSTC_WRAPPER`
+    entry point. `RUSTC_WRAPPER=/path/to/verif-wrap cargo build` forwards every
+    rustc call and, for the *primary* package (`CARGO_PRIMARY_PACKAGE=1`, which cargo
+    sets for the crate under development and never for a dependency), also runs the
+    frontend on the crate source, failing the build on a false contract. The source
+    path is canonicalised first, because cargo passes it relative and `crate_options`
+    walks up from it to find the manifest's `target/`. Pinned by
+    `tests/rustc_wrapper.rs`: a true contract builds, a false one fails the build
+    naming the obligation, and a *dependency's* false contract does not fail the
+    build (the primary-package guard).
   - Remaining: a *demonstration* on a real external crate (`embedded-hal`) needs a
-    network install; the mechanism is identical to the path-dependency fixture. The
-    `cargo verif` subcommand is `cargo-verif` (a `[[bin]]`), not a `RUSTC_WRAPPER`.
+    network install; the mechanism is identical to the path-dependency fixture.
   - Exit: one function in a real `no_std` crate with at least one dependency
     (an `embedded-hal` driver, say) verified end to end with `cargo verif`.
   - Move: **build**.
