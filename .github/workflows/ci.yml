@@ -105,6 +105,35 @@ jobs:
           export VERIF_RUSTC
           sh scripts/gate.sh
 
+  # Dogfoods the reusable action (`./.github/actions/verif`) and the SARIF report it
+  # uploads. It writes a fixture with one verified and one failing function, runs the
+  # action with `upload: false` (code scanning is not enabled on every fork), and
+  # asserts the SARIF is well-formed and names the failing function -- so a run that
+  # silently reports nothing fails here rather than passing.
+  sarif:
+    name: SARIF report + reusable action
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: A fixture with one verified and one failing function
+        run: |
+          mkdir -p fixtures
+          cat > fixtures/sarif_fixture.rs <<'RS'
+          macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+          spec! { requires: x <= 100, ensures: ret <= 100, }
+          pub fn clampish(x: u8) -> u8 { if x > 100 { 100 } else { x } }
+          spec! { requires: true, ensures: ret == 99, }
+          pub fn bad(x: u8) -> u8 { x }
+          RS
+      - name: Run the reusable action (SARIF, no upload)
+        uses: ./.github/actions/verif
+        with:
+          file: fixtures/sarif_fixture.rs
+          upload: 'false'
+          fail-on-findings: 'false'
+      - name: The SARIF is well-formed and names the failing function
+        run: python3 scripts/check_sarif.py verif.sarif bad
+
   ferrocene:
     name: ferrocene (qualified toolchain) build
     runs-on: ubuntu-latest

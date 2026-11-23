@@ -171,8 +171,27 @@ library decides. `--format json` is hand-written (the crate is zero-dependency)
 and emits `file`, `outcomes`, `missing` and a `summary`; `--format sarif` emits a
 SARIF 2.1.0 document (one `result` per non-verified outcome, `error` for a failure
 and `warning` for an incomplete or skipped one, an empty `results` array on a
-clean run) for GitHub code scanning. Wiring it to `github/codeql-action/upload-sarif`
-is a two-step recipe:
+clean run) for GitHub code scanning.
+
+### The reusable GitHub Action
+
+`.github/actions/verif` is a composite action that wires `--format sarif` to
+`github/codeql-action/upload-sarif`, so a failed or incomplete contract shows up on
+the pull request like a compiler error:
+
+```yaml
+- uses: cipansor/verif/.github/actions/verif@v0.2.0   # or ./.github/actions/verif
+  with: { file: src/lib.rs }
+```
+
+It builds `cargo-verif` from its own checkout (`GITHUB_ACTION_PATH`), runs it with
+`--format sarif`, uploads the report (`upload: false` to skip, for a fork without
+code scanning), and fails the step on any finding (`fail-on-findings: false` to
+report without failing). A *skipped* contract is a failure by default, because a
+contract the tool could not read was never checked. This repository dogfoods the
+action in the `sarif` CI job, and `scripts/check_sarif.py` asserts the report is a
+well-formed SARIF 2.1.0 run that names the failing function -- so a run that
+silently reports nothing fails there. If you would rather wire it by hand:
 
 ```yaml
 - run: cargo install --path . --features std     # or `cargo install verif --features std`

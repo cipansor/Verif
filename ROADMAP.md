@@ -1317,7 +1317,7 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     change.)
   - Exit: `cargo add verif` works. ✅
   - Move: **build**.
-- **U2. `cargo verif`.** · P1 · in progress · Kani (`cargo kani`)
+- **U2. `cargo verif`.** · P1 · done · Kani (`cargo kani`)
   - Gap: there was no command-line entry point; a user had to write an example
     that called `verify_file_with`.
   - Progress: `src/bin/cargo-verif.rs` (a `[[bin]]` gated on `std`, so the
@@ -1337,9 +1337,19 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     `results` array on a clean run -- so `github/codeql-action/upload-sarif` can
     annotate a pull request. Pinned by
     `sarif_output_is_a_2_1_0_run_with_one_result_per_failure`.
-  - Remaining: the reusable GitHub Action that wires `--format sarif` to
-    `upload-sarif` (a workflow file, which cannot be exercised in this container,
-    so it is documented as a recipe in the README rather than shipped untested).
+  - Progress (the Action, done): the reusable composite action
+    `.github/actions/verif/action.yml` wires `--format sarif` to
+    `github/codeql-action/upload-sarif` (pinned to a commit SHA). It builds
+    `cargo-verif` from its own checkout, runs it, uploads the report (skippable with
+    `upload: false`), and fails the step on any finding (`fail-on-findings: false`
+    to report without failing); a *skipped* contract is a failure by default. This
+    repository dogfoods it in the `sarif` CI job, and `scripts/check_sarif.py`
+    asserts the produced report is a well-formed SARIF 2.1.0 run naming the failing
+    function, so a run that silently reports nothing fails there. The action's YAML
+    is validated (composite, every `uses:` pinned) and `scripts/check_actions_pinned.py`
+    scans it. The only piece not exercised in CI is the `upload-sarif` call itself
+    (it needs code scanning enabled on the repo), which is why the dogfood runs with
+    `upload: false` -- the report it would upload is what `check_sarif.py` checks.
   - Exit: `cargo verif --format json|sarif` plus a GitHub Action that annotates a
     PR.
   - Move: **build**.
