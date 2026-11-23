@@ -1215,6 +1215,37 @@ fn the_independent_corpus_does_not_regress() {
          --features std --example mir_coverage -- {EVERYDAY}",
         report.outcomes.len()
     );
+
+    // The three original gaps are *walls*, not budget problems: each is a claim the
+    // engine cannot decide at the width the source uses, and a `verified` on any of
+    // them would be a false proof of an unbounded claim. The corpus keeps the gap and
+    // adds a *decidable companion* per gap rather than editing the original, so both
+    // halves are pinned: the wall stays undecided, and the companion verifies. A
+    // change that "fixes" a wall by widening a budget would turn the first assertion
+    // red, and one that breaks the bounded shape turns the second red.
+    let outcome_of = |name: &str| {
+        report
+            .outcomes
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, o)| o)
+            .unwrap_or_else(|| panic!("`{name}` must be reported by `everyday.rs`"))
+    };
+    for wall in ["div_unwrap", "sum_iter", "tri"] {
+        let o = outcome_of(wall);
+        assert!(
+            !o.is_verified(),
+            "`{wall}` is an undecidable wall (C7 u32 divider / C11 unbounded sum / \
+             C12 nonlinear invariant); a `verified` here would be a false proof, got: {o}"
+        );
+    }
+    for companion in ["div_unwrap_byte", "sum_iter_bounded", "tri_bounded"] {
+        let o = outcome_of(companion);
+        assert!(
+            o.is_verified(),
+            "`{companion}` is the decidable companion of a wall and must verify, got: {o}"
+        );
+    }
 }
 
 /// Every edition compiles the corpus to the same verdicts (review E4).

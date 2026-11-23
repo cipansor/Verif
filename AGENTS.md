@@ -4355,9 +4355,14 @@ Three facts cost time here and are worth keeping: `swap_bytes` is a rotation by
 `div_euclid` adjusts the truncating quotient *away* from zero when the remainder is
 negative, which is the opposite of the natural reading (also caught by the test);
 and `core` has no `to_ne` *value* method, only `to_ne_bytes`, so the byte-order
-model has two variants and not three. The `next_multiple_of`/`div_*` helpers and
-the `_bytes` byte-order forms (which return an array, not an integer) remain
-reachable and unmodelled. The bit-count proofs do **not** go in `verif-arithmetic`: their oracle here is Rust's own method, checked
+model has two variants and not three. The `next_multiple_of`/`checked_next_multiple_of`
+and `div_ceil`/`div_euclid`/`rem_euclid` helpers are modelled too (they were gaps when
+this paragraph was first written -- measured now: every stable integer method
+`classify`s, and the only unmodelled call across the corpora is a deliberate `Self`
+refusal). Two boundaries are deliberate and named: `div_floor` is unstable
+(`int_roundings`) and cannot be differential-tested on the gate's toolchains, so it is
+refused; and the `_bytes` byte-order forms (which return an array, not an integer) are
+refused rather than modelled as a word. The bit-count proofs do **not** go in `verif-arithmetic`: their oracle here is Rust's own method, checked
 exhaustively over the whole operand domain, which is a stronger oracle than a
 small-domain enumeration would be. A third engine with less coverage is not a proof,
 so the split the roadmap proposed is not made.

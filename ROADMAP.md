@@ -164,8 +164,11 @@ keeps growing.
   - Who has it: Kani, Prusti, Creusot, Verus, SPARK (finalization).
   - Move: **build**.
 - **C2. `Option`/`Result` and `?`.** · P0 · in progress · Kani, Verus, Prusti, Creusot
-  - Gap: `?`, `map`/`map_err`/`and_then`/`unwrap_or_else` (closures) are
-    unmodelled; `unwrap`, `unwrap_or`, `expect`, `ok_or`/`ok`/`err`, `is_some`,
+  - Gap: the *closure-taking* methods (`map`/`map_err`/`and_then`/`unwrap_or_else`)
+    are unmodelled because a closure body is an indirect call the frontend does not
+    inline -- that is C10 (closures), not this item. `?` is modelled
+    (`TryBranch`/`FromResidual`); `unwrap`, `unwrap_or`, `unwrap_or_default`,
+    `expect`, `ok_or`/`ok`/`err`, `is_some`,
     the enum-return discriminant methods and bare payload reads are modelled (see
     the progress notes). Evidence: `checked_or_max` verified, `div_unwrap`
     incomplete (the divider wall, not the `Option`).
@@ -469,7 +472,7 @@ keeps growing.
   - Exit: `next_mode` decided (`verified`), plus the refuted fixture
     `guarded_match_tripwire` in `realistic.rs`.
   - Move: **built**.
-- **C6. The everyday `core` surface.** · P0 · in progress · Kani, Verus (`vstd`)
+- **C6. The everyday `core` surface.** · P0 · **done** · Kani, Verus (`vstd`)
   - Gap: `Ord::min/max/clamp`, `PartialEq`/`PartialOrd` comparisons,
     `iN::abs`, `abs_diff`, `rotate_*`, `is_ascii_*`,
     `is_negative`/`is_positive`, `<[T]>::len/is_empty/first/get`. Evidence:
@@ -859,6 +862,21 @@ keeps growing.
     one tripwire), pinned by `a_bool_conversion_is_the_zero_extended_bit`.
     `realistic.rs` **626 of 1141** (from **623 of 1137**; four new fixtures, three
     verified and one refuted).
+  - Progress (measured, done): the surface is complete for the *stable* integer
+    API. Every method the three corpora call classifies; a sweep of ~30 standard
+    methods (`checked_/saturating_/wrapping_/overflowing_`, the shifts, the counts,
+    `abs`/`abs_diff`/`signum`, `min`/`max`/`clamp`/`cmp`, `rotate_*`, `pow`,
+    `div_ceil`/`div_euclid`/`rem_euclid`, `midpoint`, `next_multiple_of`,
+    `next_power_of_two`, `ilog*`, `to_be`/`to_le`, `is_ascii_*`, `is_multiple_of`,
+    the `cast_signed`/`cast_unsigned` pair) is `classify`-able, and the only
+    unmodelled call across `everyday.rs`/`actuator.rs`/`realistic.rs` is a
+    *deliberate* refusal (`<Self as …>::set`, a `Self` receiver). `unwrap_or_default`
+    on a `Result<u8, Boom>` where `Boom: Drop` is refused *because dropping `Boom`
+    panics* -- a sound refusal, not a gap. The boundaries that remain are deliberate
+    and named: `div_floor` is unstable (`int_roundings`) and cannot be
+    differential-tested on the gate's toolchains, so it is refused; the `_bytes`
+    forms return an array and are refused rather than modelled as a word. See
+    `mir::intrinsics` tests `classify`/`the_new_shapes_are_modelled_only_on_the_types_that_have_them`.
 - **C7. Arithmetic scale and speed.** · P0 · in progress · Kani, Boolector,
   Bitwuzla
   - Gap: `u32::wrapping_mul` is past the 32-bit model; `clamp_std` takes 9.9 s.
