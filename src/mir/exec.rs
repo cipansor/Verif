@@ -1785,6 +1785,18 @@ impl Env {
         // read of the target meet in one store.
         let resolved = self.resolve(p);
         let p = &resolved;
+        // A write through a `Box` pointer: `*b = v` lowers to `(*_b) = v`, and `*b`
+        // reads `boxed[boxl]` (see the read arm above). Without this arm the write was
+        // dropped and a later `*b` returned the value the box held at `new` -- a stale
+        // read, so `requires: *b == 0` / `ensures: ret == 0` was proved against a body
+        // that returns 7.
+        if p.proj.as_slice() == [Proj::Deref] {
+            if let Some(&boxl) = self.box_refs.get(&p.local) {
+                self.boxed.insert(boxl, v);
+                self.forget_parts(boxl);
+                return;
+            }
+        }
         // A write to the *whole* referent through a reference -- `(*_1) = v`, how
         // `*v = 5` lowers for `v: &mut u8` -- is a whole-place write to `_1`,
         // because `Ty::Ref` is modelled as its referent (`_1` *is* the value

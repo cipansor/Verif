@@ -1790,6 +1790,17 @@ already a commit-SHA placeholder. Regressions:
   zeroed slice was a **false proof** (`Verified`, reporting `false` as `true`); it is now
   refused (teeth confirmed by disabling the guard). `clearing_a_vec_of_droppable_elements_is_not_proved_panic_free`.
 
+**Round 15:**
+- The emitted-test replay (`compile_emitted_test`) now compiles with
+  `-C overflow-checks=on`, so a counterexample that is a subtraction underflow panics
+  regardless of the test profile (a release `--test` without checks could otherwise pass
+  before the function was fixed).
+- `Env::set` gained a lone-`Deref`-of-a-box arm: a write through a `Box` pointer (`*b = v`)
+  lands in the `boxed` store the read consults, so a later `*b` never returns the value the
+  box held at `new`. The shape is currently refused before the write (an unmodelled
+  null-deref assert), so the pinned invariant is the soundness one
+  (`a_write_through_a_box_pointer_is_seen_by_a_later_read`).
+
 **Tracked (open):**
 - Executor: compound iterator closures (`closure_map`/`closure_binop`/`closure_filter`
   read an intermediate as the result), `Vec::clear`/drops of user-`Drop` elements,

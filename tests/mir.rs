@@ -7035,6 +7035,26 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     o
 }
 
+/// A write through a `Box` pointer (`*b = v`) must be seen by a later `*b` read; before
+/// the write arm existed the read returned the value the box held at `new` (a stale read,
+/// so `ensures: ret == 0` was a false proof).
+#[test]
+fn a_write_through_a_box_pointer_is_seen_by_a_later_read() {
+    // Defence-in-depth: `set` writes through a box pointer's `Deref` into the boxed
+    // store, so a later `*b` never returns the value the box held at `new`. The shape
+    // is currently refused before the write (an unmodelled null-deref assert), so the
+    // invariant pinned here is the soundness one: the stale `ret == 0` is never proved.
+    let f = verify_src(
+        "bw_false",
+        "/// ensures: ret == 0\npub fn bw_false() -> u8 { let mut b = Box::new(0u8); *b = 7; *b }",
+    );
+    let Some(f) = f else { return };
+    assert!(
+        !matches!(f, FnOutcome::Verified { .. }),
+        "a stale Box read must not prove ret == 0, got {f}"
+    );
+}
+
 /// `Vec::clear` destroys its elements; with a panicking `Drop` that is a real panic, so
 /// the reset must be refused rather than reported panic-free.
 #[test]
@@ -14396,7 +14416,7 @@ fn compile_emitted_test(rustc: &str, dir: &std::path::Path, name: &str, src: &st
     let path = dir.join(name);
     std::fs::write(&path, src).expect("write test source");
     let status = std::process::Command::new(rustc)
-        .args(["--test", "--edition", "2024", "-o"])
+        .args(["--test", "--edition", "2024", "-C", "overflow-checks=on", "-o"])
         .arg(out)
         .arg(&path)
         .status()
