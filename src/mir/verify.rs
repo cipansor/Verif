@@ -124,6 +124,14 @@ pub struct MirOptions {
     /// `None` means "the caller supplied these by hand", which is not checked: a
     /// hand-built [`MirOptions`] may legitimately name a prebuilt rlib.
     pub probed_with: Option<String>,
+    /// A directory for the proof cache (U7), or `None` to verify every run.
+    ///
+    /// When set, a function whose *decided* verdict (`Verified`/`Failed`) is already
+    /// in the cache for this file's key is reused instead of re-verified. The key
+    /// covers the MIR text, the source text, the edition and the engine hash, so any
+    /// change to the program or the engine is a miss — never a stale hit. Only the
+    /// library-side option is here; `cargo verif` sets it from `--cache`.
+    pub cache: Option<PathBuf>,
 }
 
 /// Everything a build script needs to let its own source name a crate: the
@@ -1642,12 +1650,38 @@ pub fn verify_file_with_opts(
         missing,
         ..Default::default()
     };
+    // The cache key covers the MIR, the source (contracts), the edition and the
+    // engine (via `VERIF_ENGINE_HASH`); a change to any of them is a miss.
+    let cache_key = opts
+        .cache
+        .as_ref()
+        .map(|_| super::cache::file_key(&mir, &text, &format!("{edition:?}")));
+    let cached = match (&opts.cache, &cache_key) {
+        (Some(dir), Some(k)) => super::cache::load(dir, k),
+        _ => super::cache::Entries::new(),
+    };
+    let mut fresh = super::cache::Entries::new();
     for (key, f) in select(&prog, &targets, only) {
         if let Some(c) = specs.resolve(&f.name) {
             report.lines.insert(key.clone(), c.line);
         }
-        let outcome = smt::with_fresh(|| verify_function(&prog, f, &specs));
+        let outcome = match cached.get(&key) {
+            Some(c) => c.to_outcome(),
+            None => smt::with_fresh(|| verify_function(&prog, f, &specs)),
+        };
+        if let Some(c) = super::cache::Cached::of(&outcome) {
+            fresh.insert(key.clone(), c);
+        }
         report.outcomes.push((key, outcome));
+    }
+    if let (Some(dir), Some(k)) = (&opts.cache, &cache_key) {
+        // Merge with the previous entries, so a `--function` run does not drop the
+        // verdicts it did not recompute.
+        let mut merged = cached;
+        for (n, c) in fresh {
+            merged.insert(n, c);
+        }
+        let _ = super::cache::store(dir, k, &merged);
     }
     for m in &report.missing {
         if let Some(c) = specs.by_fn.get(m) {

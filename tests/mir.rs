@@ -14338,3 +14338,77 @@ fn compile_emitted_test(rustc: &str, dir: &std::path::Path, name: &str, src: &st
         .expect("spawn rustc");
     assert!(status.success(), "the emitted test must compile: {}", path.display());
 }
+
+/// U7: the proof cache reuses a decided verdict when nothing changed, and a change
+/// to the program invalidates it.
+///
+/// A cached `verified` surviving a change to the rule that produced it would be a
+/// false proof, so the test proves both halves: the cache *is* consulted (a tampered
+/// entry shows through), and a change to the source is a *miss* (the real verdict
+/// returns). The key covers the MIR, the contracts, the edition and the engine.
+#[test]
+fn the_proof_cache_reuses_a_decided_verdict_and_a_change_is_a_miss() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif_cache_{}_{seq}", std::process::id()));
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let file = dir.join("f.rs");
+    let src = "/// ensures: ret == n\npub fn id(n: u8) -> u8 { n }\n\n\
+               /// ensures: ret == 7\npub fn wrong(n: u8) -> u8 { n }\n";
+    std::fs::write(&file, src).expect("write fixture");
+
+    let mut opts = probe_opts();
+    opts.cache = Some(cache.clone());
+
+    let kind = |r: &verify::FileReport, name: &str| {
+        r.outcomes.iter().find(|(n, _)| n == name).map(|(_, o)| match o {
+            FnOutcome::Verified { .. } => "verified",
+            FnOutcome::Failed { .. } => "failed",
+            FnOutcome::Incomplete { .. } => "incomplete",
+            FnOutcome::Skipped { .. } => "skipped",
+        })
+    };
+
+    // First run: real verdicts, and a cache entry is written.
+    let r1 = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    assert_eq!(kind(&r1, "id"), Some("verified"), "id holds");
+    assert_eq!(kind(&r1, "wrong"), Some("failed"), "wrong is refuted");
+    let entry = std::fs::read_dir(&cache)
+        .expect("cache dir")
+        .next()
+        .expect("one entry")
+        .unwrap()
+        .path();
+
+    // Second run: same verdicts (reused or recomputed, the answers must agree).
+    let r2 = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    assert_eq!(kind(&r2, "id"), Some("verified"));
+    assert_eq!(kind(&r2, "wrong"), Some("failed"));
+
+    // Tamper the cache: `id` marked Failed{TAMPERED}. If the cache is consulted the
+    // tampered kind shows through -- the only way to observe a hit without timing,
+    // and it is exactly the stale value a wrong key would trust.
+    std::fs::write(&entry, "F\tid\tTAMPERED\tx\n").expect("tamper cache");
+    let r3 = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    let id3 = r3.outcomes.iter().find(|(n, _)| n == "id").map(|(_, o)| o).unwrap();
+    assert!(
+        matches!(id3, FnOutcome::Failed { kind, .. } if kind.contains("TAMPERED")),
+        "the cache must be consulted: a tampered entry should show through, got {id3:?}"
+    );
+
+    // Change the source: a new key, so a *miss* -- the real verdict returns, not the
+    // tampered one.
+    let src2 = "/// ensures: ret == n\npub fn id(n: u8) -> u8 { n }\n\n\
+                /// ensures: ret == 8\npub fn wrong(n: u8) -> u8 { n }\n";
+    std::fs::write(&file, src2).expect("rewrite fixture");
+    let r4 = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    assert_eq!(
+        kind(&r4, "id"),
+        Some("verified"),
+        "a changed source is a cache miss, so the real verdict returns (not the tampered one)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

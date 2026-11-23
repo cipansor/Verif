@@ -7,6 +7,7 @@ Part of the [`verif` README](../README.md).
 ```
 .
 ├── Cargo.toml          the crate manifest (`no_std`, zero dependencies)
+├── build.rs            bakes VERIF_ENGINE_HASH (hash of src/ + Cargo.toml) for the proof cache
 ├── Cargo.lock          committed: two packages (this crate and its sibling), and no
 │                       external dependency at all
 ├── README.md           the crate's page on crates.io
@@ -49,6 +50,7 @@ Part of the [`verif` README](../README.md).
 │       ├── intrinsics.rs  the `core` model: `checked_*`/`saturating_*`/`wrapping_*`,
 │       │                  the bit counts, `Range`/`Iterator::next`, `?`, ...
 │       ├── shape.rs    per-function summary the rustc_public oracle compares
+│       ├── cache.rs    the proof cache: decided verdicts keyed on MIR+contracts+edition+engine
 │       ├── spec.rs     contract scanner + the small contract-expression grammar
 │       └── verify.rs   driver: emit MIR, extract contracts, discharge, report
 ├── verif-arithmetic/   the sibling crate, re-exported as `verif::arith` (its own

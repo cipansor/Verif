@@ -10843,3 +10843,22 @@ Two mechanical points, both easy to get wrong again:
 The lesson is the one the `Len`/`PtrMetadata` and `RangeInclusive` sections already
 record, a third time: a predicate that keys on a *printed lowering shape* is a claim
 about a toolchain, and only running the floor toolchain's suite proves it holds there.
+
+## The proof cache keys on the engine, or it is not sound
+
+`mir::cache` (U7) reuses a decided verdict across runs. The soundness argument is the
+*key*: a verdict is a pure function of the MIR text, the source text (the contracts), the
+edition and the engine, and `file_key` folds in all four. The fourth is the one that is
+easy to forget and fatal to omit — `build.rs` hashes `src/**` + `Cargo.toml` into
+`VERIF_ENGINE_HASH`, so *any* change to a rule or a budget invalidates every entry. Without
+it, a change that turned a `verified` into a `failed` would be masked by the stale
+`verified`: a false proof, the one outcome a verifier must not produce.
+
+Two rules keep it sound, both pinned by
+`tests/mir.rs::the_proof_cache_reuses_a_decided_verdict_and_a_change_is_a_miss`. Only
+`Verified`/`Failed` are stored — an `Incomplete` carries a `MirReport` whose obligations
+are arena term ids, gone by the next run, so it cannot be cached — and a *change to the
+source is a miss*. The test tampers the cache to prove it is consulted, then changes the
+source to prove the tampered value does not survive: a cache you cannot observe being hit
+is a cache you cannot trust, and the tamper makes "the cache was used" a check rather than
+a hope.

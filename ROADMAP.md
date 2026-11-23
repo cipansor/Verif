@@ -1482,9 +1482,23 @@ Exit: one real `no_std` crate with a dependency verified end to end with
   - `AGENTS.md` is deliberately **not** split: it is the agent-facing record, not a
     published page, and the exit names the README.
   - Move: **build**.
-- **U7. Proof caching.** · P1 · todo · —
+- **U7. Proof caching.** · P1 · **done** · —
   - Exit: unchanged MIR plus unchanged contracts reuses the verdict across runs.
-  - Move: **build**.
+  - Progress (done): `mir::cache` stores each file's *decided* outcomes
+    (`Verified`/`Failed`) under a key that folds in the MIR text, the source text (the
+    contracts), the edition **and the engine hash** — the last baked by `build.rs` from
+    `src/**` + `Cargo.toml`. A change to any of the four is a *miss*, never a stale hit,
+    which is what makes reuse sound: a cached `verified` cannot survive a change to the
+    rule that produced it. Only `Verified`/`Failed` are stored (they carry no arena
+    handles); `Incomplete`/`Skipped` are re-derived every run. Opt-in via
+    `MirOptions.cache` / `cargo verif --cache <dir>`; a `--function` run merges rather
+    than drops the other entries.
+  - Exit met -- `tests/mir.rs::the_proof_cache_reuses_a_decided_verdict_and_a_change_is_a_miss`
+    proves both halves: a *tampered* cache entry shows through (the cache is consulted),
+    and a change to the source is a *miss* (the real verdict returns). `mir::cache`'s
+    unit test pins that every key part changes the key, and that a tab/newline round-trips
+    through the line format.
+  - Move: **done**.
 - **U8. A public scoreboard.** · P1 · in progress · Kani
   - Exit: `everyday.rs`, an SV-COMP-style set, and `verify-rust-std` functions
     scored for verif **and** Kani on the same inputs, updated by CI.

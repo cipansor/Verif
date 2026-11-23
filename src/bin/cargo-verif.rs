@@ -34,6 +34,7 @@ fn main() {
     let mut function: Option<String> = None;
     let mut format = String::from("human");
     let mut emit_test: Option<String> = None;
+    let mut cache_dir: Option<PathBuf> = None;
     // `cargo verif` invokes this binary as `cargo-verif verif [args]`; drop the
     // subcommand name so a bare `cargo verif --file x` parses.
     let mut pending = Vec::new();
@@ -50,6 +51,7 @@ fn main() {
             "--function" | "--fn" => function = it.next(),
             "--format" => format = it.next().unwrap_or_default(),
             "--emit-test" => emit_test = it.next(),
+            "--cache" => cache_dir = it.next().map(PathBuf::from),
             "--help" | "-h" => {
                 println!(
                     "cargo verif [--file <path>] [--function <name>]\n\
@@ -59,6 +61,8 @@ fn main() {
                      Default file: src/lib.rs (then src/main.rs).\n\
                      --emit-test <fn> prints a `#[test]` that reproduces a panic\n\
                      counterexample (it fails while the bug exists, passes once fixed).\n\
+                     --cache <dir> reuses decided verdicts across runs when the MIR,\n\
+                     the contracts, the edition and the engine are unchanged.\n\
                      Set VERIF_RUSTC to choose the compiler the frontend runs."
                 );
                 return;
@@ -88,7 +92,8 @@ fn main() {
     // Make the crate's own dependencies resolvable, so a file that `use`s another
     // crate compiles (C8). `crate_options` returns the default when the crate has no
     // deps or they are not built, so this changes nothing for a single-file file.
-    let opts = verify::crate_options(&file);
+    let mut opts = verify::crate_options(&file);
+    opts.cache = cache_dir;
     let report = match verify::verify_file_with_opts(&rustc, &file, &only, &opts) {
         Ok(r) => r,
         Err(e) => {
