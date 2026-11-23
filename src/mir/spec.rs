@@ -2030,30 +2030,89 @@ pub fn extract_crate(root: &Path, root_src: &str) -> Specs {
 }
 
 /// Replace each `mod name;` line with an inline `mod name { <file contents> }`.
+///
+/// A `#[path = "…"]` attribute on the line above (or on the same line as) the `mod`
+/// names the file directly; the attribute is dropped, because `#[path]` is only valid
+/// on an out-of-line `mod`, so leaving it above an inlined `mod name { … }` would be a
+/// compile error. A `#[path]` whose file cannot be read leaves a bare `mod name;` (its
+/// functions are then reported `missing`, which is visible), never a silently empty
+/// module. A `mod child;` *inside* an inline `mod parent { … }` is not inlined here (the
+/// scanner is line-based, not brace-aware) and is left as `mod child;` -- also a visible
+/// `missing`; see `ROADMAP.md`.
 fn inline_external_modules(src: &str, dir: &Path, seen: &mut Vec<PathBuf>) -> String {
+    let lines: Vec<&str> = src.lines().collect();
     let mut out = String::new();
-    for line in src.lines() {
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(attr_path) = path_attr(line) {
+            // The `mod` may share the attribute's line or follow it.
+            let same_line = path_attr_mod(line);
+            let target = same_line
+                .clone()
+                .or_else(|| lines.get(i + 1).copied().and_then(external_mod));
+            let advance = if same_line.is_some() { 1 } else { 2 };
+            if let Some((vis, name)) = target {
+                let file = dir.join(&attr_path);
+                // A `#[path]` file's sub-modules live in the file's own directory, not a
+                // `name/` directory (the Rust reference's rule for `#[path]`).
+                let sub_dir = file.parent().unwrap_or(dir).to_path_buf();
+                match read_and_inline(&file, &sub_dir, seen) {
+                    Some(body) => out.push_str(&format!("{vis}mod {name} {{\n{body}\n}}\n")),
+                    None => out.push_str(&format!("{vis}mod {name};\n")),
+                }
+                i += advance;
+                continue;
+            }
+            // A `#[path]` with no `mod` is malformed; drop it rather than emit it above
+            // whatever follows.
+            i += 1;
+            continue;
+        }
         if let Some((vis, name)) = external_mod(line) {
             let candidates = [dir.join(format!("{name}.rs")), dir.join(&name).join("mod.rs")];
             if let Some(file) = candidates.iter().find(|p| p.is_file()) {
-                let canonical = file.canonicalize().unwrap_or_else(|_| file.clone());
-                if seen.contains(&canonical) {
-                    out.push_str(line);
-                    out.push('\n');
-                    continue;
-                }
-                if let Ok(sub) = std::fs::read_to_string(file) {
-                    seen.push(canonical);
-                    let body = inline_external_modules(&sub, &dir.join(&name), seen);
+                // A plain `mod name;`'s sub-modules live in `dir/name/`.
+                if let Some(body) = read_and_inline(file, &dir.join(&name), seen) {
                     out.push_str(&format!("{vis}mod {name} {{\n{body}\n}}\n"));
+                    i += 1;
                     continue;
                 }
             }
         }
         out.push_str(line);
         out.push('\n');
+        i += 1;
     }
     out
+}
+
+/// The path in a `#[path = "…"]` attribute on this line, if any.
+fn path_attr(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    let rest = t.strip_prefix("#[path = \"")?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// The `mod name;` on the *same* line as a `#[path]` attribute, if any.
+fn path_attr_mod(line: &str) -> Option<(String, String)> {
+    let t = line.trim_start();
+    let rest = t.strip_prefix("#[path = \"")?;
+    let end = rest.find('"')?;
+    external_mod(&rest[end + 1..])
+}
+
+/// Read `file` and inline it as a module body whose sub-modules resolve in `sub_dir`,
+/// honouring the `seen` cycle set (a cycle returns `None`, leaving the `mod` bare).
+fn read_and_inline(file: &Path, sub_dir: &Path, seen: &mut Vec<PathBuf>) -> Option<String> {
+    let canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    if seen.contains(&canonical) {
+        return None;
+    }
+    let sub = std::fs::read_to_string(file).ok()?;
+    seen.push(canonical);
+    Some(inline_external_modules(&sub, sub_dir, seen))
 }
 
 /// Match a bare external-module declaration `[pub[(..)] ] mod name;`, returning the
@@ -9188,6 +9247,37 @@ mod tests {
         assert!(!c.ensures.is_empty(), "the module contract must be read, not just the name");
         // `extract` alone (the root text) sees nothing in the module.
         assert!(!extract("pub mod a;\n").by_fn.contains_key("a::clampish"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_crate_honours_a_path_attribute() {
+        // `#[path = "alt.rs"] pub mod a;` names the file directly; the contract must be
+        // read from `alt.rs`, not the `a.rs` the plain convention would look for.
+        let dir = std::env::temp_dir().join(format!(
+            "verif-extract-path-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("alt.rs"),
+            "spec! { requires: x <= 100, ensures: ret <= 100, }\npub fn clampish(x: u8) -> u8 { x }\n",
+        )
+        .unwrap();
+        let root_text = "#[path = \"alt.rs\"]\npub mod a;\n";
+        let root = dir.join("lib.rs");
+        std::fs::write(&root, root_text).unwrap();
+        let specs = extract_crate(&root, root_text);
+        assert!(
+            specs.by_fn.contains_key("a::clampish"),
+            "keys: {:?}",
+            specs.by_fn.keys().collect::<Vec<_>>()
+        );
+        // The attribute is dropped: a `#[path]` above an inline `mod a { … }` is a compile
+        // error, so it must not survive into the inlined snapshot.
+        assert!(!specs.snapshot.contains("#[path"), "the attribute must be dropped: {}", specs.snapshot);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

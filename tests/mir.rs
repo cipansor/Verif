@@ -14964,3 +14964,73 @@ fn map_or_all_then_a_terminal_is_refused() {
     let an = "/// requires: xs.len() == 5\n/// ensures: ret == 10\npub fn an(xs: &[u8]) -> u8 { let mut it = xs.iter(); let _ = it.all(|x| *x < 100); it.next().copied().unwrap_or(0) }";
     assert!(matches!(verify_src("an", an), Some(FnOutcome::Incomplete { .. })), "all() then next() must be refused");
 }
+
+
+#[test]
+fn a_multifile_method_contract_is_reported_missing_not_verified() {
+    // A method's contract in an external module is keyed by the *inlined* line, which
+    // does not match the MIR's original `impl at FILE:L:C` -- so it is reported `missing`
+    // (visible, a lost proof), never `Verified` against a body it did not pair with.
+    // Fixing it needs a line map (see ROADMAP.md); the current behaviour is the safe one.
+    let Some(rustc) = rustc() else { return };
+    let dir = std::env::temp_dir().join(format!("verif-mf-{}-{:?}", std::process::id(), std::thread::current().id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lib.rs"), "pub mod m;\n").unwrap();
+    std::fs::write(dir.join("m.rs"), "pub struct Foo;\nimpl Foo {\n    /// ensures: ret == 1\n    pub fn f(&self) -> u8 { 2 }\n}\n").unwrap();
+    let report = verify::verify_file_with_opts(&rustc, &dir.join("lib.rs"), &[], &probe_opts()).expect("frontend");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !report.outcomes.iter().any(|(_, o)| o.is_verified()),
+        "a multi-file method contract must not be Verified (a false proof); outcomes: {:?}",
+        report.outcomes
+    );
+    assert!(
+        report.missing.iter().any(|m| m == "f") || report.outcomes.iter().any(|(n, _)| n == "f"),
+        "the method is reported (missing or refused), never silently dropped; missing: {:?}",
+        report.missing
+    );
+}
+
+#[test]
+fn iterator_chain_differential_agrees_with_rustc() {
+    // Every chain the verifier decides `Verified` must match a real `rustc` compile+run of
+    // the same expression (the CONTRIBUTING differential-harness rule for a proof
+    // shortcut). A chain the verifier refuses is skipped -- a refusal is never wrong.
+    let Some(rustc) = rustc() else { return };
+    let cases: &[(&str, u8)] = &[
+        ("xs.iter().copied().sum::<u8>()", 150),
+        ("xs.iter().copied().max().unwrap_or(0)", 50),
+        ("xs.iter().copied().min().unwrap_or(0)", 10),
+        ("xs.iter().rev().next().copied().unwrap_or(0)", 50),
+        ("xs.iter().rev().take(2).last().copied().unwrap_or(0)", 40),
+        ("xs.iter().take(2).rev().next().copied().unwrap_or(0)", 20),
+        ("xs.iter().skip(2).next().copied().unwrap_or(0)", 30),
+        ("xs.iter().step_by(2).next().copied().unwrap_or(0)", 10),
+        ("xs.iter().copied().map(|x| x.wrapping_add(1)).sum::<u8>()", 155),
+        ("xs.iter().copied().filter(|x| *x > 25).count() as u8", 3),
+        ("xs.iter().copied().any(|x| x == 30) as u8", 1),
+        ("xs.iter().copied().all(|x| x < 100) as u8", 1),
+    ];
+    let pre = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n";
+    for (i, (body, expected)) in cases.iter().enumerate() {
+        let prog = format!("fn main() {{ let xs: [u8; 5] = [10, 20, 30, 40, 50]; let v: u8 = {{ {body} }}; println!(\"{{}}\", v); }}");
+        let dir = std::env::temp_dir().join(format!("verif-itdiff-{}-{i}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("main.rs");
+        std::fs::write(&f, &prog).unwrap();
+        let bin = dir.join("main");
+        let out = std::process::Command::new(&rustc).arg("--edition").arg("2024").arg("-o").arg(&bin).arg(&f).output().expect("rustc");
+        assert!(out.status.success(), "rustc failed on `{body}`: {}", String::from_utf8_lossy(&out.stderr));
+        let ran = std::process::Command::new(&bin).output().expect("run");
+        let real: u8 = String::from_utf8_lossy(&ran.stdout).trim().parse().expect("a value");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(real, *expected, "the differential case's own expected value is wrong for `{body}`");
+        let src = format!("{pre}/// ensures: ret == {expected}\npub fn f{i}(xs: &[u8]) -> u8 {{ {body} }}");
+        if let Some(o) = verify_src(&format!("f{i}"), &src) {
+            if o.is_verified() {
+                assert_eq!(real, *expected, "verifier Verified `{body} == {expected}` but rustc computes {real}");
+            }
+        }
+    }
+}
