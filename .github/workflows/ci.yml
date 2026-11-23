@@ -503,3 +503,24 @@ jobs:
             echo "::notice::The strict publish check reports a crate as blocked on its sibling version."
             echo "That is release ordering (a dependency is uploaded before its dependent), not a manifest fault."
           fi
+
+  # U8: the coverage scoreboard's regression floor, enforced in CI.
+  #
+  # `scripts/scoreboard.py --check` runs `mir_coverage` on the three MIR corpora and
+  # fails when a corpus drops below `scripts/scoreboard-floor.txt`. Verdicts are stable
+  # across the gate's toolchains, so a drop is a *regression* -- a change un-verified a
+  # function -- not noise. It is a separate job rather than a gate step because it takes
+  # minutes, and a gate that slow stops being run locally.
+  scoreboard:
+    name: coverage scoreboard (regression floor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Check the coverage floor
+        run: python3 scripts/scoreboard.py --check

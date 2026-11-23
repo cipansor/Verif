@@ -414,6 +414,10 @@ wall, an unbounded-length sum, and a nonlinear inductive invariant -- and are tr
 - [`docs/tcb.md`](docs/tcb.md) is the **trusted computing base** and the semantics of
   the supported MIR subset: what a `verified` line trusts, and the check behind each
   layer (roadmap A4).
+- [`docs/qualification.md`](docs/qualification.md) is a **draft qualification plan**
+  (DO-330 TQL-5 / ISO 26262 TCL3): the tool's operational requirements, each backed by
+  the gate or oracle that demonstrates it, and what a real qualification would still
+  need (roadmap A5).
 - [`SOUNDNESS.md`](SOUNDNESS.md) is the ledger of every false proof and wrong
   verdict the project has found, each with the fixture that fails if the fix is
   undone; `tests/soundness.rs` checks the fixtures still exist.

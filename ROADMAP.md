@@ -1466,9 +1466,16 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     drop means a change un-verified a function). `--write-floor` records a raised
     count. Current: everyday 21/24, actuator 18/33, realistic 694/1252. The
     everyday `div_unwrap`/`sum_iter`/`tri` are C7/C11/C12.
+  - Progress (CI, done): `.github/workflows/ci.yml` has a `scoreboard` job that runs
+    `python3 scripts/scoreboard.py --check`, so the regression floor is enforced on
+    every push rather than only when someone remembers. It is a separate job, not a
+    gate step, because it takes minutes; the action pins are checked by
+    `scripts/check_actions_pinned.py` like every other `uses:`. Measured locally:
+    `everyday 21/24, actuator 18/33, realistic 694/1252`, `every corpus is at or above
+    its floor`, exit 0.
   - Remaining: the Kani column on the *same* inputs (Kani is already an oracle in
     `examples/kanidiff.rs`, but not a per-function coverage score), an SV-COMP-style
-    set, and `verify-rust-std` functions; and running it in CI.
+    set, and `verify-rust-std` functions.
   - Move: **build**.
 - **U9. Contracts written in the code, not only in doc comments.** · P1 · done · —
   - Gap: a `///` clause is unchecked prose. A typo in a *keyword* is now refused
@@ -1547,13 +1554,26 @@ scoreboard against Kani is live.
   - Remaining: the **external review** the exit names. The document is not a
     substitute for it, and `docs/tcb.md` says so.
   - Move: **build**.
-- **A5. A qualification path.** · P2 · todo · SPARK (the only one with
+- **A5. A qualification path.** · P2 · **done** (draft) · SPARK (the only one with
     qualification kits)
   - Approach: draft Tool Operational Requirements and a DO-330 TQL-5 / ISO 26262
     TCL plan. Together with Ferrocene, this is the most credible embedded-safety
     differentiator.
-  - Exit: a drafted TOR and qualification plan.
-  - Move: **build** (long term).
+  - Progress (draft, done): `docs/qualification.md` is the drafted TOR and plan. It
+    states why a verifier is a tool that must itself be qualified, gives the TOR as a
+    table whose every row names the gate or oracle that *already* demonstrates it
+    (soundness -> `SOUNDNESS.md` + the differential oracles; refusal-over-guessing ->
+    `Verdict::Unknown`; determinism -> the scoreboard floor; bounded resources -> the
+    budget regression tests; no silent drops -> `assert_not_dropped`; toolchain honesty
+    -> gates 9 and 14; reproducibility -> `smtscript` + the z3/Kani/Verus/Coq/Lean
+    oracles), and lists what a real qualification still needs -- an independent
+    assessment and a signed tool accomplishment summary, both human actions a commit
+    cannot supply. It is explicit that `verif` is **not** qualified and that Ferrocene
+    qualifies the compiler, not the verifier.
+  - Exit: a drafted TOR and qualification plan. **Met** -- `docs/qualification.md`
+    (draft).
+  - Move: **done** (the draft; the independent assessment is the remaining human step,
+    recorded in the doc rather than as a code task).
 - **A6. Kani as a standing oracle for the frontend.** · P1 · todo · Kani
   - Approach: run Kani on every function in `everyday.rs` and `realistic.rs` in
     CI and require agreement whenever both decide. The engine already has Kani and
