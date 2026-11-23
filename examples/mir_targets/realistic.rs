@@ -15221,6 +15221,168 @@ pub fn vec_index_empty_is_a_panic(v: &Vec<u8>) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// `for` loops over slices and arrays: `into_iter`/`iter` + `next` are modelled
+// ---------------------------------------------------------------------------
+//
+// `for x in xs` desugars to `IntoIterator::into_iter` and `Iterator::next` on the
+// resulting cursor, so the model tracks a *concrete* position into the slice and
+// reads the element at each index -- the same element variable a contract's
+// `xs[k]` names. A bounded length (`requires: xs.len() == N`) makes the loop
+// finite, so the sum over a fixed-size slice is decided rather than unwound.
+
+spec! {
+    requires: xs.len() == 2,
+    ensures: ret == xs[0].wrapping_add(xs[1]),
+}
+/// The canonical loop-over-a-slice sum. The two elements the body reads through
+/// the iterator are the ones the contract names, so the equality holds.
+pub fn for_slice_sum(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for &x in xs {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() == 2,
+    ensures: ret == xs[0],
+}
+/// The false twin: the sum of two elements is not the first one (witness
+/// `xs[1] == 1`).
+pub fn for_slice_sum_cannot_prove_this(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for &x in xs {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() <= 3,
+    ensures: ret == xs.len() as u8,
+}
+/// Counting the elements agrees with the slice length: each `Some` from `next`
+/// increments, and `next` is `None` exactly when `pos >= len`.
+pub fn for_slice_count(xs: &[u8]) -> u8 {
+    let mut n = 0u8;
+    for _x in xs {
+        n = n.wrapping_add(1);
+    }
+    n
+}
+
+spec! {
+    requires: xs.len() <= 3,
+    ensures: ret == xs.len() as u8 + 1,
+}
+/// The false twin: the count is the length, not one more.
+pub fn for_slice_count_cannot_prove_this(xs: &[u8]) -> u8 {
+    let mut n = 0u8;
+    for _x in xs {
+        n = n.wrapping_add(1);
+    }
+    n
+}
+
+spec! {
+    requires: true,
+    ensures: ret == a[0].wrapping_add(a[1]),
+}
+/// `for &x in &a` over an *array*: the length is the type's constant, so the
+/// loop is bounded without a precondition, and `next` reads `a[0]`/`a[1]`.
+pub fn for_array_sum(a: [u8; 2]) -> u8 {
+    let mut s = 0u8;
+    for &x in &a {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: true,
+    ensures: ret == a[0],
+}
+/// The false twin for the by-reference array loop.
+pub fn for_array_sum_cannot_prove_this(a: [u8; 2]) -> u8 {
+    let mut s = 0u8;
+    for &x in &a {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: true,
+    ensures: ret == a[0].wrapping_add(a[1]),
+}
+/// `for x in a` by *value* owns an `array::IntoIter`, whose `next` advances the
+/// same way and whose drop (glue-free for `u8`) is a no-op.
+pub fn for_array_by_value_sum(a: [u8; 2]) -> u8 {
+    let mut s = 0u8;
+    for x in a {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: true,
+    ensures: ret == a[1],
+}
+/// The false twin for the by-value array loop (the sum is not `a[1]`).
+pub fn for_array_by_value_sum_cannot_prove_this(a: [u8; 2]) -> u8 {
+    let mut s = 0u8;
+    for x in a {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() == 2,
+    ensures: ret == xs[0].wrapping_add(xs[1]),
+}
+/// `for &x in xs.iter()` is the same iteration through the explicit `iter`
+/// cursor (an `Iter` is its own `IntoIterator`, so `into_iter` is the identity).
+pub fn for_slice_iter_sum(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for &x in xs.iter() {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() == 2,
+    ensures: ret == xs[0],
+}
+/// The false twin for the `iter()` spelling.
+pub fn for_slice_iter_sum_cannot_prove_this(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for &x in xs.iter() {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() == 2,
+    ensures: ret >= xs[0] && ret >= xs[1],
+}
+/// A branch *inside* the loop (a running maximum) also decides: the loop is
+/// unwound and each `next` names a constant index.
+pub fn for_slice_max(xs: &[u8]) -> u8 {
+    let mut m = 0u8;
+    for &x in xs {
+        if x > m {
+            m = x;
+        }
+    }
+    m
+}
+
+// ---------------------------------------------------------------------------
 // Chained `Option` combinators: the element identity must compose
 // ---------------------------------------------------------------------------
 

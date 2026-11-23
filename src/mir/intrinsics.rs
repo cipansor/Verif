@@ -364,6 +364,26 @@ pub enum Intrinsic {
     /// *array*'s length is a constant, so `a.last()` is the exact element `a[N-1]`
     /// and is modelled as that element rather than a fresh one.
     SliceLast,
+    /// `IntoIterator::into_iter` / `slice::iter`: begin iterating a slice.
+    ///
+    /// `for x in xs` (with `xs: &[T]`) desugars to
+    /// `<&[T] as IntoIterator>::into_iter(xs)` then `Iterator::next` on the
+    /// resulting `std::slice::Iter`, so the model holds a *cursor* -- the base
+    /// slice local and a position -- that `next` advances. The position is a
+    /// concrete `u64`, so each iteration names the element at a constant index
+    /// (`s[0]`, `s[1]`, ...), which is the same element variable a contract's
+    /// `s[0]` names. A loop cut havocs the cursor (dropping it), so a `for` loop
+    /// with an `invariant:` -- where the position would be symbolic -- refuses
+    /// `next` rather than reading an arbitrary element.
+    SliceIntoIter,
+    /// `Iterator::next` on a `std::slice::Iter`: `Option<&T>` -- `Some(&s[pos])`
+    /// when `pos < len`, `None` otherwise, advancing the cursor.
+    ///
+    /// The guard is the slice's own length variable, so `next` cannot disagree
+    /// with `len`/`is_empty`/`first`. The element is the store's element at the
+    /// concrete `pos`, recorded in `slice_elem_ref` so the loop body's
+    /// `*_payload` read resolves to it.
+    SliceNext,
     /// A method on a `Vec<T>`: `new`, `push` or `len`.
     ///
     /// A `Vec` has no bit-vector value (its fields -- a heap pointer, a length
@@ -1354,6 +1374,21 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             _ => {}
         }
     }
+    // `for x in xs` over a *slice*: `<&[T] as IntoIterator>::into_iter` /
+    // `slice::<impl [T]>::iter` begin the cursor, and `<slice::Iter<..> as
+    // Iterator>::next` advances it. The *path* is checked (`&[`/`[` head for the
+    // slice, `slice::Iter` for the cursor) so a user iterator is refused, and the
+    // range `next` above is matched first so this cannot shadow it. The same-dump
+    // lookup still answers a real body first.
+    if short == "into_iter" && (names_slice_into_iter(name) || names_slice_iter_into_iter(name)) {
+        return Some(Intrinsic::SliceIntoIter);
+    }
+    if names_slice_iter_impl(name) && short == "iter" {
+        return Some(Intrinsic::SliceIntoIter);
+    }
+    if short == "next" && names_slice_iter_next(name) {
+        return Some(Intrinsic::SliceNext);
+    }
     // `Try::branch` and `FromResidual::from_residual`, the two calls the `?`
     // operator's desugaring makes. Both are *trait* methods -- the dump spells
     // them `<Result<u8, u8> as Try>::branch` and `<Result<u8, u8> as
@@ -1710,6 +1745,74 @@ pub fn names_slice_impl(name: &str) -> bool {
     name.contains("slice::<impl [")
 }
 
+/// True for `<&[T] as IntoIterator>::into_iter` (and the `[T]`, `[T; N]`,
+/// `&[T; N]` spellings).
+///
+/// `into_iter` is spelled on many types, so the *head* is checked: a slice or
+/// array's `IntoIterator` impl is the only one printed with a `[` immediately
+/// after `&` (or at the start). A user type cannot produce a `[T]`/`[T; N]` head,
+/// so this cannot collide. The element is a reference for a `&[T]`/`&[T; N]`
+/// receiver and a value for a `[T; N]` one; the executor reads the same element
+/// variable either way, so both are modelled.
+pub fn names_slice_into_iter(name: &str) -> bool {
+    let Some(inner) = name.strip_prefix('<') else { return false };
+    let Some((ty, rest)) = inner.split_once(" as ") else { return false };
+    let trait_path = rest.split(['<', '>']).next().unwrap_or(rest).trim();
+    if !(trait_path == "IntoIterator" || trait_path.ends_with("::IntoIterator")) {
+        return false;
+    }
+    let ty = ty.trim();
+    let ty = ty.strip_prefix('&').unwrap_or(ty);
+    ty.strip_prefix('[').and_then(|s| s.strip_suffix(']')).is_some()
+}
+
+/// True for `<slice::Iter<..> as IntoIterator>::into_iter` (or `<array::IntoIter<..>
+/// as IntoIterator>`), the identity call `for x in xs.iter()` makes (an iterator is
+/// already an `IntoIterator`).
+pub fn names_slice_iter_into_iter(name: &str) -> bool {
+    let Some(inner) = name.strip_prefix('<') else { return false };
+    let Some((ty, rest)) = inner.split_once(" as ") else { return false };
+    let head = ty.split('<').next().unwrap_or(ty).trim();
+    let is_iter = head == "slice::Iter"
+        || head.ends_with("::slice::Iter")
+        || head == "array::IntoIter"
+        || head.ends_with("::array::IntoIter");
+    if !is_iter {
+        return false;
+    }
+    let trait_path = rest.split(['<', '>']).next().unwrap_or(rest).trim();
+    trait_path == "IntoIterator" || trait_path.ends_with("::IntoIterator")
+}
+
+/// True when a call names the inherent `iter` on a slice: `core::slice::<impl
+/// [T]>::iter`. A `Vec::iter` reaches the slice through `Deref` first, so it is
+/// printed against the slice too; a user `iter` has no `slice::<impl [` path.
+pub fn names_slice_iter_impl(name: &str) -> bool {
+    name.contains("slice::<impl [")
+}
+
+/// True for `<slice::Iter<..> as Iterator>::next` (or the `core::slice` spelling),
+/// and the by-value array iterator `<array::IntoIter<..> as Iterator>::next`.
+///
+/// The `next` tail is also the range desugaring's, but that is matched by
+/// `names_range` *before* this in `classify`, so the only thing this adds is the
+/// slice/array cursor. A user iterator named `Iter` in a local module is `m::Iter`,
+/// which has no `slice::Iter`/`array::IntoIter` segment, and is refused.
+pub fn names_slice_iter_next(name: &str) -> bool {
+    let Some(inner) = name.strip_prefix('<') else { return false };
+    let Some((ty, rest)) = inner.split_once(" as ") else { return false };
+    let head = ty.split('<').next().unwrap_or(ty).trim();
+    let is_iter = head == "slice::Iter"
+        || head.ends_with("::slice::Iter")
+        || head == "array::IntoIter"
+        || head.ends_with("::array::IntoIter");
+    if !is_iter {
+        return false;
+    }
+    let trait_path = rest.split(['<', '>']).next().unwrap_or(rest).trim();
+    trait_path == "Iterator" || trait_path.ends_with("::Iterator")
+}
+
 /// True when a call names an inherent method on `str`.
 ///
 /// `len` and `is_empty` are spelled the same on `[T]`, `Vec`, `String` and many
@@ -1985,7 +2088,9 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         | Intrinsic::SliceIsEmpty
         | Intrinsic::SliceFirst
         | Intrinsic::SliceGet
-        | Intrinsic::SliceLast => true,
+        | Intrinsic::SliceLast
+        | Intrinsic::SliceIntoIter
+        | Intrinsic::SliceNext => true,
         // The `Vec` methods. Like the slice shapes they read a length the
         // executor tracks rather than an operand term, so there is no width or
         // sign to check here; `eval` never sees them and the executor answers
@@ -2212,6 +2317,8 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             | Intrinsic::SliceFirst
             | Intrinsic::SliceGet
             | Intrinsic::SliceLast
+            | Intrinsic::SliceIntoIter
+            | Intrinsic::SliceNext
     ) {
         return None;
     }
@@ -2255,6 +2362,9 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         | Intrinsic::SliceGet
         | Intrinsic::SliceLast => {
             unreachable!("slice shapes are answered from the executor's stores")
+        }
+        Intrinsic::SliceIntoIter | Intrinsic::SliceNext => {
+            unreachable!("slice iteration is answered from the executor's cursor store")
         }
         // Answered by the executor's `enum_method` from the discriminant/payload
         // stores; the early return above keeps them from reaching here.
@@ -6006,6 +6116,49 @@ mod tests {
         assert!(classify("core::num::<impl u8>::overflowing_shr").is_none());
         assert!(classify("core::num::<impl u8>::saturating_shl").is_none());
     }
+    /// Slice iteration classifies on the *path*, so a user iterator is refused.
+    ///
+    /// `for x in xs` desugars to `into_iter` + `next`; the two heads that must be
+    /// read are the slice/array and the cursor types (`slice::Iter`,
+    /// `array::IntoIter`). A user `struct Slice`/`Iter` with the same method tails
+    /// must not be answered by the model, so each is checked as a near miss.
+    #[test]
+    fn slice_iteration_classifies_and_a_user_iterator_does_not() {
+        assert_eq!(
+            classify("<&[u8] as IntoIterator>::into_iter"),
+            Some(Intrinsic::SliceIntoIter)
+        );
+        assert_eq!(
+            classify("<&[u8; 4] as IntoIterator>::into_iter"),
+            Some(Intrinsic::SliceIntoIter)
+        );
+        assert_eq!(
+            classify("<[u8; 4] as IntoIterator>::into_iter"),
+            Some(Intrinsic::SliceIntoIter)
+        );
+        assert_eq!(classify("core::slice::<impl [u8]>::iter"), Some(Intrinsic::SliceIntoIter));
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::next"),
+            Some(Intrinsic::SliceNext)
+        );
+        assert_eq!(
+            classify("<std::array::IntoIter<u8, 2> as Iterator>::next"),
+            Some(Intrinsic::SliceNext)
+        );
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as IntoIterator>::into_iter"),
+            Some(Intrinsic::SliceIntoIter)
+        );
+        // A user type spelled `Iter`/`Slice` (a module-qualified head) is refused.
+        assert!(classify("<m::Slice<u8> as IntoIterator>::into_iter").is_none());
+        assert!(classify("<m::Iter<u8> as Iterator>::next").is_none());
+        // The range desugaring's `next` is still the range model, not this one.
+        assert_eq!(
+            classify("<std::ops::RangeInclusive<u32> as Iterator>::next"),
+            Some(Intrinsic::Range(RangeMethod::Next))
+        );
+    }
+
     /// The module header's "what is modelled" list must match the tables below it.
     ///
     /// The header claimed `abs_diff`, `rotate_*` and `is_ascii_*` "remain absent"

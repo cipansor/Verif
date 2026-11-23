@@ -1003,10 +1003,8 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     no longer reads the entry length at the exit (`ret == 0` for `ret == 3`); and
     a `Vec` move (`let w = v`) and a returned vector transfer the length to the
     destination rather than dropping it.
-  - Remaining: `String`, `Box`, symbolic-length slices, and *iteration* (`Vec`/
-    slice `iter`, so `vec_iter_sum`/`for_over_slice` still stop at
-    `slice::iter`). (`pop`, `is_empty` and the **element** model are done — see
-    the progress notes below.)
+  - Remaining: `String`, `Box`, symbolic-length slices. (Iteration, `pop`,
+    `is_empty` and the **element** model are done — see the progress notes below.)
   - Progress (`pop`, `is_empty`): `Vec::is_empty` reads the tracked length;
     `Vec::pop` returns `None` iff the length is zero and decrements it on the
     non-empty path; on a constant-length vector the popped element is the payload.
@@ -1032,6 +1030,27 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     pins every direction, and the `Vec` argument's length moving from a refusal to
     a symbolic input is pinned by `arg_len_reflexive` (verifies) against
     `arg_len_refused` (now a refutation, not a refusal).
+  - Progress (**iteration**): `for x in xs` over a slice, a `&[T; N]`, a `[T; N]`
+    (by value) and `xs.iter()` now decides. The desugaring is `IntoIterator::
+    into_iter` + `Iterator::next`, so the model holds a *cursor* -- the base slice
+    local and a **concrete** `u64` position -- that `next` advances. A concrete
+    position makes each iteration name the element at a constant index, the same
+    variable a contract's `xs[k]` names, so `for_slice_sum`'s `xs[0] + xs[1]`
+    agrees with the body. `next`'s `None` guard is the slice's own length variable
+    (`pos >= len`), so it cannot disagree with `len`/`is_empty`/`first`. A loop cut
+    havocs the cursor (drops it), so a `for` loop with an `invariant:` -- where the
+    position would be symbolic -- refuses `next` rather than reading an arbitrary
+    element. A by-value `[T; N]` loop owns an `array::IntoIter`, whose drop is a
+    no-op exactly when `T` is glue-free (the glue check reads `T` off the name).
+    `classify` accepts the calls only for a `[T]`/`[T; N]`/`slice::Iter`/
+    `array::IntoIter` head, so a user iterator is refused. `vec_iter_sum` and
+    `for_over_slice` now **verify** (as do `make`, `for_array_sum`,
+    `for_array_by_value_sum`, `for_slice_iter_sum`, `for_slice_count`,
+    `for_slice_max`). `realistic.rs` **637/1163 → 643/1174**;
+    `tests/mir.rs` `a_for_loop_over_a_slice_is_modelled` (five verified, three
+    refuted) and `a_for_loop_with_an_invariant_refuses_the_iterator` pin both
+    directions, and `slice_iteration_classifies_and_a_user_iterator_does_not`
+    pins the path guard.
   - Move: **build**.
 - **C12. A specification language that can say more.** · P1 · in progress · Verus,
   Creusot, Prusti, SPARK

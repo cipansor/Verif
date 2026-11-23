@@ -2517,28 +2517,35 @@ says "I could not decide" is worth more than one that guesses.
    behind the `std` feature. The engine it uses is the embedded one, but the
    frontend that feeds it is a development tool, not something that ships on a
    microcontroller.
-5. **A `for` loop over a *range* is modelled; a `for` over a *slice or array*, and an
-   iterator chain, are not.** `for i in 0..n` / `for i in 0..=n` desugars to
+5. **A `for` loop over a *range*, a *slice* or an *array* is modelled; an iterator
+   chain is not.** `for i in 0..n` / `for i in 0..=n` desugars to
    `Range`/`RangeInclusive` construction, `IntoIterator::into_iter` and
    `Iterator::next(&mut range)`, and all of those *are* in the model (with `core`'s
    `forward_overflowing` boundary reproduced exactly), so the loop decides through the
    same machinery a `while` loop uses — `for i in 0..=n { s += i }` verifies under a
    `requires:` that bounds `n` (or an `unwind:` bound), and a body decided by an
-   *inductive* `invariant:` verifies with one. What is *not* modelled is `for x in xs`
-   over a slice or array (it lowers to `<&[u8] as IntoIterator>::into_iter`, which is a
-   different impl) and any iterator chain (`fold`, `map`, `sum`, `.iter()`); those are
-   reported `incomplete` with the unmodelled call named, so the gap is visible rather
-   than silent. A `Vec`'s *elements* are modelled — `v[k]`, `v.first()`, `v.get(k)` and
-   `pop` read back what `push` wrote, and a `Vec` argument's `v.len()`/`v[k]` are
-   symbolic inputs — but `v.iter()` derefs to a slice and stops at the same
-   `slice::iter` gap, so a `for` or iterator chain over a `Vec` is `incomplete` like one
-   over a slice. Two things are worth knowing about the range form: an `invariant:` that
-   *names* the loop element (`s <= i`) is refused as `unknown name i`, because the
-   element is a `debug` binding that is genuinely not live at the loop header — write
-   the invariant over the loop's *carried* state (`s <= 5050`) — and the invariant must
-   be *inductive* (`s <= 5050` over a body doing `s += i` is not; `s = i.min(5050)` is).
-   A `while` loop carrying an `invariant:` and a `variant:` remains the way to state an
-   iteration the `for` desugaring does not cover, and it is *more* precise, not less: the
+   *inductive* `invariant:` verifies with one. `for x in xs` over a slice (`&[T]`), a
+   `&[T; N]`, a `[T; N]` (by value) and `xs.iter()` is modelled too: `into_iter`/`iter`
+   starts a *cursor* at a concrete position and `next` reads the element there, so each
+   iteration names the same element variable a contract's `xs[k]` names — `for x in xs
+   { s += x }` verifies against `requires: xs.len() == 2, ensures: s == xs[0] + xs[1]`,
+   and the false twin is refuted. What is *not* modelled is an **iterator chain**
+   (`fold`, `map`, `sum`, `filter`, `.enumerate()`, `for (i, x) in xs.iter().enumerate()`);
+   those are reported `incomplete` with the unmodelled call named, so the gap is visible
+   rather than silent. A `Vec`'s *elements* are modelled — `v[k]`, `v.first()`,
+   `v.get(k)` and `pop` read back what `push` wrote, and a `Vec` argument's
+   `v.len()`/`v[k]` are symbolic inputs — and `v.iter()` derefs to a slice, so
+   `for &x in v.iter()` decides like one over a slice. Two limits of the iteration model
+   are worth knowing. A `for` loop carrying an `invariant:` is **refused** for a slice
+   (`incomplete`): the loop cut havocs the cursor, so `next` finds none — the position
+   would be symbolic, and reading "some element" would be a wrong value, so the honest
+   answer is a refusal, and a `while` loop with an invariant (indexing `xs[i]`) is the
+   way to state such an iteration. And an `invariant:` that *names* a range loop's element
+   (`s <= i`) is refused as `unknown name i`, because the element is a `debug` binding
+   that is genuinely not live at the loop header — write the invariant over the loop's
+   *carried* state (`s <= 5050`), and it must be *inductive* (`s <= 5050` over a body
+   doing `s += i` is not; `s = i.min(5050)` is). A `while` loop carrying an `invariant:`
+   and a `variant:` remains the most precise way to state an iteration, because the
    measure gives total correctness, where an unwound `for` gives a bounded check.
 
 ## What this is *not* — read this before trusting a green test

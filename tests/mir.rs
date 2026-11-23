@@ -7641,6 +7641,79 @@ pub fn returned_ok() -> usize { let v = mk(); v.len() }
     assert!(o.is_verified(), "a returned vector keeps its length; got: {o}");
 }
 
+/// `for` loops over slices and arrays are modelled: `into_iter`/`iter` starts a
+/// cursor at a *concrete* position and `next` reads the element there, so each
+/// iteration names the same element variable a contract's `xs[k]` names.
+///
+/// The false twins are the teeth: a model that read a fresh (unconstrained)
+/// element per iteration would *refute* the true sum, and one that read a fixed
+/// element would *verify* the false twins. Both directions are asserted.
+#[test]
+fn a_for_loop_over_a_slice_is_modelled() {
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! { requires: xs.len() == 2, ensures: ret == xs[0].wrapping_add(xs[1]), }
+pub fn sum2(xs: &[u8]) -> u8 { let mut s = 0u8; for &x in xs { s = s.wrapping_add(x); } s }
+
+spec! { requires: xs.len() == 2, ensures: ret == xs[0], }
+pub fn sum2_bad(xs: &[u8]) -> u8 { let mut s = 0u8; for &x in xs { s = s.wrapping_add(x); } s }
+
+spec! { requires: xs.len() <= 3, ensures: ret == xs.len() as u8, }
+pub fn count(xs: &[u8]) -> u8 { let mut n = 0u8; for _x in xs { n = n.wrapping_add(1); } n }
+
+spec! { requires: true, ensures: ret == a[0].wrapping_add(a[1]), }
+pub fn arr_sum(a: [u8; 2]) -> u8 { let mut s = 0u8; for &x in &a { s = s.wrapping_add(x); } s }
+
+spec! { requires: true, ensures: ret == a[1], }
+pub fn arr_sum_bad(a: [u8; 2]) -> u8 { let mut s = 0u8; for &x in &a { s = s.wrapping_add(x); } s }
+
+spec! { requires: true, ensures: ret == a[0].wrapping_add(a[1]), }
+pub fn arr_val_sum(a: [u8; 2]) -> u8 { let mut s = 0u8; for x in a { s = s.wrapping_add(x); } s }
+
+spec! { requires: xs.len() == 2, ensures: ret == xs[0].wrapping_add(xs[1]), }
+pub fn iter_sum(xs: &[u8]) -> u8 { let mut s = 0u8; for &x in xs.iter() { s = s.wrapping_add(x); } s }
+
+spec! { requires: xs.len() == 2, ensures: ret == xs[0], }
+pub fn iter_sum_bad(xs: &[u8]) -> u8 { let mut s = 0u8; for &x in xs.iter() { s = s.wrapping_add(x); } s }
+"#;
+    for name in ["sum2", "count", "arr_sum", "arr_val_sum", "iter_sum"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    // The false twins must be *refuted*, not merely undecided: a refusal would
+    // also satisfy "not verified" and would check nothing.
+    for name in ["sum2_bad", "arr_sum_bad", "iter_sum_bad"] {
+        let Some(o) = verify_src(name, src) else { return };
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "`{name}` must fail on its postcondition; got `{kind}`"
+            ),
+            other => panic!(
+                "`{name}` claims the sum is one element and must be refuted, got: {other}"
+            ),
+        }
+    }
+}
+
+/// A `for` loop with an `invariant:` is refused, not read as an arbitrary
+/// element: the loop cut havocs the iterator cursor, so `next` finds none and the
+/// function is `Incomplete`. This is the honest answer -- the position would be
+/// symbolic, and reading "some element" would be a wrong value.
+#[test]
+fn a_for_loop_with_an_invariant_refuses_the_iterator() {
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! { requires: xs.len() <= 2, invariant: s <= 255, ensures: ret <= 255, }
+pub fn sum_inv(xs: &[u8]) -> u8 { let mut s = 0u8; for &x in xs { s = s.wrapping_add(x); } s }
+"#;
+    let Some(o) = verify_src("sum_inv", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Incomplete { .. }),
+        "a `for` loop with an invariant must be refused (the cursor is havoced), got: {o}"
+    );
+}
+
 /// A user type spelled `Vec` is not the container, and its *methods* are answered
 /// by their own bodies.
 ///

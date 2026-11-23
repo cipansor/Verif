@@ -670,6 +670,19 @@ fn eval_elem_id(id: &ElemId, read: &impl Fn(ElemRef) -> Option<Val>) -> Option<V
     }
 }
 
+/// A slice iterator's cursor: the base slice local and a concrete position.
+///
+/// `next` reads `base`'s element at `pos` and advances `pos`. The position is
+/// concrete on purpose -- it makes each iteration name a constant index, so the
+/// element is the same variable a contract's `s[k]` names, and a loop cut that
+/// would make it symbolic drops the cursor (refusing `next`) rather than reading
+/// an arbitrary element.
+#[derive(Clone, Copy, Debug)]
+struct IterState {
+    base: u32,
+    pos: u64,
+}
+
 /// Local-to-symbolic environment, with side maps for aggregate parts.
 #[derive(Clone, Debug)]
 struct Env {
@@ -783,6 +796,17 @@ struct Env {
     /// distinct inputs per index, so `xs[0]` and `xs[1]` are two values and
     /// `xs[0] == xs[1]` is not provable; see `Indexed::elems`.
     indexed: BTreeMap<u32, Indexed>,
+    /// A slice iterator's cursor (`std::slice::Iter`), keyed by the local that
+    /// holds the iterator.
+    ///
+    /// `for x in xs` desugars to `into_iter` (which starts the cursor at position
+    /// 0 over the base slice local) and `next` (which reads the element at the
+    /// current position and advances it). The position is a *concrete* `u64`, so
+    /// each iteration names the element at a constant index -- the same element
+    /// variable a contract's `s[k]` names. A loop cut havocs the cursor (drops
+    /// it), so a `for` loop with an `invariant:` -- where the position would be
+    /// symbolic -- refuses `next` rather than reading an arbitrary element.
+    iters: BTreeMap<u32, IterState>,
     /// A local that carries a reference to a slice *element* (`slice::first`/`get`
     /// produce `Option<&T>`), mapped to the element it names: `(indexed local,
     /// index)`.
@@ -929,6 +953,7 @@ impl Env {
             ref_origin: BTreeMap::new(),
             arg_source: BTreeMap::new(),
             indexed: BTreeMap::new(),
+            iters: BTreeMap::new(),
             slice_elem_ref: BTreeMap::new(),
 
             whole_writes: BTreeSet::new(),
@@ -1392,6 +1417,10 @@ impl Env {
             self.payloads.iter().filter(|((l, _), _)| *l == s).map(|((_, k), v)| (*k, *v)).collect();
         let disc = self.discriminants.get(&s).copied();
         let indexed = self.indexed.get(&s).cloned();
+        // A slice-iterator cursor is a part of the local too: `_4 = move _3` copies
+        // the iterator out of the temp, and without carrying the cursor the later
+        // `next` would find none and refuse.
+        let iter = self.iters.get(&s).copied();
         // A `Vec` is an `indexed` entry like a slice, so a move (`let w = v`)
         // carries its length *and* elements with the `indexed` copy above -- the
         // same transfer a slice's store gets. Nothing extra is needed here.
@@ -1431,7 +1460,8 @@ impl Env {
             || !path_elems.is_empty()
             || !elem_parts.is_empty()
             || disc.is_some()
-            || indexed.is_some();
+            || indexed.is_some()
+            || iter.is_some();
         self.forget_parts(dst);
         for (k, chain, v) in elem_parts {
             self.elem_parts.insert((dst, k, chain), v);
@@ -1456,6 +1486,9 @@ impl Env {
         }
         if let Some(ix) = indexed {
             self.indexed.insert(dst, ix);
+        }
+        if let Some(it) = iter {
+            self.iters.insert(dst, it);
         }
         any
     }
@@ -1998,6 +2031,10 @@ impl Env {
         self.payloads.retain(|(l, _), _| *l != local);
         self.discriminants.remove(&local);
         self.tag_widths.remove(&local);
+        // A slice-iterator cursor over this local is dropped: the header is an
+        // arbitrary state, so the position is no longer a concrete index, and a
+        // `next` that read an arbitrary element would be a wrong value.
+        self.iters.retain(|l, it| *l != local && it.base != local);
         // A mutable-length container (`Vec`) has its length refreshed to a fresh
         // `usize`, and its elements dropped. The header is an arbitrary state, so a
         // loop that pushes must not let the *exit* edge read the entry length: an
@@ -2032,6 +2069,7 @@ impl Env {
         self.strs.remove(&local);
         self.piece_sets.remove(&local);
         self.tmpl_bytes.remove(&local);
+        self.iters.remove(&local);
         // A `Vec` local overwritten as a whole place is no longer the value the
         // length and elements were tracking, so the whole entry is dropped rather
         // than kept: `v = other_vec` must not leave the old length readable. A
@@ -5687,6 +5725,76 @@ fn slice_element(
     Ok(Vec::new())
 }
 
+/// Model `for x in xs` over a slice: `into_iter`/`iter` starts a cursor, `next`
+/// advances it and yields `Option<&T>`.
+///
+/// The cursor is a concrete position into the *base* slice local, so each
+/// iteration names the element at a constant index -- the same element variable a
+/// contract's `s[k]` names, so a contract about `xs[0] + xs[1]` and a body that
+/// sums `for &x in xs` are about the same values. `next`'s `None` guard is the
+/// slice's own length variable (`pos >= len`), so it cannot disagree with
+/// `len`/`is_empty`/`first`. A cursor whose base is not a modelled slice (a
+/// havoced iterator, a user iterator) is refused rather than read as an arbitrary
+/// element.
+fn slice_iter(
+    name: &str,
+    op: intrinsics::Intrinsic,
+    receiver: &Place,
+    dest: &Place,
+    env: &mut Env,
+) -> Result<Vec<Obligation>, String> {
+    use intrinsics::Intrinsic;
+    let recv = env.pointee(receiver);
+    match op {
+        Intrinsic::SliceIntoIter => {
+            // `for x in xs.iter()` calls `into_iter` on the `Iter` itself, which is
+            // the identity: carry the existing cursor to the destination.
+            if let Some(it) = env.iters.get(&recv.local).copied() {
+                env.iters.insert(dest.local, it);
+                return Ok(Vec::new());
+            }
+            let Some(s) = env.indexed.get(&recv.local) else {
+                return Err(format!("`{name}` on a receiver whose elements are not modelled"));
+            };
+            if s.elem_w == 0 {
+                return Err(format!("`{name}` on a slice whose element width is not modelled"));
+            }
+            env.iters.insert(dest.local, IterState { base: recv.local, pos: 0 });
+            Ok(Vec::new())
+        }
+        Intrinsic::SliceNext => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!(
+                    "`{name}` on a receiver that is not a modelled slice iterator"
+                ));
+            };
+            let (base, pos) = (it.base, it.pos);
+            let Some(s) = env.indexed.get(&base) else {
+                return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+            };
+            let (len, elem_w) = (s.len, s.elem_w);
+            let (elem, sign) = env.index_elem(base, pos).ok_or_else(|| {
+                format!("`{name}` on an iterator whose elements are not modelled")
+            })?;
+            // `None` exactly when `pos >= len`, which is `len <= pos` (a concrete
+            // `pos`). `Some` otherwise; the tag is one bit like `first`/`get`.
+            let tag = smt::ite(
+                smt::ule_const(len, pos),
+                smt::word(0, 1),
+                smt::word(intrinsics::SOME_TAG, 1),
+            );
+            env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+            env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(elem, sign), elem_w);
+            env.slice_elem_ref.insert(dest.local, ElemId::Leaf((base, pos)));
+            if let Some(it) = env.iters.get_mut(&recv.local) {
+                it.pos = it.pos.saturating_add(1);
+            }
+            Ok(Vec::new())
+        }
+        _ => Err(format!("`{name}` is not a slice iterator method")),
+    }
+}
+
 /// The element type of a `Vec<T>`, from its printed name.
 ///
 /// rustc prints the standard container's *type* as `std::vec::Vec<u8>` (or
@@ -6199,6 +6307,13 @@ fn try_intrinsic(
                 | intrinsics::Intrinsic::TryBranch
                 | intrinsics::Intrinsic::FromResidual
                 | intrinsics::Intrinsic::VecMethod(_)
+                // Slice iteration is a *trait* call too (`<&[u8] as
+                // IntoIterator>::into_iter`, `<slice::Iter as Iterator>::next`), so
+                // it has no `<impl`. `classify` accepts it only for a `[T]` head or
+                // a `slice::Iter` head, and the same-dump lookup answers a real body
+                // first, so a user iterator cannot be answered by the model.
+                | intrinsics::Intrinsic::SliceIntoIter
+                | intrinsics::Intrinsic::SliceNext
         );
     if !name.contains("<impl") && !trait_method {
         return None;
@@ -6300,6 +6415,19 @@ fn try_intrinsic(
             Operand::Const(_) => return Some(Err(format!("unmodelled argument to `{name}`"))),
         };
         return Some(slice_element(name, op, p, args, dest, env, cur));
+    }
+    // `for x in xs` over a slice: `into_iter`/`iter` starts a cursor over the
+    // slice local, `next` advances it. Answered from the executor's cursor store,
+    // not an operand term.
+    if matches!(
+        op,
+        intrinsics::Intrinsic::SliceIntoIter | intrinsics::Intrinsic::SliceNext
+    ) {
+        let p = match first {
+            Operand::Copy(p) | Operand::Move(p) => p,
+            Operand::Const(_) => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        };
+        return Some(slice_iter(name, op, p, dest, env));
     }
     // The standard library's `Option`/`Result` methods. The receiver is an
     // `Option<T>`/`Result<T, E>` whose tag and payload the model's own
@@ -8273,10 +8401,20 @@ fn drop_is_noop(ty: &Ty) -> bool {
         // type (`Ty::Other`) is *not* glue-free by this test, which is the
         // conservative direction -- it is refused by the `has_field_glue` check
         // rather than assumed to be a no-op.
-        Ty::Other(name) => match vec_elem_ty(name) {
-            Some(elem) => drop_is_noop(&elem),
-            None => false,
-        },
+        Ty::Other(name) => {
+            // A slice iterator holds a reference (glue-free); an array iterator
+            // holds `T`s, so it is glue-free exactly when `T` is.
+            if name.contains("slice::Iter") {
+                return true;
+            }
+            if let Some(elem) = array_into_iter_elem(name) {
+                return drop_is_noop(&elem);
+            }
+            match vec_elem_ty(name) {
+                Some(elem) => drop_is_noop(&elem),
+                None => false,
+            }
+        }
     }
 }
 
@@ -8410,6 +8548,14 @@ fn has_drop_glue(
             if drop_destructor(prog, ty).is_some() {
                 return Ok(true);
             }
+            // A slice iterator holds a reference (glue-free); an array iterator
+            // holds `T`s, so its glue is `T`'s.
+            if name.contains("slice::Iter") {
+                return Ok(false);
+            }
+            if let Some(elem) = array_into_iter_elem(name) {
+                return has_drop_glue(prog, structs, &elem);
+            }
             match spec::struct_lookup(structs, name) {
                 Some(def) => {
                     for (_, fty) in &def.fields {
@@ -8472,6 +8618,12 @@ fn has_field_glue(
         }
         Ty::Array(inner, _) | Ty::Slice(inner) => has_drop_glue(prog, structs, inner),
         Ty::Other(name) => {
+            if name.contains("slice::Iter") {
+                return Ok(false);
+            }
+            if let Some(elem) = array_into_iter_elem(name) {
+                return has_field_glue(prog, structs, &elem);
+            }
             match spec::struct_lookup(structs, name) {
                 Some(def) => {
                     for (_, fty) in &def.fields {
@@ -8505,6 +8657,21 @@ fn receiver_error_type(f: &MirFn, p: &Place) -> Option<Ty> {
     let inner = spec::angle_inner(name)?;
     let args = crate::mir::parse::split_top_level(inner, ',');
     args.get(1).map(|e| Ty::parse(e.trim()))
+}
+
+/// The `T` of a `std::array::IntoIter<T, N>` type, for the drop-glue check.
+///
+/// `for x in a` (by value) owns an `array::IntoIter<T, N>`, whose drop destroys
+/// the *remaining* elements -- so its glue is `T`'s glue. Reading `T` off the name
+/// is what lets that drop be a no-op for a glue-free `T` and still refuse a
+/// panicking one. Any other type yields `None`.
+fn array_into_iter_elem(name: &str) -> Option<Ty> {
+    if !name.contains("array::IntoIter") {
+        return None;
+    }
+    let inner = spec::angle_inner(name)?;
+    let args = crate::mir::parse::split_top_level(inner, ',');
+    args.first().map(|t| Ty::parse(t.trim()))
 }
 
 /// The `T` of a `Result<T, E>` receiver's declared type, for the drop-glue check

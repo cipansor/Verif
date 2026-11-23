@@ -10368,8 +10368,8 @@ pin the index -- a wrong element would be worse than none). And an element first
 created by a deref'd read is not the one a later `v[k]` creates, so
 `v.first() == v[0]` is a *lost* proof in that ordering (never a false one); a
 contract that names `v[0]`, or a body that reads `v[0]` first, shares the element.
-`String`, `Box`, symbolic-length slices and *iteration* (`slice::iter`, so
-`vec_iter_sum`/`for_over_slice`) remain open.
+`String`, `Box` and symbolic-length slices remain open. (Iteration is now modelled
+— see the next section.)
 
 Two collision guards matter. A user type spelled `Vec` in a local module
 (`m::Vec`) is not the standard one: `classify` refuses a path that is neither
@@ -10377,6 +10377,56 @@ Two collision guards matter. A user type spelled `Vec` in a local module
 first regardless. And `Vec::<u8>::len` is **not** read as a slice length -- the
 slice path is matched on `core::slice::<impl [T]>`, so the two lengths (a slice's
 symbolic input, a `Vec`'s tracked model) cannot be confused.
+
+## Iterating a slice is a *cursor* at a concrete position, and a loop cut drops it
+
+`for x in xs` over a slice desugars to `<&[T] as IntoIterator>::into_iter` then
+`Iterator::next` on a `std::slice::Iter`. Modelling it is a cursor -- the base
+slice local and a **concrete `u64` position** -- that `next` reads and advances.
+The concreteness is the whole point, and three things fall out of it:
+
+- **Each iteration names the element at a constant index.** `next` at position
+  `k` reads `index_elem(base, k)`, the *same* element variable a contract's
+  `xs[k]` names. So `for x in xs { s += x }` under `requires: xs.len() == 2,
+  ensures: ret == xs[0] + xs[1]` verifies, and its false twin is refuted. A fresh
+  (unconstrained) element per iteration would *refute* the true sum; a fixed one
+  would *verify* the twin. Both are pinned.
+- **The `None` guard is the slice's own length variable.** `next` is `None`
+  exactly when `pos >= len`, so it cannot disagree with `len`/`is_empty`/`first`
+  -- they read the same variable.
+- **A loop cut havocs the cursor, and that is the honest refusal.** A `for` loop
+  with an `invariant:` havocs the loop-header state; the cursor is dropped, so
+  `next` finds none and the function is `Incomplete`. That is correct: the
+  position would be symbolic, and reading "some element" would be a wrong value.
+  A `while` loop indexing `xs[i]` with an invariant is the way to state such an
+  iteration.
+
+Four mechanical points, each a way it could have been wrong:
+
+- **`into_iter` writes the cursor on its *destination*, not its receiver.** The
+  first version keyed it on `recv.local`, so `_3 = into_iter(_1)` set `iters[_1]`
+  and the later `next(&mut _4)` (after `_4 = move _3`) found none -- `next` was
+  "not a modelled slice iterator" while `into_iter` looked modelled.
+- **The cursor travels through a move.** `_4 = move _3` copies the `Iter` by
+  value, so `copy_parts` carries `iters[s]` to `d` -- otherwise the cursor dies at
+  the move. `havoc_parts` drops it (and any cursor whose *base* is havocked);
+  `forget_parts` removes it.
+- **`for x in xs.iter()` is the identity `into_iter`.** An `Iter` is its own
+  `IntoIterator`, so `into_iter(Iter)` just carries the existing cursor.
+- **A by-value `[T; N]` loop owns an `array::IntoIter`.** Its `next` is modelled
+  the same way (accept the `array::IntoIter` head); its `drop` is a no-op exactly
+  when `T` is glue-free -- the glue check reads `T` off the name (`array::IntoIter
+  <u8, 2>` -> `u8`), so a `[String; 2]` loop is still refuted rather than assumed.
+
+`classify` accepts the two calls only for a `[T]`/`[T; N]` head (`into_iter`/`iter`)
+and a `slice::Iter`/`array::IntoIter` head (`next`), so a user iterator is refuted;
+the range `next` is matched *before* this in `classify`, so it is not shadowed.
+
+A `for` loop over a slice still needs a **bounded length** to be finite: with a
+symbolic `xs.len()` the unwinding forks at every `pos < len` and runs into the
+unwind bound, so the contract carries `requires: xs.len() == N` (or an `unwind:`).
+An array's length is its type's constant, so it needs no such precondition.
+
 
 ## A qualified type name must not resolve to a bare layout
 
