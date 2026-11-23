@@ -132,11 +132,14 @@ Part of the [`verif` README](../README.md).
 │   │                   other verifiers": `run.sh` measures `verif`, Kani, Verus,
 │   │                   Coq and Lean on the same three functions (setup + per-
 │   │                   verification; the artifact axis is `shape-bench/`)
-│   └── shape-bench/    the measured table in "Two ways to use the verifier":
+│   ├── shape-bench/    the measured table in "Two ways to use the verifier":
 │                       `run.sh` builds four crates (build-time vs on-target
 │                       vs unused) on scratch copies, and `measurer.rs` is the
 │                       native launcher that reads each process's own `VmHWM`
 │                       rather than a `fork` harness's inflated `ru_maxrss`
+│   └── external-demo/  C8: verifies a `no_std` crate that depends on
+│                       `embedded-hal` end to end with `cargo verif` (a scratch
+│                       crate; exit 2, reported, when there is no network)
 └── scripts/
     ├── gate.sh              every gate in one command, failing loudly
     ├── test-count.sh        the exact passing-test count, only when all pass

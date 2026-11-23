@@ -281,7 +281,7 @@ pub fn crate_options(file: &Path) -> MirOptions {
     let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
     let mut externs: Vec<(String, PathBuf)> = Vec::new();
     for name in &deps {
-        let us = name.replace('-', "_");
+        let us = extern_name(name);
         let prefix = format!("lib{us}-");
         let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
         for d in &dirs {
@@ -303,7 +303,7 @@ pub fn crate_options(file: &Path) -> MirOptions {
             }
         }
         if let Some((rlib, _)) = best {
-            externs.push((name.clone(), rlib));
+            externs.push((us.clone(), rlib));
         }
     }
     if externs.is_empty() {
@@ -326,6 +326,13 @@ pub fn crate_options(file: &Path) -> MirOptions {
 /// `name = { … }`, and the `[dependencies.name]` sub-table form; skips dev and build
 /// dependencies, which the verified source does not link.
 #[cfg(feature = "std")]
+/// The extern name for a dependency: Rust spells a crate with underscores, so a
+/// hyphenated manifest key (`embedded-hal`) becomes the extern `embedded_hal`. A
+/// hyphenated `--extern embedded-hal=...` names nothing the source can `use`.
+fn extern_name(dep: &str) -> String {
+    dep.replace('-', "_")
+}
+
 fn dependency_names(text: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut in_deps = false;
@@ -2182,6 +2189,17 @@ mod extern_probe_tests {
         assert_eq!(dependency_names(toml), vec!["bar", "foo", "serde"]);
         // No `[dependencies]` at all -> nothing, so `crate_options` is the default.
         assert!(dependency_names("[package]\nname = \"x\"\n").is_empty());
+    }
+
+    /// A hyphenated manifest key becomes an underscored extern, because that is the
+    /// name Rust spells (`use embedded_hal`), and a hyphenated `--extern
+    /// embedded-hal=...` names nothing the source can `use`. Found by the external
+    /// crate demo (C8): `embedded-hal` resolved to no extern and the file failed
+    /// `E0433` even though the rlib was found.
+    #[test]
+    fn a_hyphenated_dependency_name_is_an_underscored_extern() {
+        assert_eq!(extern_name("embedded-hal"), "embedded_hal");
+        assert_eq!(extern_name("scratch_dep"), "scratch_dep");
     }
 
     /// The *path* and the *identity* of a toolchain's `rustc`, when it is installed.

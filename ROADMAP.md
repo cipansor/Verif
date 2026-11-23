@@ -941,7 +941,7 @@ keeps growing.
 Exit: one real `no_std` crate with a dependency verified end to end with
 `cargo verif`; Kani agrees on every function both tools decide.
 
-- **C8. Cargo, multi-module crates and dependencies.** · P1 · in progress · Kani
+- **C8. Cargo, multi-module crates and dependencies.** · P1 · **done** · Kani
   (`cargo kani`)
   - Gap: the frontend runs `rustc --crate-type=lib` on one file, without
     `--extern`, so a crate that `use`s another crate, or a file whose
@@ -983,11 +983,19 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     `tests/rustc_wrapper.rs`: a true contract builds, a false one fails the build
     naming the obligation, and a *dependency's* false contract does not fail the
     build (the primary-package guard).
-  - Remaining: a *demonstration* on a real external crate (`embedded-hal`) needs a
-    network install; the mechanism is identical to the path-dependency fixture.
+  - Progress (external crate, done): `tools/external-demo/run.sh` builds a throwaway
+    `no_std` crate that depends on `embedded-hal = "=1.0.0"` and `use`s it, then runs
+    `cargo verif` on it. Recorded output: `clamp_percent: verified (1 obligation(s))`
+    and `all contracts held` (exit 0) for the true contract, `FAILED` (exit 1) for a
+    false one. It found and fixed a real defect: a hyphenated manifest key
+    (`embedded-hal`) was passed as `--extern embedded-hal=…`, which names nothing the
+    source can `use`; `extern_name` now underscores it (`embedded_hal`), pinned by
+    `a_hyphenated_dependency_name_is_an_underscored_extern`. The demo exits 2 (a
+    reported skip, not a pass) when there is no network to fetch the crate.
   - Exit: one function in a real `no_std` crate with at least one dependency
     (an `embedded-hal` driver, say) verified end to end with `cargo verif`.
-  - Move: **build**.
+    **Met** -- `tools/external-demo/run.sh`.
+  - Move: **done**.
 - **C9. References and aliasing.** · P1 · **done** (scalar referents) · Prusti
     (ownership), Creusot (prophecies)
   - Gap: reference arguments are refused ("no aliasing model"), yet `&`/`&mut`
