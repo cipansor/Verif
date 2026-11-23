@@ -1418,16 +1418,30 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             // resolved to the input. `old(name)` still works -- the entry value is
             // known regardless of what the body did.
             let mut args = args_for_post.clone();
+            let mut fields = fields_for_post.clone();
             for name in &ref_arg_names {
                 args.remove(name);
             }
             for (l, v) in ref_final {
-                if let Some(name) = spec::arg_name_of(f, rename.as_ref(), *l) {
-                    args.insert(name, *v);
+                // The argument's source name. `arg_name_of` only covers *width-
+                // bearing* args (a `Vec`/slice has no single word), so the name is
+                // taken from the debug binding directly, with the contract's
+                // rename applied -- the same rule `arg_bindings` uses.
+                let Some(name) = spec::arg_name_any(f, rename.as_ref(), *l) else {
+                    continue;
+                };
+                // A Vec/slice/array argument's length is the post-state length (a
+                // slice or array's is unchanged, so this is a no-op; a `&mut Vec`'s
+                // is the pushed length). Reading the entry length was a false proof.
+                let len_name = format!("{name}__len");
+                match fields.vars.get_mut(&len_name) {
+                    Some(slot) => *slot = *v,
+                    None => {
+                        args.insert(name, *v);
+                    }
                 }
             }
             // Bind each declared component that this path actually produced.
-            let mut fields = fields_for_post.clone();
             for (i, ty) in ret_components.iter().enumerate() {
                 let i = i as u32;
                 // Declared but unwritten on this path: binding a *fresh*

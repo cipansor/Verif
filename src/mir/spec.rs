@@ -9046,6 +9046,27 @@ pub fn arg_name_of(
         .map(|(_, name, _)| name)
 }
 
+/// The source name of *any* argument local, width-bearing or not.
+///
+/// `arg_name_of` omits a widthless argument (a `Vec`/slice has no single word), but a
+/// `Vec`'s *length* still needs a name: the postcondition's `v.len()` must be rebound
+/// to the post-state length, and the key is `{name}__len`.
+pub fn arg_name_any(
+    f: &crate::mir::parse::MirFn,
+    rename: Option<&ArgRename>,
+    local: crate::mir::parse::LocalIdx,
+) -> Option<String> {
+    if !f.arg_locals.contains(&local) {
+        return None;
+    }
+    Some(
+        rename
+            .and_then(|r| r.name_of(local))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| f.name_of(local)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

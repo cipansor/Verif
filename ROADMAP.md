@@ -1801,14 +1801,16 @@ already a commit-SHA placeholder. Regressions:
   null-deref assert), so the pinned invariant is the soundness one
   (`a_write_through_a_box_pointer_is_seen_by_a_later_read`).
 
-**KNOWN FALSE PROOF (tracked, highest priority): mutable-`Vec` postcondition length.**
+**Round 16 — mutable-`Vec` postcondition length (was a known false proof; FIXED).**
 `pub fn f(v: &mut Vec<u8>) { v.push(1); }` with `requires: v.len() == 0` /
-`ensures: v.len() == 0` is **Verified** (the real length after `push` is 1), and the true
-`ensures: v.len() == 1` is refuted: a `&mut Vec`'s *contract* length reads the entry value, not
-the post-state. A `&Vec`/`&[T]` (immutable) length is unchanged by the body and is correct.
-The fix mirrors the scalar-ref `ref_final`: capture each `&mut Vec` argument's final length at
-the root `return` and rebind the contract's `v.len()` in the `post` evaluation. Until then it
-is a known false proof, recorded rather than hidden.
+`ensures: v.len() == 0` used to be **Verified** (the real length after `push` is 1) while the
+true `ensures: v.len() == 1` was refuted: a `&mut Vec`'s contract length read the *entry* value.
+The fix mirrors the scalar-ref `ref_final`: the executor now passes each `&Vec`/`&mut Vec`/`&[T]`
+argument's *final* length in `ref_final`, and the `post` closure rebinds `{arg}__len` to it
+(`spec::arg_name_any` supplies the widthless arg's source name, which `arg_name_of` omits). A
+slice/array length cannot change, so the rebind is a no-op there; only a `&mut Vec`'s is the
+pushed length. Pinned both ways by `a_mut_vec_postcondition_reads_the_final_length` (false `== 0`
+refuted, true `== 1` verified).
 
 **Tracked (open):**
 - Executor: compound iterator closures (`closure_map`/`closure_binop`/`closure_filter`

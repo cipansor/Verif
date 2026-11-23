@@ -8730,10 +8730,26 @@ where
                         // body, so neither needs a second binding.
                         let mut ref_final: Vec<(u32, Var)> = Vec::new();
                         for &l in &cur.arg_locals {
-                            if !matches!(cur.ty_of(l), Some(Ty::Ref(_))) {
+                            let Some(ty) = cur.ty_of(l) else { continue };
+                            if !matches!(ty, Ty::Ref(_)) {
                                 continue;
                             }
-                            if cur.ty_of(l).and_then(|t| t.referent().width()).is_none() {
+                            // A `&Vec`/`&mut Vec`/`&[T]` argument: the postcondition's
+                            // `v.len()` must read the *post-state* length, not the entry
+                            // length. A `&mut Vec` the body pushes to has a final length
+                            // the entry value does not describe, so reading the entry
+                            // length was a false proof (`requires: v.len() == 0` /
+                            // `ensures: v.len() == 0` over `v.push(1)` verified though
+                            // the length is 1). A slice/array's length cannot change, so
+                            // this is a no-op for it.
+                            let pointee = st.env.pointee(&Place::new(l)).local;
+                            if let Some(s) = st.env.indexed.get(&pointee) {
+                                ref_final.push((l, s.len));
+                                continue;
+                            }
+                            // A reference-to-scalar argument: its *value* is the
+                            // post-state value.
+                            if ty.referent().width().is_none() {
                                 continue;
                             }
                             // A `&mut bool` target is a `Val::Bool` predicate, not a

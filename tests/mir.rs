@@ -7035,6 +7035,33 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     o
 }
 
+/// A `&mut Vec` argument's postcondition `v.len()` must read the *final* length, not the
+/// entry length. Before the fix the entry length (0) was used, so `ensures: v.len() == 0`
+/// over `v.push(1)` was a false proof and the true `== 1` was refuted.
+#[test]
+fn a_mut_vec_postcondition_reads_the_final_length() {
+    let Some(f) = verify_src(
+        "mv_false",
+        "/// requires: v.len() == 0\n/// ensures: v.len() == 0\npub fn mv_false(v: &mut Vec<u8>) { v.push(1); }",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(f, FnOutcome::Failed { .. }),
+        "the final length is 1, so `v.len() == 0` must be refuted, got {f}"
+    );
+    let Some(t) = verify_src(
+        "mv_true",
+        "/// requires: v.len() == 0\n/// ensures: v.len() == 1\npub fn mv_true(v: &mut Vec<u8>) { v.push(1); }",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(t, FnOutcome::Verified { .. }),
+        "the final length is 1, so `v.len() == 1` must verify, got {t}"
+    );
+}
+
 /// A write through a `Box` pointer (`*b = v`) must be seen by a later `*b` read; before
 /// the write arm existed the read returned the value the box held at `new` (a stale read,
 /// so `ensures: ret == 0` was a false proof).
