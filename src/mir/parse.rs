@@ -2709,7 +2709,7 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
     // assert rather than guessing an alignment.
     if let Some(inner) = t.strip_prefix("AlignOf(").and_then(|r| r.strip_suffix(')')) {
         if let Some(w) = Ty::parse(inner.trim()).width() {
-            let bytes = (w + 7) / 8;
+            let bytes = w.div_ceil(8);
             if bytes > 0 {
                 return Rvalue::Use(Operand::Const(Const::UInt(u128::from(bytes), Some(Ty::U64))));
             }
