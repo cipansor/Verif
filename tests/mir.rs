@@ -13044,6 +13044,29 @@ fn an_iterator_can_be_taken() {
     );
 }
 
+/// C11 iteration: `Iterator::fold(init, f)` folds a modelled reducer closure
+/// (`|acc, x| acc <op> x`, checked or `wrapping_*`). The checked reducer raises a
+/// panic obligation per step; the tripwire's unguarded fold can overflow.
+#[test]
+fn an_iterator_can_be_folded_with_a_closure() {
+    let names = [
+        "array_iter_fold_sum",
+        "array_iter_fold_wrapping",
+        "array_iter_fold_from_one",
+        "array_iter_fold_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in ["array_iter_fold_sum", "array_iter_fold_wrapping", "array_iter_fold_from_one"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let o = outcome(&report, "array_iter_fold_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`array_iter_fold_tripwire` folds unguarded and must be refuted, got: {o}"
+    );
+}
+
 /// C11 containers: `Vec::clear`/`String::clear` reset the tracked length to zero,
 /// and the tripwire that claims the pre-clear length is refuted.
 #[test]

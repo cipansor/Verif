@@ -14398,6 +14398,48 @@ pub fn array_iter_take_sum(xs: &[u8; 4]) -> u8 {
     xs.iter().copied().take(2).sum()
 }
 
+spec! {
+    requires: xs[0] <= 60,
+    requires: xs[1] <= 60,
+    requires: xs[2] <= 60,
+    requires: xs[3] <= 60,
+    ensures: ret == xs[0] + xs[1] + xs[2] + xs[3],
+}
+/// `fold(0, |a, x| a + x)` is a checked sum over the cursor's elements.
+pub fn array_iter_fold_sum(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().fold(0u8, |a, x| a + x)
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[0].wrapping_add(xs[1]).wrapping_add(xs[2]).wrapping_add(xs[3]),
+}
+/// A `wrapping_add` reducer has no overflow obligation and wraps exactly.
+pub fn array_iter_fold_wrapping(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().fold(0u8, |a, x| a.wrapping_add(x))
+}
+
+spec! {
+    requires: xs[0] <= 60,
+    requires: xs[1] <= 60,
+    requires: xs[2] <= 60,
+    requires: xs[3] <= 60,
+    ensures: ret == xs[0] + xs[1] + xs[2] + xs[3] + 1,
+}
+/// A non-zero initial accumulator is folded in first.
+pub fn array_iter_fold_from_one(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().fold(1u8, |a, x| a + x)
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
+/// An unguarded checked fold can overflow, so this false claim must be refuted.
+pub fn array_iter_fold_tripwire(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().fold(0u8, |a, x| a + x)
+}
+
 // ---------------------------------------------------------------------------
 // A scalar reference argument named in a contract (C9)
 //

@@ -400,6 +400,8 @@ pub enum Intrinsic {
     SliceStepBy,
     /// `Iterator::take(n)` on a cursor: caps the effective end at `pos + n`.
     SliceTake,
+    /// `Iterator::fold(init, f)` on a cursor: folds a modelled reducer closure.
+    SliceFold,
     /// `Iterator::count` on a slice/array cursor: `len - pos`.
     ///
     /// The cursor is a concrete position, so the remaining count is the length
@@ -1565,6 +1567,9 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if short == "take" && names_slice_iter_ty(name) {
         return Some(Intrinsic::SliceTake);
     }
+    if short == "fold" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceFold);
+    }
     if short == "count" && names_slice_iter_ty(name) {
         return Some(Intrinsic::SliceCount);
     }
@@ -2388,6 +2393,7 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         | Intrinsic::SliceSkip
         | Intrinsic::SliceStepBy
         | Intrinsic::SliceTake
+        | Intrinsic::SliceFold
         | Intrinsic::SliceCount
         | Intrinsic::SliceSum
         | Intrinsic::SliceIterLast
@@ -2632,6 +2638,7 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             | Intrinsic::SliceSkip
             | Intrinsic::SliceStepBy
             | Intrinsic::SliceTake
+            | Intrinsic::SliceFold
             | Intrinsic::SliceCount
             | Intrinsic::SliceSum
             | Intrinsic::SliceIterLast
@@ -2706,6 +2713,7 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         | Intrinsic::SliceSkip
         | Intrinsic::SliceStepBy
         | Intrinsic::SliceTake
+        | Intrinsic::SliceFold
         | Intrinsic::SliceCount
         | Intrinsic::SliceSum
         | Intrinsic::SliceIterLast
@@ -6542,6 +6550,10 @@ mod tests {
         assert_eq!(
             classify("<std::iter::Take<std::slice::Iter<'_, u8>> as Iterator>::last"),
             Some(Intrinsic::SliceIterLast)
+        );
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::fold"),
+            Some(Intrinsic::SliceFold)
         );
         assert_eq!(
             classify("<std::slice::Iter<'_, u8> as Iterator>::count"),

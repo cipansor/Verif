@@ -5761,6 +5761,9 @@ struct IterCall<'a> {
     path: Pred,
     /// The call's full argument list, so `nth(k)` can read its constant offset.
     args: &'a [Operand],
+    /// The whole program, so a `fold`'s reducer closure can be resolved to its
+    /// `MirFn` (a closure body is a separate function in the dump).
+    prog: &'a MirProgram,
 }
 
 /// Model `for x in xs` over a slice: `into_iter`/`iter` starts a cursor, `next`
@@ -5777,6 +5780,80 @@ struct IterCall<'a> {
 ///
 /// `copied` is the identity on the cursor; `count` is `len - pos`; `sum` folds the
 /// remaining elements with a checked `+` (see [`slice_sum`]).
+/// Resolve a `fold`'s reducer operand to the `MirFn` it names.
+///
+/// A non-capturing closure prints as `const ZeroSized: {closure@FILE:L:C: L:C}`,
+/// so it is matched to the `MirFn` whose first argument type is exactly that
+/// closure type (rustc prints the closure's own `&mut {closure@…}` argument with
+/// the same string). A function item prints as a bare name and is matched on its
+/// tail. An ambiguous or unrecognised operand is refused -- a wrong reducer is a
+/// wrong value.
+fn closure_fn<'a>(prog: &'a MirProgram, arg: Option<&Operand>) -> Option<&'a MirFn> {
+    let Operand::Const(Const::Other(s)) = arg? else {
+        return None;
+    };
+    if let Some(rest) = s.split("ZeroSized: {closure@").nth(1) {
+        let ty = format!("{{closure@{rest}");
+        return prog.fns.iter().find(|f| {
+            f.arg_locals
+                .first()
+                .and_then(|&l| f.ty_of(l))
+                .is_some_and(|t| match t {
+                    Ty::Ref(inner) => matches!(**inner, Ty::Other(ref o) if *o == ty),
+                    Ty::Other(o) => *o == ty,
+                    _ => false,
+                })
+        });
+    }
+    let tail = s.rsplit("::").next().unwrap_or(s.as_str());
+    let mut hits = prog
+        .fns
+        .iter()
+        .filter(|f| f.name == *s || f.name.rsplit("::").next() == Some(tail));
+    let first = hits.next()?;
+    // Refuse an ambiguous tail rather than pick one.
+    if hits.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
+/// The reducer a `fold` closure denotes: `(op, checked)` for `|acc, x| acc <op> x`.
+/// Only a checked binary op (with its overflow `assert`) or a `wrapping_*` call on
+/// `(_2, _3)` in that order is accepted; anything else is refused.
+fn closure_binop(f: &MirFn) -> Option<(BinOp, bool)> {
+    if f.arg_locals.len() != 3 {
+        return None;
+    }
+    let (acc, x) = (f.arg_locals[1], f.arg_locals[2]);
+    let is_arg = |o: &Operand, l: u32| {
+        matches!(o, Operand::Copy(p) | Operand::Move(p) if p.local == l && p.proj.is_empty())
+    };
+    for b in &f.blocks {
+        for st in &b.stmts {
+            if let Stmt::Assign(_, Rvalue::CheckedBinary(op, a, c)) = st {
+                if is_arg(a, acc) && is_arg(c, x) {
+                    return Some((*op, true));
+                }
+            }
+        }
+        if let Term::Call { callee: Callee::Name(n), args, .. } = &b.term {
+            if let (Some(a), Some(c)) = (args.first(), args.get(1)) {
+                if is_arg(a, acc) && is_arg(c, x) {
+                    let op = match n.rsplit("::").next().unwrap_or(n.as_str()) {
+                        "wrapping_add" => BinOp::Add,
+                        "wrapping_sub" => BinOp::Sub,
+                        "wrapping_mul" => BinOp::Mul,
+                        _ => continue,
+                    };
+                    return Some((op, false));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn slice_iter(
     name: &str,
     op: intrinsics::Intrinsic,
@@ -5864,6 +5941,67 @@ fn slice_iter(
             let end = Some(it.end.map_or(cap, |e| e.min(cap)));
             env.iters.insert(dest.local, IterState { end, ..it });
             Ok(Vec::new())
+        }
+        // `fold(init, f)` folds a modelled reducer closure over the cursor:
+        // `acc = init; acc = f(acc, x)` per element. A *checked* reducer raises a
+        // reachable-panic obligation per step (exactly as `sum` does for `+`); a
+        // `wrapping_*` reducer does not. Needs a constant length (a fixed addend
+        // count) and a constant `init`.
+        Intrinsic::SliceFold => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            let Some(s) = env.indexed.get(&it.base) else {
+                return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+            };
+            let (elem_w, elem_signed) = (s.elem_w, s.elem_signed);
+            let Some(n) = iterator_const_len(s, cx.pins) else {
+                return Err(format!(
+                    "`{name}` over a slice whose length is not a constant (write \
+                     `requires: <slice>.len() == N`)"
+                ));
+            };
+            if n > MAX_SUM_LEN {
+                return Err(format!("`{name}` over {n} elements is past the {MAX_SUM_LEN}-element limit"));
+            }
+            let hi = it.end.map_or(n, |e| e.min(n));
+            let Some(init) = constant_operand(cx.args.get(1), env) else {
+                return Err(format!("`{name}` needs a constant initial accumulator"));
+            };
+            let Some(closure) = closure_fn(cx.prog, cx.args.get(2)) else {
+                return Err(format!("`{name}` over a reducer closure that is not modelled"));
+            };
+            let Some((op, checked)) = closure_binop(closure) else {
+                return Err(format!("`{name}` over a reducer closure this frontend does not model"));
+            };
+            let sign = Sign::of_bool(elem_signed);
+            let mut acc = smt::word(init, elem_w);
+            let mut obligations = Vec::new();
+            let mut k = it.pos;
+            while k < hi {
+                let Some((elem, _)) = env.index_elem(it.base, k) else {
+                    return Err(format!("`{name}` on an iterator whose elements are not modelled"));
+                };
+                if checked {
+                    let Some(over) = overflow_pred(op, Val::Sym(acc, sign), Val::Sym(elem, sign), elem_w)
+                    else {
+                        return Err(format!("`{name}` overflow predicate is not modelled"));
+                    };
+                    obligations.push(Obligation {
+                        kind: ObligationKind::Panic { message: format!("`{name}` closure overflows") },
+                        verdict: find_obligation(smt::and(cx.path, over), cx.pins),
+                    });
+                }
+                let Val::Sym(v, _) = eval_binary(op, Val::Sym(acc, sign), Val::Sym(elem, sign), Some(elem_w))
+                else {
+                    return Err(format!("`{name}` closure step is not modelled"));
+                };
+                acc = v;
+                k += it.step;
+            }
+            env.set(dest, Val::Sym(acc, sign));
+            env.iters.remove(&recv.local);
+            Ok(obligations)
         }
         Intrinsic::SliceNext => {
             let Some(it) = env.iters.get(&recv.local).copied() else {
@@ -7014,6 +7152,7 @@ fn try_intrinsic(
                 | intrinsics::Intrinsic::SliceSkip
                 | intrinsics::Intrinsic::SliceStepBy
                 | intrinsics::Intrinsic::SliceTake
+                | intrinsics::Intrinsic::SliceFold
                 | intrinsics::Intrinsic::SliceCount
                 | intrinsics::Intrinsic::SliceSum
                 | intrinsics::Intrinsic::SliceIterLast
@@ -7147,6 +7286,7 @@ fn try_intrinsic(
             | intrinsics::Intrinsic::SliceSkip
             | intrinsics::Intrinsic::SliceStepBy
             | intrinsics::Intrinsic::SliceTake
+            | intrinsics::Intrinsic::SliceFold
             | intrinsics::Intrinsic::SliceCount
             | intrinsics::Intrinsic::SliceSum
             | intrinsics::Intrinsic::SliceIterLast
@@ -7163,7 +7303,7 @@ fn try_intrinsic(
             p,
             dest,
             env,
-            &IterCall { f: cur, pins, path, args },
+            &IterCall { f: cur, pins, path, args, prog },
         ));
     }
     // The standard library's `Option`/`Result` methods. The receiver is an

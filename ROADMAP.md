@@ -1181,6 +1181,20 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     pins the classification without a toolchain. Measured after all three adapter
     increments (rev, skip/step_by, take): `realistic.rs` **685 of 1237**.
 
+  - Progress (**`fold` with a reducer closure**): `Iterator::fold(init, f)` folds a
+    modelled reducer closure. A non-capturing closure prints as
+    `const ZeroSized: {closure@FILE:L:C: L:C}`, so `closure_fn` resolves it to the
+    `MirFn` whose first argument type is exactly that closure type (a function
+    item is matched on its tail, and an ambiguous tail is refused). `closure_binop`
+    reads the reducer shape `|acc, x| acc <op> x` -- a *checked* `Add`/`Sub`/`Mul`
+    (with its overflow `assert`, so the fold raises a reachable-panic obligation
+    per step, exactly as `sum` does for `+`) or a `wrapping_*` call (no
+    obligation). Needs a constant length and a constant `init`. Anything else is
+    refused, because a wrong reducer is a wrong value.
+    `tests/mir.rs::an_iterator_can_be_folded_with_a_closure` pins three verified
+    (checked sum, `wrapping_add`, a non-zero init) and one refuted tripwire (an
+    unguarded fold overflows), and `mir::intrinsics` pins the classification.
+
   - Progress (**`enumerate`**): `Iterator::enumerate` is a cursor identity whose
     `next` yields `Option<(usize, &T)>`. `next` writes the concrete index and the
     element into the tuple store and sets the payload to an aggregate, so the
