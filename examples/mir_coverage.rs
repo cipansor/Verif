@@ -28,8 +28,9 @@
 //! measured without editing this file. A second argument names one function to
 //! measure on its own, which is what makes a slow shape attributable: the
 //! engine has a size budget, not a time budget, so a shape can take a long time
-//! without ever answering `Unknown`, and the per-function elapsed time is the
-//! evidence for where that time goes.
+//! without ever answering `Unknown`. A single named target is timed on its own, so
+//! its elapsed time is the evidence for where that time goes; a full run reports
+//! one batch time and a numerator and denominator drawn from the same inventory.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -84,7 +85,11 @@ fn main() {
     names.dedup();
 
     println!("# {target} ({edition})");
-    println!("{:<22} {:<12} {:>9}  detail", "function", "outcome", "elapsed");
+    if only.is_none() {
+        println!("{:<22} {:<12}  detail", "function", "outcome");
+    } else {
+        println!("{:<22} {:<12} {:>9}  detail", "function", "outcome", "elapsed");
+    }
     let mut decided = 0usize;
     // With a filter, hand the *whole* requested name to the driver once. The list
     // above holds bare tails, but a method whose tail is shared is *reported* as
@@ -96,32 +101,53 @@ fn main() {
         Some(want) => vec![want.clone()],
         None => names.clone(),
     };
-    // One pass over the selected names: `verify_mir_text` deduplicates by MIR definition
-    // identity, so a bare name and its module-qualified spelling that both select the
-    // same definition are counted once, while two distinct same-named methods are both
-    // kept. Selecting per name would count a shared definition once per call.
-    let started = Instant::now();
-    match verify::verify_mir_text(&mir, &specs, &selected) {
-        Ok(report) => {
-            let elapsed = started.elapsed();
-            for (fname, outcome) in &report.outcomes {
-                let (label, detail) = describe(outcome);
-                if label == "verified" {
-                    decided += 1;
+    let mut total = 0usize;
+    match &only {
+        // One named target: its own call, so the row's elapsed time is that function's
+        // -- the attribution path for a slow shape.
+        Some(want) => {
+            let started = Instant::now();
+            match verify::verify_mir_text(&mir, &specs, std::slice::from_ref(want)) {
+                Ok(report) => {
+                    let elapsed = started.elapsed();
+                    total = report.outcomes.len();
+                    for (fname, outcome) in &report.outcomes {
+                        let (label, detail) = describe(outcome);
+                        if label == "verified" {
+                            decided += 1;
+                        }
+                        let short: String = detail.chars().take(72).collect();
+                        println!("{fname:<22} {label:<12} {:>8.2}s  {short}", elapsed.as_secs_f64());
+                    }
                 }
-                // Truncate on a char boundary, not a byte offset: a counterexample
-                // can contain a multi-byte character and slicing blind would panic.
-                let short: String = detail.chars().take(72).collect();
-                println!("{fname:<22} {label:<12} {:>8.2}s  {short}", elapsed.as_secs_f64());
+                Err(e) => println!("{want:<22} {:<12} driver error: {e}", "error", "-"),
             }
         }
-        Err(e) => println!("{:<22} {:<12} {:>9}  driver error: {e}", "error", "-", "-"),
+        // Full corpus: one pass so a definition selected by two names is counted once,
+        // and the numerator and denominator come from the SAME inventory (the report),
+        // so an inherited-only corpus cannot print `decided N of 0`.
+        None => {
+            let started = Instant::now();
+            match verify::verify_mir_text(&mir, &specs, &selected) {
+                Ok(report) => {
+                    total = report.outcomes.len();
+                    for (fname, outcome) in &report.outcomes {
+                        let (label, detail) = describe(outcome);
+                        if label == "verified" {
+                            decided += 1;
+                        }
+                        // Truncate on a char boundary, not a byte offset: a counterexample
+                        // can contain a multi-byte character and slicing blind would panic.
+                        let short: String = detail.chars().take(72).collect();
+                        println!("{fname:<22} {label:<12}  {short}");
+                    }
+                }
+                Err(e) => println!("error        driver error: {e}"),
+            }
+            println!("\nelapsed {:.2}s", started.elapsed().as_secs_f64());
+        }
     }
     if only.is_none() {
-        // Every free function and every method is one outcome, so the
-        // denominator is their sum -- a shared method tail is deduplicated for
-        // display but is still two outcomes.
-        let total = specs.by_fn.len() + specs.by_method.len();
         println!("\ndecided {decided} of {total}");
     }
 }

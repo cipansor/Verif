@@ -15047,8 +15047,10 @@ fn a_same_named_method_in_two_same_basename_files_is_paired_by_file() {
     // its own contract and body; a body swap or a contract swap makes BOTH fail.
     let a = report.outcomes.iter().find(|(k, _)| k.contains("A::")).map(|(_, o)| o);
     let b = report.outcomes.iter().find(|(k, _)| k.contains("B::")).map(|(_, o)| o);
-    assert!(matches!(a, Some(FnOutcome::Verified { .. })), "A::f (ret==1 body 1) must verify; outcomes {:?}", report.outcomes);
-    assert!(matches!(b, Some(FnOutcome::Verified { .. })), "B::f (ret==2 body 2) must verify; a swap breaks both; outcomes {:?}", report.outcomes);
+    // `Verified { obligations: 0 }` means a dropped contract, which also reads as
+    // success -- so require a non-zero obligation count, not merely `Verified`.
+    assert!(matches!(a, Some(FnOutcome::Verified { obligations, .. }) if *obligations > 0), "A::f (ret==1 body 1) must verify with a real obligation; outcomes {:?}", report.outcomes);
+    assert!(matches!(b, Some(FnOutcome::Verified { obligations, .. }) if *obligations > 0), "B::f (ret==2 body 2) must verify with a real obligation; a swap breaks both; outcomes {:?}", report.outcomes);
     // A third method with a FALSE contract (ret==9 on a body of 1) must be refuted, so
     // the test cannot pass on two empty `Verified { obligations: 0 }` rows.
     let c = report.outcomes.iter().find(|(k, _)| k.contains("C::")).map(|(_, o)| o);
