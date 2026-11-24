@@ -15192,3 +15192,42 @@ fn the_second_review_duplicate_and_const_len_findings_are_refused() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+#[test]
+fn a_reexported_trait_contract_across_inclusions_is_refused_not_verified() {
+    // One `shared.rs` included by two modules; it does `pub use super::T;` and
+    // `impl self::T for Shared`. `qualify_trait` cannot follow the re-export, so the two
+    // inclusions resolve `self::T` to two *unresolved* paths. The inherited contract
+    // cannot be known to agree, so the shared impl must be REFUSED (never Verified), not
+    // checked against an arbitrary trait's postcondition (here a violating ret==7 against
+    // the re-exported T::value == 9). Control: the direct impl satisfies the contract.
+    let Some(rustc) = rustc() else { return };
+    let dir = std::env::temp_dir().join(format!("verif-reexport-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lib.rs"), concat!(
+        "pub trait T {\n    /// ensures: ret == 9\n    fn value(&self) -> u8;\n}\n",
+        "pub struct Direct;\nimpl T for Direct { fn value(&self) -> u8 { 9 } }\n",
+        "#[cfg(unix)]\n#[path = \"shared.rs\"]\npub mod disabled;\n",
+        "#[cfg(not(unix))]\n#[path = \"shared.rs\"]\npub mod active;\n",
+    )).unwrap();
+    std::fs::write(dir.join("shared.rs"), concat!(
+        "pub use super::T;\n",
+        "pub struct Shared;\n",
+        "impl self::T for Shared {\n",
+        "    /// ensures: ret == 7\n",
+        "    fn value(&self) -> u8 { 7 }\n",
+        "}\n",
+    )).unwrap();
+    let rep = verify::verify_file_with_opts(&rustc, &dir.join("lib.rs"), &[], &probe_opts()).expect("verify");
+    let _ = std::fs::remove_dir_all(&dir);
+    let shared = rep
+        .outcomes
+        .iter()
+        .find(|(n, _)| n.contains("Shared") && n.ends_with("::value"))
+        .map(|(_, o)| o);
+    assert!(shared.is_some(), "the shared impl must be reported; outcomes {:?}", rep.outcomes);
+    assert!(
+        !matches!(shared, Some(FnOutcome::Verified { .. })),
+        "a re-exported-trait shared impl must be refused, never Verified; got {shared:?}"
+    );
+}

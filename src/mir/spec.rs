@@ -762,28 +762,42 @@ impl Specs {
             return false;
         };
         let w = std::path::Path::new(file);
-        // The inherited-contract *identity* per exact snapshot line, using the same
-        // trait-key normalisation as `trait_contract`. Two absent inherited contracts
-        // (no declaring trait, or a `#[cfg]`-disabled duplicate of an uncontracted
-        // method) are EQUAL -- not ambiguous -- so an explicit contract on the method is
-        // still applied. Only differing identities (one inherits a contract another does
-        // not, or a different declaration) are refused.
-        let keys: Vec<Option<String>> = self
-            .line_map
-            .iter()
-            .enumerate()
-            .filter(|(_, (fl, l))| *l == orig_line && same_file_exact(fl.as_path(), w))
-            .map(|(i, _)| {
-                self.impl_traits
-                    .get(&(i + 1, col))
-                    .map(|tr| {
-                        let tr = tr.strip_prefix("crate::").unwrap_or(tr);
-                        format!("{tr}::{tail}")
-                    })
-                    .filter(|k| self.by_trait.contains_key(k.as_str()))
-            })
-            .collect();
-        keys.len() >= 2 && keys.windows(2).any(|w| w[0] != w[1])
+        // The trait path each exact inclusion resolves to, and (for a *known* declaration)
+        // that declaration's contract key for this method. `known` = the scanner read a
+        // trait at that path (or it is a std/core trait); a path the scanner could NOT
+        // resolve -- a `pub use` re-export it does not follow, say -- is *unknown*, and
+        // two unknown paths cannot be assumed to impose the same contract.
+        let mut paths: Vec<&str> = Vec::new();
+        let mut keys: Vec<Option<String>> = Vec::new();
+        let mut any_unresolved = false;
+        for (i, (fl, l)) in self.line_map.iter().enumerate() {
+            if *l != orig_line || !same_file_exact(fl.as_path(), w) {
+                continue;
+            }
+            let Some(tr) = self.impl_traits.get(&(i + 1, col)) else {
+                continue;
+            };
+            let tr = tr.strip_prefix("crate::").unwrap_or(tr);
+            paths.push(tr);
+            let known = self.declared_traits.contains(tr)
+                || tr.starts_with("std::")
+                || tr.starts_with("core::");
+            any_unresolved |= !known;
+            let key = format!("{tr}::{tail}");
+            keys.push(self.by_trait.contains_key(&key).then_some(key));
+        }
+        if paths.len() < 2 {
+            return false;
+        }
+        if paths.iter().all(|p| *p == paths[0]) {
+            // One trait reached through more than one inclusion: identical contract.
+            return false;
+        }
+        // Paths differ. An *unresolved* path means we cannot know the contracts agree, so
+        // refuse (the safe direction) rather than apply an arbitrary one. If every path is
+        // a known declaration, refuse only when the contract they impose differs (one
+        // declares a contract for this method and the other does not).
+        any_unresolved || keys.windows(2).any(|w| w[0] != w[1])
     }
 
     /// The contract for one *body* in the dump, with the argument-name alignment the
