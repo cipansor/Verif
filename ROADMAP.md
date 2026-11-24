@@ -1848,6 +1848,17 @@ build-script forwarding, custom source path, action ref, literal-masking replay 
   `map().next()`, `all()` then `next()`, `rev().sum()`. `#[path]` on an external `mod` is now honoured;
   a method contract in an external module is a visible `missing` (a lost proof, never a false proof);
   `iterator_chain_differential_agrees_with_rustc` checks every `Verified` chain against real execution.
+- **Round 25 (round-24 re-review):** re-probed every finding with the reviewer's *exact*
+  shapes. Most were already refused (`Incomplete`: compound closures, `Vec::clear` on drop
+  glue, a Box write, `filter().next()`, `enumerate().map`, `skip.take.rev.last()`, `rev().sum()`;
+  `take.rev().all` and `filter().count()` are correct). Two were real false proofs and are now
+  refused: `take(k).rev().skip(1).rev()` (read `xs[1]` = 20 vs real 10; `rev()` refuses when
+  `pos > 0`) and `v.push(1); v = w` (a rebound `&mut Vec` read the entry length; the length is
+  now refused when any Vec arg is rebound). Multi-file: a one-line `#[path]` (closing `]`), a
+  `#[path]` relative to its source file, and a file shared by two `#[path]` modules are fixed.
+  The differential harness now also submits a FALSE postcondition. Still open (documented): the
+  inlining line-map (a multi-file method is a visible `missing`), `--emit-test` for a
+  module-qualified function, nested Cargo wrappers, and SARIF per-file paths.
 - Executor/iterator: `iterator_const_len` pin reuse; cross-adapter chains (`rev().step_by()`, …).
   **Same-adapter chaining is verified composing** (round 20): `take` by `min`, `skip`
   additively, `step_by` multiplicatively -- `take(2).take(3)` yields 2, not 3 -- pinned by
