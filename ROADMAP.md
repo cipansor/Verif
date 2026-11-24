@@ -19,8 +19,8 @@ output decides the number, so the table is a measurement rather than a claim:
 | Corpus | Command | Verified / total |
 |---|---|---|
 | `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 18 / 33 |
-| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 630 / 1148 |
-| `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **18 / 21 (86%)** |
+| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 694 / 1252 |
+| `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **21 / 24 (87%)** |
 
 This table is the *current* measurement and is the only number to quote. The
 `N of M` figures inside the per-item progress notes below are the value *at the
