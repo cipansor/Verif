@@ -2336,7 +2336,7 @@ fn path_attr(line: &str) -> Option<String> {
     if let Some(after_r) = rest.strip_prefix('r') {
         let hashes = after_r.chars().take_while(|c| *c == '#').count();
         let body = after_r[hashes..].strip_prefix('"')?;
-        let end: String = std::iter::once('"').chain(std::iter::repeat('#').take(hashes)).collect();
+        let end: String = std::iter::once('"').chain(std::iter::repeat_n('#', hashes)).collect();
         let idx = body.find(&end)?;
         return Some(body[..idx].to_string());
     }
