@@ -15037,13 +15037,15 @@ fn a_same_named_method_in_two_same_basename_files_is_paired_by_file() {
     std::fs::write(dir.join("a.rs"), "pub mod m;\n").unwrap();
     std::fs::write(dir.join("b.rs"), "pub mod m;\n").unwrap();
     std::fs::write(dir.join("a/m.rs"), "pub struct A;\nimpl A {\n    /// ensures: ret == 1\n    pub fn f(&self) -> u8 { 1 }\n}\n").unwrap();
-    std::fs::write(dir.join("b/m.rs"), "pub struct B;\nimpl B {\n    /// ensures: ret == 2\n    pub fn f(&self) -> u8 { 1 }\n}\n").unwrap();
+    std::fs::write(dir.join("b/m.rs"), "pub struct B;\nimpl B {\n    /// ensures: ret == 1\n    pub fn f(&self) -> u8 { 9 }\n}\n").unwrap();
     let report = verify::verify_file_with_opts(&rustc, &dir.join("lib.rs"), &[], &probe_opts()).expect("frontend");
     let _ = std::fs::remove_dir_all(&dir);
-    let verified = report.outcomes.iter().filter(|(_, o)| matches!(o, FnOutcome::Verified { .. })).count();
-    let failed = report.outcomes.iter().filter(|(_, o)| matches!(o, FnOutcome::Failed { .. })).count();
-    assert_eq!(verified, 1, "exactly one `f` (a::m, ret==1 body 1) must verify; outcomes {:?}", report.outcomes);
-    assert_eq!(failed, 1, "exactly one `f` (b::m, ret==2 body 1) must be refuted; outcomes {:?}", report.outcomes);
+    // A::f (body 1, ret==1) must verify; B::f (body 9, ret==1) must be refuted. Asserting
+    // per method, not a total, so a swap (A gets B's body or vice versa) is caught.
+    let a = report.outcomes.iter().find(|(k, _)| k.contains("A::")).map(|(_, o)| o);
+    let b = report.outcomes.iter().find(|(k, _)| k.contains("B::")).map(|(_, o)| o);
+    assert!(matches!(a, Some(FnOutcome::Verified { .. })), "A::f (ret==1 body 1) must verify; outcomes {:?}", report.outcomes);
+    assert!(matches!(b, Some(FnOutcome::Failed { .. })), "B::f (ret==1 body 9) must be refuted; outcomes {:?}", report.outcomes);
 }
 
 #[test]

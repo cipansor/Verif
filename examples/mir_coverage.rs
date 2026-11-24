@@ -69,7 +69,10 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let specs = spec::extract(&source);
+    // File-aware: the driver compiles the whole crate, so the specs must carry each
+    // module's file too, or a cfg-disabled root method could pair with a module body at
+    // the same coordinates. `extract_crate` gives `original_loc` a file for every impl.
+    let specs = spec::extract_crate(&src, &source);
 
     // Order by name so the output is diffable between runs. Methods are listed by
     // their bare tail, like free functions, because that is what a reader looks
