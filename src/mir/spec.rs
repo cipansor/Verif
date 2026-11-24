@@ -488,11 +488,16 @@ impl Specs {
     /// The exact or suffix `by_fn` key `name` resolves to *if* it was declared twice
     /// (a `#[cfg]`-alternative). `None` when the name is unambiguous.
     fn ambiguous_key<'a>(&'a self, name: &str) -> Option<&'a str> {
-        // An exact `by_fn` key wins: only *it* can be ambiguous. Falling through to the
-        // suffix loop for an exact match would let an unrelated ambiguous key (e.g.
-        // `platform::f`) refuse a crate-root `f` whose own contract is unambiguous.
+        // A *bare* MIR name cannot tell a crate-root `f` from a `#[cfg]`-alternative
+        // module's `platform::f` that rustc shortened to `f` (it shortens when the module
+        // fn is the only compiled one). So ANY ambiguous key whose `::`-tail is `name`
+        // makes `name` unidentifiable -- refuse it, exact match or not. Refusing a
+        // genuinely separate crate-root `f` is a safe lost proof; pairing it with the
+        // wrong body (an active `platform::f` shortened to `f`) would be a false proof.
         if let Some((k, _)) = self.by_fn.get_key_value(name) {
-            return self.ambiguous.contains(k).then_some(k.as_str());
+            if self.ambiguous.contains(k) {
+                return Some(k);
+            }
         }
         self.by_fn
             .keys()
@@ -2072,89 +2077,79 @@ pub fn extract_crate(root: &Path, root_src: &str) -> Specs {
 /// or `}` inside them does not miscount. `in_block` carries an open `/* */` across lines.
 /// Char literals are not tracked: a `{`/`}` inside one is rare and would only shift the
 /// inliner's file-scope heuristic, never a verdict on a body that parses.
-fn brace_delta(line: &str, in_block: &mut bool) -> i32 {
-    let b = line.as_bytes();
-    let mut d = 0i32;
-    let mut i = 0;
-    let mut in_str = false;
-    while i < b.len() {
-        let c = b[i];
-        if *in_block {
-            if c == b'*' && i + 1 < b.len() && b[i + 1] == b'/' { *in_block = false; i += 2; continue; }
-            i += 1; continue;
-        }
-        if in_str {
-            if c == b'\\' { i += 2; continue; }
-            if c == b'"' { in_str = false; }
-            i += 1; continue;
-        }
-        if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' { break; }
-        if c == b'/' && i + 1 < b.len() && b[i + 1] == b'*' { *in_block = true; i += 2; continue; }
-        if c == b'"' { in_str = true; }
-        else if c == b'{' { d += 1; }
-        else if c == b'}' { d -= 1; }
-        i += 1;
-    }
-    d
+/// The net brace depth change of a *masked* code line (see [`code_of_line`]): strings and
+/// comments are already spaces, so only real code braces are counted.
+fn brace_delta_code(code: &str) -> i32 {
+    code.bytes().fold(0, |d, c| match c {
+        b'{' => d + 1,
+        b'}' => d - 1,
+        _ => d,
+    })
 }
 
 fn inline_external_modules(src: &str, src_dir: &Path, child_dir: &Path, seen: &mut Vec<PathBuf>) -> String {
     let lines: Vec<&str> = src.lines().collect();
+    // Mask every line with the carried lexer, recording the lexical state at each line's
+    // start. A `{`/`}` or a `mod`/`#[path]` inside a multiline string or a (multiline)
+    // comment is therefore not mistaken for code -- which would mis-track brace depth and
+    // skip later modules (their contracts then go unchecked) or resurrect a module hidden
+    // inside a comment (its contract paired with an unrelated body).
+    let mut lex = Lex { block: 0, lit: Lit::None };
+    let mut starts: Vec<(i32, Lit)> = Vec::with_capacity(lines.len());
+    let mut codes: Vec<String> = Vec::with_capacity(lines.len());
+    for line in &lines {
+        starts.push((lex.block, lex.lit));
+        codes.push(code_of_line(line, &mut lex));
+    }
     let mut out = String::new();
     let mut i = 0;
     let mut depth = 0i32;
-    let mut in_block = false;
     while i < lines.len() {
         let line = lines[i];
-        // Only a *file-scope* item (brace depth 0) is inlined: a `#[path]`/`mod` inside an
-        // inline `mod { … }` resolves relative to that module's own directory in Rust,
-        // which this scanner does not track -- reading it from the enclosing directory
-        // would attach a sibling file's contract (a false proof). Depth, not indentation,
-        // is the scope signal: an indented file-scope `#[path]` above an unindented `mod`
-        // is still file scope, and dropping it to read the conventional file is wrong.
-        let at_file_scope = depth == 0 && !in_block;
+        let code = &codes[i];
+        let (b0, l0) = starts[i];
+        let at_file_scope = depth == 0 && b0 == 0 && matches!(l0, Lit::None);
         if at_file_scope {
-        if let Some(attr_path) = path_attr(line) {
-            // The `mod` may share the attribute's line or follow it.
-            let same_line = path_attr_mod(line);
-            let target = same_line
-                .clone()
-                .or_else(|| lines.get(i + 1).copied().and_then(external_mod));
-            let advance = if same_line.is_some() { 1 } else { 2 };
-            if let Some((vis, name)) = target {
-                // A file-scope `#[path]` resolves relative to the *source file's* directory
-                // (`src_dir`), not the conventional `name/` child directory. The module's
-                // own children then live in that file's directory.
-                let file = src_dir.join(&attr_path);
-                let m_child = file.parent().unwrap_or(src_dir).to_path_buf();
-                match read_and_inline(&file, &m_child, seen) {
-                    Some(body) => out.push_str(&format!("{vis}mod {name} {{\n{body}\n}}\n")),
-                    None => out.push_str(&format!("{vis}mod {name};\n")),
-                }
-                i += advance;
-                continue;
-            }
-            // A `#[path]` with no `mod` is malformed; drop it rather than emit it above
-            // whatever follows.
-            i += 1;
-            continue;
-        }
-        if let Some((vis, name)) = external_mod(line) {
-            // A plain `mod name;` searches the conventional child directory.
-            let candidates = [child_dir.join(format!("{name}.rs")), child_dir.join(&name).join("mod.rs")];
-            if let Some(file) = candidates.iter().find(|p| p.is_file()) {
-                let m_child = child_dir.join(&name);
-                if let Some(body) = read_and_inline(file, &m_child, seen) {
-                    out.push_str(&format!("{vis}mod {name} {{\n{body}\n}}\n"));
-                    i += 1;
+            // `#[path` is code (the lexer masked the string to spaces); detect it by prefix
+            // and read the real path from the *original* line.
+            if code.trim_start().starts_with("#[path") {
+                let attr_path = path_attr(line).expect("path attribute present");
+                let same_line = path_attr_mod(line);
+                let next_mod = if same_line.is_none() && i + 1 < lines.len() && starts[i + 1].0 == 0 && matches!(starts[i + 1].1, Lit::None) {
+                    external_mod(&codes[i + 1])
+                } else {
+                    None
+                };
+                let advance = if same_line.is_some() { 1 } else { 2 };
+                if let Some((vis, name)) = same_line.or(next_mod) {
+                    let file = src_dir.join(&attr_path);
+                    let m_child = file.parent().unwrap_or(src_dir).to_path_buf();
+                    match read_and_inline(&file, &m_child, seen) {
+                        Some(body) => out.push_str(&format!("{vis}mod {name} {{\n{body}\n}}\n")),
+                        None => out.push_str(&format!("{vis}mod {name};\n")),
+                    }
+                    i += advance;
                     continue;
                 }
+                i += 1;
+                continue;
             }
-        }
+            if let Some((vis, name)) = external_mod(code) {
+                let trailing = line.find(';').map(|p| &line[p + 1..]).unwrap_or("");
+                let candidates = [child_dir.join(format!("{name}.rs")), child_dir.join(&name).join("mod.rs")];
+                if let Some(file) = candidates.iter().find(|p| p.is_file()) {
+                    let m_child = child_dir.join(&name);
+                    if let Some(body) = read_and_inline(file, &m_child, seen) {
+                        out.push_str(&format!("{vis}mod {name} {{\n{body}\n}}{trailing}\n"));
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
         }
         out.push_str(line);
         out.push('\n');
-        depth += brace_delta(line, &mut in_block);
+        depth += brace_delta_code(code);
         i += 1;
     }
     out
@@ -9476,16 +9471,55 @@ mod tests {
     }
 
     #[test]
-    fn a_crate_root_contract_is_not_refused_by_an_unrelated_ambiguous_key() {
-        // `platform::f` is ambiguous (a cfg duplicate), but a crate-root `f` is its own
-        // exact, unambiguous contract -- the suffix match against `platform::f` must not
-        // refuse it.
+    fn a_bare_name_is_refused_when_an_ambiguous_key_shares_its_tail() {
+        // A bare MIR `f` cannot be distinguished from a `#[cfg]`-alternative `platform::f`
+        // that rustc shortened to `f`, so it must be refused even when a crate-root `f`
+        // also exists. Refusing a genuinely separate root `f` is a safe lost proof; using
+        // it for the shortened module body would be a false proof.
         let mut s = Specs::default();
         s.by_fn.insert("f".into(), FnContract::default());
         s.by_fn.insert("platform::f".into(), FnContract::default());
         s.ambiguous.insert("platform::f".into());
-        assert!(s.ambiguous_key("f").is_none(), "a crate-root `f` must not be refused by an unrelated ambiguous key");
+        assert_eq!(s.ambiguous_key("f"), Some("platform::f"), "a bare `f` sharing an ambiguous tail must be refused");
         assert_eq!(s.ambiguous_key("platform::f"), Some("platform::f"));
+        // With no ambiguous key, a bare name is not refused.
+        let mut ok = Specs::default();
+        ok.by_fn.insert("f".into(), FnContract::default());
+        assert!(ok.ambiguous_key("f").is_none());
+    }
+
+    #[test]
+    fn a_multiline_string_does_not_hide_a_module_contract() {
+        // A `{` on a continuation line of a multiline string must not raise the brace depth,
+        // which would skip the following module and leave its contract unchecked.
+        let dir = crate_dir("multiline-str");
+        let src = "const BANNER: &str = \"line one\n{\nline three\";\npub mod checks;\n";
+        std::fs::write(dir.join("lib.rs"), src).unwrap();
+        std::fs::write(dir.join("checks.rs"), "spec! { ensures: ret == 2, }\npub fn f() -> u8 { 1 }\n").unwrap();
+        let root = dir.join("lib.rs");
+        let specs = extract_crate(&root, src);
+        assert!(
+            specs.by_fn.keys().any(|k| k.ends_with("checks::f")),
+            "a `{{` inside a multiline string must not hide the module: {:?}",
+            specs.by_fn.keys().collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_module_inside_a_block_comment_is_not_inlined() {
+        // `mod setup; /*` opens a block comment; the `mod legacy;` inside it must not be
+        // inlined (its contract would otherwise be paired with an unrelated body). Tested
+        // on `inline_external_modules` directly so it does not depend on `extract`'s scope
+        // walk.
+        let dir = crate_dir("comment-mod2");
+        std::fs::write(dir.join("setup.rs"), "pub fn s() {}\n").unwrap();
+        std::fs::write(dir.join("legacy.rs"), "pub fn f() {}\n").unwrap();
+        let src = "mod setup; /*\nmod legacy;\n*/\n";
+        let out = inline_external_modules(src, &dir, &dir, &mut Vec::new());
+        assert!(out.contains("mod setup {"), "setup must be inlined: {out}");
+        assert!(!out.contains("mod legacy {"), "legacy (inside a comment) must not be inlined: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A contract written as a `spec! { … }` block is read from the source text,
