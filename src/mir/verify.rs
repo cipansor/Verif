@@ -1633,7 +1633,13 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             // back from the entry value (a false proof for `v.push(1); v = w`).
             for l in ref_len_unknown {
                 if let Some(name) = spec::arg_name_any(f, rename.as_ref(), *l) {
-                    fields.vars.remove(&format!("{name}__len"));
+                    let len_name = format!("{name}__len");
+                    fields.vars.remove(&len_name);
+                    // The refused length must not fall through to a crate constant of the
+                    // same *generated* name (`const out__len = 0`), which would resolve the
+                    // postcondition to the wrong value -- a false proof. Remove it from the
+                    // const table too, so the name is genuinely unbound (refused).
+                    fields.consts.remove(&len_name);
                 }
             }
             // Bind each declared component that this path actually produced.

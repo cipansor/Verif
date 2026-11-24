@@ -6649,10 +6649,20 @@ fn constant_operand(o: Option<&Operand>, env: &Env) -> Option<u64> {
 /// slice whose length the precondition pinned (`requires: xs.len() == N`). `None`
 /// for a symbolic slice length, which `sum`/`max`/`min` refuse.
 fn iterator_const_len(s: &Indexed, pins: &[(u32, u64)]) -> Option<u64> {
-    match s.fixed_len {
-        Some(n) => Some(n),
-        None => pins.iter().find(|(i, _)| *i == smt::index(s.len)).map(|(_, k)| *k),
+    if let Some(n) = s.fixed_len {
+        return Some(n);
     }
+    // A *constant* length -- a `Vec` whose length folds to a literal -- is that value.
+    // `smt::index` on a constant returns its *value*, so looking a pin up by it would
+    // match an unrelated argument's pin (a one-element Vec modeled as empty). Only a
+    // *variable* length (a slice's symbolic length) can carry a pin.
+    if let Some(k) = smt::evaluate(s.len, |_| None) {
+        return Some(k);
+    }
+    if !smt::is_var(s.len) {
+        return None;
+    }
+    pins.iter().find(|(i, _)| *i == smt::index(s.len)).map(|(_, k)| *k)
 }
 
 /// `Iterator::max`/`Iterator::min` over a slice/array cursor: a fold of comparisons
@@ -11415,6 +11425,28 @@ mod tests {
             // refutes it and hands back one of them.
             smt::find_model(smt::ult_const(x, 3))
         })
+    }
+
+    /// `iterator_const_len` reads a *folded* length as its value, not as a pin index.
+    /// A one-element `Vec` (whose length folds to the literal `1`) must be length 1 --
+    /// the old code looked a pin up by `smt::index(1) == 1`, so it borrowed arg-1's pin
+    /// of 0 and modeled the vec as empty (a false proof).
+    #[test]
+    fn iterator_const_len_reads_a_folded_length_not_a_pin() {
+        let ix = Indexed {
+            len: smt::word(1, USIZE_WIDTH),
+            len_mutable: true,
+            elem_w: 8,
+            elem_signed: false,
+            elems: std::collections::BTreeMap::new(),
+            fixed_len: None,
+            slice_steps: None,
+            poisoned: false,
+        };
+        assert_eq!(iterator_const_len(&ix, &[(1, 0)]), Some(1u64), "a folded length of 1 must not borrow arg-1's pin");
+        let sym = Indexed { len: smt::var_named(7, USIZE_WIDTH), ..ix.clone() };
+        assert_eq!(iterator_const_len(&sym, &[(7, 3)]), Some(3u64), "a symbolic length reads its pin");
+        assert_eq!(iterator_const_len(&sym, &[(1, 0)]), None, "a symbolic length ignores an unrelated pin");
     }
 
     /// The signedness a `Val` is *built* with comes from the operand's own type.

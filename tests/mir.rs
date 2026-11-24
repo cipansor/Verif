@@ -15046,6 +15046,14 @@ fn iterator_chain_differential_agrees_with_rustc() {
         assert_eq!(real, *expected, "the differential case's own expected value is wrong for `{body}`");
         let src = format!("{pre}/// ensures: ret == {expected}\npub fn f{i}(xs: &[u8]) -> u8 {{ {body} }}");
         if let Some(o) = verify_src(&format!("f{i}"), &src) {
+            // A true postcondition must not be *refuted* (a false refutation): the
+            // verifier may prove it or refuse it, but a `Failed` on a contract that
+            // holds on every input is a bug the false-postcondition check below cannot
+            // see (it would pass if both clauses were refuted).
+            assert!(
+                !matches!(o, FnOutcome::Failed { .. }),
+                "verifier REFUTED a TRUE postcondition (`{body} == {expected}`, real computes {real})"
+            );
             if o.is_verified() {
                 assert_eq!(real, *expected, "verifier Verified `{body} == {expected}` but rustc computes {real}");
             }
@@ -15060,3 +15068,35 @@ fn iterator_chain_differential_agrees_with_rustc() {
     }
 }
 
+
+
+#[test]
+fn the_second_review_duplicate_and_const_len_findings_are_refused() {
+    let Some(rustc) = rustc() else { return };
+    // #3: a `const out__len` must NOT hijack a *refused* Vec length. Real `out` length
+    // is 1 (one push); the postcondition is refused (Incomplete), never the constant.
+    for (n, e) in [("sr_c3_0", 0u64), ("sr_c3_1", 1u64)] {
+        let src = format!("const out__len: usize = 0;\n/// requires: v.len() == 0 && w.len() == 1 && out.len() == 0\n/// ensures: out.len() == {e}\npub fn {n}<'a>(mut v: &'a mut Vec<u8>, w: &'a mut Vec<u8>, out: &'a mut Vec<u8>) -> u8 {{ v.push(1); v = w; out.push(1); 0 }}");
+        assert!(
+            matches!(verify_src(n, &src), Some(FnOutcome::Incomplete { .. })),
+            "`{n}`: a refused Vec length must not resolve to `const out__len`"
+        );
+    }
+    // #2: two `#[cfg]`-alternative modules sharing a name. Rust compiles one; the
+    // inliner reads both, so the contract is ambiguous -> refused (Skipped), never the
+    // inactive module's claim.
+    let dir = std::env::temp_dir().join(format!("verif-sr-cfg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a_unix.rs"), "spec! { ensures: ret == 1, }\npub fn f() -> u8 { 1 }\n").unwrap();
+    std::fs::write(dir.join("a_other.rs"), "spec! { ensures: ret == 2, }\npub fn f() -> u8 { 2 }\n").unwrap();
+    let lib = dir.join("lib.rs");
+    std::fs::write(&lib, "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n#[cfg(unix)]\n#[path = \"a_unix.rs\"]\npub mod platform;\n#[cfg(not(unix))]\n#[path = \"a_other.rs\"]\npub mod platform;\n").unwrap();
+    let rep = verify::verify_file_with_opts(&rustc, &lib, &[], &probe_opts()).expect("verify");
+    let o = rep.outcomes.iter().find(|(n, _)| n == "platform::f").map(|(_, o)| o);
+    assert!(
+        matches!(o, Some(FnOutcome::Skipped { .. })),
+        "a cfg-alternative duplicate contract must be refused (Skipped), got {o:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

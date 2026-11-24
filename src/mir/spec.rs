@@ -254,6 +254,12 @@ pub struct Specs {
     /// contract, which means "check panic freedom on every input" rather than
     /// "skip it".
     pub by_fn: BTreeMap<String, FnContract>,
+    /// Keys whose contract was declared more than once -- two `#[cfg]`-alternative
+    /// modules that share a name (Rust compiles exactly one; the inliner reads both).
+    /// Such a contract is *refused* by [`Self::contract_for_fn`] rather than silently
+    /// applying the inactive module's claim: reading the inactive one was a false
+    /// proof (a weaker claim) or a false refutation (a stronger one).
+    pub ambiguous: BTreeSet<String>,
     /// The combined source text this `Specs` was read from -- the root file with
     /// every external module inlined. This is the *contract input*, and it is what
     /// the proof cache fingerprints: a module's contract lives here and not in the
@@ -479,6 +485,20 @@ impl Specs {
         self.by_fn.get(name)
     }
 
+    /// The exact or suffix `by_fn` key `name` resolves to *if* it was declared twice
+    /// (a `#[cfg]`-alternative). `None` when the name is unambiguous.
+    fn ambiguous_key<'a>(&'a self, name: &str) -> Option<&'a str> {
+        if let Some((k, _)) = self.by_fn.get_key_value(name) {
+            if self.ambiguous.contains(k) {
+                return Some(k);
+            }
+        }
+        self.by_fn
+            .keys()
+            .find(|k| is_path_suffix(k.as_str(), name) && self.ambiguous.contains(k.as_str()))
+            .map(|s| s.as_str())
+    }
+
     /// The contract for a function whose MIR definition name is `name`.
     ///
     /// The name is rustc's: a free function's path-qualified name (`f`, `a::f`,
@@ -616,6 +636,14 @@ impl Specs {
         f: &crate::mir::parse::MirFn,
     ) -> Result<(Option<&'a FnContract>, Option<ArgRename>), String> {
         let Some(loc) = impl_location(&f.name) else {
+            // A `#[cfg]`-alternative duplicate: refuse rather than apply the inactive
+            // module's contract (a false proof, or a false refutation of the active one).
+            if let Some(key) = self.ambiguous_key(&f.name) {
+                return Err(format!(
+                    "the contract for `{key}` is declared by two `#[cfg]`-alternative \
+                     modules; refusing rather than apply the inactive one"
+                ));
+            }
             return Ok((self.resolve(&f.name), None));
         };
         let Some(tail) = f.name.rsplit("::").next() else {
@@ -2045,6 +2073,13 @@ fn inline_external_modules(src: &str, src_dir: &Path, child_dir: &Path, seen: &m
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
+        // Only a *file-scope* item is inlined: a declaration indented inside an inline
+        // `mod { … }` resolves relative to that module's own directory in Rust, which this
+        // line-oriented scanner does not track -- reading it from the enclosing directory
+        // would attach a sibling file's contract (a false proof). Leaving it un-inlined
+        // makes the contract `missing` (visible, safe).
+        let at_file_scope = line.trim_start().len() == line.len();
+        if at_file_scope {
         if let Some(attr_path) = path_attr(line) {
             // The `mod` may share the attribute's line or follow it.
             let same_line = path_attr_mod(line);
@@ -2081,6 +2116,7 @@ fn inline_external_modules(src: &str, src_dir: &Path, child_dir: &Path, seen: &m
                     continue;
                 }
             }
+        }
         }
         out.push_str(line);
         out.push('\n');
@@ -2160,6 +2196,7 @@ fn external_mod(line: &str) -> Option<(String, String)> {
 /// which inlines external `mod` declarations first.
 pub fn extract(source: &str) -> Specs {
     let mut specs = Specs::default();
+    let mut seen_contract_keys: BTreeSet<String> = BTreeSet::new();
     let mut pending = FnContract::default();
     let mut in_block_comment = false;
     // Which `const` items are declared at the crate root, before any brace opens.
@@ -2528,6 +2565,13 @@ pub fn extract(source: &str) -> Specs {
                         } else {
                             if !fn_has_body(&lines, lineno) {
                                 specs.bodyless.insert(key.clone());
+                            }
+                            // A second declaration of the same qualified path is a
+                            // `#[cfg]`-alternative (Rust compiles exactly one). Mark it
+                            // ambiguous so `contract_for_fn` refuses rather than applying
+                            // the inactive module's claim.
+                            if !seen_contract_keys.insert(key.clone()) {
+                                specs.ambiguous.insert(key.clone());
                             }
                             specs.by_fn.insert(key, std::mem::take(&mut pending));
                         }
@@ -9350,6 +9394,26 @@ mod tests {
         let specs = extract_crate(&root, root_text);
         assert!(specs.by_fn.contains_key("a::f"), "keys: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
         assert!(specs.by_fn.contains_key("b::f"), "the second inclusion must also be scanned: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_nested_path_module_is_not_inlined_from_the_enclosing_directory() {
+        // An indented `#[path]`/`mod` inside an inline `mod { }` resolves relative to that
+        // module's own directory in Rust, which the line-oriented scanner does not track.
+        // Inlining it from the enclosing directory would attach a sibling file's contract
+        // (a false proof); leaving it un-inlined keeps `outer::child::f` missing (safe).
+        let dir = crate_dir("nested-inline");
+        let src = "pub mod outer { #[path = \"alt.rs\"] pub mod child; }\n";
+        std::fs::write(dir.join("lib.rs"), src).unwrap();
+        std::fs::write(dir.join("alt.rs"), "spec! { ensures: ret == 2, }\npub fn f() -> u8 { 2 }\n").unwrap();
+        let root = dir.join("lib.rs");
+        let specs = extract_crate(&root, src);
+        assert!(
+            !specs.by_fn.contains_key("outer::child::f"),
+            "a nested #[path] must not be inlined from the enclosing dir: {:?}",
+            specs.by_fn.keys().collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
