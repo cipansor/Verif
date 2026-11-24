@@ -1818,8 +1818,21 @@ impl Env {
         // that returns 7.
         if p.proj.as_slice() == [Proj::Deref] {
             if let Some(&boxl) = self.box_refs.get(&p.local) {
-                self.boxed.insert(boxl, v);
+                // Keep the box's field-0 pointer token across the forget: `forget_parts`
+                // would drop it, and the read's own null check (`(_1.0) as *const u8` ->
+                // `Eq(.., 0)`) then reads `Unknown`, so the read is `unmodelled assert`.
+                // The token is the box's *pointer*, not a part of the boxed value.
+                // Forget the *old* boxed value's parts and value first, THEN store the
+                // new one: `forget_parts` also does `boxed.remove(boxl)`, so inserting
+                // before it erased the value the write just produced (`*b = 7` left the
+                // box empty and a later `*b` read `Unknown`). The field-0 pointer token
+                // is restored after, since `forget_parts` drops it too.
+                let tok = self.fields.get(&(boxl, 0)).copied();
                 self.forget_parts(boxl);
+                self.boxed.insert(boxl, v);
+                if let Some(t) = tok {
+                    self.fields.insert((boxl, 0), t);
+                }
                 return;
             }
         }
@@ -8720,6 +8733,15 @@ where
                         if q.proj.as_slice() == [Proj::Field(0)] =>
                     {
                         if st.env.boxed.contains_key(&q.local) {
+                            // Set the pointer's *value* to the box's field-0 token too,
+                            // not only the deref link: the null-check assert reads the
+                            // pointer as a usize (`Eq(ptr_as_usize, 0)`), and without the
+                            // value that `Eq` is `Unknown`, so `assert(!null)` is
+                            // `unmodelled` and the box write/read is never reached (a
+                            // lost proof, and the reason the Box write test had no teeth).
+                            if let Some(tok) = st.env.fields.get(&(q.local, 0)).copied() {
+                                st.env.set(dest, tok);
+                            }
                             st.env.box_refs.insert(dest.local, q.local);
                         }
                     }

@@ -399,6 +399,16 @@ pub struct Specs {
     /// false`, which is the false alarm that trains a reader to ignore the report.
     /// Recorded here so the report can tell the two apart.
     pub bodyless: BTreeSet<String>,
+    /// Maps each 1-based line of [`Self::snapshot`] to the original `(file, line)` it
+    /// came from, with `line == 0` for a synthetic line the inliner introduced (the
+    /// `mod name {` / `}` wrapper, or a preserved trailing comment). The snapshot is a
+    /// *flattened* view of a multi-file crate, so a method's `impl` gets a synthetic
+    /// snapshot line that does not match rustc's original `impl at FILE:L:C`; this map
+    /// lets [`Self::original_loc`] recover the original `(file, line)` so a method
+    /// contract pairs with its body and a SARIF finding points at the module file a
+    /// reviewer opened. Empty for a `Specs` built by [`extract`] directly (single
+    /// file), where snapshot line == original line.
+    pub line_map: Vec<(std::path::PathBuf, usize)>,
 }
 
 /// An enum's variants, in declaration order.
@@ -476,6 +486,56 @@ impl StructDef {
 }
 
 impl Specs {
+    /// The original `(file, line)` a 1-based snapshot line came from, if known.
+    /// Returns `(None, line)` for a synthetic line (a `mod name {` wrapper) or for a
+    /// `Specs` with no line map (built by [`extract`] directly, where the snapshot *is*
+    /// the file and snapshot line == original line).
+    pub fn original_loc(&self, line: usize) -> (Option<std::path::PathBuf>, usize) {
+        if line >= 1 {
+            if let Some((f, l)) = self.line_map.get(line - 1) {
+                if *l != 0 {
+                    return (Some(f.clone()), *l);
+                }
+            }
+        }
+        (None, line)
+    }
+
+    /// The 1-based snapshot line whose original `(file, line)` matches, if known. The
+    /// map is injective on `(file, line)` (the inliner emits each source line once), so
+    /// at most one line matches -- the snapshot line is a unique handle for an original
+    /// location.
+    fn snapshot_line_for(&self, file: Option<&str>, line: usize) -> Option<usize> {
+        for (i, (f, l)) in self.line_map.iter().enumerate() {
+            if *l != line {
+                continue;
+            }
+            let ok = match file {
+                Some(w) => {
+                    let wf = std::path::Path::new(w);
+                    f.as_path() == wf || f.file_name() == wf.file_name()
+                }
+                None => true,
+            };
+            if ok {
+                return Some(i + 1);
+            }
+        }
+        None
+    }
+
+    /// The *snapshot* `(line, col)` of the `impl` a MIR function name names, translating
+    /// rustc's original `impl at FILE:L:C` line through the line map. `None` when the
+    /// name is not a method, or when a multi-file map has no entry for that line. For a
+    /// single-file `Specs` (empty map) the original line *is* the snapshot line.
+    pub fn snapshot_impl_loc(&self, name: &str) -> Option<(usize, usize)> {
+        let (orig_line, col) = impl_location(name)?;
+        if self.line_map.is_empty() {
+            return Some((orig_line, col));
+        }
+        let snap = self.snapshot_line_for(impl_file(name), orig_line)?;
+        Some((snap, col))
+    }
     /// The contract attached to `name`, if the source declared one.
     ///
     /// Only free functions are looked up: a method's contract is keyed by its
@@ -534,7 +594,7 @@ impl Specs {
         if let Some(c) = self.by_fn.get(name) {
             return Some(c);
         }
-        if let Some(loc) = impl_location(name) {
+        if let Some(loc) = self.snapshot_impl_loc(name) {
             let tail = name.rsplit("::").next()?;
             if let Some(c) = self.by_method.get(&(loc.0, loc.1, tail.to_string())) {
                 return Some(c);
@@ -641,7 +701,7 @@ impl Specs {
         &'a self,
         f: &crate::mir::parse::MirFn,
     ) -> Result<(Option<&'a FnContract>, Option<ArgRename>), String> {
-        let Some(loc) = impl_location(&f.name) else {
+        let Some(loc) = self.snapshot_impl_loc(&f.name) else {
             // A `#[cfg]`-alternative duplicate: refuse rather than apply the inactive
             // module's contract (a false proof, or a false refutation of the active one).
             if let Some(key) = self.ambiguous_key(&f.name) {
@@ -731,6 +791,22 @@ pub(crate) fn impl_location(name: &str) -> Option<(usize, usize)> {
     let col = parts.next()?;
     let line = parts.next()?;
     Some((line.trim().parse().ok()?, col.trim().parse().ok()?))
+}
+
+/// The *file* in a method's definition name `<impl at FILE:L:C: L:C>::m`, if any.
+///
+/// `impl_location` keeps only the `(line, column)`; the file is the thing that tells
+/// two `impl`s at the same line and column in different module files apart. `head` is
+/// `FILE:L:C`, so stripping the two right-most `:` fields leaves the file (a Windows
+/// drive's `C:` is the third field from the right and survives).
+pub(crate) fn impl_file(name: &str) -> Option<&str> {
+    let start = name.find("<impl at ")? + "<impl at ".len();
+    let inner = name[start..].split('>').next()?;
+    let (head, _end) = inner.rsplit_once(": ")?;
+    let mut parts = head.rsplitn(3, ':');
+    let _col = parts.next()?;
+    let _line = parts.next()?;
+    parts.next()
 }
 
 /// The names of `const` generic parameters declared anywhere in the source.
@@ -2057,9 +2133,10 @@ fn parse_use(raw: &str) -> Vec<(String, String)> {
 pub fn extract_crate(root: &Path, root_src: &str) -> Specs {
     let dir = root.parent().unwrap_or_else(|| Path::new("."));
     let mut seen: Vec<PathBuf> = Vec::new();
-    let inlined = inline_external_modules(root_src, dir, dir, &mut seen);
+    let (inlined, line_map) = inline_external_modules(root_src, root, dir, dir, &mut seen);
     let mut specs = extract(&inlined);
     specs.snapshot = inlined;
+    specs.line_map = line_map;
     specs
 }
 
@@ -2087,13 +2164,8 @@ fn brace_delta_code(code: &str) -> i32 {
     })
 }
 
-fn inline_external_modules(src: &str, src_dir: &Path, child_dir: &Path, seen: &mut Vec<PathBuf>) -> String {
+fn inline_external_modules(src: &str, file: &Path, src_dir: &Path, child_dir: &Path, seen: &mut Vec<PathBuf>) -> (String, Vec<(PathBuf, usize)>) {
     let lines: Vec<&str> = src.lines().collect();
-    // Mask every line with the carried lexer, recording the lexical state at each line's
-    // start. A `{`/`}` or a `mod`/`#[path]` inside a multiline string or a (multiline)
-    // comment is therefore not mistaken for code -- which would mis-track brace depth and
-    // skip later modules (their contracts then go unchecked) or resurrect a module hidden
-    // inside a comment (its contract paired with an unrelated body).
     let mut lex = Lex { block: 0, lit: Lit::None };
     let mut starts: Vec<(i32, Lit)> = Vec::with_capacity(lines.len());
     let mut codes: Vec<String> = Vec::with_capacity(lines.len());
@@ -2102,6 +2174,7 @@ fn inline_external_modules(src: &str, src_dir: &Path, child_dir: &Path, seen: &m
         codes.push(code_of_line(line, &mut lex));
     }
     let mut out = String::new();
+    let mut map: Vec<(PathBuf, usize)> = Vec::new();
     let mut i = 0;
     let mut depth = 0i32;
     while i < lines.len() {
@@ -2110,8 +2183,6 @@ fn inline_external_modules(src: &str, src_dir: &Path, child_dir: &Path, seen: &m
         let (b0, l0) = starts[i];
         let at_file_scope = depth == 0 && b0 == 0 && matches!(l0, Lit::None);
         if at_file_scope {
-            // `#[path` is code (the lexer masked the string to spaces); detect it by prefix
-            // and read the real path from the *original* line.
             if code.trim_start().starts_with("#[path") {
                 let attr_path = path_attr(line).expect("path attribute present");
                 let same_line = path_attr_mod(line, code);
@@ -2122,11 +2193,14 @@ fn inline_external_modules(src: &str, src_dir: &Path, child_dir: &Path, seen: &m
                 };
                 let advance = if same_line.is_some() { 1 } else { 2 };
                 if let Some((vis, name)) = same_line.or(next_mod) {
-                    let file = src_dir.join(&attr_path);
-                    let m_child = file.parent().unwrap_or(src_dir).to_path_buf();
-                    match read_and_inline(&file, &m_child, seen) {
-                        Some(body) => out.push_str(&format!("{vis}mod {name} {{\n{body}\n}}\n")),
-                        None => out.push_str(&format!("{vis}mod {name};\n")),
+                    let mfile = src_dir.join(&attr_path);
+                    let m_child = mfile.parent().unwrap_or(src_dir).to_path_buf();
+                    match read_and_inline(&mfile, &m_child, seen) {
+                        Some((body, bmap)) => push_wrapped(&mut out, &mut map, &format!("{vis}mod {name}"), file, &body, &bmap),
+                        None => {
+                            out.push_str(&format!("{vis}mod {name};\n"));
+                            map.push((file.to_path_buf(), 0));
+                        }
                     }
                     i += advance;
                     continue;
@@ -2137,10 +2211,15 @@ fn inline_external_modules(src: &str, src_dir: &Path, child_dir: &Path, seen: &m
             if let Some((vis, name)) = external_mod(code) {
                 let trailing = line.find(';').map(|p| &line[p + 1..]).unwrap_or("");
                 let candidates = [child_dir.join(format!("{name}.rs")), child_dir.join(&name).join("mod.rs")];
-                if let Some(file) = candidates.iter().find(|p| p.is_file()) {
+                if let Some(mfile) = candidates.iter().find(|p| p.is_file()) {
                     let m_child = child_dir.join(&name);
-                    if let Some(body) = read_and_inline(file, &m_child, seen) {
-                        out.push_str(&format!("{vis}mod {name} {{\n{body}\n}}\n{trailing}\n"));
+                    if let Some((body, bmap)) = read_and_inline(mfile, &m_child, seen) {
+                        push_wrapped(&mut out, &mut map, &format!("{vis}mod {name}"), file, &body, &bmap);
+                        if !trailing.trim().is_empty() {
+                            out.push_str(trailing);
+                            out.push('\n');
+                            map.push((file.to_path_buf(), 0));
+                        }
                         i += 1;
                         continue;
                     }
@@ -2149,10 +2228,25 @@ fn inline_external_modules(src: &str, src_dir: &Path, child_dir: &Path, seen: &m
         }
         out.push_str(line);
         out.push('\n');
+        map.push((file.to_path_buf(), i + 1));
         depth += brace_delta_code(code);
         i += 1;
     }
-    out
+    (out, map)
+}
+
+/// Emit an inlined module as `{header} {` + its body + `}`, recording one line-map entry
+/// per emitted line. The two wrapper lines are synthetic (line 0, the parent file); the
+/// body lines keep their own `(file, line)` from `bmap`, which is what makes a method's
+/// original `impl` line recoverable.
+fn push_wrapped(out: &mut String, map: &mut Vec<(PathBuf, usize)>, header: &str, parent_file: &Path, body: &str, bmap: &[(PathBuf, usize)]) {
+    out.push_str(header);
+    out.push_str(" {\n");
+    map.push((parent_file.to_path_buf(), 0));
+    out.push_str(body);
+    map.extend(bmap.iter().cloned());
+    out.push_str("}\n");
+    map.push((parent_file.to_path_buf(), 0));
 }
 
 /// The path in a `#[path = "…"]` attribute on this line, if any.
@@ -2181,7 +2275,7 @@ fn path_attr_mod(line: &str, code: &str) -> Option<(String, String)> {
 /// Read `file` and inline it as a module body whose plain children resolve in `m_child`,
 /// honouring `seen` as an *active recursion stack* (popped on return), so two `#[path]`
 /// modules that share one file are both scanned rather than the second read as a cycle.
-fn read_and_inline(file: &Path, m_child: &Path, seen: &mut Vec<PathBuf>) -> Option<String> {
+fn read_and_inline(file: &Path, m_child: &Path, seen: &mut Vec<PathBuf>) -> Option<(String, Vec<(PathBuf, usize)>)> {
     let canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
     if seen.contains(&canonical) {
         return None;
@@ -2189,7 +2283,7 @@ fn read_and_inline(file: &Path, m_child: &Path, seen: &mut Vec<PathBuf>) -> Opti
     let sub = std::fs::read_to_string(file).ok()?;
     seen.push(canonical);
     let src_dir = file.parent().unwrap_or_else(|| Path::new("."));
-    let body = inline_external_modules(&sub, src_dir, m_child, seen);
+    let body = inline_external_modules(&sub, file, src_dir, m_child, seen);
     let _ = seen.pop();
     Some(body)
 }
@@ -9520,7 +9614,7 @@ mod tests {
         std::fs::write(dir.join("setup.rs"), "pub fn s() {}\n").unwrap();
         std::fs::write(dir.join("legacy.rs"), "pub fn f() {}\n").unwrap();
         let src = "mod setup; /*\nmod legacy;\n*/\n";
-        let out = inline_external_modules(src, &dir, &dir, &mut Vec::new());
+        let out = inline_external_modules(src, &dir.join("lib.rs"), &dir, &dir, &mut Vec::new()).0;
         assert!(out.contains("mod setup {"), "setup must be inlined: {out}");
         assert!(!out.contains("mod legacy {"), "legacy (inside a comment) must not be inlined: {out}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -9547,7 +9641,7 @@ mod tests {
         let dir = crate_dir("trailing-comment");
         std::fs::write(dir.join("setup.rs"), "spec! { ensures: ret == 1, }\npub fn f() -> u8 { 1 }\n").unwrap();
         let src = "mod setup; /* init */\n/// ensures: ret == 2\npub fn f() -> u8 { 2 }\n";
-        let out = inline_external_modules(src, &dir, &dir, &mut Vec::new());
+        let out = inline_external_modules(src, &dir.join("lib.rs"), &dir, &dir, &mut Vec::new()).0;
         let specs = extract(&out);
         assert!(specs.by_fn.contains_key("setup::f"), "setup::f must be present: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
         assert!(specs.by_fn.contains_key("f"), "the root `f` must be at file scope, not `setup::f`: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
@@ -9566,13 +9660,13 @@ mod tests {
         std::fs::write(dir.join("b.rs"), "spec! { ensures: ret == 2, }\npub fn check() -> u8 { 1 }\n").unwrap();
         // WITH a following plain module: `a` from `alt].rs` (ret==1), `b` from `b.rs` (ret==2).
         let src = "#[path = \"alt].rs\"] mod a;\nmod b;\n";
-        let out = inline_external_modules(src, &dir, &dir, &mut Vec::new());
+        let out = inline_external_modules(src, &dir.join("lib.rs"), &dir, &dir, &mut Vec::new()).0;
         let specs = extract(&out);
         assert!(specs.by_fn.get("a::check").is_some_and(|c| c.ensures.iter().any(|e| e.contains("ret == 1"))), "a::check must be alt].rs's contract (ret==1): {:?}", specs.by_fn.keys().collect::<Vec<_>>());
         assert!(specs.by_fn.get("b::check").is_some_and(|c| c.ensures.iter().any(|e| e.contains("ret == 2"))), "b::check must be b.rs's contract (ret==2): {:?}", specs.by_fn.keys().collect::<Vec<_>>());
         // WITHOUT a following module: `a` alone is still read from `alt].rs`.
         let src2 = "#[path = \"alt].rs\"] mod a;\n";
-        let out2 = inline_external_modules(src2, &dir, &dir, &mut Vec::new());
+        let out2 = inline_external_modules(src2, &dir.join("lib.rs"), &dir, &dir, &mut Vec::new()).0;
         let specs2 = extract(&out2);
         assert!(specs2.by_fn.get("a::check").is_some_and(|c| c.ensures.iter().any(|e| e.contains("ret == 1"))), "without a following module, a::check must still be alt].rs's (ret==1): {:?}", specs2.by_fn.keys().collect::<Vec<_>>());
         let _ = std::fs::remove_dir_all(&dir);

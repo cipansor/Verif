@@ -171,7 +171,7 @@ fn print_human(file: &Path, report: &verify::FileReport) {
         let at = report
             .lines
             .get(name)
-            .map(|l| format!("{name}:{l}"))
+            .map(|(_, l)| format!("{name}:{l}"))
             .unwrap_or_else(|| name.clone());
         println!("  {at:<28} {}", describe(outcome));
     }
@@ -277,48 +277,37 @@ fn print_sarif(file: &Path, report: &verify::FileReport) {
         }
         out.push_str("}}]}");
     };
+    // The line map makes a multi-file crate's findings point at the module a method
+    // lives in: `report.lines` carries `(Some(module_file), module_line)`, so a
+    // reviewer opening the SARIF lands in the file that actually holds the function.
+    // A `None` file (single-file source) falls back to the root `file`.
+    let loc = |name: &str| -> (std::path::PathBuf, Option<usize>) {
+        match report.lines.get(name) {
+            Some((Some(f), l)) => (f.clone(), if *l == 0 { None } else { Some(*l) }),
+            Some((None, l)) => (file.to_path_buf(), if *l == 0 { None } else { Some(*l) }),
+            None => (file.to_path_buf(), None),
+        }
+    };
     for (name, outcome) in &report.outcomes {
         match outcome {
             FnOutcome::Verified { .. } => {}
-            FnOutcome::Failed { kind, detail } => push(
-                &mut out,
-                "verif.failed",
-                "error",
-                name,
-                &format!("{kind} — {detail}"),
-                file,
-                report.lines.get(name).copied(),
-            ),
-            FnOutcome::Incomplete { reasons, .. } => push(
-                &mut out,
-                "verif.incomplete",
-                "warning",
-                name,
-                &reasons.join("; "),
-                file,
-                report.lines.get(name).copied(),
-            ),
-            FnOutcome::Skipped { reason } => push(
-                &mut out,
-                "verif.skipped",
-                "warning",
-                name,
-                reason,
-                file,
-                report.lines.get(name).copied(),
-            ),
+            FnOutcome::Failed { kind, detail } => {
+                let (lf, ll) = loc(name);
+                push(&mut out, "verif.failed", "error", name, &format!("{kind} — {detail}"), &lf, ll);
+            }
+            FnOutcome::Incomplete { reasons, .. } => {
+                let (lf, ll) = loc(name);
+                push(&mut out, "verif.incomplete", "warning", name, &reasons.join("; "), &lf, ll);
+            }
+            FnOutcome::Skipped { reason } => {
+                let (lf, ll) = loc(name);
+                push(&mut out, "verif.skipped", "warning", name, reason, &lf, ll);
+            }
         }
     }
     for m in &report.missing {
-        push(
-            &mut out,
-            "verif.missing",
-            "warning",
-            m,
-            "contract carried, but no MIR body found",
-            file,
-            report.lines.get(m).copied(),
-        );
+        let (lf, ll) = loc(m);
+        push(&mut out, "verif.missing", "warning", m, "contract carried, but no MIR body found", &lf, ll);
     }
     out.push_str("]}]}");
     println!("{out}");

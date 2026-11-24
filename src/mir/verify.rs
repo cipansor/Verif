@@ -1800,13 +1800,14 @@ pub struct FileReport {
     pub edition: Option<Edition>,
     /// One outcome per verified function, in contract order.
     pub outcomes: Vec<(String, FnOutcome)>,
-    /// The `fn` item's source line for each reported function, keyed by the
-    /// report key. A diagnostic convenience -- a report that says `v1:u8 = 224`
-    /// names the variable but not where the function is, and `cargo verif` puts
-    /// the line in its human output and its SARIF `region`. Absent when the
-    /// scanner could not place the function (a method keyed by an impl location,
-    /// say), never a guessed line.
-    pub lines: std::collections::BTreeMap<String, usize>,
+    /// The source `(file, line)` of each reported function, keyed by the report key.
+    /// A diagnostic convenience -- a report that says `v1:u8 = 224` names the variable
+    /// but not where the function is, and `cargo verif` puts the file and line in its
+    /// SARIF `artifactLocation`/`region`. The file is `Some` for a multi-file crate
+    /// (the module a method lives in, via the line map) and `None` for a single-file
+    /// source, where the root file is implied. The line is `0` when the scanner could
+    /// not place the function, never a guessed line.
+    pub lines: std::collections::BTreeMap<String, (Option<PathBuf>, usize)>,
     /// Functions that carried a contract but were not found in the MIR. A
     /// non-empty list means the run covered less than the contracts asked for.
     pub missing: Vec<String>,
@@ -1909,7 +1910,8 @@ pub fn verify_file_with_opts(
     let mut fresh = super::cache::Entries::new();
     for (key, f) in select(&prog, &targets, only) {
         if let Some(c) = specs.resolve(&f.name) {
-            report.lines.insert(key.clone(), c.line);
+            let (file, line) = specs.original_loc(c.line);
+            report.lines.insert(key.clone(), (file, line));
         }
         // Keyed by the MIR definition name (`f.name`), which is unique per function
         // -- two trait impls of one method share a *report label* (`S::check`) but not
@@ -1935,7 +1937,8 @@ pub fn verify_file_with_opts(
     }
     for m in &report.missing {
         if let Some(c) = specs.by_fn.get(m) {
-            report.lines.insert(m.clone(), c.line);
+            let (file, line) = specs.original_loc(c.line);
+            report.lines.insert(m.clone(), (file, line));
         }
     }
     Ok(report)
@@ -1975,6 +1978,20 @@ fn enum_layouts(specs: &Specs) -> BTreeMap<String, parse::EnumLayout> {
 /// otherwise collapse into one `outcomes` entry and only one of them would be
 /// visible. The bare name is preferred because it is what a reader looks for, and
 /// it is exactly what the MIR dump itself uses as the method's tail.
+/// Whether a method's MIR definition name (`<impl at FILE:L:C: L:C>::m`) names the file
+/// a contract came from. Compares the full path, then the basename (rustc prints the
+/// path as it resolved it, which may differ in spelling from the path the caller used).
+/// When either side has no file, it does not constrain -- the line and column alone do.
+fn impl_file_matches(name: &str, want: Option<&Path>) -> bool {
+    match (spec::impl_file(name), want) {
+        (Some(f), Some(w)) => {
+            let fp = Path::new(f);
+            fp == w || fp.file_name() == w.file_name()
+        }
+        _ => true,
+    }
+}
+
 fn resolve_targets<'a>(
     prog: &'a MirProgram,
     specs: &Specs,
@@ -2075,8 +2092,14 @@ fn resolve_targets<'a>(
     for (line, col, method) in specs.by_method.keys() {
         seen.insert((*line, *col, method.clone()));
         let method = method.as_str();
-        match prog.fns.iter().find(|f| f.impl_loc == Some((*line, *col))
-            && f.name.rsplit("::").next() == Some(method))
+        // The `by_method` key is a *snapshot* line; the MIR's `impl_loc` is rustc's
+        // original line. Translate through the line map so a method in a module (whose
+        // snapshot line differs from its file's) still pairs with its body, and check the
+        // file so two `impl`s at the same line and column in different files stay apart.
+        let (orig_file, orig_line) = specs.original_loc(*line);
+        match prog.fns.iter().find(|f| f.impl_loc == Some((orig_line, *col))
+            && f.name.rsplit("::").next() == Some(method)
+            && impl_file_matches(&f.name, orig_file.as_deref()))
         {
             Some(f) => targets.push((method_key(*line, *col, method, f), f)),
             None => missing.push(method.to_string()),
@@ -2096,8 +2119,10 @@ fn resolve_targets<'a>(
         // `resolve` can only hand back one of them. Reporting it is the only
         // honest answer: silently preferring either would drop a claim the source
         // wrote. See `verify_function`, which refuses on `contract_conflict`.
-        let Some(f) = prog.fns.iter().find(|f| f.impl_loc == Some((line, col))
-            && f.name.rsplit("::").next() == Some(method.as_str())) else {
+        let (orig_file, orig_line) = specs.original_loc(line);
+        let Some(f) = prog.fns.iter().find(|f| f.impl_loc == Some((orig_line, col))
+            && f.name.rsplit("::").next() == Some(method.as_str())
+            && impl_file_matches(&f.name, orig_file.as_deref())) else {
             continue;
         };
         enforced.insert(format!("{}::{method}", specs.impl_traits[&(line, col)]));

@@ -24,10 +24,22 @@ def fail(message: str) -> int:
 
 
 def main(argv: list[str]) -> int:
-    if not argv:
-        print("usage: check_sarif.py <report.sarif> [expected-function ...]", file=sys.stderr)
+    # Optional `--root <path>`: assert that per-file attribution works -- at least one
+    # result points at a file OTHER than the root (a module file), with a positive line.
+    root = None
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--root" and i + 1 < len(argv):
+            root = argv[i + 1]
+            i += 2
+        else:
+            rest.append(argv[i])
+            i += 1
+    if not rest:
+        print("usage: check_sarif.py [--root PATH] <report.sarif> [expected-function ...]", file=sys.stderr)
         return 2
-    path, expected = argv[0], argv[1:]
+    path, expected = rest[0], rest[1:]
     try:
         with open(path) as handle:
             data = json.load(handle)
@@ -66,6 +78,23 @@ def main(argv: list[str]) -> int:
             return fail(f"result {index} has no positive `startLine`")
         if not physical.get("artifactLocation", {}).get("uri"):
             return fail(f"result {index} has no artifact URI")
+
+    if root is not None:
+        import os
+
+        root_norm = os.path.normpath(root)
+
+        def uri_of(result: dict) -> str:
+            return result.get("locations", [{}])[0].get("physicalLocation", {}).get("artifactLocation", {}).get("uri", "")
+
+        module_results = [r for r in run.get("results", []) if os.path.normpath(uri_of(r)) != root_norm]
+        if not module_results:
+            return fail(
+                f"--root {root}: no result points at a module file; per-file attribution is broken"
+            )
+        for r in module_results:
+            if r.get("locations", [{}])[0].get("physicalLocation", {}).get("region", {}).get("startLine", 0) < 1:
+                return fail("a module-file result has no positive `startLine`")
 
     missing = [name for name in expected if name not in names]
     if missing:

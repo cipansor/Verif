@@ -7062,24 +7062,25 @@ fn a_mut_vec_postcondition_reads_the_final_length() {
     );
 }
 
-/// A write through a `Box` pointer (`*b = v`) must be seen by a later `*b` read; before
-/// the write arm existed the read returned the value the box held at `new` (a stale read,
-/// so `ensures: ret == 0` was a false proof).
+/// A write through a `Box` pointer (`*b = v`) reaches the boxed store, so a later `*b`
+/// reads the *new* value: a true contract (`ret == 7`) verifies and the stale one
+/// (`ret == 0`) is refuted. The write actually runs -- it is not refused at the null
+/// check -- and its teeth are the true direction: dropping the boxed-store write (or the
+/// forget/insert reorder that keeps it) makes `ret == 7` stop verifying.
 #[test]
 fn a_write_through_a_box_pointer_is_seen_by_a_later_read() {
-    // Defence-in-depth: `set` writes through a box pointer's `Deref` into the boxed
-    // store, so a later `*b` never returns the value the box held at `new`. The shape
-    // is currently refused before the write (an unmodelled null-deref assert), so the
-    // invariant pinned here is the soundness one: the stale `ret == 0` is never proved.
+    let t = verify_src(
+        "bw_true",
+        "/// requires: true\n/// ensures: ret == 7\npub fn bw_true() -> u8 { let mut b = Box::new(3u8); *b = 7; *b }",
+    );
+    let Some(t) = t else { return };
+    assert!(matches!(t, FnOutcome::Verified { .. }), "the box write must be seen (ret == 7), got {t}");
     let f = verify_src(
         "bw_false",
-        "/// ensures: ret == 0\npub fn bw_false() -> u8 { let mut b = Box::new(0u8); *b = 7; *b }",
+        "/// requires: true\n/// ensures: ret == 0\npub fn bw_false() -> u8 { let mut b = Box::new(3u8); *b = 7; *b }",
     );
     let Some(f) = f else { return };
-    assert!(
-        !matches!(f, FnOutcome::Verified { .. }),
-        "a stale Box read must not prove ret == 0, got {f}"
-    );
+    assert!(matches!(f, FnOutcome::Failed { .. }), "the stale box value must be refuted (ret == 0), got {f}");
 }
 
 /// `Vec::clear` destroys its elements; with a panicking `Drop` that is a real panic, so
@@ -14969,8 +14970,6 @@ fn vec_clear_with_drop_glue_and_box_write_are_refused() {
     // hits the null-check refusal before the store, so neither can be verified.
     let vc = "pub struct Boom;\nimpl Drop for Boom { fn drop(&mut self) { assert!(false); } }\n/// requires: v.len() == 1\n/// ensures: ret == 0\npub fn vc(v: &mut Vec<Boom>) -> usize { v.clear(); v.len() }";
     assert!(matches!(verify_src("vc", vc), Some(FnOutcome::Incomplete { .. })), "Vec::clear on a drop-glue element must be refused");
-    let bw = "/// requires: true\n/// ensures: ret == 7\npub fn bw() -> u8 { let mut b = Box::new(3u8); *b = 7; *b }";
-    assert!(!verify_src("bw", bw).is_some_and(|o| o.is_verified()), "a Box write must never be verified");
 }
 
 #[test]
@@ -14985,29 +14984,41 @@ fn map_or_all_then_a_terminal_is_refused() {
 
 
 #[test]
-fn a_multifile_method_contract_is_reported_missing_not_verified() {
-    // A method's contract in an external module is keyed by the *inlined* line, which
-    // does not match the MIR's original `impl at FILE:L:C` -- so it is reported `missing`
-    // (visible, a lost proof), never `Verified` against a body it did not pair with.
-    // Fixing it needs a line map (see ROADMAP.md); the current behaviour is the safe one.
+fn a_multifile_method_contract_is_verified_or_refuted_by_original_location() {
+    // A method's contract is keyed by a *snapshot* line; the MIR's `impl_loc` is rustc's
+    // original line. The line map translates between them, so a method in a module file
+    // and a root method below a `mod` declaration both pair with their own body: a true
+    // contract is `Verified`, a false one `Failed` -- never a `missing` (a lost proof) nor
+    // a wrong-body `Verified` (a false proof).
     let Some(rustc) = rustc() else { return };
-    let dir = std::env::temp_dir().join(format!("verif-mf-{}-{:?}", std::process::id(), std::thread::current().id()));
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-mf2-{}-{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("lib.rs"), "pub mod m;\n").unwrap();
-    std::fs::write(dir.join("m.rs"), "pub struct Foo;\nimpl Foo {\n    /// ensures: ret == 1\n    pub fn f(&self) -> u8 { 2 }\n}\n").unwrap();
+    std::fs::write(dir.join("lib.rs"), "pub mod m;\npub struct Root;\nimpl Root {\n    /// ensures: ret == 7\n    pub fn rok(&self) -> u8 { 7 }\n    /// ensures: ret == 7\n    pub fn rbad(&self) -> u8 { 8 }\n}\n").unwrap();
+    std::fs::write(dir.join("m.rs"), "pub struct Foo;\nimpl Foo {\n    /// ensures: ret == 1\n    pub fn ok(&self) -> u8 { 1 }\n    /// ensures: ret == 1\n    pub fn bad(&self) -> u8 { 2 }\n}\n").unwrap();
     let report = verify::verify_file_with_opts(&rustc, &dir.join("lib.rs"), &[], &probe_opts()).expect("frontend");
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        !report.outcomes.iter().any(|(_, o)| o.is_verified()),
-        "a multi-file method contract must not be Verified (a false proof); outcomes: {:?}",
-        report.outcomes
-    );
-    assert!(
-        report.missing.iter().any(|m| m == "f") || report.outcomes.iter().any(|(n, _)| n == "f"),
-        "the method is reported (missing or refused), never silently dropped; missing: {:?}",
-        report.missing
-    );
+    let get = |n: &str| report.outcomes.iter().find(|(k, _)| k == n).map(|(_, o)| o);
+    assert!(matches!(get("ok"), Some(FnOutcome::Verified { .. })), "module method, true contract -> Verified, got {:?}", get("ok"));
+    assert!(matches!(get("bad"), Some(FnOutcome::Failed { .. })), "module method, false contract -> Failed, got {:?}", get("bad"));
+    assert!(matches!(get("rok"), Some(FnOutcome::Verified { .. })), "root method below `mod m;`, true contract -> Verified, got {:?}", get("rok"));
+    assert!(matches!(get("rbad"), Some(FnOutcome::Failed { .. })), "root method, false contract -> Failed, got {:?}", get("rbad"));
+    assert!(report.missing.is_empty(), "no method should be missing now: {:?}", report.missing);
+    // Item 2: the report's `(file, line)` points at the module file, not the root, so a
+    // SARIF finding lands in the file that actually holds the function.
+    match report.lines.get("ok") {
+        Some((Some(f), line)) => {
+            assert!(f.to_string_lossy().ends_with("m.rs"), "module method's report file must be m.rs, got {f:?}");
+            assert_eq!(*line, 4, "`fn ok` is at m.rs line 4");
+        }
+        other => panic!("report.lines[ok] must be (Some(m.rs), 4), got {other:?}"),
+    }
+    match report.lines.get("rok") {
+        Some((Some(f), _)) => assert!(f.to_string_lossy().ends_with("lib.rs"), "root method's report file must be lib.rs, got {f:?}"),
+        other => panic!("report.lines[rok] must be (Some(lib.rs), ..), got {other:?}"),
+    }
 }
 
 #[test]
