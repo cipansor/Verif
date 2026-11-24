@@ -502,7 +502,7 @@ pub(crate) fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
     // therefore names the same file as the other side's path when the basenames agree.
     // Two full paths that merely share a basename are different files and must NOT match
     // (that is the same-basename cross-match this guard exists to prevent).
-    let bare = |p: &std::path::Path| p.parent().map_or(true, |d| d.as_os_str().is_empty());
+    let bare = |p: &std::path::Path| p.parent().is_none_or(|d| d.as_os_str().is_empty());
     (bare(a) || bare(b)) && a.file_name() == b.file_name()
 }
 
