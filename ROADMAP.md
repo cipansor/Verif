@@ -1859,6 +1859,21 @@ build-script forwarding, custom source path, action ref, literal-masking replay 
   The differential harness now also submits a FALSE postcondition. Still open (documented): the
   inlining line-map (a multi-file method is a visible `missing`), `--emit-test` for a
   module-qualified function, nested Cargo wrappers, and SARIF per-file paths.
+- **Round 26 (second, fuller review -- 27 findings):** re-verified each with its exact
+  shape. Three more **real false proofs** fixed (refused): a `#[cfg]`-alternative module
+  whose *inactive* contract overwrote the active one (compiled body checked against the
+  wrong module's claim); a *refused* `&mut Vec` length falling through to a crate
+  `const <name>__len`; and `iterator_const_len` reading a pin off a *folded* length (a
+  one-element Vec modeled as empty). One wrong-contract fixed: an indented `#[path]`/`mod`
+  inside an inline `mod {}` was inlined from the enclosing directory (now refused). The
+  differential harness now also rejects a false *refutation* of a true postcondition. The
+  rest were already refused/correct (compound closures, `Vec::clear` on drop glue, a Box
+  write, `filter().next()`, `enumerate`, `skip.take.rev.last`, `rev().sum()`,
+  `take.rev().all/any`, `all`/`any` cursor discard, `take.rev.rev`). **Known over-refusal
+  (safe lost proof):** a shared `&Vec` rebind discards its length (`Ty::Ref` carries no
+  mutability, so `&Vec` and `&mut Vec` cannot be told apart) -- refused, never wrongly
+  proved. Still open: the inlining line-map, `--emit-test`, nested wrappers, SARIF paths,
+  cached builds.
 - Executor/iterator: `iterator_const_len` pin reuse; cross-adapter chains (`rev().step_by()`, …).
   **Same-adapter chaining is verified composing** (round 20): `take` by `min`, `skip`
   additively, `step_by` multiplicatively -- `take(2).take(3)` yields 2, not 3 -- pinned by
