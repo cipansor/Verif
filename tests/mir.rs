@@ -15050,6 +15050,13 @@ fn iterator_chain_differential_agrees_with_rustc() {
                 assert_eq!(real, *expected, "verifier Verified `{body} == {expected}` but rustc computes {real}");
             }
         }
+        // The harness's own teeth: a FALSE postcondition must never be Verified, or a
+        // verifier that proves everything would pass the true check above alone.
+        let wrong = expected.wrapping_add(1);
+        let fsrc = format!("{pre}/// ensures: ret == {wrong}\npub fn f{i}b(xs: &[u8]) -> u8 {{ {body} }}");
+        if let Some(o) = verify_src(&format!("f{i}b"), &fsrc) {
+            assert!(!o.is_verified(), "verifier Verified a FALSE postcondition (`{body} == {wrong}`, real {real})");
+        }
     }
 }
 

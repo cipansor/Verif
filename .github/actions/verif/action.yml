@@ -9,7 +9,7 @@
 #
 # and from any other repository as
 #
-#     - uses: cipansor/verif/.github/actions/verif@verif-v0.2.0
+#     - uses: cipansor/verif/.github/actions/verif@<commit-sha>   # a ref that includes this action
 #       with: { file: src/lib.rs }
 #
 # The action builds `cargo-verif` from the checkout it lives in (`GITHUB_ACTION_PATH`),

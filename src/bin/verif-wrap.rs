@@ -345,6 +345,33 @@ mod tests {
     }
 
     #[test]
+    fn source_arg_skips_an_existing_crate_name_file() {
+        // The regression the bare-name test cannot catch: `--crate-name app` where `app`
+        // *is* an existing file. If `--crate-name` were not skipped, `source_arg` would pick
+        // `app` (a file) instead of `lib.rs`, so this case actually discriminates.
+        let dir = std::env::temp_dir().join(format!("verif_srcarg3_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = dir.join("lib.rs");
+        std::fs::write(&lib, "\n").unwrap();
+        let app = dir.join("app");
+        std::fs::write(&app, "\n").unwrap();
+        let args = vec![
+            OsString::from("--crate-name"),
+            app.into_os_string(),
+            OsString::from("--edition"),
+            OsString::from("2024"),
+            lib.clone().into_os_string(),
+        ];
+        let picked = source_arg(&args).expect("an input");
+        assert_eq!(
+            Path::new(&picked),
+            lib.as_path(),
+            "must pick lib.rs, not the existing `--crate-name` file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn source_arg_finds_a_custom_extension_path() {
         let dir = std::env::temp_dir().join(format!("verif_srcarg2_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

@@ -2023,7 +2023,7 @@ fn parse_use(raw: &str) -> Vec<(String, String)> {
 pub fn extract_crate(root: &Path, root_src: &str) -> Specs {
     let dir = root.parent().unwrap_or_else(|| Path::new("."));
     let mut seen: Vec<PathBuf> = Vec::new();
-    let inlined = inline_external_modules(root_src, dir, &mut seen);
+    let inlined = inline_external_modules(root_src, dir, dir, &mut seen);
     let mut specs = extract(&inlined);
     specs.snapshot = inlined;
     specs
@@ -2039,7 +2039,7 @@ pub fn extract_crate(root: &Path, root_src: &str) -> Specs {
 /// module. A `mod child;` *inside* an inline `mod parent { … }` is not inlined here (the
 /// scanner is line-based, not brace-aware) and is left as `mod child;` -- also a visible
 /// `missing`; see `ROADMAP.md`.
-fn inline_external_modules(src: &str, dir: &Path, seen: &mut Vec<PathBuf>) -> String {
+fn inline_external_modules(src: &str, src_dir: &Path, child_dir: &Path, seen: &mut Vec<PathBuf>) -> String {
     let lines: Vec<&str> = src.lines().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -2053,11 +2053,12 @@ fn inline_external_modules(src: &str, dir: &Path, seen: &mut Vec<PathBuf>) -> St
                 .or_else(|| lines.get(i + 1).copied().and_then(external_mod));
             let advance = if same_line.is_some() { 1 } else { 2 };
             if let Some((vis, name)) = target {
-                let file = dir.join(&attr_path);
-                // A `#[path]` file's sub-modules live in the file's own directory, not a
-                // `name/` directory (the Rust reference's rule for `#[path]`).
-                let sub_dir = file.parent().unwrap_or(dir).to_path_buf();
-                match read_and_inline(&file, &sub_dir, seen) {
+                // A file-scope `#[path]` resolves relative to the *source file's* directory
+                // (`src_dir`), not the conventional `name/` child directory. The module's
+                // own children then live in that file's directory.
+                let file = src_dir.join(&attr_path);
+                let m_child = file.parent().unwrap_or(src_dir).to_path_buf();
+                match read_and_inline(&file, &m_child, seen) {
                     Some(body) => out.push_str(&format!("{vis}mod {name} {{\n{body}\n}}\n")),
                     None => out.push_str(&format!("{vis}mod {name};\n")),
                 }
@@ -2070,10 +2071,11 @@ fn inline_external_modules(src: &str, dir: &Path, seen: &mut Vec<PathBuf>) -> St
             continue;
         }
         if let Some((vis, name)) = external_mod(line) {
-            let candidates = [dir.join(format!("{name}.rs")), dir.join(&name).join("mod.rs")];
+            // A plain `mod name;` searches the conventional child directory.
+            let candidates = [child_dir.join(format!("{name}.rs")), child_dir.join(&name).join("mod.rs")];
             if let Some(file) = candidates.iter().find(|p| p.is_file()) {
-                // A plain `mod name;`'s sub-modules live in `dir/name/`.
-                if let Some(body) = read_and_inline(file, &dir.join(&name), seen) {
+                let m_child = child_dir.join(&name);
+                if let Some(body) = read_and_inline(file, &m_child, seen) {
                     out.push_str(&format!("{vis}mod {name} {{\n{body}\n}}\n"));
                     i += 1;
                     continue;
@@ -2095,24 +2097,31 @@ fn path_attr(line: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// The `mod name;` on the *same* line as a `#[path]` attribute, if any.
+/// The `mod name;` on the *same* line as a `#[path]` attribute, if any. The attribute's
+/// closing `]` sits between the path's quote and the `mod`, so it is stripped first.
 fn path_attr_mod(line: &str) -> Option<(String, String)> {
     let t = line.trim_start();
     let rest = t.strip_prefix("#[path = \"")?;
     let end = rest.find('"')?;
-    external_mod(&rest[end + 1..])
+    let after = rest[end + 1..].trim_start();
+    let after = after.strip_prefix(']').unwrap_or(after);
+    external_mod(after)
 }
 
-/// Read `file` and inline it as a module body whose sub-modules resolve in `sub_dir`,
-/// honouring the `seen` cycle set (a cycle returns `None`, leaving the `mod` bare).
-fn read_and_inline(file: &Path, sub_dir: &Path, seen: &mut Vec<PathBuf>) -> Option<String> {
+/// Read `file` and inline it as a module body whose plain children resolve in `m_child`,
+/// honouring `seen` as an *active recursion stack* (popped on return), so two `#[path]`
+/// modules that share one file are both scanned rather than the second read as a cycle.
+fn read_and_inline(file: &Path, m_child: &Path, seen: &mut Vec<PathBuf>) -> Option<String> {
     let canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
     if seen.contains(&canonical) {
         return None;
     }
     let sub = std::fs::read_to_string(file).ok()?;
     seen.push(canonical);
-    Some(inline_external_modules(&sub, sub_dir, seen))
+    let src_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let body = inline_external_modules(&sub, src_dir, m_child, seen);
+    let _ = seen.pop();
+    Some(body)
 }
 
 /// Match a bare external-module declaration `[pub[(..)] ] mod name;`, returning the
@@ -9278,6 +9287,69 @@ mod tests {
         // The attribute is dropped: a `#[path]` above an inline `mod a { … }` is a compile
         // error, so it must not survive into the inlined snapshot.
         assert!(!specs.snapshot.contains("#[path"), "the attribute must be dropped: {}", specs.snapshot);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn crate_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "verif-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn extract_crate_honours_a_same_line_path_attribute() {
+        // `#[path = "alt.rs"] pub mod a;` on one line: the closing `]` between the path's
+        // quote and the `mod` must be stripped, or `a` is missed and its contracts land on
+        // whatever bare module follows (a misassignment) or vanish.
+        let dir = crate_dir("extract-oneline");
+        std::fs::write(dir.join("alt.rs"), "spec! { ensures: ret <= 1, }\npub fn f() -> u8 { 1 }\n").unwrap();
+        let root_text = "#[path = \"alt.rs\"] pub mod a;\npub mod b;\n";
+        std::fs::write(dir.join("b.rs"), "pub fn g() -> u8 { 2 }\n").unwrap();
+        let root = dir.join("lib.rs");
+        std::fs::write(&root, root_text).unwrap();
+        let specs = extract_crate(&root, root_text);
+        assert!(specs.by_fn.contains_key("a::f"), "keys: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_crate_resolves_a_path_relative_to_its_source_file() {
+        // A `#[path]` inside `parent.rs` resolves relative to *that file's* directory, not
+        // `parent/`. `lib.rs` -> `mod parent;` -> `parent.rs` -> `#[path = "alt.rs"] mod child;`
+        // must read `dir/alt.rs`, not `dir/parent/alt.rs`.
+        let dir = crate_dir("extract-nested-path");
+        std::fs::write(dir.join("lib.rs"), "pub mod parent;\n").unwrap();
+        std::fs::write(dir.join("parent.rs"), "#[path = \"alt.rs\"] pub mod child;\n").unwrap();
+        std::fs::write(dir.join("alt.rs"), "spec! { ensures: ret <= 1, }\npub fn f() -> u8 { 1 }\n").unwrap();
+        // A decoy at the wrong location that must NOT be read.
+        let _ = std::fs::create_dir_all(dir.join("parent"));
+        std::fs::write(dir.join("parent").join("alt.rs"), "spec! { ensures: ret == 99, }\npub fn f() -> u8 { 99 }\n").unwrap();
+        let root = dir.join("lib.rs");
+        let specs = extract_crate(&root, "pub mod parent;\n");
+        assert!(specs.by_fn.contains_key("parent::child::f"), "keys: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        let c = specs.by_fn.get("parent::child::f").unwrap();
+        assert!(c.ensures.iter().any(|e| e.contains("1")), "the real alt.rs contract (`<= 1`), not the decoy: {:?}", c.ensures);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_crate_scans_a_file_shared_by_two_path_modules() {
+        // Two `#[path]` modules that share one file are each compiled in their own scope,
+        // so both must be scanned; `seen` is an active stack (popped on return), not a
+        // permanent "already read" set.
+        let dir = crate_dir("extract-shared");
+        std::fs::write(dir.join("common.rs"), "spec! { ensures: ret <= 1, }\npub fn f() -> u8 { 1 }\n").unwrap();
+        let root_text = "#[path = \"common.rs\"] pub mod a;\n#[path = \"common.rs\"] pub mod b;\n";
+        std::fs::write(dir.join("lib.rs"), root_text).unwrap();
+        let root = dir.join("lib.rs");
+        let specs = extract_crate(&root, root_text);
+        assert!(specs.by_fn.contains_key("a::f"), "keys: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        assert!(specs.by_fn.contains_key("b::f"), "the second inclusion must also be scanned: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
