@@ -1886,8 +1886,12 @@ build-script forwarding, custom source path, action ref, literal-masking replay 
   `*b = 7; *b` read unknown and the stale value could be proved; forget-then-insert, keep the
   token, and set the pointer's value in the `Cast` arm fix it. The Box and Vec-rebind tests are
   two-way with teeth (mutating the store write / `any_mut_vec_rebound` turns them red).
-  Commit `b16a719`. Still open (safe over-refusal): a shared `&Vec` rebind discards its length
-  (`Ty::Ref` carries no mutability -- optional item 5, not done).
+  Commit `b16a719`. Follow-ups (commit `59bebea`): `contract_conflict` translates its line
+  through `snapshot_impl_loc` (a module-file method carrying its own and an inherited trait
+  contract now refuses, and an imported trait's `crate::` path matches `by_trait`), and
+  `impl_file_matches`/`snapshot_line_for` compare the full path only (two same-basename files
+  in different directories no longer cross-match). Still open (safe over-refusal): a shared
+  `&Vec` rebind discards its length (`Ty::Ref` carries no mutability -- optional item 5, not done).
 - Executor/iterator: `iterator_const_len` pin reuse; cross-adapter chains (`rev().step_by()`, …).
   **Same-adapter chaining is verified composing** (round 20): `take` by `min`, `skip`
   additively, `step_by` multiplicatively -- `take(2).take(3)` yields 2, not 3 -- pinned by
