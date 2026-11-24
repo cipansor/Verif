@@ -119,6 +119,9 @@ fn main() {
                         let short: String = detail.chars().take(72).collect();
                         println!("{fname:<22} {label:<12} {:>8.2}s  {short}", elapsed.as_secs_f64());
                     }
+                    for m in &report.missing {
+                        println!("{:<22} {:<12}  {m}", "missing", "unchecked");
+                    }
                 }
                 Err(e) => println!("{want:<22} {:<12} driver error: {e}", "error"),
             }
@@ -145,6 +148,11 @@ fn main() {
                         // can contain a multi-byte character and slicing blind would panic.
                         let short: String = detail.chars().take(72).collect();
                         println!("{fname:<22} {label:<12}  {short}");
+                    }
+                    // An unmatched contract is in the denominator; name it so the reader
+                    // can see which contract went unchecked rather than a bare total.
+                    for m in &report.missing {
+                        println!("{:<22} {:<12}  {m}", "missing", "unchecked");
                     }
                     println!("\nelapsed {:.2}s", elapsed.as_secs_f64());
                 }

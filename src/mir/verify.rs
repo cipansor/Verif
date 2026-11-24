@@ -2144,7 +2144,13 @@ fn resolve_targets<'a>(
             && impl_file_matches(&f.name, orig_file.as_deref())) else {
             continue;
         };
-        enforced.insert(format!("{}::{method}", specs.impl_traits[&(line, col)]));
+        // Normalise the trait key the same way `trait_method_targets` does, or an
+        // impl of a `use crate::Trait` imported name is *checked* (discovery strips
+        // the prefix) yet its declaration is also reported `missing` under the
+        // unstripped `crate::Trait::m` -- double-counted in coverage.
+        let tr = &specs.impl_traits[&(line, col)];
+        let tr = tr.strip_prefix("crate::").unwrap_or(tr);
+        enforced.insert(format!("{tr}::{method}"));
         if seen.insert((line, col, method.clone())) {
             targets.push((method_key(line, col, &method, f), f));
         }
