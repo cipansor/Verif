@@ -110,7 +110,7 @@ fn main() {
             match verify::verify_mir_text(&mir, &specs, std::slice::from_ref(want)) {
                 Ok(report) => {
                     let elapsed = started.elapsed();
-                    total = report.outcomes.len();
+                    total = report.outcomes.len() + report.missing.len();
                     for (fname, outcome) in &report.outcomes {
                         let (label, detail) = describe(outcome);
                         if label == "verified" {
@@ -130,7 +130,12 @@ fn main() {
             let started = Instant::now();
             match verify::verify_mir_text(&mir, &specs, &selected) {
                 Ok(report) => {
-                    total = report.outcomes.len();
+                    // Read the clock before printing so `elapsed` is engine-only, not the
+                    // cost of formatting every row.
+                    let elapsed = started.elapsed();
+                    // The whole inventory: checked outcomes plus contracts the driver could
+                    // not pair with a body, so a dropped contract cannot look covered.
+                    total = report.outcomes.len() + report.missing.len();
                     for (fname, outcome) in &report.outcomes {
                         let (label, detail) = describe(outcome);
                         if label == "verified" {
@@ -141,10 +146,10 @@ fn main() {
                         let short: String = detail.chars().take(72).collect();
                         println!("{fname:<22} {label:<12}  {short}");
                     }
+                    println!("\nelapsed {:.2}s", elapsed.as_secs_f64());
                 }
                 Err(e) => println!("error        driver error: {e}"),
             }
-            println!("\nelapsed {:.2}s", started.elapsed().as_secs_f64());
         }
     }
     if only.is_none() {
