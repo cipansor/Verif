@@ -75,15 +75,6 @@ fn main() {
     // the same coordinates. `extract_crate` gives `original_loc` a file for every impl.
     let specs = spec::extract_crate(&src, &source);
 
-    // Order by name so the output is diffable between runs. Methods are listed by
-    // their bare tail, like free functions, because that is what a reader looks
-    // for; two `impl` blocks that share a tail are reported under `Owner::method`
-    // by the driver, so they still appear once each.
-    let mut names: Vec<String> = specs.by_fn.keys().cloned().collect();
-    names.extend(specs.by_method.keys().map(|(_, _, m)| m.clone()));
-    names.sort();
-    names.dedup();
-
     println!("# {target} ({edition})");
     if only.is_none() {
         println!("{:<22} {:<12}  detail", "function", "outcome");
@@ -91,16 +82,10 @@ fn main() {
         println!("{:<22} {:<12} {:>9}  detail", "function", "outcome", "elapsed");
     }
     let mut decided = 0usize;
-    // With a filter, hand the *whole* requested name to the driver once. The list
-    // above holds bare tails, but a method whose tail is shared is *reported* as
-    // `Owner::method`, so a reader who copies a name out of the output must be
-    // able to paste it back. Passing it through lets `verify_mir_text` match the
-    // report key exactly (one row for one `Owner::method`) while a bare tail still
-    // matches every owner that shares it.
-    let selected: Vec<String> = match &only {
-        Some(want) => vec![want.clone()],
-        None => names.clone(),
-    };
+    // The single-function branch filters by the requested name. The full run passes
+    // an EMPTY filter so the driver selects every resolved target -- including impls
+    // that only *inherit* a trait contract and so carry no direct contract to list.
+    // A name-based filter would silently skip those, leaving them unchecked.
     let mut total = 0usize;
     match &only {
         // One named target: its own call, so the row's elapsed time is that function's
@@ -131,7 +116,7 @@ fn main() {
         // so an inherited-only corpus cannot print `decided N of 0`.
         None => {
             let started = Instant::now();
-            match verify::verify_mir_text(&mir, &specs, &selected) {
+            match verify::verify_mir_text(&mir, &specs, &[]) {
                 Ok(report) => {
                     // Read the clock before printing so `elapsed` is engine-only, not the
                     // cost of formatting every row.

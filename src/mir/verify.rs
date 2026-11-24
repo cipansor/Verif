@@ -2139,11 +2139,24 @@ fn resolve_targets<'a>(
         // honest answer: silently preferring either would drop a claim the source
         // wrote. See `verify_function`, which refuses on `contract_conflict`.
         let (orig_file, orig_line) = specs.original_loc(line);
-        let Some(f) = prog.fns.iter().find(|f| f.impl_loc == Some((orig_line, col))
+        let mut cands = prog.fns.iter().filter(|f| f.impl_loc == Some((orig_line, col))
             && f.name.rsplit("::").next() == Some(method.as_str())
-            && impl_file_matches(&f.name, orig_file.as_deref())) else {
+            && impl_file_matches(&f.name, orig_file.as_deref()));
+        let Some(f) = cands.next() else {
             continue;
         };
+        if cands.next().is_some() {
+            // Two `#[path]` inclusions of one file place the impl at the same file,
+            // line and column, so this pairing cannot tell them apart. Picking either
+            // would check one body and silently skip the other -- a clean verdict over
+            // an unchecked impl. Refuse: report it visibly unchecked, do not mark the
+            // declaration enforced.
+            missing.push(format!(
+                "{}::{method} (ambiguous: implemented in more than one module inclusion)",
+                specs.impl_traits[&(line, col)]
+            ));
+            continue;
+        }
         // Normalise the trait key the same way `trait_method_targets` does, or an
         // impl of a `use crate::Trait` imported name is *checked* (discovery strips
         // the prefix) yet its declaration is also reported `missing` under the
