@@ -758,18 +758,32 @@ impl Specs {
         let (Some((orig_line, col)), Some(file)) = (impl_location(name), impl_file(name)) else {
             return false;
         };
+        let Some(tail) = name.rsplit("::").next() else {
+            return false;
+        };
         let w = std::path::Path::new(file);
-        let traits: Vec<&str> = self
+        // The inherited-contract *identity* per exact snapshot line, using the same
+        // trait-key normalisation as `trait_contract`. Two absent inherited contracts
+        // (no declaring trait, or a `#[cfg]`-disabled duplicate of an uncontracted
+        // method) are EQUAL -- not ambiguous -- so an explicit contract on the method is
+        // still applied. Only differing identities (one inherits a contract another does
+        // not, or a different declaration) are refused.
+        let keys: Vec<Option<String>> = self
             .line_map
             .iter()
             .enumerate()
             .filter(|(_, (fl, l))| *l == orig_line && same_file_exact(fl.as_path(), w))
-            .filter_map(|(i, _)| self.impl_traits.get(&(i + 1, col)).map(String::as_str))
+            .map(|(i, _)| {
+                self.impl_traits
+                    .get(&(i + 1, col))
+                    .map(|tr| {
+                        let tr = tr.strip_prefix("crate::").unwrap_or(tr);
+                        format!("{tr}::{tail}")
+                    })
+                    .filter(|k| self.by_trait.contains_key(k.as_str()))
+            })
             .collect();
-        match traits.first() {
-            Some(first) => traits.iter().any(|t| *t != *first),
-            None => false,
-        }
+        keys.len() >= 2 && keys.windows(2).any(|w| w[0] != w[1])
     }
 
     pub fn contract_for_fn<'a>(
