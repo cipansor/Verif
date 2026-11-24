@@ -2114,7 +2114,7 @@ fn inline_external_modules(src: &str, src_dir: &Path, child_dir: &Path, seen: &m
             // and read the real path from the *original* line.
             if code.trim_start().starts_with("#[path") {
                 let attr_path = path_attr(line).expect("path attribute present");
-                let same_line = path_attr_mod(line);
+                let same_line = path_attr_mod(line, code);
                 let next_mod = if same_line.is_none() && i + 1 < lines.len() && starts[i + 1].0 == 0 && matches!(starts[i + 1].1, Lit::None) {
                     external_mod(&codes[i + 1])
                 } else {
@@ -2169,12 +2169,13 @@ fn path_attr(line: &str) -> Option<String> {
 
 /// The `mod name;` on the *same* line as a `#[path]` attribute, if any. The attribute's
 /// closing `]` sits between the path's quote and the `mod`, so it is stripped first.
-fn path_attr_mod(line: &str) -> Option<(String, String)> {
+fn path_attr_mod(line: &str, code: &str) -> Option<(String, String)> {
     path_attr(line)?;
-    let t = line.trim_start();
-    let after = t.strip_prefix("#[path")?;
-    let close = after.find(']')?;
-    external_mod(after[close + 1..].trim_start())
+    // The attribute's closing `]` is *outside* the path literal; find it in the masked
+    // code (the string is spaces), so a `]` inside the filename is not the delimiter.
+    // `code_of_line` keeps one space per char, so the offset is valid in `line` too.
+    let close = code.find(']')?;
+    external_mod(line[close + 1..].trim_start())
 }
 
 /// Read `file` and inline it as a module body whose plain children resolve in `m_child`,
@@ -9550,6 +9551,21 @@ mod tests {
         let specs = extract(&out);
         assert!(specs.by_fn.contains_key("setup::f"), "setup::f must be present: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
         assert!(specs.by_fn.contains_key("f"), "the root `f` must be at file scope, not `setup::f`: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bracketed_filename_is_not_misrouted() {
+        // `]` inside a `#[path]` filename is legal; the attribute's `]` is the delimiter,
+        // found in the masked code so the `]` in the filename is not mistaken for it.
+        let dir = crate_dir("bracket-name");
+        std::fs::write(dir.join("alt].rs"), "spec! { ensures: ret == 2, }\npub fn f() -> u8 { 1 }\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "spec! { ensures: ret == 1, }\npub fn f() -> u8 { 2 }\n").unwrap();
+        let src = "#[path = \"alt].rs\"] mod a;\nmod b;\n";
+        let out = inline_external_modules(src, &dir, &dir, &mut Vec::new());
+        let specs = extract(&out);
+        assert!(specs.by_fn.get("a::f").is_some_and(|c| c.ensures.iter().any(|e| e.contains("ret == 2"))), "a::f must be alt].rs's contract: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        assert!(specs.by_fn.get("b::f").is_some_and(|c| c.ensures.iter().any(|e| e.contains("ret == 1"))), "b::f must be b.rs's contract: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
