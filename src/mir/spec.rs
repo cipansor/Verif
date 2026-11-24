@@ -2208,31 +2208,49 @@ fn inline_external_modules(src: &str, file: &Path, src_dir: &Path, child_dir: &P
         let at_file_scope = depth == 0 && b0 == 0 && matches!(l0, Lit::None);
         if at_file_scope {
             if code.trim_start().starts_with("#[path") {
-                let Some(attr_path) = path_attr(line) else {
-                    // A `#[path =` attribute split across lines: rustc accepts it, but this
-                    // single-line reader cannot bind the filename to its module. Refuse the
-                    // module (emit the line and its following `mod name;` un-inlined) rather
-                    // than panicking or falling back to a same-named conventional file.
+                // The attribute may wrap (`#[path =` then `"alt.rs"]` on a later line),
+                // and the `mod name;` may follow on another line. Join forward to read
+                // the path literal, then bind it to the module declaration -- parsing it
+                // rather than panicking or falling back to a same-named conventional file.
+                let mut j = i;
+                let mut joined = line.to_string();
+                // `masked` is the same span with string literals blanked, so a `]` inside
+                // the filename is not mistaken for the attribute's closing bracket.
+                let mut masked = code.to_string();
+                while path_attr(&joined).is_none() && j + 1 < lines.len() && j - i < 4 {
+                    j += 1;
+                    joined.push('\n');
+                    joined.push_str(lines[j]);
+                    masked.push('\n');
+                    masked.push_str(&codes[j]);
+                }
+                let Some(attr_path) = path_attr(&joined) else {
+                    // Truly unreadable (rustc would reject it): emit the line as-is.
                     out.push_str(line);
                     out.push('\n');
                     map.push((file.to_path_buf(), i + 1));
                     i += 1;
-                    if i < lines.len() && external_mod(&codes[i]).is_some() {
-                        out.push_str(lines[i]);
-                        out.push('\n');
-                        map.push((file.to_path_buf(), i + 1));
-                        i += 1;
-                    }
                     continue;
                 };
-                let same_line = path_attr_mod(line, code);
-                let next_mod = if same_line.is_none() && i + 1 < lines.len() && starts[i + 1].0 == 0 && matches!(starts[i + 1].1, Lit::None) {
-                    external_mod(&codes[i + 1])
+                // The `mod name;` after the attribute's closing `]`: on a joined line, or
+                // on a later file-scope line.
+                let (mod_decl, consumed) = if let Some(x) = path_attr_mod(&joined, &masked) {
+                    (Some(x), j - i + 1)
                 } else {
-                    None
+                    let mut k = j;
+                    let mut found = None;
+                    while k + 1 < lines.len() && k - i < 6 {
+                        k += 1;
+                        if starts[k].0 == 0 && matches!(starts[k].1, Lit::None) {
+                            if let Some(x) = external_mod(&codes[k]) {
+                                found = Some(x);
+                                break;
+                            }
+                        }
+                    }
+                    (found, k - i + 1)
                 };
-                let advance = if same_line.is_some() { 1 } else { 2 };
-                if let Some((vis, name)) = same_line.or(next_mod) {
+                if let Some((vis, name)) = mod_decl {
                     let mfile = src_dir.join(&attr_path);
                     let m_child = mfile.parent().unwrap_or(src_dir).to_path_buf();
                     match read_and_inline(&mfile, &m_child, seen) {
@@ -2242,10 +2260,17 @@ fn inline_external_modules(src: &str, file: &Path, src_dir: &Path, child_dir: &P
                             map.push((file.to_path_buf(), 0));
                         }
                     }
-                    i += advance;
+                    i += consumed;
                     continue;
                 }
-                i += 1;
+                // No module declaration after the attribute: emit the consumed lines as-is
+                // so conventional lookup never runs on a bare `mod`.
+                for k in i..(i + consumed).min(lines.len()) {
+                    out.push_str(lines[k]);
+                    out.push('\n');
+                    map.push((file.to_path_buf(), k + 1));
+                }
+                i += consumed;
                 continue;
             }
             if let Some((vis, name)) = external_mod(code) {

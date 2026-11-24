@@ -2244,7 +2244,17 @@ pub fn verify_mir_text(
         parse::parse_program_scoped(mir, &enum_layouts(specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners, &specs.impl_traits, &specs.impl_trait_args, &specs.declared_traits);
     let (targets, missing) = resolve_targets(&prog, specs);
     let mut report = FileReport { missing, ..Default::default() };
+    // A request matching both a bare tail and a full path (e.g. `f` and `m::f`)
+    // selects the same MIR definition twice; dedupe by definition pointer so it is
+    // verified once. Two *distinct* methods that share a display key (two traits'
+    // `S::check`) have different pointers and both survive.
+    let mut seen: Vec<*const MirFn> = Vec::new();
     for (key, f) in select(&prog, &targets, only) {
+        let ptr = f as *const MirFn;
+        if seen.contains(&ptr) {
+            continue;
+        }
+        seen.push(ptr);
         let outcome = smt::with_fresh(|| verify_function(&prog, f, specs));
         report.outcomes.push((key, outcome));
     }
