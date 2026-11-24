@@ -551,11 +551,12 @@ impl Specs {
             .filter(|(_, (f, l))| *l == line && same_file_exact(f.as_path(), w))
             .map(|(i, _)| i + 1)
             .collect();
-        if exact.len() == 1 {
-            return Some(exact[0]);
-        }
-        if exact.len() > 1 {
-            return None;
+        if let Some(&first) = exact.first() {
+            // Two `#[path]` inclusions of one file give it two line-map entries at the
+            // same line; both are the same canonical file (a `same_file_exact` match),
+            // so their contracts are identical -- pick either rather than refusing,
+            // which would drop the contract and verify with no postcondition.
+            return Some(first);
         }
         let loose: Vec<usize> = self
             .line_map
