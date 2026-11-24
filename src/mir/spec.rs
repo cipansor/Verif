@@ -485,6 +485,27 @@ impl StructDef {
     }
 }
 
+/// Whether two paths name the same file. A literal match wins; otherwise the paths are
+/// canonicalised, so the same file spelled two ways (relative vs absolute, a `./` prefix)
+/// compares equal while two *different* files that share a basename do not. A path that
+/// cannot be canonicalised (it does not exist) only matches its literal spelling.
+pub(crate) fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    if let (Ok(x), Ok(y)) = (a.canonicalize(), b.canonicalize()) {
+        if x == y {
+            return true;
+        }
+    }
+    // rustc prints a crate-unique file by its *bare* name. A bare filename on one side
+    // therefore names the same file as the other side's path when the basenames agree.
+    // Two full paths that merely share a basename are different files and must NOT match
+    // (that is the same-basename cross-match this guard exists to prevent).
+    let bare = |p: &std::path::Path| p.parent().map_or(true, |d| d.as_os_str().is_empty());
+    (bare(a) || bare(b)) && a.file_name() == b.file_name()
+}
+
 impl Specs {
     /// The original `(file, line)` a 1-based snapshot line came from, if known.
     /// Returns `(None, line)` for a synthetic line (a `mod name {` wrapper) or for a
@@ -514,7 +535,7 @@ impl Specs {
         let w = std::path::Path::new(file?);
         self.line_map
             .iter()
-            .position(|(f, l)| *l == line && f.as_path() == w)
+            .position(|(f, l)| *l == line && same_file(f.as_path(), w))
             .map(|i| i + 1)
     }
 

@@ -1989,7 +1989,7 @@ fn impl_file_matches(name: &str, want: Option<&Path>) -> bool {
     // The map's file and rustc's `impl at FILE` share the root spelling, so the full
     // path agrees; a mismatch refuses the pairing (the method is `missing`).
     match (spec::impl_file(name), want) {
-        (Some(f), Some(w)) => Path::new(f) == w,
+        (Some(f), Some(w)) => spec::same_file(Path::new(f), w),
         _ => false,
     }
 }
