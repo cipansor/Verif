@@ -2265,10 +2265,10 @@ fn inline_external_modules(src: &str, file: &Path, src_dir: &Path, child_dir: &P
                 }
                 // No module declaration after the attribute: emit the consumed lines as-is
                 // so conventional lookup never runs on a bare `mod`.
-                for k in i..(i + consumed).min(lines.len()) {
-                    out.push_str(lines[k]);
+                for (off, l) in lines[i..(i + consumed).min(lines.len())].iter().enumerate() {
+                    out.push_str(l);
                     out.push('\n');
-                    map.push((file.to_path_buf(), k + 1));
+                    map.push((file.to_path_buf(), i + off + 1));
                 }
                 i += consumed;
                 continue;
