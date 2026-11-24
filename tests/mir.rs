@@ -15033,11 +15033,14 @@ fn a_same_named_method_in_two_same_basename_files_is_paired_by_file() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("a")).unwrap();
     std::fs::create_dir_all(dir.join("b")).unwrap();
-    std::fs::write(dir.join("lib.rs"), "pub mod a;\npub mod b;\n").unwrap();
+    std::fs::create_dir_all(dir.join("c")).unwrap();
+    std::fs::write(dir.join("lib.rs"), "pub mod a;\npub mod b;\npub mod c;\n").unwrap();
     std::fs::write(dir.join("a.rs"), "pub mod m;\n").unwrap();
     std::fs::write(dir.join("b.rs"), "pub mod m;\n").unwrap();
+    std::fs::write(dir.join("c.rs"), "pub mod m;\n").unwrap();
     std::fs::write(dir.join("a/m.rs"), "pub struct A;\nimpl A {\n    /// ensures: ret == 1\n    pub fn f(&self) -> u8 { 1 }\n}\n").unwrap();
     std::fs::write(dir.join("b/m.rs"), "pub struct B;\nimpl B {\n    /// ensures: ret == 2\n    pub fn f(&self) -> u8 { 2 }\n}\n").unwrap();
+    std::fs::write(dir.join("c/m.rs"), "pub struct C;\nimpl C {\n    /// ensures: ret == 9\n    pub fn f(&self) -> u8 { 1 }\n}\n").unwrap();
     let report = verify::verify_file_with_opts(&rustc, &dir.join("lib.rs"), &[], &probe_opts()).expect("frontend");
     let _ = std::fs::remove_dir_all(&dir);
     // A::f (body 1, ret==1) and B::f (body 2, ret==2) both verify *only* when each gets
@@ -15046,6 +15049,10 @@ fn a_same_named_method_in_two_same_basename_files_is_paired_by_file() {
     let b = report.outcomes.iter().find(|(k, _)| k.contains("B::")).map(|(_, o)| o);
     assert!(matches!(a, Some(FnOutcome::Verified { .. })), "A::f (ret==1 body 1) must verify; outcomes {:?}", report.outcomes);
     assert!(matches!(b, Some(FnOutcome::Verified { .. })), "B::f (ret==2 body 2) must verify; a swap breaks both; outcomes {:?}", report.outcomes);
+    // A third method with a FALSE contract (ret==9 on a body of 1) must be refuted, so
+    // the test cannot pass on two empty `Verified { obligations: 0 }` rows.
+    let c = report.outcomes.iter().find(|(k, _)| k.contains("C::")).map(|(_, o)| o);
+    assert!(matches!(c, Some(FnOutcome::Failed { .. })), "C::f (ret==9 body 1) must be refuted on its postcondition; outcomes {:?}", report.outcomes);
 }
 
 #[test]

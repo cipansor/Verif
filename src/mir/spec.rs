@@ -2237,18 +2237,27 @@ fn inline_external_modules(src: &str, file: &Path, src_dir: &Path, child_dir: &P
                 let (mod_decl, consumed) = if let Some(x) = path_attr_mod(&joined, &masked) {
                     (Some(x), j - i + 1)
                 } else {
+                    // Only an external `mod name;` (after at most blank trivia) takes the
+                    // file. An inline module (`#[path="dir"] mod x {}`) changes where its
+                    // children resolve -- not a file to substitute -- and any other item
+                    // is left to the normal loop, which tracks brace depth so a nested
+                    // declaration is not resolved at crate scope.
                     let mut k = j;
-                    let mut found = None;
-                    while k + 1 < lines.len() && k - i < 6 {
+                    while k + 1 < lines.len() && k - i < 6 && codes[k + 1].trim().is_empty() {
                         k += 1;
-                        if starts[k].0 == 0 && matches!(starts[k].1, Lit::None) {
-                            if let Some(x) = external_mod(&codes[k]) {
-                                found = Some(x);
-                                break;
-                            }
-                        }
                     }
-                    (found, k - i + 1)
+                    let found = if k + 1 < lines.len()
+                        && starts[k + 1].0 == 0
+                        && matches!(starts[k + 1].1, Lit::None)
+                    {
+                        external_mod(&codes[k + 1])
+                    } else {
+                        None
+                    };
+                    match found {
+                        Some(x) => (Some(x), k + 1 - i + 1),
+                        None => (None, j - i + 1),
+                    }
                 };
                 if let Some((vis, name)) = mod_decl {
                     let mfile = src_dir.join(&attr_path);
@@ -2321,7 +2330,17 @@ fn path_attr(line: &str) -> Option<String> {
     // keeps the compact form from panicking.
     let t = line.trim_start();
     let rest = t.strip_prefix("#[path")?;
-    let rest = rest.trim_start().strip_prefix('=')?.trim_start().strip_prefix('"')?;
+    let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+    // A raw string (`r"x"`, `r#"x"#`, …) is a valid path too; parse it so the explicit
+    // file is not dropped and the conventional `name.rs` read instead.
+    if let Some(after_r) = rest.strip_prefix('r') {
+        let hashes = after_r.chars().take_while(|c| *c == '#').count();
+        let body = after_r[hashes..].strip_prefix('"')?;
+        let end: String = std::iter::once('"').chain(std::iter::repeat('#').take(hashes)).collect();
+        let idx = body.find(&end)?;
+        return Some(body[..idx].to_string());
+    }
+    let rest = rest.strip_prefix('"')?;
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
 }
@@ -2334,7 +2353,10 @@ fn path_attr_mod(line: &str, code: &str) -> Option<(String, String)> {
     // code (the string is spaces), so a `]` inside the filename is not the delimiter.
     // `code_of_line` keeps one space per char, so the offset is valid in `line` too.
     let close = code.find(']')?;
-    external_mod(line[close + 1..].trim_start())
+    // Slice the *masked* text, not the original: `code_of_line` keeps one space per
+    // char, so a byte offset valid in `code` can land inside a multibyte character of
+    // the original and panic. The declaration is ASCII, so masking it changes nothing.
+    external_mod(code[close + 1..].trim_start())
 }
 
 /// Read `file` and inline it as a module body whose plain children resolve in `m_child`,
