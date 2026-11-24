@@ -1997,6 +1997,21 @@ fn impl_file_matches(name: &str, want: Option<&Path>) -> bool {
     }
 }
 
+/// Like [`impl_file_matches`] but WITHOUT the bare-basename fallback: true only when
+/// the impl file is the *same* path as the wanted file (or canonicalises to it). Used
+/// to prefer an exact candidate over the loose basename one, so an unrelated
+/// same-basename file at the same coordinates does not force an ambiguity refusal.
+fn impl_file_matches_exact(name: &str, want: Option<&Path>) -> bool {
+    match (spec::impl_file(name), want) {
+        (Some(f), Some(w)) => {
+            let fp = Path::new(f);
+            fp == w || matches!((fp.canonicalize(), w.canonicalize()), (Ok(a), Ok(b)) if a == b)
+        }
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 fn resolve_targets<'a>(
     prog: &'a MirProgram,
     specs: &Specs,
@@ -2139,13 +2154,19 @@ fn resolve_targets<'a>(
         // honest answer: silently preferring either would drop a claim the source
         // wrote. See `verify_function`, which refuses on `contract_conflict`.
         let (orig_file, orig_line) = specs.original_loc(line);
-        let mut cands = prog.fns.iter().filter(|f| f.impl_loc == Some((orig_line, col))
+        let all: Vec<&MirFn> = prog.fns.iter().filter(|f| f.impl_loc == Some((orig_line, col))
             && f.name.rsplit("::").next() == Some(method.as_str())
-            && impl_file_matches(&f.name, orig_file.as_deref()));
-        let Some(f) = cands.next() else {
+            && impl_file_matches(&f.name, orig_file.as_deref())).collect();
+        // Prefer an exact-path candidate over the bare-basename fallback: an unrelated
+        // file that merely shares a basename at the same coordinates must not force a
+        // refusal. Only multiple candidates at the *same* location are truly ambiguous.
+        let exact: Vec<&MirFn> = all.iter().copied()
+            .filter(|f| impl_file_matches_exact(&f.name, orig_file.as_deref())).collect();
+        let pool: &[&MirFn] = if !exact.is_empty() { &exact } else { &all };
+        let Some(f) = pool.first().copied() else {
             continue;
         };
-        if cands.next().is_some() {
+        if pool.len() > 1 {
             // Two `#[path]` inclusions of one file place the impl at the same file,
             // line and column, so this pairing cannot tell them apart. Picking either
             // would check one body and silently skip the other -- a clean verdict over
