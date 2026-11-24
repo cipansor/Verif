@@ -15022,6 +15022,51 @@ fn a_multifile_method_contract_is_verified_or_refuted_by_original_location() {
 }
 
 #[test]
+fn a_multifile_method_with_two_contracts_is_refused() {
+    // A module-file method that declares its own contract AND inherits a contracted
+    // trait's must be refused (Skipped), not silently checked against one. Before the
+    // line-map the method was `missing`; the line-map makes it a target, so
+    // `contract_conflict` must translate the line too or the conflict is missed and the
+    // trait's promise is dropped.
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-mfc-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lib.rs"), "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\npub mod m;\n").unwrap();
+    std::fs::write(dir.join("m.rs"), "use crate::Bump;\npub struct S;\nimpl Bump for S {\n    /// ensures: ret == 7\n    fn bump(&self) -> u8 { 7 }\n}\n").unwrap();
+    let report = verify::verify_file_with_opts(&rustc, &dir.join("lib.rs"), &[], &probe_opts()).expect("frontend");
+    let _ = std::fs::remove_dir_all(&dir);
+    let o = report.outcomes.iter().find(|(k, _)| k == "bump").map(|(_, o)| o);
+    assert!(matches!(o, Some(FnOutcome::Skipped { .. })), "a module method with its own and an inherited contract must be refused (Skipped), got {o:?}");
+}
+
+#[test]
+fn a_same_basename_module_does_not_cross_match() {
+    // Two module files with the same basename (`m.rs`) in different directories, each with
+    // an impl at the same line and column. A basename-only file comparison would pair one
+    // body with the other's contract (a false proof); the full-path match keeps them apart.
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-sbn-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::create_dir_all(dir.join("b")).unwrap();
+    std::fs::write(dir.join("lib.rs"), "pub mod a;\npub mod b;\n").unwrap();
+    std::fs::write(dir.join("a.rs"), "pub mod m;\n").unwrap();
+    std::fs::write(dir.join("b.rs"), "pub mod m;\n").unwrap();
+    std::fs::write(dir.join("a/m.rs"), "pub struct S;\nimpl S {\n    /// ensures: ret == 1\n    pub fn af(&self) -> u8 { 1 }\n}\n").unwrap();
+    std::fs::write(dir.join("b/m.rs"), "pub struct S;\nimpl S {\n    /// ensures: ret == 2\n    pub fn bf(&self) -> u8 { 1 }\n}\n").unwrap();
+    let report = verify::verify_file_with_opts(&rustc, &dir.join("lib.rs"), &[], &probe_opts()).expect("frontend");
+    let _ = std::fs::remove_dir_all(&dir);
+    let get = |n: &str| report.outcomes.iter().find(|(k, _)| k == n).map(|(_, o)| o);
+    assert!(matches!(get("af"), Some(FnOutcome::Verified { .. })), "a::m::af (contract 1, body 1) must verify, got {:?}", get("af"));
+    assert!(matches!(get("bf"), Some(FnOutcome::Failed { .. })), "b::m::bf (contract 2, body 1) must be refuted, got {:?} (a basename cross-match would wrongly verify it)", get("bf"));
+}
+
+#[test]
 fn iterator_chain_differential_agrees_with_rustc() {
     // Every chain the verifier decides `Verified` must match a real `rustc` compile+run of
     // the same expression (the CONTRIBUTING differential-harness rule for a proof

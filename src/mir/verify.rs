@@ -1983,12 +1983,14 @@ fn enum_layouts(specs: &Specs) -> BTreeMap<String, parse::EnumLayout> {
 /// path as it resolved it, which may differ in spelling from the path the caller used).
 /// When either side has no file, it does not constrain -- the line and column alone do.
 fn impl_file_matches(name: &str, want: Option<&Path>) -> bool {
+    // Strict full-path comparison, mirroring `Specs::snapshot_line_for`: a basename
+    // fallback would let two same-named files in different directories match, and an
+    // absent file must not be treated as "no constraint" (that would match any file).
+    // The map's file and rustc's `impl at FILE` share the root spelling, so the full
+    // path agrees; a mismatch refuses the pairing (the method is `missing`).
     match (spec::impl_file(name), want) {
-        (Some(f), Some(w)) => {
-            let fp = Path::new(f);
-            fp == w || fp.file_name() == w.file_name()
-        }
-        _ => true,
+        (Some(f), Some(w)) => Path::new(f) == w,
+        _ => false,
     }
 }
 

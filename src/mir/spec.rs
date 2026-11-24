@@ -506,22 +506,16 @@ impl Specs {
     /// at most one line matches -- the snapshot line is a unique handle for an original
     /// location.
     fn snapshot_line_for(&self, file: Option<&str>, line: usize) -> Option<usize> {
-        for (i, (f, l)) in self.line_map.iter().enumerate() {
-            if *l != line {
-                continue;
-            }
-            let ok = match file {
-                Some(w) => {
-                    let wf = std::path::Path::new(w);
-                    f.as_path() == wf || f.file_name() == wf.file_name()
-                }
-                None => true,
-            };
-            if ok {
-                return Some(i + 1);
-            }
-        }
-        None
+        // Strict full-path comparison: a basename fallback would let two files that share
+        // a basename in different directories match at the same line and column, pairing
+        // one body with another's contract (a false proof). The map's file and rustc's
+        // `impl at FILE` both derive from the same root path, so the full spelling agrees;
+        // a mismatch is a refusal (the method reported `missing`), never a wrong pairing.
+        let w = std::path::Path::new(file?);
+        self.line_map
+            .iter()
+            .position(|(f, l)| *l == line && f.as_path() == w)
+            .map(|i| i + 1)
     }
 
     /// The *snapshot* `(line, col)` of the `impl` a MIR function name names, translating
@@ -655,12 +649,20 @@ impl Specs {
     /// impl's author wrote about their own body. The caller refuses on this and
     /// names both, which is the only answer that loses nothing.
     pub fn contract_conflict(&self, name: &str) -> Option<String> {
-        let loc = impl_location(name)?;
+        // Translate rustc's original `impl at FILE:L:C` to the snapshot line the maps
+        // are keyed by; the raw `impl_location` misses for a multi-file method, so the
+        // conflict went undetected and the trait's promise was silently dropped.
+        let loc = self.snapshot_impl_loc(name)?;
         let tail = name.rsplit("::").next()?;
         if !self.by_method.contains_key(&(loc.0, loc.1, tail.to_string())) {
             return None;
         }
         let tr = self.impl_traits.get(&(loc.0, loc.1))?;
+        // A trait imported with `use crate::T;` is recorded as `crate::T`, but
+        // `by_trait` keys the declaration by its module path (`T::m` at the root); the
+        // `crate::` prefix (crate root) is the same location, so strip it or the lookup
+        // misses and the conflict goes undetected.
+        let tr = tr.strip_prefix("crate::").unwrap_or(tr);
         if !self.by_trait.contains_key(&format!("{tr}::{tail}")) {
             return None;
         }
@@ -679,6 +681,7 @@ impl Specs {
     /// reports rather than treating as a promise.
     pub fn trait_contract(&self, line: usize, col: usize, tail: &str) -> Option<&FnContract> {
         let tr = self.impl_traits.get(&(line, col))?;
+        let tr = tr.strip_prefix("crate::").unwrap_or(tr);
         self.by_trait.get(&format!("{tr}::{tail}"))
     }
 
