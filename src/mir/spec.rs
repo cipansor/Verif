@@ -786,6 +786,10 @@ impl Specs {
         keys.len() >= 2 && keys.windows(2).any(|w| w[0] != w[1])
     }
 
+    /// The contract for one *body* in the dump, with the argument-name alignment the
+    /// body needs. `Err` when an inherited contract cannot be aligned positionally, or
+    /// when one file is included by two modules whose trait contracts differ (an
+    /// ambiguous shape that is refused rather than guessed).
     pub fn contract_for_fn<'a>(
         &'a self,
         f: &crate::mir::parse::MirFn,
