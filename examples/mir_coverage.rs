@@ -96,23 +96,26 @@ fn main() {
         Some(want) => vec![want.clone()],
         None => names.clone(),
     };
-    for name in &selected {
-        let started = Instant::now();
-        let Ok(report) = verify::verify_mir_text(&mir, &specs, std::slice::from_ref(name)) else {
-            println!("{name:<22} {:<12} {:>9}  driver error", "error", "-");
-            continue;
-        };
-        let elapsed = started.elapsed();
-        for (fname, outcome) in &report.outcomes {
-            let (label, detail) = describe(outcome);
-            if label == "verified" {
-                decided += 1;
+    // One pass over the selected names: `verify_mir_text` deduplicates by MIR definition
+    // identity, so a bare name and its module-qualified spelling that both select the
+    // same definition are counted once, while two distinct same-named methods are both
+    // kept. Selecting per name would count a shared definition once per call.
+    let started = Instant::now();
+    match verify::verify_mir_text(&mir, &specs, &selected) {
+        Ok(report) => {
+            let elapsed = started.elapsed();
+            for (fname, outcome) in &report.outcomes {
+                let (label, detail) = describe(outcome);
+                if label == "verified" {
+                    decided += 1;
+                }
+                // Truncate on a char boundary, not a byte offset: a counterexample
+                // can contain a multi-byte character and slicing blind would panic.
+                let short: String = detail.chars().take(72).collect();
+                println!("{fname:<22} {label:<12} {:>8.2}s  {short}", elapsed.as_secs_f64());
             }
-            // Truncate on a char boundary, not a byte offset: a counterexample
-            // can contain a multi-byte character and slicing blind would panic.
-            let short: String = detail.chars().take(72).collect();
-            println!("{fname:<22} {label:<12} {:>8.2}s  {short}", elapsed.as_secs_f64());
         }
+        Err(e) => println!("{:<22} {:<12} {:>9}  driver error: {e}", "error", "-", "-"),
     }
     if only.is_none() {
         // Every free function and every method is one outcome, so the
