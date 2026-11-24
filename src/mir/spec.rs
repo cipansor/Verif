@@ -2208,7 +2208,23 @@ fn inline_external_modules(src: &str, file: &Path, src_dir: &Path, child_dir: &P
         let at_file_scope = depth == 0 && b0 == 0 && matches!(l0, Lit::None);
         if at_file_scope {
             if code.trim_start().starts_with("#[path") {
-                let attr_path = path_attr(line).expect("path attribute present");
+                let Some(attr_path) = path_attr(line) else {
+                    // A `#[path =` attribute split across lines: rustc accepts it, but this
+                    // single-line reader cannot bind the filename to its module. Refuse the
+                    // module (emit the line and its following `mod name;` un-inlined) rather
+                    // than panicking or falling back to a same-named conventional file.
+                    out.push_str(line);
+                    out.push('\n');
+                    map.push((file.to_path_buf(), i + 1));
+                    i += 1;
+                    if i < lines.len() && external_mod(&codes[i]).is_some() {
+                        out.push_str(lines[i]);
+                        out.push('\n');
+                        map.push((file.to_path_buf(), i + 1));
+                        i += 1;
+                    }
+                    continue;
+                };
                 let same_line = path_attr_mod(line, code);
                 let next_mod = if same_line.is_none() && i + 1 < lines.len() && starts[i + 1].0 == 0 && matches!(starts[i + 1].1, Lit::None) {
                     external_mod(&codes[i + 1])

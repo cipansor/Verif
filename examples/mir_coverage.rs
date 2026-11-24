@@ -96,6 +96,9 @@ fn main() {
         Some(want) => vec![want.clone()],
         None => names.clone(),
     };
+    // `select` matches a bare tail, so querying both `f` and `m::f` re-verifies `m::f`.
+    // Deduplicate by the report key so each function is counted once.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for name in &selected {
         let started = Instant::now();
         let Ok(report) = verify::verify_mir_text(&mir, &specs, std::slice::from_ref(name)) else {
@@ -104,6 +107,9 @@ fn main() {
         };
         let elapsed = started.elapsed();
         for (fname, outcome) in &report.outcomes {
+            if !seen.insert(fname.clone()) {
+                continue;
+            }
             let (label, detail) = describe(outcome);
             if label == "verified" {
                 decided += 1;

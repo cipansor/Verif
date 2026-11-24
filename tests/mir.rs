@@ -15037,7 +15037,7 @@ fn a_same_named_method_in_two_same_basename_files_is_paired_by_file() {
     std::fs::write(dir.join("a.rs"), "pub mod m;\n").unwrap();
     std::fs::write(dir.join("b.rs"), "pub mod m;\n").unwrap();
     std::fs::write(dir.join("a/m.rs"), "pub struct A;\nimpl A {\n    /// ensures: ret == 1\n    pub fn f(&self) -> u8 { 1 }\n}\n").unwrap();
-    std::fs::write(dir.join("b/m.rs"), "pub struct B;\nimpl B {\n    /// ensures: ret == 1\n    pub fn f(&self) -> u8 { 9 }\n}\n").unwrap();
+    std::fs::write(dir.join("b/m.rs"), "pub struct B;\nimpl B {\n    /// ensures: ret == 3\n    pub fn f(&self) -> u8 { 2 }\n}\n").unwrap();
     let report = verify::verify_file_with_opts(&rustc, &dir.join("lib.rs"), &[], &probe_opts()).expect("frontend");
     let _ = std::fs::remove_dir_all(&dir);
     // A::f (body 1, ret==1) must verify; B::f (body 9, ret==1) must be refuted. Asserting
@@ -15045,7 +15045,7 @@ fn a_same_named_method_in_two_same_basename_files_is_paired_by_file() {
     let a = report.outcomes.iter().find(|(k, _)| k.contains("A::")).map(|(_, o)| o);
     let b = report.outcomes.iter().find(|(k, _)| k.contains("B::")).map(|(_, o)| o);
     assert!(matches!(a, Some(FnOutcome::Verified { .. })), "A::f (ret==1 body 1) must verify; outcomes {:?}", report.outcomes);
-    assert!(matches!(b, Some(FnOutcome::Failed { .. })), "B::f (ret==1 body 9) must be refuted; outcomes {:?}", report.outcomes);
+    assert!(matches!(b, Some(FnOutcome::Failed { .. })), "B::f (ret==3 body 2) must be refuted; outcomes {:?}", report.outcomes);
 }
 
 #[test]
