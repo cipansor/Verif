@@ -2953,7 +2953,7 @@ pub fn verify_fn<F>(
     rec: Option<Recursion>,
 ) -> MirReport
 where
-    F: Fn(Option<Var>, &[(u32, Var)], &[(u64, Var)], &[(u32, Var)]) -> Result<Pred, String>,
+    F: Fn(Option<Var>, &[(u32, Var)], &[(u64, Var)], &[(u32, Var)], &[u32]) -> Result<Pred, String>,
 {
     let mut report = MirReport { function: f.name.clone(), ..Default::default() };
 
@@ -6128,6 +6128,17 @@ fn slice_iter(
                         "`{name}` after a `take` on a reversed cursor is not modelled"
                     ));
                 }
+                // A `skip` on the reversed cursor advanced `pos` relative to the
+                // *reversed* sequence; flipping back to forward with the same `pos`
+                // would read from the front, outside the window --
+                // `take(3).rev().skip(1).rev()` read `xs[1]` = 20 where the real next
+                // element is 10 (a false proof). Only a `rev` with no intervening skip
+                // (`pos == 0`) cancels cleanly.
+                if it.pos > 0 {
+                    return Err(format!(
+                        "`{name}` after a `skip` on a reversed cursor is not modelled"
+                    ));
+                }
                 // `take(k).rev().rev()` -> forward `take(k)` (keep `taken_forward`, so a
                 // further `rev` is `take(k).rev()` again, not `rev().take(k)`).
                 env.iters.insert(dest.local, IterState { rev: false, ..it });
@@ -8484,7 +8495,7 @@ fn run_state<F>(
     unwind_declared: bool,
 )
 where
-    F: Fn(Option<Var>, &[(u32, Var)], &[(u64, Var)], &[(u32, Var)]) -> Result<Pred, String>,
+    F: Fn(Option<Var>, &[(u32, Var)], &[(u64, Var)], &[(u32, Var)], &[u32]) -> Result<Pred, String>,
 {
     let cur = &prog.fns[st.frame.func];
     // A path that cannot be taken is not a path. Pruning it is what lets
@@ -8849,6 +8860,26 @@ where
                         // are collected: a reference to an aggregate has no single
                         // word, and a by-value argument cannot be written by the
                         // body, so neither needs a second binding.
+                        // A `&mut Vec` argument that the body *rebinds* (`v = w`) aliases
+                        // the new target, and the model tracks no alias: a later push
+                        // through `v` would grow `w`'s storage without updating `w`'s
+                        // length, so any Vec length is unreliable once one is rebound. In
+                        // that case every `&mut Vec` length in the postcondition is
+                        // *refused* (unbound), never read back from the entry value -- the
+                        // entry fallback was a false proof for `v.push(1); v = w`.
+                        let any_mut_vec_rebound = cur.arg_locals.iter().any(|&l| {
+                            st.env.indexed.get(&l).is_some_and(|s| s.len_mutable)
+                                && st.env.whole_writes.contains(&l)
+                        });
+                        let ref_len_unknown: Vec<u32> = if any_mut_vec_rebound {
+                            cur.arg_locals
+                                .iter()
+                                .copied()
+                                .filter(|&l| st.env.indexed.get(&l).is_some_and(|s| s.len_mutable))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                         let mut ref_final: Vec<(u32, Var)> = Vec::new();
                         for &l in &cur.arg_locals {
                             let Some(ty) = cur.ty_of(l) else { continue };
@@ -8866,10 +8897,9 @@ where
                             let pointee = st.env.pointee(&Place::new(l)).local;
                             if let Some(s) = st.env.indexed.get(&pointee) {
                                 // Only a `Vec`'s length can change (`push`/`pop`), so only a
-                                // Vec rebinds to the final length -- and only when the argument
-                                // was *not* rebound (`v = w` leaves the caller's Vec untouched,
-                                // so the caller reads its entry length, not `w`'s).
-                                if s.len_mutable && !st.env.whole_writes.contains(&l) {
+                                // Vec rebinds to the final length -- unless a Vec was
+                                // rebound (aliased), when every Vec length is refused.
+                                if s.len_mutable && !any_mut_vec_rebound {
                                     ref_final.push((l, s.len));
                                 }
                                 continue;
@@ -8892,7 +8922,7 @@ where
                                 _ => {}
                             }
                         }
-                        match post(rv, &projs, &ret_payloads, &ref_final) {
+                        match post(rv, &projs, &ret_payloads, &ref_final, &ref_len_unknown) {
                             Ok(p) => {
                                 report.obligations.push(Obligation {
                                     kind: ObligationKind::Postcondition,

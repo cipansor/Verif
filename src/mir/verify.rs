@@ -1589,7 +1589,8 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         Some(move |ret: Option<smt::Var>,
                    projs: &[(u32, smt::Var)],
                    ret_payloads: &[(u64, smt::Var)],
-                   ref_final: &[(u32, smt::Var)]| {
+                   ref_final: &[(u32, smt::Var)],
+                   ref_len_unknown: &[u32]| {
             // A reference argument's name denotes the value the body left at the
             // target, so a bare `c` in the postcondition is bound to the *final*
             // value. Binding it to the entry value instead (which `arg_vars` holds)
@@ -1624,6 +1625,15 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
                     None => {
                         args.insert(name, *v);
                     }
+                }
+            }
+            // A `&mut Vec` argument whose length is unknown on this path (the body
+            // rebound a Vec reference, aliasing the storage): *remove* the length
+            // binding so `v.len()` in the postcondition is refused, rather than read
+            // back from the entry value (a false proof for `v.push(1); v = w`).
+            for l in ref_len_unknown {
+                if let Some(name) = spec::arg_name_any(f, rename.as_ref(), *l) {
+                    fields.vars.remove(&format!("{name}__len"));
                 }
             }
             // Bind each declared component that this path actually produced.

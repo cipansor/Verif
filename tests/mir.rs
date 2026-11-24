@@ -14890,18 +14890,36 @@ fn a_rebound_slice_reads_the_callers_entry_length() {
 }
 
 #[test]
-fn a_rebound_vec_reads_the_callers_entry_length_but_push_is_seen() {
-    // A `&mut Vec` the body pushes to has a final length (push is seen); a `&mut Vec`
-    // that is *rebound* (`v = w`) leaves the caller's Vec untouched, so `v.len()` is the
-    // entry length. Before the fix the rebound case read `w`'s length (a false proof).
+fn a_rebound_mut_vec_length_is_refused_but_push_is_seen() {
+    // A `&mut Vec` the body pushes to has a final length (push is seen). A `&mut Vec`
+    // that is *rebound* (`v = w`) aliases the new target, which the model does not
+    // track, so a Vec length after a rebind is *refused* (unreadable `v.len()`), never
+    // read back from the entry value -- that fallback was a false proof for
+    // `v.push(1); v = w` (the caller's Vec has length 1, the entry value 0).
     let pre = "/// requires: v.len() == 1 && w.len() == 2\n";
-    let t = format!("{pre}/// ensures: v.len() == 1\npub fn vr_true<'a>(mut v: &'a mut Vec<u8>, w: &'a mut Vec<u8>) -> u8 {{ v = w; 0 }}");
-    assert!(verify_src("vr_true", &t).is_some_and(|o| o.is_verified()), "a rebound &mut Vec keeps the caller's entry length");
-    let f = format!("{pre}/// ensures: v.len() == 2\npub fn vr_false<'a>(mut v: &'a mut Vec<u8>, w: &'a mut Vec<u8>) -> u8 {{ v = w; 0 }}");
-    assert!(matches!(verify_src("vr_false", &f), Some(FnOutcome::Failed { .. })), "the caller's Vec is still length 1, so == 2 must be refuted");
+    for (n, e) in [("vr_true", 1u64), ("vr_false", 2u64)] {
+        let src = format!("{pre}/// ensures: v.len() == {e}\npub fn {n}<'a>(mut v: &'a mut Vec<u8>, w: &'a mut Vec<u8>) -> u8 {{ v = w; 0 }}");
+        assert!(matches!(verify_src(n, &src), Some(FnOutcome::Incomplete { .. })), "`{n}`: a rebound &mut Vec's length must be refused (Incomplete)");
+    }
     // The push case is still seen (the entry length 0 becomes 1).
     let p = "/// requires: v.len() == 0\n/// ensures: ret == 1\npub fn vp(v: &mut Vec<u8>) -> usize { v.push(1); v.len() }";
     assert!(verify_src("vp", p).is_some_and(|o| o.is_verified()), "a push must be reflected in the final length");
+    // A push *then* rebind is refused, not proved against the entry length.
+    let pr = "/// requires: v.len() == 0 && w.len() == 1\n/// ensures: v.len() == 0\npub fn pr0<'a>(mut v: &'a mut Vec<u8>, w: &'a mut Vec<u8>) -> u8 { v.push(1); v = w; 0 }";
+    assert!(matches!(verify_src("pr0", pr), Some(FnOutcome::Incomplete { .. })), "push-then-rebind must refuse the length, not prove the entry value");
+}
+
+#[test]
+fn a_skip_on_a_reversed_prefix_cannot_be_reversed_again() {
+    // `take(k).rev().skip(1).rev()`: the `skip` advanced `pos` relative to the reversed
+    // sequence, so the second `rev` cannot map it back to a forward cursor -- it read
+    // `xs[1]` = 20 where the real next element is 10 (a false proof). Both directions are
+    // now refused (the single `take.rev.skip.next` is still correct).
+    let pre = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n";
+    for (n, e) in [("trsr10", 10u64), ("trsr20", 20u64)] {
+        let src = format!("{pre}/// ensures: ret == {e}\npub fn {n}(xs: &[u8]) -> u8 {{ xs.iter().take(3).rev().skip(1).rev().next().copied().unwrap_or(0) }}");
+        assert!(matches!(verify_src(n, &src), Some(FnOutcome::Incomplete { .. })), "`{n}` must be refused");
+    }
 }
 
 #[test]
@@ -15034,3 +15052,4 @@ fn iterator_chain_differential_agrees_with_rustc() {
         }
     }
 }
+
