@@ -2140,7 +2140,7 @@ fn inline_external_modules(src: &str, src_dir: &Path, child_dir: &Path, seen: &m
                 if let Some(file) = candidates.iter().find(|p| p.is_file()) {
                     let m_child = child_dir.join(&name);
                     if let Some(body) = read_and_inline(file, &m_child, seen) {
-                        out.push_str(&format!("{vis}mod {name} {{\n{body}\n}}{trailing}\n"));
+                        out.push_str(&format!("{vis}mod {name} {{\n{body}\n}}\n{trailing}\n"));
                         i += 1;
                         continue;
                     }
@@ -2157,8 +2157,12 @@ fn inline_external_modules(src: &str, src_dir: &Path, child_dir: &Path, seen: &m
 
 /// The path in a `#[path = "…"]` attribute on this line, if any.
 fn path_attr(line: &str) -> Option<String> {
+    // Rust allows any whitespace around `=`: `#[path="x"]` and `#[path = "x"]` are the
+    // same attribute. Parsing the name, `=`, and path in sequence (not an exact prefix)
+    // keeps the compact form from panicking.
     let t = line.trim_start();
-    let rest = t.strip_prefix("#[path = \"")?;
+    let rest = t.strip_prefix("#[path")?;
+    let rest = rest.trim_start().strip_prefix('=')?.trim_start().strip_prefix('"')?;
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
 }
@@ -2166,12 +2170,11 @@ fn path_attr(line: &str) -> Option<String> {
 /// The `mod name;` on the *same* line as a `#[path]` attribute, if any. The attribute's
 /// closing `]` sits between the path's quote and the `mod`, so it is stripped first.
 fn path_attr_mod(line: &str) -> Option<(String, String)> {
+    path_attr(line)?;
     let t = line.trim_start();
-    let rest = t.strip_prefix("#[path = \"")?;
-    let end = rest.find('"')?;
-    let after = rest[end + 1..].trim_start();
-    let after = after.strip_prefix(']').unwrap_or(after);
-    external_mod(after)
+    let after = t.strip_prefix("#[path")?;
+    let close = after.find(']')?;
+    external_mod(after[close + 1..].trim_start())
 }
 
 /// Read `file` and inline it as a module body whose plain children resolve in `m_child`,
@@ -9519,6 +9522,34 @@ mod tests {
         let out = inline_external_modules(src, &dir, &dir, &mut Vec::new());
         assert!(out.contains("mod setup {"), "setup must be inlined: {out}");
         assert!(!out.contains("mod legacy {"), "legacy (inside a comment) must not be inlined: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_compact_path_attribute_is_honoured_without_panicking() {
+        // `#[path="x"]` (no spaces around `=`) is valid Rust; it must not panic and must
+        // be honoured.
+        let dir = crate_dir("compact-path");
+        std::fs::write(dir.join("alt.rs"), "spec! { ensures: ret == 2, }\npub fn f() -> u8 { 2 }\n").unwrap();
+        let src = "#[path=\"alt.rs\"]\npub mod a;\n";
+        let root = dir.join("lib.rs");
+        std::fs::write(&root, src).unwrap();
+        let specs = extract_crate(&root, src);
+        assert!(specs.by_fn.contains_key("a::f"), "compact #[path] must be honoured: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_trailing_comment_does_not_merge_module_and_root_scopes() {
+        // `mod setup; /* init */` must inline `setup` and leave a later root `f` at file
+        // scope -- not fold it into `setup` (which would make the two contracts collide).
+        let dir = crate_dir("trailing-comment");
+        std::fs::write(dir.join("setup.rs"), "spec! { ensures: ret == 1, }\npub fn f() -> u8 { 1 }\n").unwrap();
+        let src = "mod setup; /* init */\n/// ensures: ret == 2\npub fn f() -> u8 { 2 }\n";
+        let out = inline_external_modules(src, &dir, &dir, &mut Vec::new());
+        let specs = extract(&out);
+        assert!(specs.by_fn.contains_key("setup::f"), "setup::f must be present: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        assert!(specs.by_fn.contains_key("f"), "the root `f` must be at file scope, not `setup::f`: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
