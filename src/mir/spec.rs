@@ -506,6 +506,16 @@ pub(crate) fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
     (bare(a) || bare(b)) && a.file_name() == b.file_name()
 }
 
+/// Like [`same_file`] but WITHOUT the bare-basename fallback: true only for the same
+/// path or a canonicalising match. Used where a loose basename match could pair one
+/// body with another file's contract at the same coordinates.
+pub(crate) fn same_file_exact(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+}
+
 impl Specs {
     /// The original `(file, line)` a 1-based snapshot line came from, if known.
     /// Returns `(None, line)` for a synthetic line (a `mod name {` wrapper) or for a
@@ -527,16 +537,34 @@ impl Specs {
     /// at most one line matches -- the snapshot line is a unique handle for an original
     /// location.
     fn snapshot_line_for(&self, file: Option<&str>, line: usize) -> Option<usize> {
-        // Strict full-path comparison: a basename fallback would let two files that share
-        // a basename in different directories match at the same line and column, pairing
-        // one body with another's contract (a false proof). The map's file and rustc's
-        // `impl at FILE` both derive from the same root path, so the full spelling agrees;
-        // a mismatch is a refusal (the method reported `missing`), never a wrong pairing.
+        // Use the SAME path-ranking as `resolve_targets`: prefer a unique exact/canonical
+        // match, accept a unique bare-basename fallback, and REFUSE an ambiguous match.
+        // `.position`-style "first match" let a same-basename file at the same line supply
+        // the wrong contract, so the selected body was checked against another file's line
+        // (a false proof). The map's file and rustc's `impl at FILE` share the root
+        // spelling, so the exact match normally wins; ambiguity is a refusal, never a guess.
         let w = std::path::Path::new(file?);
-        self.line_map
+        let exact: Vec<usize> = self
+            .line_map
             .iter()
-            .position(|(f, l)| *l == line && same_file(f.as_path(), w))
-            .map(|i| i + 1)
+            .enumerate()
+            .filter(|(_, (f, l))| *l == line && same_file_exact(f.as_path(), w))
+            .map(|(i, _)| i + 1)
+            .collect();
+        if exact.len() == 1 {
+            return Some(exact[0]);
+        }
+        if exact.len() > 1 {
+            return None;
+        }
+        let loose: Vec<usize> = self
+            .line_map
+            .iter()
+            .enumerate()
+            .filter(|(_, (f, l))| *l == line && same_file(f.as_path(), w))
+            .map(|(i, _)| i + 1)
+            .collect();
+        if loose.len() == 1 { Some(loose[0]) } else { None }
     }
 
     /// The *snapshot* `(line, col)` of the `impl` a MIR function name names, translating
