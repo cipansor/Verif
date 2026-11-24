@@ -9558,14 +9558,23 @@ mod tests {
     fn a_bracketed_filename_is_not_misrouted() {
         // `]` inside a `#[path]` filename is legal; the attribute's `]` is the delimiter,
         // found in the masked code so the `]` in the filename is not mistaken for it.
+        // `alt].rs` promises `ret == 1` (returns 0) and `b.rs` promises `ret == 2`
+        // (returns 1) -- the exact misrouting trap: if `alt].rs` were read under `b`,
+        // `b`'s body (returns 1) would be checked against `ret == 1` and wrongly pass.
         let dir = crate_dir("bracket-name");
-        std::fs::write(dir.join("alt].rs"), "spec! { ensures: ret == 2, }\npub fn f() -> u8 { 1 }\n").unwrap();
-        std::fs::write(dir.join("b.rs"), "spec! { ensures: ret == 1, }\npub fn f() -> u8 { 2 }\n").unwrap();
+        std::fs::write(dir.join("alt].rs"), "spec! { ensures: ret == 1, }\npub fn check() -> u8 { 0 }\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "spec! { ensures: ret == 2, }\npub fn check() -> u8 { 1 }\n").unwrap();
+        // WITH a following plain module: `a` from `alt].rs` (ret==1), `b` from `b.rs` (ret==2).
         let src = "#[path = \"alt].rs\"] mod a;\nmod b;\n";
         let out = inline_external_modules(src, &dir, &dir, &mut Vec::new());
         let specs = extract(&out);
-        assert!(specs.by_fn.get("a::f").is_some_and(|c| c.ensures.iter().any(|e| e.contains("ret == 2"))), "a::f must be alt].rs's contract: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
-        assert!(specs.by_fn.get("b::f").is_some_and(|c| c.ensures.iter().any(|e| e.contains("ret == 1"))), "b::f must be b.rs's contract: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        assert!(specs.by_fn.get("a::check").is_some_and(|c| c.ensures.iter().any(|e| e.contains("ret == 1"))), "a::check must be alt].rs's contract (ret==1): {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        assert!(specs.by_fn.get("b::check").is_some_and(|c| c.ensures.iter().any(|e| e.contains("ret == 2"))), "b::check must be b.rs's contract (ret==2): {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        // WITHOUT a following module: `a` alone is still read from `alt].rs`.
+        let src2 = "#[path = \"alt].rs\"] mod a;\n";
+        let out2 = inline_external_modules(src2, &dir, &dir, &mut Vec::new());
+        let specs2 = extract(&out2);
+        assert!(specs2.by_fn.get("a::check").is_some_and(|c| c.ensures.iter().any(|e| e.contains("ret == 1"))), "without a following module, a::check must still be alt].rs's (ret==1): {:?}", specs2.by_fn.keys().collect::<Vec<_>>());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
