@@ -1677,6 +1677,11 @@ fn qualify_trait(
     scope: &[String],
     imports: &BTreeMap<String, String>,
 ) -> String {
+    // Rust's leading `::` is the external-crate root: `::core::hash::Hasher` is the same
+    // trait as `core::hash::Hasher`. Strip it *before* the relative/import/module logic, or
+    // each `#[path]` inclusion prefixes its own module and one standard-library trait looks
+    // like two different unresolved traits (wrongly refused as ambiguous).
+    let written = written.strip_prefix("::").unwrap_or(written);
     // A path written with a *relative* root names the same trait as the
     // module-qualified path the declaration is keyed by, so it has to be resolved
     // to that spelling or the two never meet:

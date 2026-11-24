@@ -15220,14 +15220,25 @@ fn a_reexported_trait_contract_across_inclusions_is_refused_not_verified() {
     )).unwrap();
     let rep = verify::verify_file_with_opts(&rustc, &dir.join("lib.rs"), &[], &probe_opts()).expect("verify");
     let _ = std::fs::remove_dir_all(&dir);
-    let shared = rep
-        .outcomes
-        .iter()
-        .find(|(n, _)| n.contains("Shared") && n.ends_with("::value"))
-        .map(|(_, o)| o);
-    assert!(shared.is_some(), "the shared impl must be reported; outcomes {:?}", rep.outcomes);
+    let find = |want: &str| {
+        rep.outcomes
+            .iter()
+            .find(|(n, _)| n.contains(want) && n.ends_with("::value"))
+            .map(|(_, o)| o)
+    };
+    // Control: the direct impl satisfies T::value (ret == 9), so it must verify -- this
+    // rules out "everything is skipped" masking a broken fixture.
     assert!(
-        !matches!(shared, Some(FnOutcome::Verified { .. })),
-        "a re-exported-trait shared impl must be refused, never Verified; got {shared:?}"
+        matches!(find("Direct"), Some(FnOutcome::Verified { .. })),
+        "the direct impl must verify (control); outcomes {:?}",
+        rep.outcomes
+    );
+    // The shared impl must be *Skipped* for the inclusion ambiguity (not Verified, and not
+    // an unrelated Failed/Incomplete): the two inclusions resolve the re-exported trait to
+    // unresolved paths, so no contract can be applied safely.
+    assert!(
+        matches!(find("Shared"), Some(FnOutcome::Skipped { .. })),
+        "the shared impl must be Skipped for the inclusion ambiguity; outcomes {:?}",
+        rep.outcomes
     );
 }
