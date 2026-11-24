@@ -120,7 +120,7 @@ fn main() {
                         println!("{fname:<22} {label:<12} {:>8.2}s  {short}", elapsed.as_secs_f64());
                     }
                 }
-                Err(e) => println!("{want:<22} {:<12} driver error: {e}", "error", "-"),
+                Err(e) => println!("{want:<22} {:<12} driver error: {e}", "error"),
             }
         }
         // Full corpus: one pass so a definition selected by two names is counted once,
