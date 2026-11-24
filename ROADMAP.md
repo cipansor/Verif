@@ -1872,8 +1872,22 @@ build-script forwarding, custom source path, action ref, literal-masking replay 
   `take.rev().all/any`, `all`/`any` cursor discard, `take.rev.rev`). **Known over-refusal
   (safe lost proof):** a shared `&Vec` rebind discards its length (`Ty::Ref` carries no
   mutability, so `&Vec` and `&mut Vec` cannot be told apart) -- refused, never wrongly
-  proved. Still open: the inlining line-map, `--emit-test`, nested wrappers, SARIF paths,
-  cached builds.
+  proved. Still open: `--emit-test`, nested wrappers, cached builds. (The inlining line-map
+  and SARIF per-file paths are now DONE -- see Round 27.)
+- **Round 27 (line-map, per-file SARIF, Box write):** `extract_crate`/`inline_external_modules`
+  record a map from each snapshot line to the original `(file, line)`; `resolve_targets` and
+  the contract lookup (`snapshot_impl_loc`) translate through it, so a method in a module file
+  and a root method below a `mod` declaration pair with their own body (true -> `Verified`,
+  false -> `Failed`; before, a multi-file method was a visible `missing`). `report.lines`
+  carries `(file, line)`, so `print_sarif` points `artifactLocation`/`region.startLine` at the
+  module a method lives in, and `check_sarif.py --root` asserts a non-root URI with a positive
+  line. The `Box` write now reaches its store: `set`'s box arm forgot the value it had just
+  stored (`forget_parts` does `boxed.remove`) and erased the field-0 pointer token, so
+  `*b = 7; *b` read unknown and the stale value could be proved; forget-then-insert, keep the
+  token, and set the pointer's value in the `Cast` arm fix it. The Box and Vec-rebind tests are
+  two-way with teeth (mutating the store write / `any_mut_vec_rebound` turns them red).
+  Commit `b16a719`. Still open (safe over-refusal): a shared `&Vec` rebind discards its length
+  (`Ty::Ref` carries no mutability -- optional item 5, not done).
 - Executor/iterator: `iterator_const_len` pin reuse; cross-adapter chains (`rev().step_by()`, …).
   **Same-adapter chaining is verified composing** (round 20): `take` by `min`, `skip`
   additively, `step_by` multiplicatively -- `take(2).take(3)` yields 2, not 3 -- pinned by
