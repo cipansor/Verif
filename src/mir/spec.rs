@@ -488,10 +488,11 @@ impl Specs {
     /// The exact or suffix `by_fn` key `name` resolves to *if* it was declared twice
     /// (a `#[cfg]`-alternative). `None` when the name is unambiguous.
     fn ambiguous_key<'a>(&'a self, name: &str) -> Option<&'a str> {
+        // An exact `by_fn` key wins: only *it* can be ambiguous. Falling through to the
+        // suffix loop for an exact match would let an unrelated ambiguous key (e.g.
+        // `platform::f`) refuse a crate-root `f` whose own contract is unambiguous.
         if let Some((k, _)) = self.by_fn.get_key_value(name) {
-            if self.ambiguous.contains(k) {
-                return Some(k);
-            }
+            return self.ambiguous.contains(k).then_some(k.as_str());
         }
         self.by_fn
             .keys()
@@ -2067,18 +2068,51 @@ pub fn extract_crate(root: &Path, root_src: &str) -> Specs {
 /// module. A `mod child;` *inside* an inline `mod parent { … }` is not inlined here (the
 /// scanner is line-based, not brace-aware) and is left as `mod child;` -- also a visible
 /// `missing`; see `ROADMAP.md`.
+/// The net brace depth change of one line, with strings and comments masked so a `{`
+/// or `}` inside them does not miscount. `in_block` carries an open `/* */` across lines.
+/// Char literals are not tracked: a `{`/`}` inside one is rare and would only shift the
+/// inliner's file-scope heuristic, never a verdict on a body that parses.
+fn brace_delta(line: &str, in_block: &mut bool) -> i32 {
+    let b = line.as_bytes();
+    let mut d = 0i32;
+    let mut i = 0;
+    let mut in_str = false;
+    while i < b.len() {
+        let c = b[i];
+        if *in_block {
+            if c == b'*' && i + 1 < b.len() && b[i + 1] == b'/' { *in_block = false; i += 2; continue; }
+            i += 1; continue;
+        }
+        if in_str {
+            if c == b'\\' { i += 2; continue; }
+            if c == b'"' { in_str = false; }
+            i += 1; continue;
+        }
+        if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' { break; }
+        if c == b'/' && i + 1 < b.len() && b[i + 1] == b'*' { *in_block = true; i += 2; continue; }
+        if c == b'"' { in_str = true; }
+        else if c == b'{' { d += 1; }
+        else if c == b'}' { d -= 1; }
+        i += 1;
+    }
+    d
+}
+
 fn inline_external_modules(src: &str, src_dir: &Path, child_dir: &Path, seen: &mut Vec<PathBuf>) -> String {
     let lines: Vec<&str> = src.lines().collect();
     let mut out = String::new();
     let mut i = 0;
+    let mut depth = 0i32;
+    let mut in_block = false;
     while i < lines.len() {
         let line = lines[i];
-        // Only a *file-scope* item is inlined: a declaration indented inside an inline
-        // `mod { … }` resolves relative to that module's own directory in Rust, which this
-        // line-oriented scanner does not track -- reading it from the enclosing directory
-        // would attach a sibling file's contract (a false proof). Leaving it un-inlined
-        // makes the contract `missing` (visible, safe).
-        let at_file_scope = line.trim_start().len() == line.len();
+        // Only a *file-scope* item (brace depth 0) is inlined: a `#[path]`/`mod` inside an
+        // inline `mod { … }` resolves relative to that module's own directory in Rust,
+        // which this scanner does not track -- reading it from the enclosing directory
+        // would attach a sibling file's contract (a false proof). Depth, not indentation,
+        // is the scope signal: an indented file-scope `#[path]` above an unindented `mod`
+        // is still file scope, and dropping it to read the conventional file is wrong.
+        let at_file_scope = depth == 0 && !in_block;
         if at_file_scope {
         if let Some(attr_path) = path_attr(line) {
             // The `mod` may share the attribute's line or follow it.
@@ -2120,6 +2154,7 @@ fn inline_external_modules(src: &str, src_dir: &Path, child_dir: &Path, seen: &m
         }
         out.push_str(line);
         out.push('\n');
+        depth += brace_delta(line, &mut in_block);
         i += 1;
     }
     out
@@ -9399,22 +9434,58 @@ mod tests {
 
     #[test]
     fn a_nested_path_module_is_not_inlined_from_the_enclosing_directory() {
-        // An indented `#[path]`/`mod` inside an inline `mod { }` resolves relative to that
-        // module's own directory in Rust, which the line-oriented scanner does not track.
-        // Inlining it from the enclosing directory would attach a sibling file's contract
-        // (a false proof); leaving it un-inlined keeps `outer::child::f` missing (safe).
+        // A `#[path]`/`mod` on its *own* line, indented inside an inline `mod { }` (brace
+        // depth 1), resolves relative to that module's own directory in Rust, which the
+        // scanner does not track. Inlining it from the enclosing directory would attach a
+        // sibling file's contract (a false proof); depth 1 keeps `outer::child::f` missing.
+        // (The one-line form would be vacuous -- the scanner never sees a standalone decl.)
         let dir = crate_dir("nested-inline");
-        let src = "pub mod outer { #[path = \"alt.rs\"] pub mod child; }\n";
+        let src = "pub mod outer {\n    #[path = \"alt.rs\"]\n    pub mod child;\n}\n";
         std::fs::write(dir.join("lib.rs"), src).unwrap();
         std::fs::write(dir.join("alt.rs"), "spec! { ensures: ret == 2, }\npub fn f() -> u8 { 2 }\n").unwrap();
         let root = dir.join("lib.rs");
         let specs = extract_crate(&root, src);
         assert!(
             !specs.by_fn.contains_key("outer::child::f"),
-            "a nested #[path] must not be inlined from the enclosing dir: {:?}",
+            "a nested #[path] (depth > 0) must not be inlined: {:?}",
             specs.by_fn.keys().collect::<Vec<_>>()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_indented_file_scope_path_attribute_is_still_honoured() {
+        // An indented `#[path]` above an *unindented* `mod` is still file scope (brace
+        // depth 0). It must be honoured -- read `actual.rs`, the file Rustc compiles --
+        // not dropped to read the conventional `platform.rs` (which would be a wrong
+        // contract). This is the shape an indentation-based gate got wrong.
+        let dir = crate_dir("indented-path");
+        let src = "    #[path = \"actual.rs\"]\npub mod platform;\n";
+        std::fs::write(dir.join("lib.rs"), src).unwrap();
+        std::fs::write(dir.join("actual.rs"), "spec! { ensures: ret == 2, }\npub fn f() -> u8 { 2 }\n").unwrap();
+        std::fs::write(dir.join("platform.rs"), "spec! { ensures: ret == 1, }\npub fn f() -> u8 { 1 }\n").unwrap();
+        let root = dir.join("lib.rs");
+        let specs = extract_crate(&root, src);
+        let c = specs.by_fn.get("platform::f").expect("platform::f must be contracted");
+        assert!(
+            c.ensures.iter().any(|e| e.contains("ret == 2")),
+            "an indented file-scope #[path] must be honoured (actual.rs, ret==2), got {:?}",
+            c.ensures
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_crate_root_contract_is_not_refused_by_an_unrelated_ambiguous_key() {
+        // `platform::f` is ambiguous (a cfg duplicate), but a crate-root `f` is its own
+        // exact, unambiguous contract -- the suffix match against `platform::f` must not
+        // refuse it.
+        let mut s = Specs::default();
+        s.by_fn.insert("f".into(), FnContract::default());
+        s.by_fn.insert("platform::f".into(), FnContract::default());
+        s.ambiguous.insert("platform::f".into());
+        assert!(s.ambiguous_key("f").is_none(), "a crate-root `f` must not be refused by an unrelated ambiguous key");
+        assert_eq!(s.ambiguous_key("platform::f"), Some("platform::f"));
     }
 
     /// A contract written as a `spec! { … }` block is read from the source text,
