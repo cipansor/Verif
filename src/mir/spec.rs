@@ -750,10 +750,39 @@ impl Specs {
     /// aligned exactly (an unreadable signature, or a different number of slots).
     /// The caller refuses then: an inherited contract that cannot be bound
     /// positionally is not a contract that may be guessed at.
+    /// True when one file is included by two `#[path]` modules that qualify this impl's
+    /// trait path differently (`impl super::T for S`), so the inherited contract differs
+    /// by inclusion and the MIR body does not say which one compiled. Applying either is
+    /// a coin flip, so [`Self::contract_for_fn`] refuses the shape (a visible skip).
+    fn inherited_contract_is_ambiguous(&self, name: &str) -> bool {
+        let (Some((orig_line, col)), Some(file)) = (impl_location(name), impl_file(name)) else {
+            return false;
+        };
+        let w = std::path::Path::new(file);
+        let traits: Vec<&str> = self
+            .line_map
+            .iter()
+            .enumerate()
+            .filter(|(_, (fl, l))| *l == orig_line && same_file_exact(fl.as_path(), w))
+            .filter_map(|(i, _)| self.impl_traits.get(&(i + 1, col)).map(String::as_str))
+            .collect();
+        match traits.first() {
+            Some(first) => traits.iter().any(|t| *t != *first),
+            None => false,
+        }
+    }
+
     pub fn contract_for_fn<'a>(
         &'a self,
         f: &crate::mir::parse::MirFn,
     ) -> Result<(Option<&'a FnContract>, Option<ArgRename>), String> {
+        if self.inherited_contract_is_ambiguous(&f.name) {
+            return Err(format!(
+                "`{}` is implemented in more than one module inclusion whose trait contracts \
+                 differ; refusing rather than apply an arbitrary one",
+                f.name
+            ));
+        }
         let Some(loc) = self.snapshot_impl_loc(&f.name) else {
             // A `#[cfg]`-alternative duplicate: refuse rather than apply the inactive
             // module's contract (a false proof, or a false refutation of the active one).
