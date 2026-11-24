@@ -108,7 +108,7 @@ are the defects where it produced a wrong verdict.
 | 62 | A `mod` inside a block comment opened by a consumed `mod x; /*` line was treated as live (the trailing `/*` was dropped and lexical state not carried), so its contract was paired with an unrelated body | false proof | `a_module_inside_a_block_comment_is_not_inlined` (`src/mir/spec.rs`) | `7abc7a7` | 2026-11-23 |
 | 63 | A compact `#[path="x"]` (no spaces around `=`) panicked `path_attr` (it required `#[path = "`), crashing verification before any contract was checked | wrong verdict | `a_compact_path_attribute_is_honoured_without_panicking` (`src/mir/spec.rs`) | `3a320ed` | 2026-11-23 |
 | 64 | The generated `}` of an inlined module shared a line with a preserved trailing `/*`, so `line_scopes` dropped the `}` and a following root contract inherited the module's scope (two `f`s collided as an ambiguity, both refused) | lost proof | `a_trailing_comment_does_not_merge_module_and_root_scopes` (`src/mir/spec.rs`) | `3a320ed` | 2026-11-23 |
-| 65 | A `]` inside a `#[path]` filename was taken as the attribute delimiter, so the module's contracts were dropped or misrouted to a following module (a wrong contract) | false proof | `a_bracketed_filename_is_not_misrouted` (`src/mir/spec.rs`) | `2af55b1` | 2026-11-23 |
+| 65 | A `]` inside a `#[path]` filename was taken as the attribute delimiter, so the module's contracts were dropped or misrouted to a following module (a wrong contract) | false proof | `a_bracketed_filename_is_not_misrouted` (`src/mir/spec.rs`) | `7babd14` | 2026-11-23 |
 
 The clusters are the lesson: rows 1–9 are all the *contract reader's* value and
 width model; rows 10–13 are all *name resolution* (a name bound to the wrong
