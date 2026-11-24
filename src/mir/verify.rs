@@ -1990,6 +1990,9 @@ fn impl_file_matches(name: &str, want: Option<&Path>) -> bool {
     // path agrees; a mismatch refuses the pairing (the method is `missing`).
     match (spec::impl_file(name), want) {
         (Some(f), Some(w)) => spec::same_file(Path::new(f), w),
+        // A `None` want is a single-file `Specs` (no line map): pair by location alone.
+        // The caller still requires a singleton candidate set, so ambiguity is refused.
+        (Some(_), None) => true,
         _ => false,
     }
 }
@@ -2099,10 +2102,24 @@ fn resolve_targets<'a>(
         // snapshot line differs from its file's) still pairs with its body, and check the
         // file so two `impl`s at the same line and column in different files stay apart.
         let (orig_file, orig_line) = specs.original_loc(*line);
-        match prog.fns.iter().find(|f| f.impl_loc == Some((orig_line, *col))
+        let candidates: Vec<&_> = prog.fns.iter().filter(|f| f.impl_loc == Some((orig_line, *col))
             && f.name.rsplit("::").next() == Some(method)
-            && impl_file_matches(&f.name, orig_file.as_deref()))
-        {
+            && impl_file_matches(&f.name, orig_file.as_deref())).collect();
+        // Prefer the exact-file body over a bare-name fallback so an earlier
+        // same-basename match cannot beat the exact file; with no file, or no exact
+        // candidate, the pairing must be unambiguous (exactly one body) or it is refused.
+        let chosen = match orig_file.as_deref() {
+            Some(w) => {
+                let exact: Vec<&_> = candidates.iter().copied()
+                    .filter(|f| spec::impl_file(&f.name).map(Path::new) == Some(w)).collect();
+                if exact.len() == 1 { Some(exact[0]) }
+                else if exact.is_empty() && candidates.len() == 1 { Some(candidates[0]) }
+                else { None }
+            }
+            None if candidates.len() == 1 => Some(candidates[0]),
+            None => None,
+        };
+        match chosen {
             Some(f) => targets.push((method_key(*line, *col, method, f), f)),
             None => missing.push(method.to_string()),
         }
@@ -2163,7 +2180,10 @@ fn trait_method_targets(specs: &Specs) -> Vec<(usize, usize, String)> {
         // Every declaration the trait carries, which is every method of it this
         // scanner read a contract for. A trait with no contracted method
         // contributes nothing, so an impl of it is left as it was: checked for
-        // panic freedom, with no postcondition to establish.
+        // panic freedom, with no postcondition to establish. Strip a `crate::`
+        // prefix (an imported trait) the same way `trait_contract` does, or a method
+        // with only an inherited contract never becomes a target.
+        let tr = tr.strip_prefix("crate::").unwrap_or(tr);
         let prefix = format!("{tr}::");
         for key in specs.by_trait.keys() {
             if let Some(method) = key.strip_prefix(&prefix) {

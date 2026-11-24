@@ -15022,6 +15022,31 @@ fn a_multifile_method_contract_is_verified_or_refuted_by_original_location() {
 }
 
 #[test]
+fn a_same_named_method_in_two_same_basename_files_is_paired_by_file() {
+    // Two module files with the same basename and the SAME method name at the SAME line
+    // and column: only the file distinguishes them, so target selection must use the path
+    // (not the bare name), or one body gets the other's contract.
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-snn-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::create_dir_all(dir.join("b")).unwrap();
+    std::fs::write(dir.join("lib.rs"), "pub mod a;\npub mod b;\n").unwrap();
+    std::fs::write(dir.join("a.rs"), "pub mod m;\n").unwrap();
+    std::fs::write(dir.join("b.rs"), "pub mod m;\n").unwrap();
+    std::fs::write(dir.join("a/m.rs"), "pub struct A;\nimpl A {\n    /// ensures: ret == 1\n    pub fn f(&self) -> u8 { 1 }\n}\n").unwrap();
+    std::fs::write(dir.join("b/m.rs"), "pub struct B;\nimpl B {\n    /// ensures: ret == 2\n    pub fn f(&self) -> u8 { 1 }\n}\n").unwrap();
+    let report = verify::verify_file_with_opts(&rustc, &dir.join("lib.rs"), &[], &probe_opts()).expect("frontend");
+    let _ = std::fs::remove_dir_all(&dir);
+    let verified = report.outcomes.iter().filter(|(_, o)| matches!(o, FnOutcome::Verified { .. })).count();
+    let failed = report.outcomes.iter().filter(|(_, o)| matches!(o, FnOutcome::Failed { .. })).count();
+    assert_eq!(verified, 1, "exactly one `f` (a::m, ret==1 body 1) must verify; outcomes {:?}", report.outcomes);
+    assert_eq!(failed, 1, "exactly one `f` (b::m, ret==2 body 1) must be refuted; outcomes {:?}", report.outcomes);
+}
+
+#[test]
 fn a_multifile_method_with_two_contracts_is_refused() {
     // A module-file method that declares its own contract AND inherits a contracted
     // trait's must be refused (Skipped), not silently checked against one. Before the
