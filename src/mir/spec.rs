@@ -2255,13 +2255,163 @@ fn parse_use(raw: &str) -> Vec<(String, String)> {
 /// `line` a contract carries is the line within the module file, so a multi-file
 /// line number is best-effort; the *verdict* and its keying are exact.
 pub fn extract_crate(root: &Path, root_src: &str) -> Specs {
+    extract_crate_with_cfgs(root, root_src, &[])
+}
+
+/// [`extract_crate`], told which `cfg`s the crate is compiled with.
+///
+/// The `cfg` set is what makes a `#[cfg]`-gated enum variant readable as present or
+/// absent. Without it the reader counts every variant the *source* writes, while
+/// `rustc` compiles only the enabled ones, and both directions of that mismatch are
+/// wrong verdicts:
+///
+/// * an extra variant widens the tag domain, so the `otherwise` arm of an exhaustive
+///   `match` -- which rustc lowers to `unreachable` -- looks reachable and a panic is
+///   reported that cannot happen (`serde_json`'s `ParserNumber`, whose
+///   `#[cfg(feature = "arbitrary_precision")]` variant is off);
+/// * a *missing* variant shifts every later implicit discriminant, so a contract
+///   naming a later variant lands on the wrong tag -- a false proof.
+pub fn extract_crate_with_cfgs(root: &Path, root_src: &str, cfgs: &[String]) -> Specs {
     let dir = root.parent().unwrap_or_else(|| Path::new("."));
     let mut seen: Vec<PathBuf> = Vec::new();
     let (inlined, line_map) = inline_external_modules(root_src, root, dir, dir, &mut seen);
-    let mut specs = extract(&inlined);
+    let mut specs = extract_with_cfgs(&inlined, cfgs);
     specs.snapshot = inlined;
     specs.line_map = line_map;
     specs
+}
+
+/// The `--cfg` flags a crate is compiled with, for reading `#[cfg]`-gated items.
+///
+/// Only `feature = "…"` predicates are *decided*: the feature set comes from the
+/// manifest and nowhere else, so a feature flag that is absent really is off. Every
+/// other predicate (`unix`, `target_os = "linux"`, `debug_assertions`, a build
+/// script's own cfg) can be set by the compiler itself and not appear in this list,
+/// so those are reported as *unknown* and the item is kept as written -- the
+/// conservative direction, because dropping an item that does exist is the
+/// discriminant-shifting failure this whole mechanism exists to prevent.
+#[derive(Clone, Debug, Default)]
+pub struct CfgSet {
+    flags: Vec<String>,
+    /// Whether anything is known at all. An *empty* flag list is ambiguous -- a crate
+    /// with no features is genuinely featureless, while `extract` with no argument list
+    /// (the corpora, the unit tests) knows nothing -- so the two are told apart here
+    /// rather than inferred. Nothing known means every gated item is kept as written.
+    known: bool,
+}
+
+impl CfgSet {
+    /// Read the `--cfg` values out of a `rustc` argument list (`--cfg v`,
+    /// `--cfg=v`).
+    pub fn from_rustc_args(args: &[String]) -> Self {
+        let mut flags = Vec::new();
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            let v = if a == "--cfg" {
+                match it.next() {
+                    Some(v) => v.as_str(),
+                    None => break,
+                }
+            } else if let Some(v) = a.strip_prefix("--cfg=") {
+                v
+            } else {
+                continue;
+            };
+            flags.push(normalise_cfg(v));
+        }
+        let known = !flags.is_empty();
+        CfgSet { flags, known }
+    }
+
+    /// Whether nothing is known about the crate's `cfg`s.
+    pub fn is_empty(&self) -> bool {
+        !self.known
+    }
+
+    fn has(&self, flag: &str) -> bool {
+        self.flags.iter().any(|f| f == flag)
+    }
+
+    /// `Some(true)`/`Some(false)` when the predicate is decidable, `None` when it
+    /// names something this reader cannot evaluate.
+    ///
+    /// Three-valued: `any(true, …)` is true and `all(false, …)` is false even when
+    /// another disjunct is unknown, which is what makes `not(any(...))` usable.
+    fn eval(&self, pred: &str) -> Option<bool> {
+        let p = pred.trim();
+        if let Some(inner) = strip_call(p, "not") {
+            return self.eval(inner).map(|b| !b);
+        }
+        if let Some(inner) = strip_call(p, "any") {
+            let mut unknown = false;
+            for part in split_top_level(inner, ',') {
+                match self.eval(&part) {
+                    Some(true) => return Some(true),
+                    Some(false) => {}
+                    None => unknown = true,
+                }
+            }
+            return if unknown { None } else { Some(false) };
+        }
+        if let Some(inner) = strip_call(p, "all") {
+            let mut unknown = false;
+            for part in split_top_level(inner, ',') {
+                match self.eval(&part) {
+                    Some(false) => return Some(false),
+                    Some(true) => {}
+                    None => unknown = true,
+                }
+            }
+            return if unknown { None } else { Some(true) };
+        }
+        // A keyed predicate: only `feature` is decided by the manifest-derived set.
+        let key = normalise_cfg(p);
+        let (name, _) = key.split_once('=')?;
+        if name.trim() != "feature" || !self.known {
+            return None;
+        }
+        Some(self.has(&key))
+    }
+}
+
+/// `inner` when `p` is a call to `name` with balanced parentheses, else `None`.
+fn strip_call<'a>(p: &'a str, name: &str) -> Option<&'a str> {
+    let rest = p.strip_prefix(name)?;
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('(')?;
+    let end = rest.rfind(')')?;
+    if !rest[end + 1..].trim().is_empty() {
+        return None;
+    }
+    Some(&rest[..end])
+}
+
+/// A `cfg` predicate with its whitespace removed, so `feature = "std"` and
+/// `feature="std"` are one spelling. Quoted values keep their quotes, which is how
+/// the `--cfg feature="std"` flag is spelled.
+fn normalise_cfg(v: &str) -> String {
+    v.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The `#[cfg(…)]` predicates at the start of `line`, in order.
+fn leading_cfg_preds(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = line.trim_start();
+    while rest.starts_with("#[") {
+        // `attr_close_offset` returns the offset just past the closing `]`, so the
+        // attribute's own text is `rest[2..e-1]` -- `#[` before it, `]` at `e-1`.
+        let Some(e) = attr_close_offset(rest, 1) else { break };
+        let attr = &rest[2..e - 1];
+        if let Some(inner) = attr.trim().strip_prefix("cfg") {
+            let inner = inner.trim();
+            if let Some(p) = inner.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+                out.push(p.to_string());
+            }
+        }
+        rest = &rest[e..];
+        rest = rest.trim_start();
+    }
+    out
 }
 
 /// Replace each `mod name;` line with an inline `mod name { <file contents> }`.
@@ -2510,6 +2660,16 @@ fn external_mod(line: &str) -> Option<(String, String)> {
 /// path rustc prints for each function. For a multi-file crate use [`extract_crate`],
 /// which inlines external `mod` declarations first.
 pub fn extract(source: &str) -> Specs {
+    extract_with_cfgs(source, &[])
+}
+
+/// [`extract`], told which `cfg`s the crate is compiled with.
+///
+/// The set decides `#[cfg]`-gated enum variants (see [`extract_crate_with_cfgs`] for
+/// why both directions of getting that wrong are wrong verdicts). An empty set means
+/// nothing is known, and every item is kept exactly as written.
+pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
+    let cfgs = CfgSet::from_rustc_args(cfgs);
     let mut specs = Specs::default();
     let mut seen_contract_keys: BTreeSet<String> = BTreeSet::new();
     let mut pending = FnContract::default();
@@ -2577,6 +2737,9 @@ pub fn extract(source: &str) -> Specs {
     // rather than a list of fields, so it needs its own cursor; a struct and an
     // enum cannot be open at once, so the two cursors never interleave.
     let mut cur_enum: Option<(String, EnumDef)> = None;
+    // A `#[cfg]`-gated variant whose predicate is false: the next variant line is
+    // dropped. `None` means "no constraint" (no attribute, or an undecidable one).
+    let mut cfg_pending: Option<bool> = None;
     // Struct names whose qualified key was recorded, so the bare-name
     // back-insertion can be deferred to the end and skipped when two structs
     // share a bare name. See `Specs::structs` and `Specs::struct_of`.
@@ -2614,10 +2777,30 @@ pub fn extract(source: &str) -> Specs {
                 specs.enums.insert(name, def);
                 continue;
             }
-            match enum_variant(line) {
+            // A `#[cfg]`-gated variant is present only when its predicate holds. An
+            // attribute line carries the verdict for the *next* line; a variant whose
+            // cfg is false is dropped, which is exactly the numbering rustc uses (an
+            // implicit discriminant counts only the variants that exist).
+            let preds = leading_cfg_preds(line);
+            if !preds.is_empty() {
+                let live = preds.iter().all(|p| cfgs.eval(p) != Some(false));
+                cfg_pending = if live { None } else { Some(false) };
+                continue;
+            }
+            if line.starts_with('#') {
+                continue;
+            }
+            let skip = cfg_pending.take() == Some(false);
+            let variant_line = split_leading_attrs(line).0;
+            if variant_line.is_empty() {
+                continue;
+            }
+            match enum_variant(variant_line) {
                 VariantLine::Variant { name: vname, payload, explicit } => {
                     if let Some((_, def)) = cur_enum.as_mut() {
-                        push_variant(def, vname, payload, explicit);
+                        if !skip {
+                            push_variant(def, vname, payload, explicit);
+                        }
                     }
                 }
                 VariantLine::NotAVariant => {}
@@ -2733,7 +2916,7 @@ pub fn extract(source: &str) -> Specs {
             }
             continue;
         }
-        if let Some((name, head)) = enum_head(line) {
+        if let Some((name, head)) = enum_head(line, &cfgs) {
             // Same as the struct head: a doc comment above an enum is the enum's,
             // not a function's, so the pending contract is dropped rather than
             // carried to the next `fn`.
@@ -4105,6 +4288,20 @@ pub struct FieldEnv {
     /// whole path: `o.a[0]` and `o.b[0]` are different words, and a store keyed by the local
     /// and index alone would collide them.
     pub path_elem_seeds: Vec<(u32, Vec<u32>, u64, Var, bool)>,
+    /// `(local, field chain, length variable)` for each *slice- or `str`-typed
+    /// field* of a struct argument, so `self.slice.len()` is a value.
+    ///
+    /// Nothing else in the model can supply it: the dump prints the field's type
+    /// (`&[u8]`) and never a length, and the length is not part of the type. It is
+    /// therefore a fresh `usize` input, exactly as a top-level slice argument's
+    /// length is -- an arbitrary value of that type, which is the sound reading.
+    ///
+    /// Only an *immutable-length* field is bound: `&[T]`, `&mut [T]` and `&str`.
+    /// A `Vec`/`String` field is deliberately excluded, because its length is
+    /// *mutable* (`push` grows it) and the store that tracks a container's length
+    /// is keyed by a local, not by a path -- a field length bound here would go
+    /// stale after a `push` and read a wrong value rather than an unknown one.
+    pub path_len_seeds: Vec<(u32, Vec<u32>, Var)>,
     /// `path -> array-field layout` for every array-typed field a contract may subscript
     /// (`o.a` in `o.a[0]`): the argument name, the local, the field chain to the array, the
     /// element width and signedness, and the array's length.
@@ -4770,6 +4967,36 @@ impl FieldEnv {
         self.len_seeds.push((local, v, elem_w, elem_signed));
         self.known_args.insert(arg.to_string());
         Some(v)
+    }
+
+    /// Bind the *length* of a slice- or `str`-typed field: `self.slice.len()`.
+    ///
+    /// The value is a fresh `usize` input. A field's length is not in the dump and
+    /// not in the type, so there is nothing to read it from -- and reading nothing
+    /// is what made `if self.index < self.slice.len()` unknown, so every such
+    /// `match`/`if` in `serde_json`'s readers reported "unmodelled switch
+    /// discriminant". See [`path_len_seeds`](Self::path_len_seeds) for why only a
+    /// slice/`str` field is bound and a `Vec` field is not.
+    pub fn bind_field_len(&mut self, local: u32, arg: &str, field: &str, index: u32) -> Option<()> {
+        let slot = self.base + self.next_slot;
+        if slot as usize >= crate::smt::MAX_VARS {
+            return None;
+        }
+        let mangled = format!("{arg}__f{index}__len");
+        if !self.name_is_free(&mangled) {
+            return None;
+        }
+        self.next_slot += 1;
+        let v = smt::var_named(slot, USIZE_WIDTH);
+        self.vars.insert(mangled.clone(), v);
+        self.path_len_seeds.push((local, vec![index], v));
+        self.paths.insert(format!("{arg}.{field}.len()"), mangled);
+        Some(())
+    }
+
+    /// Whether a field's type is a slice-like value whose length is an input.
+    fn field_has_len(ty: &Ty) -> bool {
+        matches!(ty, Ty::Ref(inner) if matches!(**inner, Ty::Slice(_)) || **inner == Ty::Other("str".into()))
     }
 
     /// Bind an array argument's length to its *constant*, `N`.
@@ -8664,7 +8891,7 @@ enum EnumHead {
 /// the head text, and getting that wrong would number the variants wrongly, which
 /// is the one thing this layout must not do. A missing layout makes a contract
 /// naming a variant a refusal, which is the safe direction.
-fn enum_head(line: &str) -> Option<(String, EnumHead)> {
+fn enum_head(line: &str, cfgs: &CfgSet) -> Option<(String, EnumHead)> {
     let t = line.trim_start_matches("pub(crate) ").trim_start_matches("pub ").trim();
     let rest = t.strip_prefix("enum ")?;
     // A generic enum (`enum E<T>`) is read for its name, but a variant payload
@@ -8683,7 +8910,17 @@ fn enum_head(line: &str) -> Option<(String, EnumHead)> {
         let inner = &after[..close];
         let mut def = EnumDef::default();
         for v in split_top_level(inner, ',') {
-            match enum_variant(&v) {
+            // A `#[cfg]`-gated variant on a one-line body: dropped when its
+            // predicate is decided false, so the numbering matches rustc's.
+            let preds = leading_cfg_preds(&v);
+            if preds.iter().any(|p| cfgs.eval(p) == Some(false)) {
+                continue;
+            }
+            let v = split_leading_attrs(&v).0.trim();
+            if v.is_empty() {
+                continue;
+            }
+            match enum_variant(v) {
                 VariantLine::Variant { name, payload, explicit } => {
                     push_variant(&mut def, name, payload, explicit);
                 }
@@ -9248,6 +9485,9 @@ pub fn field_env_named(
         let Some(def) = struct_lookup(structs, name) else { continue };
         for (i, (fname, fty)) in def.fields.iter().enumerate() {
             env.bind(l, &arg, fname, i as u32, fty);
+            if FieldEnv::field_has_len(fty) {
+                env.bind_field_len(l, &arg, fname, i as u32);
+            }
             // An array-typed field is subscriptable: `o.a[0]`. Recorded so a contract's
             // `o.a[0]` can bind an element variable of the right width, and the executor seeds
             // it under the same `(local, [i], index)` key the body's write lands on.
@@ -9491,6 +9731,66 @@ pub fn arg_name_any(
 
 #[cfg(test)]
 mod tests {
+    /// A `#[cfg]`-gated variant is present only when its predicate holds, so a
+    /// `match` over the remaining variants is exhaustive and the tag domain is the
+    /// one rustc compiled. Both directions matter: keeping a disabled variant makes
+    /// an exhaustive `match` look able to fall through to `unreachable`, and dropping
+    /// an enabled one shifts every later implicit discriminant.
+    #[test]
+    fn a_cfg_gated_variant_is_present_only_when_its_feature_is_on() {
+        let src = "pub enum P { A(u8), B, #[cfg(feature = \"extra\")] C(String) }\n";
+        let on = ["--cfg".to_string(), "feature=\"extra\"".to_string()];
+        let off = ["--cfg".to_string(), "feature=\"std\"".to_string()];
+        let names = |cfgs: &[String]| -> Vec<String> {
+            let specs = super::extract_with_cfgs(src, cfgs);
+            specs
+                .enums
+                .get("P")
+                .expect("P is a declared enum")
+                .variants
+                .iter()
+                .map(|(n, _, _)| n.clone())
+                .collect()
+        };
+        assert_eq!(names(&off), ["A", "B"], "a disabled variant is not part of the type");
+        assert_eq!(names(&on), ["A", "B", "C"], "an enabled variant is");
+        // Nothing known about the crate's cfgs: keep the item as written, which is the
+        // conservative direction -- dropping a variant that exists would shift the
+        // discriminants after it.
+        assert_eq!(names(&[]), ["A", "B", "C"]);
+    }
+
+    /// A disabled variant in the *middle* of an enum must not shift the ones after
+    /// it: rustc numbers only the variants that exist, so `C` is discriminant 1 when
+    /// `B` is cfg'd out.
+    #[test]
+    fn a_cfg_gated_variant_does_not_shift_the_discriminants_after_it() {
+        let src = "pub enum P {\n    A,\n    #[cfg(feature = \"extra\")]\n    B,\n    C,\n}\n";
+        let off = ["--cfg".to_string(), "feature=\"std\"".to_string()];
+        let specs = super::extract_with_cfgs(src, &off);
+        let def = specs.enums.get("P").expect("P is a declared enum");
+        assert_eq!(def.variants, vec![("A".to_string(), vec![], 0), ("C".to_string(), vec![], 1)]);
+    }
+
+    /// `not`/`any`/`all` compose three-valued: a decided `any`/`all` wins even when
+    /// another disjunct names a `cfg` this reader cannot evaluate (`unix`, a build
+    /// script's own flag), and only `feature` is decided from the flag set.
+    #[test]
+    fn cfg_predicates_are_three_valued() {
+        let set = super::CfgSet::from_rustc_args(&[
+            "--cfg".to_string(),
+            "feature=\"std\"".to_string(),
+        ]);
+        assert_eq!(set.eval("feature = \"std\""), Some(true));
+        assert_eq!(set.eval("feature = \"extra\""), Some(false));
+        assert_eq!(set.eval("not(feature = \"extra\")"), Some(true));
+        assert_eq!(set.eval("any(feature = \"extra\", unix)"), None);
+        assert_eq!(set.eval("any(feature = \"std\", unix)"), Some(true));
+        assert_eq!(set.eval("all(feature = \"extra\", unix)"), Some(false));
+        assert_eq!(set.eval("unix"), None, "a compiler-supplied cfg is not in the set");
+        assert_eq!(set.eval("target_os = \"linux\""), None);
+    }
+
     #[test]
     fn function_params_ignores_a_comment_declaration() {
         let src = "// fn bad(b: u8, a: u8)\npub fn bad(a: u8, b: u8) -> u8 { 0 }\n";

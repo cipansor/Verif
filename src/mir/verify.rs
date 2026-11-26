@@ -14,6 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 use crate::mir::exec;
 use crate::mir::parse::{self, MirFn, MirProgram, Ty, USIZE_WIDTH};
@@ -141,7 +142,26 @@ pub struct MirOptions {
     /// artifact, and the verifier could approve a contract the build violates (a
     /// false pass). Edition and `--extern` are handled separately (they are part of
     /// [`MirOptions`] proper).
+    ///
+    /// [`crate_options`] fills it too, from the crate's own manifest and build
+    /// script, because `cargo verif --file src/lib.rs` is the *other* way a real
+    /// crate reaches the frontend and it has no `RUSTC_WRAPPER` to borrow Cargo's
+    /// flags from. A crates.io tarball publishes its dependencies as
+    /// `[dependencies.foo]` tables and enables its default features through
+    /// `[features]`, and `serde_json` refuses to compile without
+    /// `--cfg feature="std"` -- so without this, every published crate failed
+    /// `compile_error!` before a single function was read.
     pub rustc_args: Vec<String>,
+    /// Environment variables the MIR-emitting `rustc` runs with, as
+    /// `(name, value)` pairs.
+    ///
+    /// Cargo exports the package's metadata to the compiler (`CARGO_PKG_VERSION`
+    /// and friends, `CARGO_MANIFEST_DIR`, `CARGO_CRATE_NAME`), and a crate that
+    /// reads one with `env!` fails to compile without it. [`crate_options`] derives
+    /// the set from the manifest, so a real crate compiles as it does under Cargo.
+    /// A caller that needs nothing here leaves it empty; the process environment is
+    /// inherited either way.
+    pub rustc_env: Vec<(String, String)>,
 }
 
 /// Everything a build script needs to let its own source name a crate: the
@@ -266,8 +286,27 @@ pub fn crate_options(file: &Path) -> MirOptions {
         return MirOptions::default();
     };
     let deps = dependency_packages(&text);
+    // The crate's own compilation environment, which Cargo supplies and a bare
+    // `rustc` does not: the features its manifest enables by default, the `cfg`s
+    // its build script printed, its crate name, and the `CARGO_PKG_*` variables a
+    // source may read with `env!`. Without these a published crate fails
+    // `compile_error!`/`E0425` before a function is read -- `serde_json` is the
+    // measured example (`requires that either std or alloc feature is enabled`,
+    // then `cannot find type Chunk`, which is `#[cfg(fast_arithmetic = "64")]`).
+    let target_dir = target_dir_for(&crate_root);
+    let crate_name = lib_crate_name(&text);
+    let mut rustc_args = cfg_args(&text, &target_dir);
+    if let Some(name) = &crate_name {
+        rustc_args.push("--crate-name".to_string());
+        rustc_args.push(name.clone());
+    }
+    let base = MirOptions {
+        rustc_args,
+        rustc_env: package_env(&manifest, &text, crate_name.as_deref()),
+        ..MirOptions::default()
+    };
     if deps.is_empty() {
-        return MirOptions::default();
+        return base;
     }
     // Where a dependency's rlib can land: `<profile>/deps` (a normal build) and every
     // `<profile>/build/<pkg>/<hash>/out` (a build-script output, which some toolchains
@@ -275,15 +314,14 @@ pub fn crate_options(file: &Path) -> MirOptions {
     // same set `build_script_roots` walks for a build script.
     // The real target directory: a custom `[build] target-dir`, `CARGO_TARGET_DIR`,
     // or a workspace's shared `target/`, none of which is `<crate_root>/target`.
-    let target_dir = target_dir_for(&crate_root);
     let mut dirs: Vec<PathBuf> = Vec::new();
     for profile in ["debug", "release"] {
-        let base = target_dir.join(profile);
-        let deps = base.join("deps");
-        if deps.is_dir() {
-            dirs.push(deps);
+        let prof_dir = target_dir.join(profile);
+        let dep_dir = prof_dir.join("deps");
+        if dep_dir.is_dir() {
+            dirs.push(dep_dir);
         }
-        if let Ok(pkgs) = std::fs::read_dir(base.join("build")) {
+        if let Ok(pkgs) = std::fs::read_dir(prof_dir.join("build")) {
             for pkg in pkgs.flatten() {
                 if let Ok(hashes) = std::fs::read_dir(pkg.path()) {
                     for h in hashes.flatten() {
@@ -297,7 +335,7 @@ pub fn crate_options(file: &Path) -> MirOptions {
         }
     }
     if dirs.is_empty() {
-        return MirOptions::default();
+        return base;
     }
     let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
     let mut externs: Vec<(String, PathBuf)> = Vec::new();
@@ -331,28 +369,317 @@ pub fn crate_options(file: &Path) -> MirOptions {
         }
     }
     if externs.is_empty() {
-        return MirOptions::default();
+        return base;
     }
     let opts = MirOptions {
         externs,
         search_paths: dirs,
         probed_with: Some(canonical_compiler(&rustc)),
-        ..MirOptions::default()
+        ..base.clone()
     };
     if extern_compiles(&rustc, &opts) {
         opts
     } else {
-        MirOptions::default()
+        // The probe failed (no rlib yet, or one from another toolchain), so the
+        // externs are dropped and the caller gets a compiler error naming the
+        // unresolved import. The *cfgs* are still correct -- they come from the
+        // manifest, not from the artifacts -- so they are kept: a crate with no
+        // dependencies at all still needs its feature flags to compile.
+        base
     }
+}
+
+/// The `--cfg` flags a crate's own source needs to compile the way Cargo compiles
+/// it: the features its manifest enables by default, and the `cfg`s its build
+/// script printed.
+///
+/// Both are part of the program, not decoration. `serde_json`'s `lib.rs` is
+/// `compile_error!` without `feature="std"`, and its `Chunk` type is declared under
+/// `#[cfg(fast_arithmetic = "64")]`, which only the build script emits. Without
+/// them `cargo verif --file` fails on every published crate before reading a
+/// function -- a tool that could not run on the code it is for.
+fn cfg_args(text: &str, target_dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in enabled_features(text) {
+        out.push("--cfg".to_string());
+        out.push(format!("feature=\"{f}\""));
+    }
+    for c in build_script_cfgs(text, target_dir) {
+        out.push("--cfg".to_string());
+        out.push(c);
+    }
+    out
+}
+
+/// The crate's own name, as Cargo spells it: `[lib] name` when declared, else the
+/// package name with hyphens turned into underscores.
+///
+/// `rustc` would otherwise derive the name from the file stem (`lib` for
+/// `src/lib.rs`), which is not the crate's name -- and a crate whose source says
+/// `#![no_mangle]` or reads `env!("CARGO_CRATE_NAME")` would see the wrong one.
+fn lib_crate_name(text: &str) -> Option<String> {
+    let name = manifest_value(text, "lib", "name")
+        .or_else(|| manifest_value(text, "package", "name"))?;
+    let name = name.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.replace('-', "_"))
+    }
+}
+
+/// The `CARGO_PKG_*` / `CARGO_MANIFEST_*` variables Cargo exports to the compiler.
+///
+/// A crate that reads one with `env!` does not compile without it, and these are
+/// ordinary in published code (`env!("CARGO_PKG_VERSION")`). The values come from
+/// the manifest, which is the same source Cargo reads, so they agree with the
+/// artifact's. A key the manifest does not set becomes the empty string, as Cargo
+/// does -- an absent variable would be a compile error instead.
+fn package_env(manifest: &Path, text: &str, crate_name: Option<&str>) -> Vec<(String, String)> {
+    let pkg = |k: &str| manifest_value(text, "package", k).unwrap_or_default();
+    let version = pkg("version");
+    let (core, pre) = version
+        .split_once('-')
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .unwrap_or_else(|| (version.clone(), String::new()));
+    let mut parts = core.split('.');
+    let mut next = || parts.next().unwrap_or("").to_string();
+    let mut out = vec![
+        ("CARGO_PKG_NAME".to_string(), pkg("name")),
+        ("CARGO_PKG_VERSION".to_string(), version),
+        ("CARGO_PKG_VERSION_MAJOR".to_string(), next()),
+        ("CARGO_PKG_VERSION_MINOR".to_string(), next()),
+        ("CARGO_PKG_VERSION_PATCH".to_string(), next()),
+        ("CARGO_PKG_VERSION_PRE".to_string(), pre),
+    ];
+    for (env, key) in [
+        ("CARGO_PKG_AUTHORS", "authors"),
+        ("CARGO_PKG_DESCRIPTION", "description"),
+        ("CARGO_PKG_HOMEPAGE", "homepage"),
+        ("CARGO_PKG_REPOSITORY", "repository"),
+        ("CARGO_PKG_LICENSE", "license"),
+        ("CARGO_PKG_LICENSE_FILE", "license-file"),
+        ("CARGO_PKG_RUST_VERSION", "rust-version"),
+        ("CARGO_PKG_README", "readme"),
+    ] {
+        out.push((env.to_string(), pkg(key)));
+    }
+    if let Some(dir) = manifest.parent() {
+        out.push(("CARGO_MANIFEST_DIR".to_string(), dir.display().to_string()));
+    }
+    out.push(("CARGO_MANIFEST_PATH".to_string(), manifest.display().to_string()));
+    if let Some(n) = crate_name {
+        out.push(("CARGO_CRATE_NAME".to_string(), n.to_string()));
+    }
+    out
+}
+
+/// The `[features]` table as `(name, items)` pairs.
+///
+/// A focused reader, like [`manifest_value`]: it joins a multi-line array (Cargo
+/// publishes one) and splits on top-level commas, but it does not evaluate
+/// anything. An entry it cannot read is skipped rather than guessed, which loses
+/// a feature name and leaves the compile error naming it.
+fn feature_table(text: &str) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut in_features = false;
+    let mut pending = String::new();
+    let mut depth = 0i32;
+    for raw in text.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if depth == 0 && line.starts_with('[') {
+            in_features = line.trim_start_matches('[').trim_end_matches(']').trim() == "features";
+            continue;
+        }
+        if !in_features || line.is_empty() {
+            continue;
+        }
+        if !pending.is_empty() {
+            pending.push(' ');
+        }
+        pending.push_str(line);
+        depth += bracket_delta(line);
+        if depth > 0 {
+            continue;
+        }
+        if let Some((k, v)) = pending.split_once('=') {
+            let name = unquote_toml_key(k.trim());
+            if !name.is_empty() {
+                out.push((name.to_string(), quoted_items(v)));
+            }
+        }
+        pending.clear();
+        depth = 0;
+    }
+    out
+}
+
+/// `[` minus `]`, counting only brackets outside string literals.
+fn bracket_delta(line: &str) -> i32 {
+    let mut d = 0i32;
+    let mut in_str = false;
+    let mut prev = '\0';
+    for c in line.chars() {
+        match c {
+            '"' if prev != '\\' => in_str = !in_str,
+            '[' if !in_str => d += 1,
+            ']' if !in_str => d -= 1,
+            _ => {}
+        }
+        prev = c;
+    }
+    d
+}
+
+/// The double-quoted strings of a TOML array, in order.
+fn quoted_items(v: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = v;
+    while let Some(start) = rest.find('"') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('"') else { break };
+        out.push(after[..end].to_string());
+        rest = &after[end + 1..];
+    }
+    out
+}
+
+/// The feature names Cargo enables for a plain `cargo build`, i.e. the `default`
+/// feature and everything it reaches transitively.
+///
+/// A plain name is a feature of *this* crate (or an implicit feature named after an
+/// optional dependency). `dep/feat` enables a feature on a dependency and, unless
+/// written `dep?/feat`, the dependency itself -- whose implicit feature Cargo also
+/// passes as a `cfg`. Emitting a `cfg` for a name nothing declares is harmless but
+/// noisy under a crate's `#![deny(warnings)]`, so only known names are emitted.
+fn enabled_features(text: &str) -> Vec<String> {
+    let table = feature_table(text);
+    let optional = optional_dependencies(text);
+    let known = |name: &str| table.iter().any(|(n, _)| n == name);
+    let items_of = |name: &str| table.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
+    let mut enabled: BTreeSet<String> = BTreeSet::new();
+    let mut stack: Vec<String> = Vec::new();
+    if known("default") {
+        enabled.insert("default".to_string());
+        stack.extend(items_of("default").unwrap_or_default());
+    }
+    while let Some(item) = stack.pop() {
+        if let Some((dep, _)) = item.split_once('/') {
+            let dep = dep.trim_end_matches('?');
+            if !item.contains("?/")
+                && (known(dep) || optional.iter().any(|d| d == dep))
+                && enabled.insert(dep.to_string())
+            {
+                stack.extend(items_of(dep).unwrap_or_default());
+            }
+            continue;
+        }
+        if !known(&item) && !optional.contains(&item) {
+            continue;
+        }
+        if enabled.insert(item.clone()) {
+            stack.extend(items_of(&item).unwrap_or_default());
+        }
+    }
+    enabled.into_iter().collect()
+}
+
+/// The dependency names declared `optional = true`, which Cargo turns into implicit
+/// features of the same name.
+fn optional_dependencies(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_deps = false;
+    let mut sub_table: Option<String> = None;
+    for raw in text.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(inner) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            let inner = inner.trim();
+            in_deps = inner == "dependencies";
+            sub_table = inner
+                .strip_prefix("dependencies.")
+                .map(|n| unquote_toml_key(n.trim()).to_string());
+            continue;
+        }
+        if in_deps {
+            if let Some((k, v)) = line.split_once('=') {
+                if v.contains("optional") && v.contains("true") {
+                    out.push(unquote_toml_key(k.trim()).to_string());
+                }
+            }
+        } else if let Some(name) = &sub_table {
+            if line.starts_with("optional")
+                && line.split_once('=').map(|(_, v)| v.trim() == "true").unwrap_or(false)
+            {
+                out.push(name.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The `cfg`s the crate's own build script printed, from Cargo's record of its
+/// output.
+///
+/// Cargo runs the script and writes its stdout to `<target>/<profile>/build/<pkg>/
+/// <hash>/run/stdout` (older Cargos: `output`); the `cargo:rustc-cfg=` lines are
+/// the cfgs the real compilation gets. Only the *newest* record is used, because a
+/// host and a target build can each have one and their cfgs can contradict
+/// (`fast_arithmetic="32"` and `"64` would both become true).
+fn build_script_cfgs(text: &str, target_dir: &Path) -> Vec<String> {
+    let Some(pkg) = manifest_value(text, "package", "name") else {
+        return Vec::new();
+    };
+    let pkg = pkg.trim();
+    let mut best: Option<(SystemTime, Vec<String>)> = None;
+    for profile in ["debug", "release"] {
+        let Ok(entries) = std::fs::read_dir(target_dir.join(profile).join("build")) else {
+            continue;
+        };
+        for pkg_dir in entries.flatten() {
+            let name = pkg_dir.path();
+            let Some(dir_name) = name.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if dir_name != pkg && !dir_name.starts_with(&format!("{pkg}-")) {
+                continue;
+            }
+            let Ok(hashes) = std::fs::read_dir(pkg_dir.path()) else { continue };
+            for h in hashes.flatten() {
+                for f in [h.path().join("run").join("stdout"), h.path().join("output")] {
+                    let Ok(body) = std::fs::read_to_string(&f) else { continue };
+                    let cfgs: Vec<String> = body
+                        .lines()
+                        .filter_map(|l| l.strip_prefix("cargo:rustc-cfg="))
+                        .map(|c| c.trim().to_string())
+                        .filter(|c| !c.is_empty())
+                        .collect();
+                    if cfgs.is_empty() {
+                        continue;
+                    }
+                    let mt = std::fs::metadata(&f)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    if best.as_ref().map(|(b, _)| mt > *b).unwrap_or(true) {
+                        best = Some((mt, cfgs));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(_, c)| c).unwrap_or_default()
 }
 
 /// The crate names in a manifest's `[dependencies]` table. Handles `name = "1"`,
 /// `name = { … }`, and the `[dependencies.name]` sub-table form; skips dev and build
 /// dependencies, which the verified source does not link.
-#[cfg(feature = "std")]
-/// The extern name for a dependency: Rust spells a crate with underscores, so a
-/// hyphenated manifest key (`embedded-hal`) becomes the extern `embedded_hal`. A
-/// hyphenated `--extern embedded-hal=...` names nothing the source can `use`.
+///
+/// The extern name is a dependency's manifest key: Rust spells a crate with
+/// underscores, so a hyphenated key (`embedded-hal`) becomes the extern
+/// `embedded_hal`. A hyphenated `--extern embedded-hal=...` names nothing the source
+/// can `use`.
 fn extern_name(dep: &str) -> String {
     dep.replace('-', "_")
 }
@@ -1099,6 +1426,13 @@ pub fn emit_mir_with_opts(
     for a in &opts.rustc_args {
         cmd.arg(a);
     }
+    // Cargo's package metadata (`CARGO_PKG_VERSION`, `CARGO_MANIFEST_DIR`, …) is
+    // part of the program: a crate that reads one with `env!` does not compile
+    // without it. Set them on the child so the inherited environment is augmented
+    // rather than replaced.
+    for (k, v) in &opts.rustc_env {
+        cmd.env(k, v);
+    }
     let out = cmd
         .arg(file)
         .envs(bootstrap_env(file))
@@ -1736,6 +2070,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             fields: fields.seeds.clone(),
             nested: fields.nested_seeds.clone(),
             lens: fields.len_seeds.clone(),
+            field_lens: fields.path_len_seeds.clone(),
             array_lens: fields.array_lens.clone(),
             slice_steps: fields.slice_chain_steps(),
             elems: fields.elem_seeds.clone(),
@@ -1885,7 +2220,12 @@ pub fn verify_file_with_opts(
     check_probe_compiler(rustc, opts)?;
     let text = std::fs::read_to_string(source)
         .map_err(|e| format!("could not read {}: {e}", source.display()))?;
-    let specs = spec::extract_crate(source, &text);
+    // The `--cfg` set is passed to the *reader* as well as to rustc, so a
+    // `#[cfg]`-gated enum variant is present or absent here exactly as it is in the
+    // compiled code. Without it a disabled variant widens the tag domain (a `match`
+    // then looks like it can fall through to `unreachable`) and an enabled one
+    // missing from a numbering shifts every later implicit discriminant.
+    let specs = spec::extract_crate_with_cfgs(source, &text, &opts.rustc_args);
     let (mir, edition) = emit_mir_with_opts(rustc, source, opts)?;
     let prog =
         parse::parse_program_scoped(&mir, &enum_layouts(&specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners, &specs.impl_traits, &specs.impl_trait_args, &specs.declared_traits);

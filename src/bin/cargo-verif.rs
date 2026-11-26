@@ -186,12 +186,19 @@ fn print_human(file: &Path, report: &verify::FileReport) {
         report.skipped(),
         report.missing.len()
     );
+    // "all contracts held" is a claim about the contracts that were *checked*, and a
+    // crate with none has nothing to check: a run over a whole crate that reports a
+    // green summary while verifying nothing is the summary outrunning its evidence.
+    // (Measured on `serde_json`: 1078 functions, 0 contracts, "all contracts held".)
     println!(
         "{}",
-        if report.is_clean() {
-            "all contracts held"
-        } else {
+        if !report.is_clean() {
             "verification did not pass"
+        } else if report.outcomes.is_empty() && report.missing.is_empty() {
+            "no contracts found: nothing was verified (write `/// requires: …` / \
+             `/// ensures: …`, or a `spec! { … }` block, on a function)"
+        } else {
+            "all contracts held"
         }
     );
 }

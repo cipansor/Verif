@@ -7282,6 +7282,43 @@ fn probe_opts() -> verify::MirOptions {
     verify::MirOptions { edition: Some(verify::Edition::Rust2024), ..Default::default() }
 }
 
+/// [`probe_opts`] with a `--cfg` set, so a `#[cfg]`-gated item is read the way the
+/// compiler read it.
+fn probe_opts_with_cfgs(cfgs: &[&str]) -> verify::MirOptions {
+    let mut args = Vec::new();
+    for c in cfgs {
+        args.push("--cfg".to_string());
+        args.push((*c).to_string());
+    }
+    verify::MirOptions {
+        edition: Some(verify::Edition::Rust2024),
+        rustc_args: args,
+        ..Default::default()
+    }
+}
+
+/// [`verify_src`], with the run's options named. Used where the *options* are part of
+/// the property under test (the `cfg` set, which decides a gated enum variant).
+fn verify_src_with(name: &str, src: &str, opts: &verify::MirOptions) -> Option<FnOutcome> {
+    let rustc = rustc()?;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir()
+        .join(format!("verif-{name}-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, src).expect("write probe");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], opts).expect("frontend");
+    let o = report
+        .outcomes
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, o)| o);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_not_dropped(name, src, o.is_some(), &report.missing);
+    o
+}
+
 /// Every outcome and the `missing` list for one source, without the
 /// "must be present" guard of [`verify_src`] -- for the trait-contract tests,
 /// whose whole point is that a declaration has *no* outcome of its own.
@@ -15240,5 +15277,209 @@ fn a_reexported_trait_contract_across_inclusions_is_refused_not_verified() {
         matches!(find("Shared"), Some(FnOutcome::Skipped { .. })),
         "the shared impl must be Skipped for the inclusion ambiguity; outcomes {:?}",
         rep.outcomes
+    );
+}
+
+/// A `match` on an enum reached **through a reference** must decide.
+///
+/// `match *e` lowers to `_2 = discriminant((*_1))`, which has *two* closing parens.
+/// The parser trimmed only one, so the place failed to parse, the discriminant was
+/// `Unknown`, and every such `match` was reported `unmodelled switch discriminant`.
+/// Measured on `serde_json`: 172 functions. Found by running the frontend over the
+/// crate; the curated corpora never matched through a reference.
+#[test]
+fn an_enum_matched_through_a_reference_decides() {
+    let src = "pub enum E { A(u8), B, C }\n\
+               /// ensures: ret <= 1\n\
+               pub fn f(e: &E) -> u8 { match *e { E::A(x) => x % 2, E::B => 1, E::C => 0 } }\n\
+               /// ensures: ret == 2\n\
+               pub fn f_tripwire(e: &E) -> u8 { match *e { E::A(x) => x % 2, E::B => 1, E::C => 0 } }\n";
+    let Some(ok) = verify_src("f", src) else { return };
+    assert!(matches!(ok, FnOutcome::Verified { .. }), "a reference match must decide, got {ok}");
+    let Some(bad) = verify_src("f_tripwire", src) else { return };
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "`ret == 2` is false on every arm, so it must be refuted, got {bad}"
+    );
+}
+
+/// A tag a *caller* built must reach the callee's `match`.
+///
+/// The caller's `E::A(x)` writes a tag into its own local; the callee matches on it.
+/// The tag has to cross the call boundary, or the callee's `switchInt` has nothing to
+/// compare against. Found on `serde_json` (`ParserNumber::visit` called from
+/// `deserialize_any`); measured before the fix as `incomplete`.
+#[test]
+fn an_enum_tag_built_by_a_caller_reaches_the_callee() {
+    let src = "pub enum E { A(u8), B, C }\n\
+               /// ensures: ret <= 1\n\
+               fn inner(e: &E) -> u8 { match *e { E::A(x) => x, E::B => 1, E::C => 0 } }\n\
+               /// requires: x == 0\n\
+               /// ensures: ret == 0\n\
+               pub fn outer(x: u8) -> u8 { let e = E::A(x); inner(&e) }\n\
+               /// requires: x == 0\n\
+               /// ensures: ret == 1\n\
+               pub fn outer_tripwire(x: u8) -> u8 { let e = E::A(x); inner(&e) }\n";
+    let Some(ok) = verify_src("outer", src) else { return };
+    assert!(matches!(ok, FnOutcome::Verified { .. }), "the caller's tag must reach the callee, got {ok}");
+    let Some(bad) = verify_src("outer_tripwire", src) else { return };
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "`ret == 1` is false when the tag reached the callee (the A arm returns 0), got {bad}"
+    );
+}
+
+/// A `#[cfg]`-disabled enum variant is not part of the type, so a `match` over the
+/// enabled ones is exhaustive and its `otherwise` arm is unreachable.
+///
+/// The reader counted every variant the *source* writes. With one extra, the tag
+/// domain is too wide, rustc's `unreachable` arm looks reachable, and the function is
+/// reported as a panic -- `serde_json`'s `ParserNumber` has a
+/// `#[cfg(feature = "arbitrary_precision")]` variant and three functions were `failed`
+/// for a panic that cannot happen.
+#[test]
+fn a_cfg_gated_variant_is_not_part_of_the_tag_domain() {
+    let src = "pub enum P { A(u8), B, #[cfg(feature = \"extra\")] C(String) }\n\
+               /// ensures: ret <= 1\n\
+               pub fn f(p: P) -> u8 { match p { P::A(x) => x % 2, P::B => 1 } }\n";
+    // The feature is off, which is how the crate is compiled: the match is exhaustive.
+    let Some(ok) = verify_src_with("f", src, &probe_opts_with_cfgs(&["feature=\"std\""])) else {
+        return;
+    };
+    assert!(
+        matches!(ok, FnOutcome::Verified { .. }),
+        "a disabled variant must not widen the tag domain, got {ok}"
+    );
+    // With nothing known about the cfgs the variant is kept as written (the
+    // conservative direction), so the match may fall through and the panic is
+    // reported -- that is the behaviour the cfg set exists to improve on, pinned so a
+    // reader that started dropping gated variants unconditionally would fail here.
+    let Some(kept) = verify_src_with("f", src, &probe_opts()) else { return };
+    assert!(
+        matches!(kept, FnOutcome::Failed { .. }),
+        "without a cfg set the variant is kept, so the `unreachable` arm is reachable, got {kept}"
+    );
+}
+
+/// A slice- or `str`-typed **field**'s length is an input, and a reference to it
+/// addresses the field.
+///
+/// Three separate gaps had to be closed for `if self.index < self.slice.len()` to
+/// decide, and each is a way to be wrong rather than slow:
+///
+/// 1. `Ty::parse("&'a [u8]")` read the lifetime as part of the referent, so the field
+///    was `Other("'a [u8]")` -- no width, not a slice, no length. Every struct field
+///    written with an explicit lifetime was unseeded.
+/// 2. A reference *field* is read as `((*_1).0)`, whose head is a deref followed by a
+///    field step. Only a projection of exactly `[Deref]` carried an address, so
+///    `PtrMetadata` of the copied reference was `Unknown`.
+/// 3. Nothing bound a *field*'s length: a top-level slice argument's length is
+///    `indexed`, but `self.slice` is a field, so it is now a fresh `usize` input keyed
+///    by the field path.
+///
+/// Measured on `serde_json`: this is its reader (`SliceRead`), and the shape accounted
+/// for 86 "unmodelled switch discriminant" refusals.
+#[test]
+fn a_slice_typed_field_has_a_length_input() {
+    // The body *branches* on the comparison, so a length the frontend cannot read
+    // leaves the `switchInt` unknown and the function `incomplete` -- which is what
+    // every one of those 86 functions was. A contract on the branch values is
+    // therefore only provable once the comparison is modelled.
+    let src = "pub struct S<'a> { pub slice: &'a [u8], pub index: usize }\n\
+               /// ensures: ret <= 1\n\
+               pub fn before_end(x: &S) -> u8 { if x.index < x.slice.len() { 1 } else { 0 } }\n\
+               /// ensures: ret <= 1\n\
+               pub fn before_end_through_a_temp(x: &S) -> u8 { let s = x.slice; if x.index < s.len() { 1 } else { 0 } }\n\
+               /// ensures: ret == 1\n\
+               pub fn before_end_tripwire(x: &S) -> u8 { if x.index < x.slice.len() { 1 } else { 0 } }\n";
+    for name in ["before_end", "before_end_through_a_temp"] {
+        let Some(f) = verify_src(name, src) else { return };
+        assert!(matches!(f, FnOutcome::Verified { .. }), "{name} must decide, got {f}");
+    }
+    // The tripwire is the evidence the length is a *symbolic input* and not a value
+    // that makes the comparison always true: `index >= len` is reachable, so
+    // `ret == 1` must be refuted.
+    let Some(bad) = verify_src("before_end_tripwire", src) else { return };
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "an index past the end is reachable, so `ret == 1` must be refuted, got {bad}"
+    );
+}
+
+/// A **turbofish** call to a local method resolves, so its body is inlined.
+///
+/// `call_type` read the receiver from the text before the *last* `::`, which for
+/// `V::scaled::<u8>` is `V::scaled` -- whose last segment is the method, not the
+/// receiver. Every explicit-generic-argument call to a local method therefore found
+/// no candidate and was reported "call to unmodelled function", which on `serde_json`
+/// was the single largest refusal (38 functions on one call to
+/// `value::de::<impl Value>::invalid_type::<error::Error>`).
+///
+/// The trailing group is now stripped before the receiver is read. Both halves are
+/// asserted: the true contract verifies *because* the body was inlined (a refused
+/// call would be `incomplete`), and the false one is refuted with a witness.
+#[test]
+fn a_turbofish_call_to_a_local_method_is_inlined() {
+    let src = "pub struct V;\n\
+               impl V {\n\
+                   fn scaled<T>(&self, k: u8) -> u8 { k + 1 }\n\
+               }\n\
+               /// ensures: ret <= 1\n\
+               pub fn use_it(v: &V) -> u8 { v.scaled::<u8>(0) }\n\
+               /// ensures: ret == 2\n\
+               pub fn use_it_tripwire(v: &V) -> u8 { v.scaled::<u8>(0) }\n";
+    let Some(f) = verify_src("use_it", src) else { return };
+    assert!(
+        matches!(f, FnOutcome::Verified { .. }),
+        "a turbofish method call must be inlined, got {f}"
+    );
+    let Some(bad) = verify_src("use_it_tripwire", src) else { return };
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "the inlined body returns 1, so `ret == 2` must be refuted, got {bad}"
+    );
+}
+
+/// A local method whose *type* lives in another module is called through an
+/// `<impl V>` projection, and that is not a `core` callee.
+///
+/// rustc prints a call to a method whose `impl` block is in the calling module but
+/// whose *type* is imported as `de::<impl V>::h`. The resolver used to refuse **any**
+/// name containing `<impl`, on the reasoning that only `core`/`std` print that
+/// projection -- which is false, and on `serde_json` cost 38 functions
+/// (`value::de::<impl Value>::invalid_type::<error::Error>`, a *local* function).
+/// What separates the two is the module prefix, which a local definition prints
+/// identically: a `core` call (`core::num::<impl u8>::wrapping_add`) then finds no
+/// candidate whose prefix matches, and is refused exactly as before.
+///
+/// The generic-argument form (`h::<u8>`) needs the turbofish strip as well, so the
+/// two halves are asserted separately.
+#[test]
+fn a_local_method_called_through_an_impl_projection_is_inlined() {
+    let src = "pub mod val { pub enum V { X } }\n\
+               pub mod de {\n\
+                   use crate::val::V;\n\
+                   impl V {\n\
+                       pub fn scaled(&self, k: u8) -> u8 { k + 1 }\n\
+                       pub fn twice<T>(&self, k: u8) -> u8 { k + k }\n\
+                   }\n\
+                   /// ensures: ret <= 1\n\
+                   pub fn use_scaled(v: &V) -> u8 { v.scaled(0) }\n\
+                   /// ensures: ret <= 2\n\
+                   pub fn use_twice(v: &V) -> u8 { v.twice::<u8>(1) }\n\
+                   /// ensures: ret == 9\n\
+                   pub fn use_scaled_tripwire(v: &V) -> u8 { v.scaled(0) }\n\
+               }\n";
+    for name in ["de::use_scaled", "de::use_twice"] {
+        let Some(f) = verify_src(name, src) else { return };
+        assert!(
+            matches!(f, FnOutcome::Verified { .. }),
+            "a local method behind `<impl V>` must be inlined, got {f}"
+        );
+    }
+    let Some(bad) = verify_src("de::use_scaled_tripwire", src) else { return };
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "the inlined body returns 1, so `ret == 9` must be refuted, got {bad}"
     );
 }
