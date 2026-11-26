@@ -2122,6 +2122,10 @@ fn read_attr_run(lines: &[&str], start: usize, end: usize) -> Option<bool> {
 /// when one is still open. Quotes are skipped, so a `(` inside a string literal is
 /// not a bracket.
 fn bracket_depth(line: &str) -> i32 {
+    // A delimiter inside a trailing comment is not a delimiter: `Open, // '('` is a
+    // complete unit variant, and counting that parenthesis made the reader treat it
+    // as a wrapped declaration and drop the whole layout.
+    let line = strip_line_comment(line);
     let mut depth = 0;
     let mut chars = line.chars();
     let mut in_str = false;
@@ -2776,6 +2780,9 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
     // `u8,` and `),` to be read as variants -- and `u8,` looks exactly like a unit
     // variant, so it became a phantom tag and shifted every later discriminant.
     let mut variant_depth: i32 = 0;
+    // An undecidable `#[cfg]` seen on an attribute-only line, carried to the variant
+    // below it. `cfg_pending` cannot hold it: `None` there means "no constraint".
+    let mut cfg_pending_unknown = false;
     // A `#[cfg]`-gated variant whose predicate is false: the next variant line is
     // dropped. `None` means "no constraint" (no attribute, or an undecidable one).
     let mut cfg_pending: Option<bool> = None;
@@ -2842,6 +2849,11 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
             // dropped `C` as well and bound `D` to 1 -- so a precondition selecting
             // `D` sent execution down `C`'s arm, a false proof.
             let mut dead = cfg_pending == Some(false);
+            // An undecidable predicate only makes the layout untrustworthy when the
+            // variant is *kept*: `#[cfg(feature = "extra")] #[cfg(target_os = "x")]`
+            // is absent on every target when `extra` is off, so a decided `false`
+            // dominates an unknown one (the same rule `all(...)` follows).
+            let mut unknown_here = false;
             for p in leading_cfg_preds(line) {
                 match cfgs.eval(&p) {
                     Some(false) => dead = true,
@@ -2851,7 +2863,7 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
                     // Guessing either way is a wrong tag: keeping a variant rustc
                     // dropped shifts every later discriminant, so a contract naming
                     // `C` would run `D`'s arm. The layout is refused instead.
-                    None => enum_undecidable = true,
+                    None => unknown_here = true,
                     Some(true) => {}
                 }
             }
@@ -2861,15 +2873,25 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
             // remainder, so a `#[derive]` line no longer consumes a pending verdict.
             if variant_line.is_empty() || variant_line.starts_with("//") {
                 cfg_pending = if dead { Some(false) } else { None };
+                // A decided `false` makes the variant absent whatever else it says,
+                // so the unknown only carries when nothing has disabled it.
+                cfg_pending_unknown = if dead { false } else { cfg_pending_unknown || unknown_here };
                 continue;
             }
             // The variant on this line consumes the verdict, whichever way it went.
             cfg_pending = None;
+            let unknown = unknown_here || cfg_pending_unknown;
+            cfg_pending_unknown = false;
             if dead {
                 // The declaration may continue on the following lines; its payload
                 // must be consumed with it, or `u8,` is read as a variant.
                 variant_depth = bracket_depth(variant_line);
                 continue;
+            }
+            // The variant is kept, so an undecidable predicate on it means this
+            // reader's tags may not be the compiled ones.
+            if unknown {
+                enum_undecidable = true;
             }
             // An *enabled* variant whose declaration wraps: this reader would have to
             // join the payload to parse it, and a partial read is a phantom variant.
@@ -3013,6 +3035,7 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
                     cur_enum = Some((name, EnumDef::default()));
                     enum_undecidable = false;
                     variant_depth = 0;
+                    cfg_pending_unknown = false;
                 }
                 // The body was refused *and* closed on this line. Opening a
                 // cursor here would run past the brace and consume every
@@ -9945,6 +9968,36 @@ mod tests {
         assert!(
             !specs.enums.contains_key("P"),
             "a variant whose cfg cannot be decided must not produce a layout"
+        );
+    }
+
+    /// A delimiter inside a trailing comment is not a delimiter: `Open, // '('` is a
+    /// complete unit variant, and counting that parenthesis dropped the whole layout.
+    #[test]
+    fn a_trailing_comment_does_not_hide_a_variant() {
+        let src = "pub enum T {\n    Open, // '('\n    Close,\n}\n";
+        let specs = super::extract_with_cfgs(src, &[]);
+        let def = specs.enums.get("T").expect("T is a declared enum");
+        assert_eq!(
+            def.variants,
+            vec![("Open".to_string(), vec![], 0), ("Close".to_string(), vec![], 1)],
+            "a comment's parenthesis must not make `Open` look wrapped"
+        );
+    }
+
+    /// A decided `false` dominates an undecidable predicate on the same variant: rustc
+    /// drops the variant whatever the other attribute says, so the layout is still
+    /// usable. Marking it undecidable dropped every enum that mixes the two.
+    #[test]
+    fn a_decided_false_attribute_dominates_an_unknown_one() {
+        let src = "pub enum Q {\n    A,\n    #[cfg(feature = \"extra\")]\n    #[cfg(target_os = \"windows\")]\n    B,\n    C,\n}\n";
+        let std_only = ["--cfg".to_string(), "feature=\"std\"".to_string()];
+        let specs = super::extract_with_cfgs(src, &std_only);
+        let def = specs.enums.get("Q").expect("`extra` is off, so `B` is gone");
+        assert_eq!(
+            def.variants,
+            vec![("A".to_string(), vec![], 0), ("C".to_string(), vec![], 1)],
+            "a decided-false attribute wins over an unknown one"
         );
     }
 

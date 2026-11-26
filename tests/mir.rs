@@ -15663,4 +15663,14 @@ fn the_cache_key_covers_the_cfg_set_that_shapes_an_enum() {
         "with `extra` on, `M::A` exists and the contract about it is checked"
     );
     assert_eq!(entries(), 2, "a different cfg set is a different key");
+
+    // Running `off` again must *not* replay the `on` verdict: both entries exist, so
+    // the only thing that can keep them apart is the key. This is the on-to-off
+    // direction, which is the one a stale hit would prove a false claim in.
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &off).expect("verify");
+    assert!(
+        !matches!(outcome(&report, "a_only"), Some(FnOutcome::Verified { .. })),
+        "the `on` entry must not answer an `off` run"
+    );
+    assert_eq!(entries(), 2, "the off run reuses its own entry");
 }

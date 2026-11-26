@@ -11091,6 +11091,20 @@ fn length_of(env: &Env, f: &MirFn, p: &Place) -> Val {
         // `v.as_slice()[0]`'s bounds check read the `Vec`'s tracked length. Only a
         // *field* path has a length of its own to look up.
     }
+    // A bare local, or one unresolved dereference of it, denotes the value the
+    // stores below track. An *indexed* or downcast step selects a different value:
+    // `&a[0]` on an `a: &[[u8; 2]]` is a two-element slice, and answering it with
+    // the outer slice's length proved `s.len() == 1` for a body Rust runs as 2.
+    // Such a place is answered by its own type (an array's length is the type's
+    // constant) or not at all.
+    let transparent =
+        p.proj.is_empty() || (p.proj.len() == 1 && matches!(p.proj[0], Proj::Deref));
+    if !transparent {
+        return match type_of_place(f, p) {
+            Some(Ty::Array(_, n)) => Val::Sym(smt::word(n, USIZE_WIDTH), Sign::Unsigned),
+            _ => Val::Unknown,
+        };
+    }
     match env.indexed.get(&p.local) {
         // A slice argument, whose length is a symbolic input.
         // A length is a `usize`, so it is unsigned.
