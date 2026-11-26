@@ -1013,10 +1013,18 @@ fn parse_place(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Option<Place> {
     if s.starts_with('(') {
         let close = matching_paren(s, 0)?;
         let inner = s.get(1..close)?.trim();
-        let mut place = match inner.rsplit_once(" as ") {
-            Some((base, variant)) => {
-                let mut p = parse_place(base.trim(), enums)?;
-                p.proj.push(Proj::Downcast(variant_index(variant.trim(), enums)?));
+        // A downcast is `base as Variant` with the ` as ` at the *top level* of
+        // the group. Splitting on the last ` as ` unconditionally mis-parsed a
+        // nested place whose group contains a downcast followed by a tail --
+        // `((_2 as Some).0).0`, how an `Option<(usize, &u8)>`'s tuple payload is
+        // destructured -- into base `(_2` and variant `Some).0`, which then failed
+        // to parse and left the whole place unknown. `find_top_level_as` sees only
+        // an ` as ` outside any nested `<...>`/`(...)`, so the outer group here is
+        // a plain grouping and the inner `(_2 as Some).0` recurses to the downcast.
+        let mut place = match find_top_level_as(inner) {
+            Some(i) => {
+                let mut p = parse_place(inner[..i].trim(), enums)?;
+                p.proj.push(Proj::Downcast(variant_index(inner[i + 4..].trim(), enums)?));
                 p
             }
             None => parse_place(inner, enums)?,
@@ -2493,6 +2501,25 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
             return parse_rvalue(&as_copy, enums);
         }
     }
+    // A cast is checked *before* the `copy`/`move`-place attempt, using the
+    // depth-aware [`find_top_level_as`]. A downcast place's ` as ` sits inside
+    // parentheses (`copy ((_2 as Some).0: u8)`) and is therefore invisible to it,
+    // so this ordering does not mis-read a place as a cast -- and it *does* catch a
+    // cast whose left side is an *annotated* place (`copy (_2.0: Unique<u8>) as
+    // *const u8`), which the place parser would otherwise swallow whole, dropping
+    // the cast and the pointer the `Box` deref needs.
+    if let Some(i) = find_top_level_as(t) {
+        let (src, dst) = (t[..i].trim(), t[i + 4..].trim());
+        let ty_text = strip_cast_kind(dst);
+        let ty = if ty_text.starts_with("*const") || ty_text.starts_with("*mut") {
+            // A raw pointer is a 64-bit word in this model (the `Box` deref's
+            // `(_2.0) as *const u8` and the `as *const ()` / `as usize` chain).
+            Ty::U64
+        } else {
+            Ty::parse(ty_text)
+        };
+        return Rvalue::Cast(parse_operand(src, enums), ty);
+    }
     // A call is handled by the caller (it is a terminator).
     //
     // `copy`/`move` of a place is tried *before* the cast check, because a
@@ -2544,11 +2571,6 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
     // hands the whole string to `parse_const`, which reads `i32 as u32 (IntToInt)`
     // as a type name and produces a constant with no width -- an `Unknown` that
     // then makes every guard written against it unmodelled.
-    if let Some(i) = find_top_level_as(t) {
-        let (src, dst) = (t[..i].trim(), t[i + 4..].trim());
-        let ty_text = dst.split_whitespace().next().unwrap_or(dst);
-        return Rvalue::Cast(parse_operand(src, enums), Ty::parse(ty_text));
-    }
     if let Some(rest) = t.strip_prefix("const ") {
         return Rvalue::Use(Operand::Const(parse_const(rest)));
     }
@@ -2678,6 +2700,21 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
     if t.contains("::") && !has_top_level_space(t) && !t.contains('(') {
         return Rvalue::Use(Operand::Const(Const::Other(t.to_string())));
     }
+    // `AlignOf(T)` — the alignment of `T` in bytes. The MSRV (1.85) emits this
+    // for a `Box` deref's alignment check (`_6 = AlignOf(u32)`); current stable
+    // const-folds it into a `SizedTypeProperties::SIZE` literal. For every
+    // primitive Rust's alignment *is* its size in bytes (`u8`..`u64`, `i8`..`i64`,
+    // `usize`, `bool`, `char`), so the alignment is the width rounded up to bytes.
+    // A type whose width the model does not hold stays `Unknown`, which refuses the
+    // assert rather than guessing an alignment.
+    if let Some(inner) = t.strip_prefix("AlignOf(").and_then(|r| r.strip_suffix(')')) {
+        if let Some(w) = Ty::parse(inner.trim()).width() {
+            let bytes = w.div_ceil(8);
+            if bytes > 0 {
+                return Rvalue::Use(Operand::Const(Const::UInt(u128::from(bytes), Some(Ty::U64))));
+            }
+        }
+    }
     Rvalue::Unknown(t.to_string())
 }
 
@@ -2698,6 +2735,25 @@ fn has_top_level_space(s: &str) -> bool {
         }
     }
     false
+}
+
+/// Strip a cast's trailing kind annotation (` (IntToInt)`, ` (Transmute)`,
+/// ` (BoxDerefTransmute)`, …) from its printed type.
+///
+/// The kind is a non-empty parenthesised identifier beginning with an uppercase
+/// letter, so `*const ()`'s empty `()` is kept while `*const () (PtrToPtr)` loses
+/// only the `(PtrToPtr)`.
+fn strip_cast_kind(s: &str) -> &str {
+    let s = s.trim();
+    if s.ends_with(')') {
+        if let Some(i) = s.rfind(" (") {
+            let inner = &s[i + 2..s.len() - 1];
+            if !inner.is_empty() && inner.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                return s[..i].trim();
+            }
+        }
+    }
+    s
 }
 
 /// The byte offset of the first ` as ` that is not inside `<...>` or `(...)`.
@@ -3695,6 +3751,44 @@ fn add(_1: u32, _2: u32) -> u32 {
         let rv = parse_rvalue("&raw mut (fake) (*_2)", &enums);
         let Rvalue::Ref(place) = rv else { panic!("expected a Ref, got {rv:?}") };
         assert_eq!(place, Place { local: 2, proj: vec![Proj::Deref] });
+    }
+
+    /// A nested place whose group holds a downcast *and* a tail parses whole.
+    ///
+    /// An `Option<(usize, &u8)>`'s payload is destructured directly --
+    /// `(((_2 as Some).0: (usize, &u8)).0: usize)` -- so the outer group is a plain
+    /// grouping and the inner `(_2 as Some).0` is the downcast. The first version
+    /// split the outer group on its last ` as ` unconditionally, giving base `(_2`
+    /// and variant `Some).0`; `(_2` has no matching paren, the place parsed to
+    /// `None`, and the read became `Unknown` -- which is how `enumerate`'s tuple
+    /// payload came back unreadable. `find_top_level_as` ignores the nested ` as `,
+    /// so the recursion reaches the real downcast.
+    #[test]
+    fn a_nested_downcast_with_a_tail_parses_whole() {
+        let enums = BTreeMap::new();
+        let rv = parse_rvalue("copy (((_2 as Some).0: (usize, &u8)).0: usize)", &enums);
+        let Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) = rv else {
+            panic!("expected a Use of a place, got {rv:?}")
+        };
+        assert_eq!(
+            place,
+            Place {
+                local: 2,
+                proj: vec![Proj::Downcast(1), Proj::Field(0), Proj::Field(0)]
+            }
+        );
+        // The sibling component (`.1`) parses to the same downcast, field 1.
+        let rv = parse_rvalue("copy (((_2 as Some).0: (usize, &u8)).1: &u8)", &enums);
+        let Rvalue::Use(Operand::Copy(place) | Operand::Move(place)) = rv else {
+            panic!("expected a Use of a place, got {rv:?}")
+        };
+        assert_eq!(
+            place,
+            Place {
+                local: 2,
+                proj: vec![Proj::Downcast(1), Proj::Field(0), Proj::Field(1)]
+            }
+        );
     }
 
     /// A borrow of an enum payload parses as a `Ref`, not as a cast.

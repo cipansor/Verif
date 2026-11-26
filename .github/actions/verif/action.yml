@@ -1,0 +1,102 @@
+# A reusable GitHub Action: verify a Rust file's `verif` contracts and upload the
+# results as SARIF to GitHub code scanning, so a failed or incomplete contract shows
+# up on the pull request like a compiler error.
+#
+# Used from a workflow in this repository as
+#
+#     - uses: ./.github/actions/verif
+#       with: { file: src/lib.rs }
+#
+# and from any other repository as
+#
+#     - uses: cipansor/verif/.github/actions/verif@<commit-sha>   # a ref that includes this action
+#       with: { file: src/lib.rs }
+#
+# The action builds `cargo-verif` from the checkout it lives in (`GITHUB_ACTION_PATH`),
+# so it needs no pre-install step and no crates.io round trip. It runs `cargo verif`
+# with `--format sarif`, uploads the report (unless `upload: false`), and fails the
+# step on any finding (unless `fail-on-findings: false`) -- so a skipped contract,
+# which is a contract the tool could not read and therefore never checked, is a
+# failure, not a pass.
+
+name: verif
+description: Verify `verif` contracts and upload SARIF results to code scanning.
+branding:
+  icon: check-circle
+  color: green
+
+inputs:
+  file:
+    description: "The Rust source file to verify (default: src/lib.rs, then src/main.rs)."
+    required: false
+    default: ''
+  args:
+    description: "Extra arguments for `cargo verif`, e.g. `--function add`."
+    required: false
+    default: ''
+  sarif-file:
+    description: Where to write the SARIF report.
+    required: false
+    default: verif.sarif
+  upload:
+    description: Upload the SARIF report to code scanning (`true`/`false`).
+    required: false
+    default: 'true'
+  fail-on-findings:
+    description: Fail the step when verif reports a failure, incomplete or skip.
+    required: false
+    default: 'true'
+
+outputs:
+  exit-code:
+    description: "The exit code of `cargo verif` (0 clean, 1 findings, 2 could not run)."
+    value: ${{ steps.run.outputs.code }}
+
+runs:
+  using: composite
+  steps:
+    - name: Build cargo-verif
+      shell: bash
+      run: cargo install --path "$GITHUB_ACTION_PATH/../../.." --features std --locked --force
+
+    - name: Run verif (SARIF)
+      id: run
+      shell: bash
+      # Capture the exit code rather than failing here, so the SARIF is always
+      # uploaded (a report is more useful than a bare non-zero step) and the failure
+      # is raised in the dedicated step below.
+      run: |
+        set +e
+        if [ -n "${{ inputs.file }}" ]; then
+          cargo verif --file "${{ inputs.file }}" --format sarif ${{ inputs.args }} > "${{ inputs.sarif-file }}"
+        else
+          cargo verif --format sarif ${{ inputs.args }} > "${{ inputs.sarif-file }}"
+        fi
+        code=$?
+        echo "code=$code" >> "$GITHUB_OUTPUT"
+        exit 0
+
+    - name: Upload SARIF to code scanning
+      if: ${{ inputs.upload == 'true' }}
+      uses: github/codeql-action/upload-sarif@d2aacf54c2fbc910db8d7ec338fdb54ea48c692d # v3
+      with:
+        sarif_file: ${{ inputs.sarif-file }}
+
+    - name: Fail on a setup or execution error (exit other than 0 or 1)
+      # Any status other than 0 (clean) or 1 (findings) is a setup/execution failure
+      # -- no compiler, `cargo-verif` not on PATH (Cargo exits 101), a compile error --
+      # and is never suppressed by `fail-on-findings`.
+      if: ${{ steps.run.outputs.code != '0' && steps.run.outputs.code != '1' }}
+      shell: bash
+      env:
+        VERIF_EXIT_CODE: ${{ steps.run.outputs.code }}
+      run: |
+        echo "::error::verif could not run (exit $VERIF_EXIT_CODE); see the log above"
+        exit 1
+
+    - name: Fail on findings
+      if: ${{ inputs.fail-on-findings == 'true' && steps.run.outputs.code == '1' }}
+      shell: bash
+      run: |
+        echo "::error::verif reported findings (exit ${{ steps.run.outputs.code }}); see ${{ inputs.sarif-file }}"
+        exit 1

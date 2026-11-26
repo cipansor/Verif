@@ -14006,13 +14006,566 @@ spec! {
     requires: true,
     ensures: ret == 1,
 }
-/// A `String` local: its destructor frees the heap, which this tool cannot
-/// represent, so the `drop` is *refused* -- never assumed to be a no-op. Assuming
-/// it were a no-op would be a false proof whenever the destructor's effect is
-/// observable, which is the one outcome this crate must never produce.
-pub fn string_drop_is_refused(s: String) -> u8 {
-    let _owned = s;
+/// An `Rc<T>` local: its destructor decrements a refcount and may free the
+/// allocation, which this tool cannot represent, so the `drop` is *refused* --
+/// never assumed to be a no-op. Assuming it were a no-op would be a false proof
+/// whenever the destructor's effect is observable, which is the one outcome this
+/// crate must never produce. (A `Box<u8>` and a `String` are glue-free and are
+/// modelled; `Rc` has no modelled field set.)
+pub fn rc_drop_is_refused(r: std::rc::Rc<u8>) -> u8 {
+    let _owned = r;
     1
+}
+
+spec! {
+    requires: true,
+    ensures: ret == x,
+}
+/// `Box::new` + a deref: the boxed value is read back (`C11` `Box<T>`).
+pub fn box_new_reads_its_value(x: u8) -> u8 {
+    let b = Box::new(x);
+    *b
+}
+
+spec! {
+    requires: true,
+    ensures: ret == x + 1,
+}
+/// The same body claiming the wrong value must be refuted -- the deref reads the
+/// box, not a constant.
+pub fn box_new_reads_its_value_tripwire(x: u8) -> u8 {
+    let b = Box::new(x);
+    *b
+}
+
+spec! {
+    requires: x < 255,
+    ensures: ret == x + 1,
+}
+/// A guarded increment through a box: the add cannot overflow.
+pub fn box_guarded_inc(x: u8) -> u8 {
+    let b = Box::new(x);
+    *b + 1
+}
+
+spec! {
+    requires: x < 255,
+    ensures: ret == x + 2,
+}
+/// The same guarded body claiming the wrong result must be refuted.
+pub fn box_guarded_inc_tripwire(x: u8) -> u8 {
+    let b = Box::new(x);
+    *b + 1
+}
+
+spec! {
+    requires: true,
+    ensures: ret == x,
+}
+/// A `u32` box: the deref's alignment check (`addr & (ALIGN-1) == 0`) is discharged.
+pub fn box_u32_reads_its_value(x: u32) -> u32 {
+    let b = Box::new(x);
+    *b
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
+/// A `Box<u8>` argument's implicit drop is glue-free (it runs no `Drop`).
+pub fn owns_box_glue_free(b: Box<u8>) -> u8 {
+    let _owned = b;
+    1
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
+/// `xs.iter().count()` on a constant-length array: the cursor starts at the
+/// array's elements and `count` reads the length.
+pub fn array_iter_count(xs: &[u8; 2]) -> u32 {
+    xs.iter().count() as u32
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
+/// The same body claiming the wrong count must be refuted.
+pub fn array_iter_count_tripwire(xs: &[u8; 2]) -> u32 {
+    xs.iter().count() as u32
+}
+
+spec! {
+    requires: xs[0] < 128,
+    requires: xs[1] < 128,
+    ensures: ret == xs[0] + xs[1],
+}
+/// `xs.iter().copied().sum()` on a constant-length array: the sum is unrolled and
+/// the guards rule out the overflow it would otherwise be refuted for.
+pub fn array_iter_sum(xs: &[u8; 2]) -> u8 {
+    xs.iter().copied().sum()
+}
+
+spec! {
+    requires: xs[0] < 128,
+    requires: xs[1] < 128,
+    ensures: ret == xs[0] + xs[1] + 1,
+}
+/// The same body claiming the wrong sum must be refuted.
+pub fn array_iter_sum_tripwire(xs: &[u8; 2]) -> u8 {
+    xs.iter().copied().sum()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
+/// An explicit `std::mem::drop` of a glue-free `Box<u8>` is a no-op.
+pub fn explicit_drop_box(b: Box<u8>) -> u8 {
+    drop(b);
+    1
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
+/// An explicit `std::mem::drop` of a `String` is a no-op (glue-free).
+pub fn explicit_drop_string(s: String) -> u8 {
+    drop(s);
+    1
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
+/// `Vec::clear` resets the length to zero.
+pub fn vec_clear_reads_zero() -> usize {
+    let mut v = Vec::new();
+    v.push(9u8);
+    v.clear();
+    v.len()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
+/// The same body claiming the pre-clear length must be refuted.
+pub fn vec_clear_tripwire() -> usize {
+    let mut v = Vec::new();
+    v.push(9u8);
+    v.clear();
+    v.len()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
+/// `String::clear` resets the length to zero.
+pub fn string_clear_reads_zero() -> usize {
+    let mut s = String::from("hello");
+    s.clear();
+    s.len()
+}
+
+spec! {
+    requires: xs[0] <= xs[1],
+    ensures: ret == xs[1],
+}
+/// `xs.iter().max()` over a constant-length array.
+pub fn array_iter_max(xs: &[u8; 2]) -> u8 {
+    *xs.iter().max().unwrap()
+}
+
+spec! {
+    requires: xs[0] <= xs[1],
+    ensures: ret == xs[0],
+}
+/// The same body claiming the minimum must be refuted.
+pub fn array_iter_max_tripwire(xs: &[u8; 2]) -> u8 {
+    *xs.iter().max().unwrap()
+}
+
+spec! {
+    requires: xs[0] <= xs[1],
+    ensures: ret == xs[0],
+}
+/// `xs.iter().min()` over a constant-length array.
+pub fn array_iter_min(xs: &[u8; 2]) -> u8 {
+    *xs.iter().min().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[1],
+}
+/// `xs.iter().last()` over a constant-length array.
+pub fn array_iter_last(xs: &[u8; 2]) -> u8 {
+    *xs.iter().last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[0],
+}
+/// The same body claiming the last element is the first must be refuted.
+pub fn array_iter_last_tripwire(xs: &[u8; 2]) -> u8 {
+    *xs.iter().last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[1],
+}
+/// `xs.iter().nth(1)` over a constant-length array.
+pub fn array_iter_nth(xs: &[u8; 2]) -> u8 {
+    *xs.iter().nth(1).unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[0],
+}
+/// `xs.iter().rev().last()`: the *last* of the reversed sequence is the first
+/// element. `last` is order-dependent, so this pins the direction mapping.
+pub fn array_iter_rev_last(xs: &[u8; 2]) -> u8 {
+    *xs.iter().rev().last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[1],
+}
+/// The same body claiming the *unreversed* last element must be refuted.
+pub fn array_iter_rev_last_tripwire(xs: &[u8; 2]) -> u8 {
+    *xs.iter().rev().last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[0],
+}
+/// `xs.iter().rev().nth(1)` names the second element of the reversed sequence,
+/// which is `xs[0]` for a two-element array.
+pub fn array_iter_rev_nth(xs: &[u8; 2]) -> u8 {
+    *xs.iter().rev().nth(1).unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[0],
+}
+/// A `for x in xs.iter().rev()` loop visits the elements back-to-front, so the
+/// last one assigned is `xs[0]`.
+pub fn array_iter_rev_for(xs: &[u8; 2]) -> u8 {
+    let mut last = 0u8;
+    for x in xs.iter().rev() {
+        last = *x;
+    }
+    last
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[1],
+}
+/// `rev().rev()` is the identity, so its last element is the original last.
+pub fn array_iter_rev_rev_last(xs: &[u8; 2]) -> u8 {
+    *xs.iter().rev().rev().last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
+/// `rev()` does not change the count.
+pub fn array_iter_rev_count(xs: &[u8; 2]) -> u32 {
+    xs.iter().rev().count() as u32
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[1],
+}
+/// `xs.iter().skip(1).last()` names the element after the skipped prefix.
+pub fn array_iter_skip_last(xs: &[u8; 2]) -> u8 {
+    *xs.iter().skip(1).last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 1,
+}
+/// `skip` removes elements from the front, so `count` drops by the skip amount.
+pub fn array_iter_skip_count(xs: &[u8; 2]) -> u32 {
+    xs.iter().skip(1).count() as u32
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
+/// `step_by(2)` over four elements visits indices 0 and 2.
+pub fn array_iter_step_count(xs: &[u8; 4]) -> u32 {
+    xs.iter().step_by(2).count() as u32
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[2],
+}
+/// `step_by(2).last()` names the last *strided* index (2, not 3).
+pub fn array_iter_step_last(xs: &[u8; 4]) -> u8 {
+    *xs.iter().step_by(2).last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[1],
+}
+/// The same body claiming the last *un-strided* element must be refuted.
+pub fn array_iter_step_last_tripwire(xs: &[u8; 4]) -> u8 {
+    *xs.iter().step_by(2).last().unwrap()
+}
+
+spec! {
+    requires: xs[0] <= 100,
+    requires: xs[2] <= 100,
+    ensures: ret == xs[0] + xs[2],
+}
+/// `step_by(2).sum()` folds the strided elements `xs[0]` and `xs[2]`.
+pub fn array_iter_step_sum(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().step_by(2).sum()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[1],
+}
+/// `xs.iter().take(2).last()` names the element at the end of the capped prefix.
+pub fn array_iter_take_last(xs: &[u8; 4]) -> u8 {
+    *xs.iter().take(2).last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[2],
+}
+/// The same body claiming the element past the `take` must be refuted.
+pub fn array_iter_take_last_tripwire(xs: &[u8; 4]) -> u8 {
+    *xs.iter().take(2).last().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
+/// `take(2).count()` is the capped prefix length.
+pub fn array_iter_take_count(xs: &[u8; 4]) -> u32 {
+    xs.iter().take(2).count() as u32
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
+/// `take(10)` over four elements yields all four (the cap exceeds the length).
+pub fn array_iter_take_over(xs: &[u8; 4]) -> u32 {
+    xs.iter().take(10).count() as u32
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[0],
+}
+/// `take(2).nth(0)` names the first element of the prefix.
+pub fn array_iter_take_nth(xs: &[u8; 4]) -> u8 {
+    *xs.iter().take(2).nth(0).unwrap()
+}
+
+spec! {
+    requires: xs[0] <= 100,
+    requires: xs[1] <= 100,
+    ensures: ret == xs[0] + xs[1],
+}
+/// `take(2).sum()` folds the two elements of the prefix.
+pub fn array_iter_take_sum(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().take(2).sum()
+}
+
+spec! {
+    requires: xs[0] <= 60,
+    requires: xs[1] <= 60,
+    requires: xs[2] <= 60,
+    requires: xs[3] <= 60,
+    ensures: ret == xs[0] + xs[1] + xs[2] + xs[3],
+}
+/// `fold(0, |a, x| a + x)` is a checked sum over the cursor's elements.
+pub fn array_iter_fold_sum(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().fold(0u8, |a, x| a + x)
+}
+
+spec! {
+    requires: true,
+    ensures: ret == xs[0].wrapping_add(xs[1]).wrapping_add(xs[2]).wrapping_add(xs[3]),
+}
+/// A `wrapping_add` reducer has no overflow obligation and wraps exactly.
+pub fn array_iter_fold_wrapping(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().fold(0u8, |a, x| a.wrapping_add(x))
+}
+
+spec! {
+    requires: xs[0] <= 60,
+    requires: xs[1] <= 60,
+    requires: xs[2] <= 60,
+    requires: xs[3] <= 60,
+    ensures: ret == xs[0] + xs[1] + xs[2] + xs[3] + 1,
+}
+/// A non-zero initial accumulator is folded in first.
+pub fn array_iter_fold_from_one(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().fold(1u8, |a, x| a + x)
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
+/// An unguarded checked fold can overflow, so this false claim must be refuted.
+pub fn array_iter_fold_tripwire(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().fold(0u8, |a, x| a + x)
+}
+
+spec! {
+    requires: xs[0] <= 30,
+    requires: xs[1] <= 30,
+    requires: xs[2] <= 30,
+    requires: xs[3] <= 30,
+    ensures: ret == xs[0] * 2 + xs[1] * 2 + xs[2] * 2 + xs[3] * 2,
+}
+/// `map(|x| x * 2).sum()` applies the transform then sums the results.
+pub fn array_iter_map_sum(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().map(|x| x * 2).sum()
+}
+
+spec! {
+    requires: xs[0] <= 30,
+    requires: xs[1] <= 30,
+    requires: xs[2] <= 30,
+    requires: xs[3] <= 30,
+    ensures: ret == xs[0] * 2 + xs[1] * 2 + xs[2] * 2 + xs[3] * 2,
+}
+/// A `wrapping_mul` transform has no overflow obligation.
+pub fn array_iter_map_wrapping_sum(xs: &[u8; 4]) -> u8 {
+    xs.iter().copied().map(|x| x.wrapping_mul(2)).sum()
+}
+
+spec! {
+    requires: xs[0] > 10,
+    requires: xs[1] > 10,
+    requires: xs[2] > 10,
+    requires: xs[3] > 10,
+    ensures: ret == 4,
+}
+/// `filter(|x| *x > 10).count()` counts the accepted elements.
+pub fn array_iter_filter_count(xs: &[u8; 4]) -> u32 {
+    xs.iter().filter(|x| **x > 10).count() as u32
+}
+
+spec! {
+    requires: xs[0] > 10,
+    requires: xs[1] > 10,
+    requires: xs[2] > 10,
+    requires: xs[3] > 10,
+    ensures: ret == 2,
+}
+/// The filter accepts all four, so a claim of two must be refuted.
+pub fn array_iter_filter_count_tripwire(xs: &[u8; 4]) -> u32 {
+    xs.iter().filter(|x| **x > 10).count() as u32
+}
+
+spec! {
+    requires: xs[0] < 10,
+    requires: xs[1] < 10,
+    requires: xs[2] < 10,
+    requires: xs[3] < 10,
+    ensures: ret == true,
+}
+/// `all(|x| *x < 10)` is the conjunction of the predicate over the elements.
+pub fn array_iter_all_lt(xs: &[u8; 4]) -> bool {
+    xs.iter().copied().all(|x| x < 10)
+}
+
+spec! {
+    requires: xs[0] < 10,
+    requires: xs[1] < 10,
+    requires: xs[2] < 10,
+    requires: xs[3] < 10,
+    ensures: ret == false,
+}
+/// All four satisfy the predicate, so `all` is true and a claim of false refutes.
+pub fn array_iter_all_lt_tripwire(xs: &[u8; 4]) -> bool {
+    xs.iter().copied().all(|x| x < 10)
+}
+
+spec! {
+    requires: xs[0] > 10,
+    requires: xs[1] > 10,
+    requires: xs[2] > 10,
+    requires: xs[3] > 10,
+    ensures: ret == true,
+}
+/// `any(|x| *x > 10)` is the disjunction of the predicate over the elements.
+pub fn array_iter_any_gt(xs: &[u8; 4]) -> bool {
+    xs.iter().copied().any(|x| x > 10)
+}
+
+spec! {
+    requires: true,
+    ensures: ret == true,
+}
+/// Without a guard `any` can be false (all zero), so this claim must be refuted.
+pub fn array_iter_any_gt_tripwire(xs: &[u8; 4]) -> bool {
+    xs.iter().copied().any(|x| x > 10)
+}
+
+spec! {
+    requires: v.len() <= 4,
+    requires: v[0] <= 10,
+    requires: v[1] <= 10,
+    requires: v[2] <= 10,
+    requires: v[3] <= 10,
+    ensures: true,
+}
+/// A *symbolic-length* sum is unrolled to a bound the precondition must prove
+/// (`len <= 8`); each step is guarded by `k < len`. Here every element is small
+/// enough that the sum cannot overflow, so it is panic-free.
+pub fn symbolic_sum_no_overflow(v: &[u8]) -> u8 {
+    v.iter().sum()
+}
+
+spec! {
+    requires: v.len() <= 4,
+    ensures: true,
+}
+/// The length is bounded but the elements are not, so the sum can overflow: the
+/// reachable-panic obligation must be refuted.
+pub fn symbolic_sum_tripwire(v: &[u8]) -> u8 {
+    v.iter().sum()
+}
+
+spec! {
+    requires: true,
+    ensures: true,
+}
+/// An *unbounded* symbolic length cannot be unrolled, so this stays an honest
+/// refusal (a bounded unroll would silently miss elements).
+pub fn symbolic_sum_unbounded_refused(v: &[u8]) -> u8 {
+    v.iter().sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -15047,6 +15600,612 @@ pub fn vec_pop_one_is_some_cannot_prove_this() -> u8 {
     let mut v = Vec::<u8>::new();
     v.push(9u8);
     v.pop().is_some() as u8
+}
+
+// ---------------------------------------------------------------------------
+// `Vec` elements: the pushed value can be read back (C11)
+// ---------------------------------------------------------------------------
+//
+// A `Vec` is an `indexed` store like a slice, so a `push`ed value is read back by
+// `v[k]`, `v.first()` and `v.get(k)`. The false twins claim a *different* value,
+// which only refutes if the store holds the pushed one.
+
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
+/// `v[0]` reads the pushed value.
+pub fn vec_index_reads_pushed() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(3u8);
+    v[0]
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
+/// The false twin: the pushed value is `3`, not `4`.
+pub fn vec_index_reads_pushed_cannot_prove_this() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(3u8);
+    v[0]
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 7,
+}
+/// Two pushes keep their indices distinct.
+pub fn vec_index_second_pushed() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(3u8);
+    v.push(7u8);
+    v[1]
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
+/// The false twin: index 1 is the second push (`7`), not the first (`3`).
+pub fn vec_index_second_pushed_cannot_prove_this() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(3u8);
+    v.push(7u8);
+    v[1]
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 9,
+}
+/// `v.first()` reads the same element `v[0]` does, through `Deref`.
+pub fn vec_first_reads_pushed() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(9u8);
+    *v.first().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 8,
+}
+/// The false twin: the first element is `9`, not `8`.
+pub fn vec_first_reads_pushed_cannot_prove_this() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(9u8);
+    *v.first().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 4,
+}
+/// `v.get(0)` reads the pushed element.
+pub fn vec_get_reads_pushed() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(4u8);
+    v.push(8u8);
+    *v.get(0).unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
+/// The false twin: `get(0)` is `4`, not `5`.
+pub fn vec_get_reads_pushed_cannot_prove_this() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(4u8);
+    v.push(8u8);
+    *v.get(0).unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 5,
+}
+/// `pop` returns the *last* pushed value, not the first.
+pub fn vec_pop_reads_pushed() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(3u8);
+    v.push(5u8);
+    v.pop().unwrap()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
+/// The false twin: `pop` returns `5` (the last), not `3`.
+pub fn vec_pop_reads_pushed_cannot_prove_this() -> u8 {
+    let mut v = Vec::<u8>::new();
+    v.push(3u8);
+    v.push(5u8);
+    v.pop().unwrap()
+}
+
+spec! {
+    requires: v.len() > 0,
+    ensures: ret == v[0],
+}
+/// A `Vec` *argument*'s element is a symbolic input, so a contract that names it
+/// agrees with the body's `v[0]` read.
+pub fn vec_arg_index_matches_contract(v: &Vec<u8>) -> u8 {
+    v[0]
+}
+
+spec! {
+    requires: v.len() > 0,
+    ensures: ret == v[0] + 1,
+}
+/// The false twin: `v[0]` is not `v[0] + 1` (in `u8` this is false at `255`).
+pub fn vec_arg_index_matches_contract_cannot_prove_this(v: &Vec<u8>) -> u8 {
+    v[0]
+}
+
+spec! {
+    requires: v.len() > 0,
+    ensures: ret == v[0],
+}
+/// `v.first()` on a `Vec` argument agrees with `v[0]`, through `Deref`.
+pub fn vec_arg_first_matches_contract(v: &Vec<u8>) -> u8 {
+    *v.first().unwrap()
+}
+
+spec! {
+    requires: v.len() > 0,
+    ensures: ret == v[0] + 1,
+}
+/// The false twin: `first()` is `v[0]`, not `v[0] + 1`.
+pub fn vec_arg_first_matches_contract_cannot_prove_this(v: &Vec<u8>) -> u8 {
+    *v.first().unwrap()
+}
+
+spec! {
+    requires: v.len() == 0,
+    ensures: true,
+}
+/// An index on a `Vec` the precondition proves empty is a *panic*, refuted with a
+/// witness -- `v[0]` on an empty vector unwinds, and the model must say so.
+pub fn vec_index_empty_is_a_panic(v: &Vec<u8>) -> u8 {
+    v[0]
+}
+
+// ---------------------------------------------------------------------------
+// `for` loops over slices and arrays: `into_iter`/`iter` + `next` are modelled
+// ---------------------------------------------------------------------------
+//
+// `for x in xs` desugars to `IntoIterator::into_iter` and `Iterator::next` on the
+// resulting cursor, so the model tracks a *concrete* position into the slice and
+// reads the element at each index -- the same element variable a contract's
+// `xs[k]` names. A bounded length (`requires: xs.len() == N`) makes the loop
+// finite, so the sum over a fixed-size slice is decided rather than unwound.
+
+spec! {
+    requires: xs.len() == 2,
+    ensures: ret == xs[0].wrapping_add(xs[1]),
+}
+/// The canonical loop-over-a-slice sum. The two elements the body reads through
+/// the iterator are the ones the contract names, so the equality holds.
+pub fn for_slice_sum(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for &x in xs {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() == 2,
+    ensures: ret == xs[0],
+}
+/// The false twin: the sum of two elements is not the first one (witness
+/// `xs[1] == 1`).
+pub fn for_slice_sum_cannot_prove_this(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for &x in xs {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() <= 3,
+    ensures: ret == xs.len() as u8,
+}
+/// Counting the elements agrees with the slice length: each `Some` from `next`
+/// increments, and `next` is `None` exactly when `pos >= len`.
+pub fn for_slice_count(xs: &[u8]) -> u8 {
+    let mut n = 0u8;
+    for _x in xs {
+        n = n.wrapping_add(1);
+    }
+    n
+}
+
+spec! {
+    requires: xs.len() <= 3,
+    ensures: ret == xs.len() as u8 + 1,
+}
+/// The false twin: the count is the length, not one more.
+pub fn for_slice_count_cannot_prove_this(xs: &[u8]) -> u8 {
+    let mut n = 0u8;
+    for _x in xs {
+        n = n.wrapping_add(1);
+    }
+    n
+}
+
+spec! {
+    requires: true,
+    ensures: ret == a[0].wrapping_add(a[1]),
+}
+/// `for &x in &a` over an *array*: the length is the type's constant, so the
+/// loop is bounded without a precondition, and `next` reads `a[0]`/`a[1]`.
+pub fn for_array_sum(a: [u8; 2]) -> u8 {
+    let mut s = 0u8;
+    for &x in &a {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: true,
+    ensures: ret == a[0],
+}
+/// The false twin for the by-reference array loop.
+pub fn for_array_sum_cannot_prove_this(a: [u8; 2]) -> u8 {
+    let mut s = 0u8;
+    for &x in &a {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: true,
+    ensures: ret == a[0].wrapping_add(a[1]),
+}
+/// `for x in a` by *value* owns an `array::IntoIter`, whose `next` advances the
+/// same way and whose drop (glue-free for `u8`) is a no-op.
+pub fn for_array_by_value_sum(a: [u8; 2]) -> u8 {
+    let mut s = 0u8;
+    for x in a {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: true,
+    ensures: ret == a[1],
+}
+/// The false twin for the by-value array loop (the sum is not `a[1]`).
+pub fn for_array_by_value_sum_cannot_prove_this(a: [u8; 2]) -> u8 {
+    let mut s = 0u8;
+    for x in a {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() == 2,
+    ensures: ret == xs[0].wrapping_add(xs[1]),
+}
+/// `for &x in xs.iter()` is the same iteration through the explicit `iter`
+/// cursor (an `Iter` is its own `IntoIterator`, so `into_iter` is the identity).
+pub fn for_slice_iter_sum(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for &x in xs.iter() {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() == 2,
+    ensures: ret == xs[0],
+}
+/// The false twin for the `iter()` spelling.
+pub fn for_slice_iter_sum_cannot_prove_this(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for &x in xs.iter() {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() == 2,
+    ensures: ret >= xs[0] && ret >= xs[1],
+}
+/// A branch *inside* the loop (a running maximum) also decides: the loop is
+/// unwound and each `next` names a constant index.
+pub fn for_slice_max(xs: &[u8]) -> u8 {
+    let mut m = 0u8;
+    for &x in xs {
+        if x > m {
+            m = x;
+        }
+    }
+    m
+}
+
+// ---------------------------------------------------------------------------
+// Iterator *consumers*: `sum`, `count`, and the `copied` adapter
+// ---------------------------------------------------------------------------
+//
+// `xs.iter().sum()` folds the remaining elements with a *checked* `+` (debug
+// `Add::add` panics on overflow), so a contract that does not rule out overflow
+// is refuted as a reachable panic; `count` is `len - pos`; `copied` is a cursor
+// identity. The sum's length must be a constant (an array's type length, or a
+// slice whose length the precondition pinned), because a symbolic length has no
+// fixed number of addends to build a term from.
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= 10,
+    requires: xs[1] <= 10,
+    ensures: ret == xs[0] + xs[1],
+}
+/// `xs.iter().sum()` over a bounded two-element slice. The element bounds make the
+/// sum non-overflowing, so the two checked additions are discharged and the sum is
+/// the elements' sum.
+pub fn iter_sum_slice(xs: &[u8]) -> u8 {
+    xs.iter().sum()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= 10,
+    requires: xs[1] <= 10,
+    ensures: ret == xs[0],
+}
+/// The false twin: the sum of two elements is not the first one.
+pub fn iter_sum_slice_cannot_prove_this(xs: &[u8]) -> u8 {
+    xs.iter().sum()
+}
+
+spec! {
+    requires: a[0] <= 10,
+    requires: a[1] <= 10,
+    ensures: ret == a[0] + a[1],
+}
+/// `a.into_iter().sum()` over an array: the length is the type's constant, so no
+/// length precondition is needed.
+pub fn iter_sum_array(a: [u8; 2]) -> u8 {
+    a.into_iter().sum()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= 10,
+    requires: xs[1] <= 10,
+    ensures: ret == xs[0] + xs[1],
+}
+/// `xs.iter().copied().sum()`: the `copied` adapter is a cursor identity, so the
+/// sum reads the same elements.
+pub fn iter_sum_copied(xs: &[u8]) -> u8 {
+    xs.iter().copied().sum()
+}
+
+spec! {
+    requires: xs.len() <= 3,
+    ensures: ret == xs.len(),
+}
+/// `xs.iter().count()` is the slice length: the cursor starts at `0` and the count
+/// is `len - 0`.
+pub fn iter_count_slice(xs: &[u8]) -> usize {
+    xs.iter().count()
+}
+
+spec! {
+    requires: xs.len() <= 3,
+    ensures: ret == xs.len() + 1,
+}
+/// The false twin: the count is the length, not one more.
+pub fn iter_count_slice_cannot_prove_this(xs: &[u8]) -> usize {
+    xs.iter().count()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    ensures: true,
+}
+/// An unguarded `sum` over `u8`s can overflow (`[200, 100]`), and `sum` uses a
+/// checked `+`, so this is a reachable panic -- refuted, not proved.
+pub fn iter_sum_may_overflow_is_a_panic(xs: &[u8]) -> u8 {
+    xs.iter().sum()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    ensures: ret == xs[1],
+}
+/// `xs.iter().last()` is the last element; with the length pinned the model names
+/// the exact `xs[len-1]`.
+pub fn iter_last_slice(xs: &[u8]) -> u8 {
+    *xs.iter().last().unwrap()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    ensures: ret == xs[0],
+}
+/// The false twin: `last` is not `first`.
+pub fn iter_last_slice_cannot_prove_this(xs: &[u8]) -> u8 {
+    *xs.iter().last().unwrap()
+}
+
+spec! {
+    requires: xs.len() == 3,
+    ensures: ret == xs[2],
+}
+/// `xs.iter().nth(2)` is the element two places past the cursor (here the third).
+pub fn iter_nth_slice(xs: &[u8]) -> u8 {
+    *xs.iter().nth(2).unwrap()
+}
+
+spec! {
+    requires: xs.len() == 3,
+    ensures: ret == xs[0],
+}
+/// The false twin: `nth(2)` is not the first element.
+pub fn iter_nth_slice_cannot_prove_this(xs: &[u8]) -> u8 {
+    *xs.iter().nth(2).unwrap()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= xs[1],
+    ensures: ret == xs[1],
+}
+/// `max` over a sorted slice is its last element.
+pub fn iter_max_slice(xs: &[u8]) -> u8 {
+    *xs.iter().max().unwrap()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= xs[1],
+    ensures: ret == xs[0],
+}
+/// The false twin: the max of an ascending slice is not its first element.
+pub fn iter_max_slice_cannot_prove_this(xs: &[u8]) -> u8 {
+    *xs.iter().max().unwrap()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= xs[1],
+    ensures: ret == xs[0],
+}
+/// `min` over a sorted slice is its first element.
+pub fn iter_min_slice(xs: &[u8]) -> u8 {
+    *xs.iter().min().unwrap()
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= xs[1],
+    ensures: ret == xs[1],
+}
+/// The false twin: the min of an ascending slice is not its last element.
+pub fn iter_min_slice_cannot_prove_this(xs: &[u8]) -> u8 {
+    *xs.iter().min().unwrap()
+}
+
+spec! {
+    requires: a[0] <= a[1],
+    requires: a[1] <= a[2],
+    ensures: ret == a[2],
+}
+/// `max` on a *signed* array reads the signed order: `i8::MIN` is the smallest, not
+/// the largest, so an unsigned comparison would pick the wrong element.
+pub fn iter_max_signed_array(a: [i8; 3]) -> i8 {
+    a.into_iter().max().unwrap()
+}
+
+spec! {
+    requires: xs.len() == 3,
+    ensures: ret == 3,
+}
+/// `enumerate`'s index is the cursor position, so summing it over a 3-element
+/// slice is `0 + 1 + 2`. The tuple payload is destructured directly from the
+/// `Option`, which needs the nested downcast place to parse whole.
+pub fn iter_enumerate_index_sum(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for (i, _) in xs.iter().enumerate() {
+        s = s.wrapping_add(i as u8);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() == 3,
+    ensures: ret == 1,
+}
+/// The false twin: the index sum is not `1`.
+pub fn iter_enumerate_index_sum_cannot_prove_this(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for (i, _) in xs.iter().enumerate() {
+        s = s.wrapping_add(i as u8);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= 10,
+    requires: xs[1] <= 10,
+    ensures: ret == xs[0] + xs[1],
+}
+/// The element half of `enumerate` is the slice sum.
+pub fn iter_enumerate_value_sum(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for (_, &x) in xs.iter().enumerate() {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: xs.len() == 2,
+    requires: xs[0] <= 10,
+    requires: xs[1] <= 10,
+    ensures: ret == xs[0],
+}
+/// The false twin: the element sum is not the first element.
+pub fn iter_enumerate_value_sum_cannot_prove_this(xs: &[u8]) -> u8 {
+    let mut s = 0u8;
+    for (_, &x) in xs.iter().enumerate() {
+        s = s.wrapping_add(x);
+    }
+    s
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
+/// `String::from("ab")` has byte length `2`; `len` reads the tracked length.
+pub fn string_from_len() -> usize {
+    String::from("ab").len()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 3,
+}
+/// The false twin: `"ab"` is length `2`, not `3`.
+pub fn string_from_len_cannot_prove_this() -> usize {
+    String::from("ab").len()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 2,
+}
+/// `String::new` is length `0`, `push_str("ab")` adds `2`.
+pub fn string_push_len() -> usize {
+    let mut s = String::new();
+    s.push_str("ab");
+    s.len()
+}
+
+spec! {
+    requires: true,
+    ensures: ret == 0,
+}
+/// The false twin: the pushed string is not empty.
+pub fn string_push_len_cannot_prove_this() -> usize {
+    let mut s = String::new();
+    s.push_str("ab");
+    s.len()
 }
 
 // ---------------------------------------------------------------------------

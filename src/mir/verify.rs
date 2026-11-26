@@ -124,6 +124,24 @@ pub struct MirOptions {
     /// `None` means "the caller supplied these by hand", which is not checked: a
     /// hand-built [`MirOptions`] may legitimately name a prebuilt rlib.
     pub probed_with: Option<String>,
+    /// A directory for the proof cache (U7), or `None` to verify every run.
+    ///
+    /// When set, a function whose *decided* verdict (`Verified`/`Failed`) is already
+    /// in the cache for this file's key is reused instead of re-verified. The key
+    /// covers the MIR text, the source text, the edition and the engine hash, so any
+    /// change to the program or the engine is a miss — never a stale hit. Only the
+    /// library-side option is here; `cargo verif` sets it from `--cache`.
+    pub cache: Option<PathBuf>,
+    /// Extra arguments passed verbatim to the MIR-emitting `rustc` invocation.
+    ///
+    /// The `RUSTC_WRAPPER` entry point fills this with the *semantic* flags Cargo
+    /// passes the real compilation -- `--cfg` and `--target` -- so the MIR it emits
+    /// is the program Cargo is actually building. Without them, `cfg!(feature =
+    /// "fast")` would evaluate to `false` during verification and `true` in the
+    /// artifact, and the verifier could approve a contract the build violates (a
+    /// false pass). Edition and `--extern` are handled separately (they are part of
+    /// [`MirOptions`] proper).
+    pub rustc_args: Vec<String>,
 }
 
 /// Everything a build script needs to let its own source name a crate: the
@@ -190,7 +208,7 @@ pub fn extern_options_with(rustc: &str, name: &str) -> Option<MirOptions> {
             let Some(f) = p.file_name().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if f.starts_with(&prefix) && f.ends_with(".rlib") {
+            if f.starts_with(&prefix) && (f.ends_with(".rlib") || f.ends_with(".rmeta")) {
                 found.push(p);
             }
         }
@@ -218,6 +236,347 @@ pub fn extern_options_with(rustc: &str, name: &str) -> Option<MirOptions> {
         if extern_compiles(rustc, &opts) {
             return Some(opts);
         }
+    }
+    None
+}
+
+/// `MirOptions` that make a crate's *own dependencies* resolvable when the frontend
+/// compiles one of its files, so `cargo verif --file src/lib.rs` works on a crate that
+/// `use`s another crate.
+///
+/// The rlibs live in the crate's own `target/<profile>/deps`; the crate names come
+/// from the manifest's `[dependencies]` table (dev/build deps are not linked by the
+/// verified source, so they are skipped). Each name's newest `lib<name>-*.rlib` (or
+/// `*.rmeta` -- cargo's pipelined build writes a dependency's `.rmeta` before its
+/// `.rlib`, and a dependent crate compiles against either, so a `RUSTC_WRAPPER` that
+/// verifies mid-build must accept both or race the `.rlib`) is picked and the whole
+/// set is *probed* with the emitting compiler (`extern_compiles`);
+/// if the probe fails -- no rlib built yet, or a stale one from another toolchain --
+/// this returns `MirOptions::default()`, so the caller falls back to a compile error
+/// that names the unresolved import rather than a guessed path. A guessed rlib is
+/// either the wrong compiler's or the wrong features', and both surface as a compiler
+/// error about a program that is fine.
+#[cfg(feature = "std")]
+pub fn crate_options(file: &Path) -> MirOptions {
+    let Some(manifest) = nearest_manifest(file) else {
+        return MirOptions::default();
+    };
+    let crate_root = manifest.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        return MirOptions::default();
+    };
+    let deps = dependency_packages(&text);
+    if deps.is_empty() {
+        return MirOptions::default();
+    }
+    // Where a dependency's rlib can land: `<profile>/deps` (a normal build) and every
+    // `<profile>/build/<pkg>/<hash>/out` (a build-script output, which some toolchains
+    // and this container's cargo use for a path dependency too). Searching both is the
+    // same set `build_script_roots` walks for a build script.
+    // The real target directory: a custom `[build] target-dir`, `CARGO_TARGET_DIR`,
+    // or a workspace's shared `target/`, none of which is `<crate_root>/target`.
+    let target_dir = target_dir_for(&crate_root);
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for profile in ["debug", "release"] {
+        let base = target_dir.join(profile);
+        let deps = base.join("deps");
+        if deps.is_dir() {
+            dirs.push(deps);
+        }
+        if let Ok(pkgs) = std::fs::read_dir(base.join("build")) {
+            for pkg in pkgs.flatten() {
+                if let Ok(hashes) = std::fs::read_dir(pkg.path()) {
+                    for h in hashes.flatten() {
+                        let out = h.path().join("out");
+                        if out.is_dir() {
+                            dirs.push(out);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if dirs.is_empty() {
+        return MirOptions::default();
+    }
+    let rustc = std::env::var("VERIF_RUSTC").unwrap_or_else(|_| "rustc".into());
+    let mut externs: Vec<(String, PathBuf)> = Vec::new();
+    for (key, pkg) in &deps {
+        // The extern name is the `[dependencies]` key (what the source `use`s); the
+        // rlib is named after the *package* -- a renamed dep (`foo = { package =
+        // "bar" }`) links `libbar-*.rlib` as `--extern foo=...`.
+        let us = extern_name(key);
+        let prefix = format!("lib{}-", extern_name(pkg));
+        let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+        for d in &dirs {
+            let Ok(entries) = std::fs::read_dir(d) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                let Some(f) = p.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if f.starts_with(&prefix) && (f.ends_with(".rlib") || f.ends_with(".rmeta")) {
+                    if let Ok(mt) = std::fs::metadata(&p).and_then(|m| m.modified()) {
+                        if best.as_ref().map(|(_, b)| mt > *b).unwrap_or(true) {
+                            best = Some((p, mt));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((rlib, _)) = best {
+            externs.push((us.clone(), rlib));
+        }
+    }
+    if externs.is_empty() {
+        return MirOptions::default();
+    }
+    let opts = MirOptions {
+        externs,
+        search_paths: dirs,
+        probed_with: Some(canonical_compiler(&rustc)),
+        ..MirOptions::default()
+    };
+    if extern_compiles(&rustc, &opts) {
+        opts
+    } else {
+        MirOptions::default()
+    }
+}
+
+/// The crate names in a manifest's `[dependencies]` table. Handles `name = "1"`,
+/// `name = { … }`, and the `[dependencies.name]` sub-table form; skips dev and build
+/// dependencies, which the verified source does not link.
+#[cfg(feature = "std")]
+/// The extern name for a dependency: Rust spells a crate with underscores, so a
+/// hyphenated manifest key (`embedded-hal`) becomes the extern `embedded_hal`. A
+/// hyphenated `--extern embedded-hal=...` names nothing the source can `use`.
+fn extern_name(dep: &str) -> String {
+    dep.replace('-', "_")
+}
+
+#[cfg(test)]
+fn dependency_names(text: &str) -> Vec<String> {
+    dependency_packages(text).into_iter().map(|(k, _)| k).collect()
+}
+
+/// The `[dependencies]` table as `(extern_key, package_name)` pairs.
+///
+/// The extern name is the manifest key (what the source `use`s); the *package* is what
+/// the rlib is named after. For a plain dependency the two agree; for a renamed one
+/// (`foo = { package = "bar" }`) they differ, and the rlib is `libbar-*.rlib` linked as
+/// `--extern foo=...`. Reading only the key searched for `libfoo-*.rlib`, found nothing,
+/// and dropped the extern -- a lost proof for any renamed dependency.
+fn dependency_packages(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut in_deps = false;
+    for raw in text.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            let inner = line.trim_start_matches('[').trim_end_matches(']').trim();
+            in_deps = inner == "dependencies";
+            if let Some(rest) = inner.strip_prefix("dependencies.") {
+                let name = rest.trim().trim_matches('"').trim_matches('\'').trim();
+                if !name.is_empty() {
+                    out.push((name.to_string(), name.to_string()));
+                }
+                in_deps = false;
+            }
+            continue;
+        }
+        if in_deps {
+            if let Some(eq) = line.find('=') {
+                let name = line[..eq]
+                    .split('.')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .trim();
+                if !name.is_empty() {
+                    let pkg = rename_target(&line[eq + 1..]).unwrap_or_else(|| name.to_string());
+                    out.push((name.to_string(), pkg));
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The `package = "name"` of a renamed dependency's inline table, or `None`. The
+/// `package` word must be a standalone key (preceded by `{`, `,` or whitespace, not a
+/// letter) so a value that merely contains `package` is not misread.
+fn rename_target(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = value[from..].find("package") {
+        let at = from + rel;
+        let boundary = at == 0 || !bytes[at - 1].is_ascii_alphanumeric() && bytes[at - 1] != b'_';
+        if boundary {
+            let after = value[at + "package".len()..].trim_start();
+            if let Some(after) = after.strip_prefix('=') {
+                let after = after.trim_start();
+                for q in ['"', '\''] {
+                    if let Some(rest) = after.strip_prefix(q) {
+                        if let Some(end) = rest.find(q) {
+                            return Some(rest[..end].to_string());
+                        }
+                    }
+                }
+            }
+        }
+        from = at + "package".len();
+    }
+    None
+}
+
+/// The target directory for `crate_root`: `CARGO_TARGET_DIR` if set (cargo's own
+/// precedence), else what `cargo metadata` reports (a custom `[build] target-dir` or a
+/// workspace's shared `target/`), else the conventional `<crate_root>/target`.
+#[cfg(feature = "std")]
+fn target_dir_for(crate_root: &Path) -> PathBuf {
+    if let Ok(t) = std::env::var("CARGO_TARGET_DIR") {
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
+    cargo_target_directory(crate_root).unwrap_or_else(|| crate_root.join("target"))
+}
+
+#[cfg(feature = "std")]
+fn cargo_target_directory(crate_root: &Path) -> Option<PathBuf> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let out = std::process::Command::new(cargo)
+        .arg("metadata")
+        .arg("--format-version=1")
+        .arg("--no-deps")
+        .current_dir(crate_root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    target_directory_from_metadata(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The `"target_directory":"…"` field of a `cargo metadata --format-version=1` blob,
+/// with the JSON string escapes (`\\`, `\"`, `\n`, `\t`) decoded.
+#[cfg(feature = "std")]
+fn target_directory_from_metadata(metadata: &str) -> Option<PathBuf> {
+    // Read `target_directory` only from the **top-level** object. Cargo prints each
+    // package's user-defined `[package.metadata]` before the root `target_directory`, so a
+    // `target_directory` nested in a package's metadata would otherwise be found first --
+    // and the dependency search would look in the wrong directory. Track the brace depth
+    // (skipping string contents) and accept the key only at depth 1.
+    let bytes = metadata.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let start = i + 1;
+                // Scan to the next *unescaped* quote: a JSON string may contain `\"`,
+                // and a `[`/`]`/`{`/`}` between two escaped quotes (in a package
+                // description) would otherwise change the depth and hide the root
+                // `target_directory`.
+                let end = json_string_end(bytes, start)?;
+                if depth == 1 && &metadata[start..end] == "target_directory" {
+                    return read_json_string(bytes, end + 1);
+                }
+                // Not the key: skip the whole string (its contents hold no braces).
+                i = end + 1;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth -= 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// The byte index of the `"` that closes the JSON string whose opening quote is just
+/// before `start`, skipping `\X` escape pairs so an escaped quote (`\"`) does not end
+/// the string early.
+#[cfg(feature = "std")]
+fn json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut k = start;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'\\' => k += 2,
+            b'"' => return Some(k),
+            _ => k += 1,
+        }
+    }
+    None
+}
+
+/// After a key's closing quote at byte `from`, skip whitespace and `:`, then read the
+/// JSON string value, decoding `\\`, `\"`, `\n`, `\t`, `\r`, `\/` and `\uXXXX`.
+///
+/// The decoded bytes are collected and validated as UTF-8 at the end: a non-ASCII
+/// character is several bytes, and decoding each byte with `byte as char` would turn
+/// `artefácts` into `artefÃ¡cts`, so the dependency search would look in the wrong
+/// directory.
+#[cfg(feature = "std")]
+fn read_json_string(bytes: &[u8], from: usize) -> Option<PathBuf> {
+    let mut j = from;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j >= bytes.len() || bytes[j] != b':' {
+        return None;
+    }
+    j += 1;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j >= bytes.len() || bytes[j] != b'"' {
+        return None;
+    }
+    j += 1;
+    let mut out: Vec<u8> = Vec::new();
+    while j < bytes.len() {
+        match bytes[j] {
+            b'"' => return String::from_utf8(out).ok().map(PathBuf::from),
+            b'\\' => {
+                j += 1;
+                if j < bytes.len() {
+                    match bytes[j] {
+                        b'n' => out.push(b'\n'),
+                        b't' => out.push(b'\t'),
+                        b'r' => out.push(b'\r'),
+                        b'u' => {
+                            if j + 4 < bytes.len() {
+                                let hex = std::str::from_utf8(&bytes[j + 1..j + 5]).ok()?;
+                                let cp = u32::from_str_radix(hex, 16).ok()?;
+                                let ch = char::from_u32(cp)?;
+                                let mut buf = [0u8; 4];
+                                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                                j += 4;
+                            }
+                        }
+                        // `\"`, `\\`, `\/` decode to the escaped byte itself.
+                        o => out.push(o),
+                    }
+                }
+            }
+            o => out.push(o),
+        }
+        j += 1;
     }
     None
 }
@@ -293,31 +652,38 @@ fn check_probe_compiler(rustc: &str, opts: &MirOptions) -> Result<(), String> {
 /// without parsing rustc's metadata format.
 #[cfg(feature = "std")]
 fn extern_compiles(rustc: &str, opts: &MirOptions) -> bool {
-    let Some((name, _)) = opts.externs.first() else {
+    if opts.externs.is_empty() {
         return false;
-    };
+    }
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("verif-extern-probe-{}-{seq}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let src = dir.join("probe.rs");
-    // `extern crate` rather than `use`, so this works on every edition and does not
-    // depend on the crate exporting any particular path.
-    let body = format!("#![allow(unused_extern_crates)]\nextern crate {name};\n");
-    if std::fs::write(&src, body).is_err() {
-        return false;
-    }
     let mut cmd = Command::new(rustc);
     cmd.arg("--edition=2021")
         .arg("--crate-type=lib")
         .arg("--emit=metadata")
         .arg("-o")
         .arg(dir.join("probe.rmeta"));
-    for (n, p) in &opts.externs {
-        cmd.arg("--extern").arg(format!("{}={}", n, p.display()));
+    // Every extern, not just the first (rustc can leave a later path unloaded until
+    // used), and under a *synthetic* alias: an artifact named `core`/`std`/`alloc`
+    // passed as `--extern core=…` would redirect the probe's implicit prelude lookup.
+    // The real MIR emit keeps the real names, so only the probe is aliased.
+    let mut crates = String::new();
+    for (i, (_, p)) in opts.externs.iter().enumerate() {
+        let syn = format!("__verif_probe_{i}");
+        crates.push_str(&format!("extern crate {syn};\n"));
+        cmd.arg("--extern").arg(format!("{syn}={}", p.display()));
     }
     for d in &opts.search_paths {
         cmd.arg("-L").arg(format!("dependency={}", d.display()));
+    }
+    // `no_std` so the probe does not inject `std` (a `panic_halt`-style dependency
+    // would otherwise clash); the synthetic aliases keep `core` free for the prelude.
+    let body = format!("#![no_std]\n#![allow(unused_extern_crates)]\n{crates}");
+    if std::fs::write(&src, body).is_err() {
+        return false;
     }
     let ok = cmd.arg(&src).output().map(|o| o.status.success()).unwrap_or(false);
     let _ = std::fs::remove_dir_all(&dir);
@@ -729,6 +1095,9 @@ pub fn emit_mir_with_opts(
     }
     for dir in &opts.search_paths {
         cmd.arg("-L").arg(format!("dependency={}", dir.display()));
+    }
+    for a in &opts.rustc_args {
+        cmd.arg(a);
     }
     let out = cmd
         .arg(file)
@@ -1220,7 +1589,8 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
         Some(move |ret: Option<smt::Var>,
                    projs: &[(u32, smt::Var)],
                    ret_payloads: &[(u64, smt::Var)],
-                   ref_final: &[(u32, smt::Var)]| {
+                   ref_final: &[(u32, smt::Var)],
+                   ref_len_unknown: &[u32]| {
             // A reference argument's name denotes the value the body left at the
             // target, so a bare `c` in the postcondition is bound to the *final*
             // value. Binding it to the entry value instead (which `arg_vars` holds)
@@ -1234,16 +1604,45 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             // resolved to the input. `old(name)` still works -- the entry value is
             // known regardless of what the body did.
             let mut args = args_for_post.clone();
+            let mut fields = fields_for_post.clone();
             for name in &ref_arg_names {
                 args.remove(name);
             }
             for (l, v) in ref_final {
-                if let Some(name) = spec::arg_name_of(f, rename.as_ref(), *l) {
-                    args.insert(name, *v);
+                // The argument's source name. `arg_name_of` only covers *width-
+                // bearing* args (a `Vec`/slice has no single word), so the name is
+                // taken from the debug binding directly, with the contract's
+                // rename applied -- the same rule `arg_bindings` uses.
+                let Some(name) = spec::arg_name_any(f, rename.as_ref(), *l) else {
+                    continue;
+                };
+                // A Vec/slice/array argument's length is the post-state length (a
+                // slice or array's is unchanged, so this is a no-op; a `&mut Vec`'s
+                // is the pushed length). Reading the entry length was a false proof.
+                let len_name = format!("{name}__len");
+                match fields.vars.get_mut(&len_name) {
+                    Some(slot) => *slot = *v,
+                    None => {
+                        args.insert(name, *v);
+                    }
+                }
+            }
+            // A `&mut Vec` argument whose length is unknown on this path (the body
+            // rebound a Vec reference, aliasing the storage): *remove* the length
+            // binding so `v.len()` in the postcondition is refused, rather than read
+            // back from the entry value (a false proof for `v.push(1); v = w`).
+            for l in ref_len_unknown {
+                if let Some(name) = spec::arg_name_any(f, rename.as_ref(), *l) {
+                    let len_name = format!("{name}__len");
+                    fields.vars.remove(&len_name);
+                    // The refused length must not fall through to a crate constant of the
+                    // same *generated* name (`const out__len = 0`), which would resolve the
+                    // postcondition to the wrong value -- a false proof. Remove it from the
+                    // const table too, so the name is genuinely unbound (refused).
+                    fields.consts.remove(&len_name);
                 }
             }
             // Bind each declared component that this path actually produced.
-            let mut fields = fields_for_post.clone();
             for (i, ty) in ret_components.iter().enumerate() {
                 let i = i as u32;
                 // Declared but unwritten on this path: binding a *fresh*
@@ -1401,6 +1800,14 @@ pub struct FileReport {
     pub edition: Option<Edition>,
     /// One outcome per verified function, in contract order.
     pub outcomes: Vec<(String, FnOutcome)>,
+    /// The source `(file, line)` of each reported function, keyed by the report key.
+    /// A diagnostic convenience -- a report that says `v1:u8 = 224` names the variable
+    /// but not where the function is, and `cargo verif` puts the file and line in its
+    /// SARIF `artifactLocation`/`region`. The file is `Some` for a multi-file crate
+    /// (the module a method lives in, via the line map) and `None` for a single-file
+    /// source, where the root file is implied. The line is `0` when the scanner could
+    /// not place the function, never a guessed line.
+    pub lines: std::collections::BTreeMap<String, (Option<PathBuf>, usize)>,
     /// Functions that carried a contract but were not found in the MIR. A
     /// non-empty list means the run covered less than the contracts asked for.
     pub missing: Vec<String>,
@@ -1478,7 +1885,7 @@ pub fn verify_file_with_opts(
     check_probe_compiler(rustc, opts)?;
     let text = std::fs::read_to_string(source)
         .map_err(|e| format!("could not read {}: {e}", source.display()))?;
-    let specs = spec::extract(&text);
+    let specs = spec::extract_crate(source, &text);
     let (mir, edition) = emit_mir_with_opts(rustc, source, opts)?;
     let prog =
         parse::parse_program_scoped(&mir, &enum_layouts(&specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners, &specs.impl_traits, &specs.impl_trait_args, &specs.declared_traits);
@@ -1490,9 +1897,49 @@ pub fn verify_file_with_opts(
         missing,
         ..Default::default()
     };
+    // The cache key covers the MIR, the source (contracts), the edition and the
+    // engine (via `VERIF_ENGINE_HASH`); a change to any of them is a miss.
+    let cache_key = opts
+        .cache
+        .as_ref()
+        .map(|_| super::cache::file_key(&mir, &specs.snapshot, &format!("{edition:?}")));
+    let cached = match (&opts.cache, &cache_key) {
+        (Some(dir), Some(k)) => super::cache::load(dir, k),
+        _ => super::cache::Entries::new(),
+    };
+    let mut fresh = super::cache::Entries::new();
     for (key, f) in select(&prog, &targets, only) {
-        let outcome = smt::with_fresh(|| verify_function(&prog, f, &specs));
+        if let Some(c) = specs.resolve(&f.name) {
+            let (file, line) = specs.original_loc(c.line);
+            report.lines.insert(key.clone(), (file, line));
+        }
+        // Keyed by the MIR definition name (`f.name`), which is unique per function
+        // -- two trait impls of one method share a *report label* (`S::check`) but not
+        // a definition name (their impl locations differ). Keying on the label would
+        // let one impl's verdict stand in for the other (a false proof).
+        let outcome = match cached.get(&f.name) {
+            Some(c) => c.to_outcome(),
+            None => smt::with_fresh(|| verify_function(&prog, f, &specs)),
+        };
+        if let Some(c) = super::cache::Cached::of(&outcome) {
+            fresh.insert(f.name.clone(), c);
+        }
         report.outcomes.push((key, outcome));
+    }
+    if let (Some(dir), Some(k)) = (&opts.cache, &cache_key) {
+        // Merge with the previous entries, so a `--function` run does not drop the
+        // verdicts it did not recompute.
+        let mut merged = cached;
+        for (n, c) in fresh {
+            merged.insert(n, c);
+        }
+        let _ = super::cache::store(dir, k, &merged);
+    }
+    for m in &report.missing {
+        if let Some(c) = specs.by_fn.get(m) {
+            let (file, line) = specs.original_loc(c.line);
+            report.lines.insert(m.clone(), (file, line));
+        }
     }
     Ok(report)
 }
@@ -1531,6 +1978,40 @@ fn enum_layouts(specs: &Specs) -> BTreeMap<String, parse::EnumLayout> {
 /// otherwise collapse into one `outcomes` entry and only one of them would be
 /// visible. The bare name is preferred because it is what a reader looks for, and
 /// it is exactly what the MIR dump itself uses as the method's tail.
+/// Whether a method's MIR definition name (`<impl at FILE:L:C: L:C>::m`) names the file
+/// a contract came from. Compares the full path, then the basename (rustc prints the
+/// path as it resolved it, which may differ in spelling from the path the caller used).
+/// When either side has no file, it does not constrain -- the line and column alone do.
+fn impl_file_matches(name: &str, want: Option<&Path>) -> bool {
+    // Strict full-path comparison, mirroring `Specs::snapshot_line_for`: a basename
+    // fallback would let two same-named files in different directories match, and an
+    // absent file must not be treated as "no constraint" (that would match any file).
+    // The map's file and rustc's `impl at FILE` share the root spelling, so the full
+    // path agrees; a mismatch refuses the pairing (the method is `missing`).
+    match (spec::impl_file(name), want) {
+        (Some(f), Some(w)) => spec::same_file(Path::new(f), w),
+        // A `None` want is a single-file `Specs` (no line map): pair by location alone.
+        // The caller still requires a singleton candidate set, so ambiguity is refused.
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// Like [`impl_file_matches`] but WITHOUT the bare-basename fallback: true only when
+/// the impl file is the *same* path as the wanted file (or canonicalises to it). Used
+/// to prefer an exact candidate over the loose basename one, so an unrelated
+/// same-basename file at the same coordinates does not force an ambiguity refusal.
+fn impl_file_matches_exact(name: &str, want: Option<&Path>) -> bool {
+    match (spec::impl_file(name), want) {
+        (Some(f), Some(w)) => {
+            let fp = Path::new(f);
+            fp == w || matches!((fp.canonicalize(), w.canonicalize()), (Ok(a), Ok(b)) if a == b)
+        }
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 fn resolve_targets<'a>(
     prog: &'a MirProgram,
     specs: &Specs,
@@ -1631,9 +2112,29 @@ fn resolve_targets<'a>(
     for (line, col, method) in specs.by_method.keys() {
         seen.insert((*line, *col, method.clone()));
         let method = method.as_str();
-        match prog.fns.iter().find(|f| f.impl_loc == Some((*line, *col))
-            && f.name.rsplit("::").next() == Some(method))
-        {
+        // The `by_method` key is a *snapshot* line; the MIR's `impl_loc` is rustc's
+        // original line. Translate through the line map so a method in a module (whose
+        // snapshot line differs from its file's) still pairs with its body, and check the
+        // file so two `impl`s at the same line and column in different files stay apart.
+        let (orig_file, orig_line) = specs.original_loc(*line);
+        let candidates: Vec<&_> = prog.fns.iter().filter(|f| f.impl_loc == Some((orig_line, *col))
+            && f.name.rsplit("::").next() == Some(method)
+            && impl_file_matches(&f.name, orig_file.as_deref())).collect();
+        // Prefer the exact-file body over a bare-name fallback so an earlier
+        // same-basename match cannot beat the exact file; with no file, or no exact
+        // candidate, the pairing must be unambiguous (exactly one body) or it is refused.
+        let chosen = match orig_file.as_deref() {
+            Some(w) => {
+                let exact: Vec<&_> = candidates.iter().copied()
+                    .filter(|f| spec::impl_file(&f.name).map(Path::new) == Some(w)).collect();
+                if exact.len() == 1 { Some(exact[0]) }
+                else if exact.is_empty() && candidates.len() == 1 { Some(candidates[0]) }
+                else { None }
+            }
+            None if candidates.len() == 1 => Some(candidates[0]),
+            None => None,
+        };
+        match chosen {
             Some(f) => targets.push((method_key(*line, *col, method, f), f)),
             None => missing.push(method.to_string()),
         }
@@ -1652,11 +2153,38 @@ fn resolve_targets<'a>(
         // `resolve` can only hand back one of them. Reporting it is the only
         // honest answer: silently preferring either would drop a claim the source
         // wrote. See `verify_function`, which refuses on `contract_conflict`.
-        let Some(f) = prog.fns.iter().find(|f| f.impl_loc == Some((line, col))
-            && f.name.rsplit("::").next() == Some(method.as_str())) else {
+        let (orig_file, orig_line) = specs.original_loc(line);
+        let all: Vec<&MirFn> = prog.fns.iter().filter(|f| f.impl_loc == Some((orig_line, col))
+            && f.name.rsplit("::").next() == Some(method.as_str())
+            && impl_file_matches(&f.name, orig_file.as_deref())).collect();
+        // Prefer an exact-path candidate over the bare-basename fallback: an unrelated
+        // file that merely shares a basename at the same coordinates must not force a
+        // refusal. Only multiple candidates at the *same* location are truly ambiguous.
+        let exact: Vec<&MirFn> = all.iter().copied()
+            .filter(|f| impl_file_matches_exact(&f.name, orig_file.as_deref())).collect();
+        let pool: &[&MirFn] = if !exact.is_empty() { &exact } else { &all };
+        let Some(f) = pool.first().copied() else {
             continue;
         };
-        enforced.insert(format!("{}::{method}", specs.impl_traits[&(line, col)]));
+        if pool.len() > 1 {
+            // Two `#[path]` inclusions of one file place the impl at the same file,
+            // line and column, so this pairing cannot tell them apart. Picking either
+            // would check one body and silently skip the other -- a clean verdict over
+            // an unchecked impl. Refuse: report it visibly unchecked, do not mark the
+            // declaration enforced.
+            missing.push(format!(
+                "{}::{method} (ambiguous: implemented in more than one module inclusion)",
+                specs.impl_traits[&(line, col)]
+            ));
+            continue;
+        }
+        // Normalise the trait key the same way `trait_method_targets` does, or an
+        // impl of a `use crate::Trait` imported name is *checked* (discovery strips
+        // the prefix) yet its declaration is also reported `missing` under the
+        // unstripped `crate::Trait::m` -- double-counted in coverage.
+        let tr = &specs.impl_traits[&(line, col)];
+        let tr = tr.strip_prefix("crate::").unwrap_or(tr);
+        enforced.insert(format!("{tr}::{method}"));
         if seen.insert((line, col, method.clone())) {
             targets.push((method_key(line, col, &method, f), f));
         }
@@ -1692,7 +2220,10 @@ fn trait_method_targets(specs: &Specs) -> Vec<(usize, usize, String)> {
         // Every declaration the trait carries, which is every method of it this
         // scanner read a contract for. A trait with no contracted method
         // contributes nothing, so an impl of it is left as it was: checked for
-        // panic freedom, with no postcondition to establish.
+        // panic freedom, with no postcondition to establish. Strip a `crate::`
+        // prefix (an imported trait) the same way `trait_contract` does, or a method
+        // with only an inherited contract never becomes a target.
+        let tr = tr.strip_prefix("crate::").unwrap_or(tr);
         let prefix = format!("{tr}::");
         for key in specs.by_trait.keys() {
             if let Some(method) = key.strip_prefix(&prefix) {
@@ -1753,7 +2284,17 @@ pub fn verify_mir_text(
         parse::parse_program_scoped(mir, &enum_layouts(specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners, &specs.impl_traits, &specs.impl_trait_args, &specs.declared_traits);
     let (targets, missing) = resolve_targets(&prog, specs);
     let mut report = FileReport { missing, ..Default::default() };
+    // A request matching both a bare tail and a full path (e.g. `f` and `m::f`)
+    // selects the same MIR definition twice; dedupe by definition pointer so it is
+    // verified once. Two *distinct* methods that share a display key (two traits'
+    // `S::check`) have different pointers and both survive.
+    let mut seen: Vec<*const MirFn> = Vec::new();
     for (key, f) in select(&prog, &targets, only) {
+        let ptr = f as *const MirFn;
+        if seen.contains(&ptr) {
+            continue;
+        }
+        seen.push(ptr);
         let outcome = smt::with_fresh(|| verify_function(&prog, f, specs));
         report.outcomes.push((key, outcome));
     }
@@ -1782,6 +2323,112 @@ pub fn decide(p: crate::smt::Pred) -> Verdict {
 
 /// Re-exported so a caller can name the error type without reaching into `spec`.
 pub type ContractError = SpecError;
+
+/// Emit a `#[test]` that reproduces a **panic** counterexample (U3).
+///
+/// A counterexample is the verifier's evidence; a test makes it executable. The
+/// *values* come from the counterexample, the argument *order* from the source's
+/// parameter list ([`spec::function_params`]), so the emitted call is the one the
+/// verifier refuted. While the bug exists the call panics and the test fails;
+/// fixing the function makes it pass -- the "failing-then-fixed" shape U3's exit
+/// criterion asks for.
+///
+/// Only a *panic* with a concrete witness is emitted. A postcondition failure has
+/// no panic to reproduce, and emitting a test for it would need the postcondition
+/// re-stated in Rust, which the frontend does not model; the refusal is the honest
+/// answer rather than a guessed test.
+pub fn emit_test_source(
+    file: &std::path::Path,
+    report: &FileReport,
+    name: &str,
+) -> Result<String, String> {
+    let outcome = report.outcomes.iter().find(|(n, _)| n == name).map(|(_, o)| o);
+    let Some(FnOutcome::Failed { kind, detail }) = outcome else {
+        return Err(format!(
+            "`{name}` did not fail with a counterexample, so there is nothing to \
+             reproduce (only a `Failed` outcome becomes a test)"
+        ));
+    };
+    if !kind.starts_with("panic") {
+        return Err(format!(
+            "`{name}` failed on `{kind}`, not a panic; a non-panic failure has no call \
+             to reproduce, so it is not emitted as a test"
+        ));
+    }
+    let src = std::fs::read_to_string(file)
+        .map_err(|e| format!("could not read {}: {e}", file.display()))?;
+    let params = spec::function_params(&src, name).ok_or_else(|| {
+        format!(
+            "could not read `{name}`'s parameter list (a method, or a signature the \
+             scanner cannot read whole); refusing to guess the call order"
+        )
+    })?;
+    // `a = 1, b = 2` -> (a, 1), (b, 2). The value is emitted verbatim: an integer
+    // literal infers the parameter's type, and one that does not fit fails to
+    // compile rather than silently changing the input.
+    let values: Vec<(&str, &str)> = detail
+        .split(", ")
+        .filter_map(|p| p.split_once(" = "))
+        .map(|(n, v)| (n.trim(), v.trim()))
+        .collect();
+    let mut args = Vec::new();
+    for (pname, ty) in &params {
+        let Some((_, v)) = values.iter().find(|(n, _)| n == pname) else {
+            return Err(format!(
+                "the counterexample does not assign `{pname}`, so the call cannot be built"
+            ));
+        };
+        args.push(render_arg(pname, ty, v)?);
+    }
+    let sanitized: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    Ok(format!(
+        "#[test]\nfn {sanitized}_reproduces_the_counterexample() {{\n    \
+         // `verif` refuted `{name}`: {kind} at `{detail}`.\n    \
+         // While the bug exists this call panics, so the test fails; fix the\n    \
+         // function and it passes.\n    \
+         let _ = {name}({});\n}}\n",
+        args.join(", ")
+    ))
+}
+
+/// Render one counterexample value as a Rust argument for a parameter of type `ty`.
+///
+/// The counterexample stores *bit patterns* -- a `bool` `false` is `0`, an `i8` `-1`
+/// is `255` -- so the value is typed back before it is passed: `false`/`true` for a
+/// `bool`, sign-extended for a signed integer, the unsigned value otherwise. Emitting
+/// the raw decimal would give `bad(0)` for a `bool` and `bad(255)` for an `i8`: an
+/// uncompilable call, or one that does not reproduce the counterexample. The literal
+/// is emitted unsuffixed so it takes the parameter's own type by inference.
+fn render_arg(pname: &str, ty: &super::parse::Ty, raw: &str) -> Result<String, String> {
+    let v: i128 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("the counterexample value `{raw}` for `{pname}` is not an integer"))?;
+    if matches!(ty, super::parse::Ty::Bool) {
+        return Ok(if v != 0 { "true".into() } else { "false".into() });
+    }
+    let Some(w) = ty.width() else {
+        return Err(format!(
+            "`{pname}` is not a scalar type the emitter can synthesise a value for"
+        ));
+    };
+    let w = u32::from(w);
+    if w == 0 || w > 64 {
+        return Err(format!("`{pname}` has an unsupported width {w}"));
+    }
+    let mask: u128 = if w == 64 { u128::MAX } else { (1u128 << w) - 1 };
+    let bits = (v as u128) & mask;
+    if ty.is_signed() {
+        let signed =
+            if (bits >> (w - 1)) & 1 == 1 { bits as i128 - (1i128 << w) } else { bits as i128 };
+        Ok(format!("{signed}"))
+    } else {
+        Ok(format!("{bits}"))
+    }
+}
 
 #[cfg(test)]
 mod edition_tests {
@@ -2010,6 +2657,38 @@ mod edition_tests {
 mod extern_probe_tests {
     use super::*;
 
+    /// `dependency_names` reads the `[dependencies]` table and *only* it: dev and
+    /// build dependencies are not linked by the verified source, so naming them would
+    /// add an `--extern` for a crate the file never sees. Both value shapes
+    /// (`name = "1"`, `name = { … }`) and the `[dependencies.name]` sub-table are read.
+    #[test]
+    fn dependency_names_reads_the_dependencies_table_only() {
+        let toml = "[package]\nname = \"x\"\n\
+                    [dependencies]\n\
+                    serde = \"1\"\n\
+                    foo = { path = \"../foo\" }\n\
+                    [dev-dependencies]\n\
+                    criterion = \"0.5\"\n\
+                    [build-dependencies]\n\
+                    cc = \"1\"\n\
+                    [dependencies.bar]\n\
+                    version = \"1\"\n";
+        assert_eq!(dependency_names(toml), vec!["bar", "foo", "serde"]);
+        // No `[dependencies]` at all -> nothing, so `crate_options` is the default.
+        assert!(dependency_names("[package]\nname = \"x\"\n").is_empty());
+    }
+
+    /// A hyphenated manifest key becomes an underscored extern, because that is the
+    /// name Rust spells (`use embedded_hal`), and a hyphenated `--extern
+    /// embedded-hal=...` names nothing the source can `use`. Found by the external
+    /// crate demo (C8): `embedded-hal` resolved to no extern and the file failed
+    /// `E0433` even though the rlib was found.
+    #[test]
+    fn a_hyphenated_dependency_name_is_an_underscored_extern() {
+        assert_eq!(extern_name("embedded-hal"), "embedded_hal");
+        assert_eq!(extern_name("scratch_dep"), "scratch_dep");
+    }
+
     /// The *path* and the *identity* of a toolchain's `rustc`, when it is installed.
     ///
     /// The two are deliberately returned together, because they are not
@@ -2233,5 +2912,82 @@ mod extern_probe_tests {
             "stable ({a_path}) and 1.85 ({b_path}) are different builds and must not \
              share an identity"
         );
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    #[test]
+    fn render_arg_types_a_counterexample_value() {
+        use super::parse::Ty;
+        assert_eq!(render_arg("b", &Ty::Bool, "0").unwrap(), "false");
+        assert_eq!(render_arg("b", &Ty::Bool, "1").unwrap(), "true");
+        assert_eq!(render_arg("x", &Ty::I8, "255").unwrap(), "-1");
+        assert_eq!(render_arg("x", &Ty::I8, "128").unwrap(), "-128");
+        assert_eq!(render_arg("x", &Ty::U8, "255").unwrap(), "255");
+        assert_eq!(render_arg("x", &Ty::I8, "127").unwrap(), "127");
+        assert!(render_arg("x", &Ty::Other("S".into()), "0").is_err());
+    }
+
+    #[test]
+    fn dependency_names_reads_dotted_and_quoted_keys() {
+        let toml = "[dependencies]\ndep.path = \"../dep\"\nfoo = \"1\"\n\n                    [dependencies.\"bar\"]\nversion = \"1\"\n";
+        let names = super::dependency_names(toml);
+        assert!(names.contains(&"dep".to_string()), "dotted key -> `dep`, got {names:?}");
+        assert!(names.contains(&"foo".to_string()), "got {names:?}");
+        assert!(names.contains(&"bar".to_string()), "quoted sub-table, got {names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains('.') || n.contains('"')),
+            "no dots or quotes may survive, got {names:?}"
+        );
+    }
+
+    /// A renamed dependency's rlib is named after the *package*, not the manifest key:
+    /// `foo = { package = "bar" }` links `libbar-*.rlib` as `--extern foo=...`. Reading
+    /// only the key searched for `libfoo-*.rlib` and dropped the extern.
+    #[test]
+    fn dependency_packages_reads_a_rename() {
+        let toml = "[dependencies]\nserde = \"1\"\nfoo = { package = \"bar\", path = \"../bar\" }\nsub = { version = \"1\" }\n";
+        let mut got = super::dependency_packages(toml);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("foo".to_string(), "bar".to_string()),
+                ("serde".to_string(), "serde".to_string()),
+                ("sub".to_string(), "sub".to_string()),
+            ]
+        );
+    }
+
+    /// `cargo metadata`'s `target_directory` is the authority for a custom `[build]
+    /// target-dir` or a workspace's shared `target/`; the extractor reads just that field.
+    #[cfg(feature = "std")]
+    #[test]
+    fn target_directory_from_metadata_reads_the_field() {
+        use std::path::PathBuf;
+        let m = r#"{"packages":[],"target_directory":"/tmp/ws/target","version":1}"#;
+        assert_eq!(super::target_directory_from_metadata(m), Some(PathBuf::from("/tmp/ws/target")));
+        // A Windows-style path is JSON-escaped (`\\`), so the decoded value is `C:\ws\target`.
+        let m2 = r#"{"target_directory":"C:\\ws\\target"}"#;
+        assert_eq!(super::target_directory_from_metadata(m2), Some(PathBuf::from(r"C:\ws\target")));
+        // A package's user-defined metadata prints before the root `target_directory`; a
+        // nested `target_directory` must not shadow the real top-level one.
+        let nested = r#"{"packages":[{"metadata":{"target_directory":"/wrong"}}],"target_directory":"/right"}"#;
+        assert_eq!(super::target_directory_from_metadata(nested), Some(PathBuf::from("/right")));
+        // A non-ASCII path is multi-byte; each byte must decode as one char, not as a
+        // separate Latin-1 char (`artefácts` must stay `artefácts`, not `artefÃ¡cts`).
+        let unicode = r#"{"target_directory":"artefácts"}"#;
+        assert_eq!(super::target_directory_from_metadata(unicode), Some(PathBuf::from("artefácts")));
+        // A `\uXXXX` escape decodes to the code point (`\u00e1` is `á`).
+        let esc = r#"{"target_directory":"a\u00e1b"}"#;
+        assert_eq!(super::target_directory_from_metadata(esc), Some(PathBuf::from("aáb")));
+        // A `[` between two escaped quotes in a preceding description must not change
+        // the brace depth and hide the root `target_directory`.
+        let quoted = r#"{"packages":[{"description":"Parses the quoted \"[\" token"}],"target_directory":"/x/target"}"#;
+        assert_eq!(super::target_directory_from_metadata(quoted), Some(PathBuf::from("/x/target")));
+        assert_eq!(super::target_directory_from_metadata("{}"), None);
     }
 }

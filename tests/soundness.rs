@@ -150,10 +150,10 @@ fn the_ledger_keeps_a_row_for_every_defect_in_both_tables() {
         .find("## The engine and the imperative layer")
         .expect("the engine section header must exist");
     let (mir, engine) = ledger.split_at(split);
-    // The MIR table's rows are numbered 1..=47 and the engine table's 48..=63; the
+    // The MIR table's rows are numbered 1..=65 and the engine table's 66..=81; the
     // counts are asserted exactly so adding or dropping a defect is a deliberate
     // edit to this number, made in the same commit as the row.
-    assert_eq!(rows(mir).len(), 47, "the MIR table must keep its 47 rows");
+    assert_eq!(rows(mir).len(), 70, "the MIR table must keep its 69 rows");
     assert_eq!(rows(engine).len(), 16, "the engine table must keep its 16 rows");
     // And the numbering is contiguous across the two, so a row cannot be renumbered
     // into a gap without the check noticing.
@@ -168,8 +168,8 @@ fn the_ledger_keeps_a_row_for_every_defect_in_both_tables() {
         .collect();
     assert_eq!(
         nums,
-        (1..=63).collect::<Vec<u32>>(),
-        "the ledger's row numbers must be 1..=63 with no gaps or duplicates"
+        (1..=86).collect::<Vec<u32>>(),
+        "the ledger's row numbers must be 1..=81 with no gaps or duplicates"
     );
 }
 
@@ -195,8 +195,8 @@ fn the_soundness_ledger_names_fixtures_that_are_tests() {
 
     let rows = rows(&ledger);
     assert!(
-        rows.len() >= 49,
-        "the ledger must keep its rows (47 MIR + 16 engine); found {}",
+        rows.len() >= 71,
+        "the ledger must keep its rows (70 MIR + 16 engine); found {}",
         rows.len()
     );
 
@@ -422,5 +422,48 @@ mod helpers {
         assert_eq!(r[0].commit.trim(), "`abc1234`");
         assert_eq!(r[0].date.trim(), "2026-01-01");
     }
+}
+
+/// The TCB document names the files it trusts, so those names are checked.
+///
+/// `docs/tcb.md` (roadmap A4) points at the source of each layer it trusts. A
+/// renamed or moved module would leave the table pointing at nothing while the
+/// prose still read as authoritative -- the same defect the ledger's fixture
+/// column has, one document over. Every backticked repository path in the table
+/// must exist, and at least a handful must be found so the test cannot pass
+/// vacuously.
+#[test]
+fn the_tcb_names_files_that_exist() {
+    // The table names repository paths (including the excluded `tools/mir-oracle`),
+    // so the check is a *repository* invariant. Cargo strips `[workspace]` from a
+    // packaged manifest, so its absence means we are inside a `.crate` and the check
+    // is skipped. Gating on the manifest rather than on a directory means a renamed
+    // or removed oracle in the *repository* is still caught (the `[workspace]` is
+    // there, so the full check runs and fails on the stale path).
+    let manifest = std::fs::read_to_string(root().join("Cargo.toml")).unwrap_or_default();
+    if !manifest.contains("[workspace]") {
+        eprintln!("soundness: packaged crate (no [workspace]); skipping the TCB path check");
+        return;
+    }
+    let doc = std::fs::read_to_string(root().join("docs/tcb.md"))
+        .expect("docs/tcb.md must exist");
+    let mut checked = 0usize;
+    for raw in doc.split('`') {
+        let p = raw.trim();
+        let looks_like_path = (p.starts_with("src/")
+            || p.starts_with("tools/")
+            || p.starts_with("examples/")
+            || p.starts_with("tests/"))
+            && (p.ends_with(".rs") || p.contains('/'));
+        if !looks_like_path || p.contains(char::is_whitespace) {
+            continue;
+        }
+        checked += 1;
+        assert!(
+            root().join(p).exists(),
+            "docs/tcb.md names `{p}`, which does not exist"
+        );
+    }
+    assert!(checked >= 5, "docs/tcb.md must name at least 5 repository paths; found {checked}");
 }
 

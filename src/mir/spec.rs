@@ -245,6 +245,8 @@ pub enum ParamSlot {
     Named(String),
 }
 
+use std::path::{Path, PathBuf};
+
 /// Every function's contract, keyed by function name.
 #[derive(Clone, Debug, Default)]
 pub struct Specs {
@@ -252,6 +254,19 @@ pub struct Specs {
     /// contract, which means "check panic freedom on every input" rather than
     /// "skip it".
     pub by_fn: BTreeMap<String, FnContract>,
+    /// Keys whose contract was declared more than once -- two `#[cfg]`-alternative
+    /// modules that share a name (Rust compiles exactly one; the inliner reads both).
+    /// Such a contract is *refused* by [`Self::contract_for_fn`] rather than silently
+    /// applying the inactive module's claim: reading the inactive one was a false
+    /// proof (a weaker claim) or a false refutation (a stronger one).
+    pub ambiguous: BTreeSet<String>,
+    /// The combined source text this `Specs` was read from -- the root file with
+    /// every external module inlined. This is the *contract input*, and it is what
+    /// the proof cache fingerprints: a module's contract lives here and not in the
+    /// root source or the MIR, so keying on the root source alone would let a
+    /// contract-only edit in a module reuse a stale verdict (a false proof). Empty
+    /// for a `Specs` built by [`extract`] directly (tests), which have no cache.
+    pub snapshot: String,
     /// Struct layouts read from the same source, keyed by struct name.
     ///
     /// A contract that names a field (`c.lo`) needs two things the MIR dump does
@@ -384,6 +399,16 @@ pub struct Specs {
     /// false`, which is the false alarm that trains a reader to ignore the report.
     /// Recorded here so the report can tell the two apart.
     pub bodyless: BTreeSet<String>,
+    /// Maps each 1-based line of [`Self::snapshot`] to the original `(file, line)` it
+    /// came from, with `line == 0` for a synthetic line the inliner introduced (the
+    /// `mod name {` / `}` wrapper, or a preserved trailing comment). The snapshot is a
+    /// *flattened* view of a multi-file crate, so a method's `impl` gets a synthetic
+    /// snapshot line that does not match rustc's original `impl at FILE:L:C`; this map
+    /// lets [`Self::original_loc`] recover the original `(file, line)` so a method
+    /// contract pairs with its body and a SARIF finding points at the module file a
+    /// reviewer opened. Empty for a `Specs` built by [`extract`] directly (single
+    /// file), where snapshot line == original line.
+    pub line_map: Vec<(std::path::PathBuf, usize)>,
 }
 
 /// An enum's variants, in declaration order.
@@ -460,7 +485,101 @@ impl StructDef {
     }
 }
 
+/// Whether two paths name the same file. A literal match wins; otherwise the paths are
+/// canonicalised, so the same file spelled two ways (relative vs absolute, a `./` prefix)
+/// compares equal while two *different* files that share a basename do not. A path that
+/// cannot be canonicalised (it does not exist) only matches its literal spelling.
+pub(crate) fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    if let (Ok(x), Ok(y)) = (a.canonicalize(), b.canonicalize()) {
+        if x == y {
+            return true;
+        }
+    }
+    // rustc prints a crate-unique file by its *bare* name. A bare filename on one side
+    // therefore names the same file as the other side's path when the basenames agree.
+    // Two full paths that merely share a basename are different files and must NOT match
+    // (that is the same-basename cross-match this guard exists to prevent).
+    let bare = |p: &std::path::Path| p.parent().is_none_or(|d| d.as_os_str().is_empty());
+    (bare(a) || bare(b)) && a.file_name() == b.file_name()
+}
+
+/// Like [`same_file`] but WITHOUT the bare-basename fallback: true only for the same
+/// path or a canonicalising match. Used where a loose basename match could pair one
+/// body with another file's contract at the same coordinates.
+pub(crate) fn same_file_exact(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+}
+
 impl Specs {
+    /// The original `(file, line)` a 1-based snapshot line came from, if known.
+    /// Returns `(None, line)` for a synthetic line (a `mod name {` wrapper) or for a
+    /// `Specs` with no line map (built by [`extract`] directly, where the snapshot *is*
+    /// the file and snapshot line == original line).
+    pub fn original_loc(&self, line: usize) -> (Option<std::path::PathBuf>, usize) {
+        if line >= 1 {
+            if let Some((f, l)) = self.line_map.get(line - 1) {
+                if *l != 0 {
+                    return (Some(f.clone()), *l);
+                }
+            }
+        }
+        (None, line)
+    }
+
+    /// The 1-based snapshot line whose original `(file, line)` matches, if known. The
+    /// map is injective on `(file, line)` (the inliner emits each source line once), so
+    /// at most one line matches -- the snapshot line is a unique handle for an original
+    /// location.
+    fn snapshot_line_for(&self, file: Option<&str>, line: usize) -> Option<usize> {
+        // Use the SAME path-ranking as `resolve_targets`: prefer a unique exact/canonical
+        // match, accept a unique bare-basename fallback, and REFUSE an ambiguous match.
+        // `.position`-style "first match" let a same-basename file at the same line supply
+        // the wrong contract, so the selected body was checked against another file's line
+        // (a false proof). The map's file and rustc's `impl at FILE` share the root
+        // spelling, so the exact match normally wins; ambiguity is a refusal, never a guess.
+        let w = std::path::Path::new(file?);
+        let exact: Vec<usize> = self
+            .line_map
+            .iter()
+            .enumerate()
+            .filter(|(_, (f, l))| *l == line && same_file_exact(f.as_path(), w))
+            .map(|(i, _)| i + 1)
+            .collect();
+        if let Some(&first) = exact.first() {
+            // Two `#[path]` inclusions of one file give it two line-map entries at the
+            // same line; both are the same canonical file (a `same_file_exact` match),
+            // so their contracts are identical -- pick either rather than refusing,
+            // which would drop the contract and verify with no postcondition.
+            return Some(first);
+        }
+        let loose: Vec<usize> = self
+            .line_map
+            .iter()
+            .enumerate()
+            .filter(|(_, (f, l))| *l == line && same_file(f.as_path(), w))
+            .map(|(i, _)| i + 1)
+            .collect();
+        if loose.len() == 1 { Some(loose[0]) } else { None }
+    }
+
+    /// The *snapshot* `(line, col)` of the `impl` a MIR function name names, translating
+    /// rustc's original `impl at FILE:L:C` line through the line map. `None` when the
+    /// name is not a method, or when a multi-file map has no entry for that line. For a
+    /// single-file `Specs` (empty map) the original line *is* the snapshot line.
+    pub fn snapshot_impl_loc(&self, name: &str) -> Option<(usize, usize)> {
+        let (orig_line, col) = impl_location(name)?;
+        if self.line_map.is_empty() {
+            return Some((orig_line, col));
+        }
+        let snap = self.snapshot_line_for(impl_file(name), orig_line)?;
+        Some((snap, col))
+    }
     /// The contract attached to `name`, if the source declared one.
     ///
     /// Only free functions are looked up: a method's contract is keyed by its
@@ -468,6 +587,26 @@ impl Specs {
     /// MIR name. This stays for callers that already know they hold a bare name.
     pub fn get(&self, name: &str) -> Option<&FnContract> {
         self.by_fn.get(name)
+    }
+
+    /// The exact or suffix `by_fn` key `name` resolves to *if* it was declared twice
+    /// (a `#[cfg]`-alternative). `None` when the name is unambiguous.
+    fn ambiguous_key<'a>(&'a self, name: &str) -> Option<&'a str> {
+        // A *bare* MIR name cannot tell a crate-root `f` from a `#[cfg]`-alternative
+        // module's `platform::f` that rustc shortened to `f` (it shortens when the module
+        // fn is the only compiled one). So ANY ambiguous key whose `::`-tail is `name`
+        // makes `name` unidentifiable -- refuse it, exact match or not. Refusing a
+        // genuinely separate crate-root `f` is a safe lost proof; pairing it with the
+        // wrong body (an active `platform::f` shortened to `f`) would be a false proof.
+        if let Some((k, _)) = self.by_fn.get_key_value(name) {
+            if self.ambiguous.contains(k) {
+                return Some(k);
+            }
+        }
+        self.by_fn
+            .keys()
+            .find(|k| is_path_suffix(k.as_str(), name) && self.ambiguous.contains(k.as_str()))
+            .map(|s| s.as_str())
     }
 
     /// The contract for a function whose MIR definition name is `name`.
@@ -499,7 +638,7 @@ impl Specs {
         if let Some(c) = self.by_fn.get(name) {
             return Some(c);
         }
-        if let Some(loc) = impl_location(name) {
+        if let Some(loc) = self.snapshot_impl_loc(name) {
             let tail = name.rsplit("::").next()?;
             if let Some(c) = self.by_method.get(&(loc.0, loc.1, tail.to_string())) {
                 return Some(c);
@@ -560,12 +699,20 @@ impl Specs {
     /// impl's author wrote about their own body. The caller refuses on this and
     /// names both, which is the only answer that loses nothing.
     pub fn contract_conflict(&self, name: &str) -> Option<String> {
-        let loc = impl_location(name)?;
+        // Translate rustc's original `impl at FILE:L:C` to the snapshot line the maps
+        // are keyed by; the raw `impl_location` misses for a multi-file method, so the
+        // conflict went undetected and the trait's promise was silently dropped.
+        let loc = self.snapshot_impl_loc(name)?;
         let tail = name.rsplit("::").next()?;
         if !self.by_method.contains_key(&(loc.0, loc.1, tail.to_string())) {
             return None;
         }
         let tr = self.impl_traits.get(&(loc.0, loc.1))?;
+        // A trait imported with `use crate::T;` is recorded as `crate::T`, but
+        // `by_trait` keys the declaration by its module path (`T::m` at the root); the
+        // `crate::` prefix (crate root) is the same location, so strip it or the lookup
+        // misses and the conflict goes undetected.
+        let tr = tr.strip_prefix("crate::").unwrap_or(tr);
         if !self.by_trait.contains_key(&format!("{tr}::{tail}")) {
             return None;
         }
@@ -584,6 +731,7 @@ impl Specs {
     /// reports rather than treating as a promise.
     pub fn trait_contract(&self, line: usize, col: usize, tail: &str) -> Option<&FnContract> {
         let tr = self.impl_traits.get(&(line, col))?;
+        let tr = tr.strip_prefix("crate::").unwrap_or(tr);
         self.by_trait.get(&format!("{tr}::{tail}"))
     }
 
@@ -602,11 +750,82 @@ impl Specs {
     /// aligned exactly (an unreadable signature, or a different number of slots).
     /// The caller refuses then: an inherited contract that cannot be bound
     /// positionally is not a contract that may be guessed at.
+    /// True when one file is included by two `#[path]` modules that qualify this impl's
+    /// trait path differently (`impl super::T for S`), so the inherited contract differs
+    /// by inclusion and the MIR body does not say which one compiled. Applying either is
+    /// a coin flip, so [`Self::contract_for_fn`] refuses the shape (a visible skip).
+    fn inherited_contract_is_ambiguous(&self, name: &str) -> bool {
+        let (Some((orig_line, col)), Some(file)) = (impl_location(name), impl_file(name)) else {
+            return false;
+        };
+        let Some(tail) = name.rsplit("::").next() else {
+            return false;
+        };
+        let w = std::path::Path::new(file);
+        // The trait path each exact inclusion resolves to, and (for a *known* declaration)
+        // that declaration's contract key for this method. `known` = the scanner read a
+        // trait at that path (or it is a std/core trait); a path the scanner could NOT
+        // resolve -- a `pub use` re-export it does not follow, say -- is *unknown*, and
+        // two unknown paths cannot be assumed to impose the same contract.
+        let mut paths: Vec<&str> = Vec::new();
+        let mut keys: Vec<Option<String>> = Vec::new();
+        let mut any_unresolved = false;
+        for (i, (fl, l)) in self.line_map.iter().enumerate() {
+            if *l != orig_line || !same_file_exact(fl.as_path(), w) {
+                continue;
+            }
+            let Some(tr) = self.impl_traits.get(&(i + 1, col)) else {
+                continue;
+            };
+            let tr = tr.strip_prefix("crate::").unwrap_or(tr);
+            paths.push(tr);
+            let known = self.declared_traits.contains(tr)
+                || tr.starts_with("std::")
+                || tr.starts_with("core::")
+                || tr.starts_with("::std")
+                || tr.starts_with("::core");
+            any_unresolved |= !known;
+            let key = format!("{tr}::{tail}");
+            keys.push(self.by_trait.contains_key(&key).then_some(key));
+        }
+        if paths.len() < 2 {
+            return false;
+        }
+        if paths.iter().all(|p| *p == paths[0]) {
+            // One trait reached through more than one inclusion: identical contract.
+            return false;
+        }
+        // Paths differ. An *unresolved* path means we cannot know the contracts agree, so
+        // refuse (the safe direction) rather than apply an arbitrary one. If every path is
+        // a known declaration, refuse only when the contract they impose differs (one
+        // declares a contract for this method and the other does not).
+        any_unresolved || keys.windows(2).any(|w| w[0] != w[1])
+    }
+
+    /// The contract for one *body* in the dump, with the argument-name alignment the
+    /// body needs. `Err` when an inherited contract cannot be aligned positionally, or
+    /// when one file is included by two modules whose trait contracts differ (an
+    /// ambiguous shape that is refused rather than guessed).
     pub fn contract_for_fn<'a>(
         &'a self,
         f: &crate::mir::parse::MirFn,
     ) -> Result<(Option<&'a FnContract>, Option<ArgRename>), String> {
-        let Some(loc) = impl_location(&f.name) else {
+        if self.inherited_contract_is_ambiguous(&f.name) {
+            return Err(format!(
+                "`{}` is implemented in more than one module inclusion whose trait contracts \
+                 differ; refusing rather than apply an arbitrary one",
+                f.name
+            ));
+        }
+        let Some(loc) = self.snapshot_impl_loc(&f.name) else {
+            // A `#[cfg]`-alternative duplicate: refuse rather than apply the inactive
+            // module's contract (a false proof, or a false refutation of the active one).
+            if let Some(key) = self.ambiguous_key(&f.name) {
+                return Err(format!(
+                    "the contract for `{key}` is declared by two `#[cfg]`-alternative \
+                     modules; refusing rather than apply the inactive one"
+                ));
+            }
             return Ok((self.resolve(&f.name), None));
         };
         let Some(tail) = f.name.rsplit("::").next() else {
@@ -688,6 +907,22 @@ pub(crate) fn impl_location(name: &str) -> Option<(usize, usize)> {
     let col = parts.next()?;
     let line = parts.next()?;
     Some((line.trim().parse().ok()?, col.trim().parse().ok()?))
+}
+
+/// The *file* in a method's definition name `<impl at FILE:L:C: L:C>::m`, if any.
+///
+/// `impl_location` keeps only the `(line, column)`; the file is the thing that tells
+/// two `impl`s at the same line and column in different module files apart. `head` is
+/// `FILE:L:C`, so stripping the two right-most `:` fields leaves the file (a Windows
+/// drive's `C:` is the third field from the right and survives).
+pub(crate) fn impl_file(name: &str) -> Option<&str> {
+    let start = name.find("<impl at ")? + "<impl at ".len();
+    let inner = name[start..].split('>').next()?;
+    let (head, _end) = inner.rsplit_once(": ")?;
+    let mut parts = head.rsplitn(3, ':');
+    let _col = parts.next()?;
+    let _line = parts.next()?;
+    parts.next()
 }
 
 /// The names of `const` generic parameters declared anywhere in the source.
@@ -1444,6 +1679,14 @@ fn qualify_trait(
     scope: &[String],
     imports: &BTreeMap<String, String>,
 ) -> String {
+    // Rust's leading `::` is the external-crate root: `::core::hash::Hasher` is ALWAYS the
+    // external crate, even when this crate declares a local module `core`. Keep the `::` so
+    // the key stays DISTINCT from a local `core::hash::Hasher` (an external impl must never
+    // be checked against the local contract), while two `#[path]` inclusions still agree on
+    // one spelling (so one std trait is not seen as two unresolved paths).
+    if written.starts_with("::") {
+        return written.to_string();
+    }
     // A path written with a *relative* root names the same trait as the
     // module-qualified path the declaration is keyed by, so it has to be resolved
     // to that spelling or the two never meet:
@@ -2001,8 +2244,274 @@ fn parse_use(raw: &str) -> Vec<(String, String)> {
 /// Only `///` (outer) doc comments are read. `//!` (inner) comments are ignored
 /// so that module documentation describing the syntax is not read as a contract
 /// for the next function in the file.
+/// Like [`extract`], but for a *multi-file* crate: it inlines every external
+/// `mod name;` declaration with the contents of `name.rs` / `name/mod.rs`
+/// (recursively) before scanning. A contract written in a module file is then read
+/// and keyed by the same `mod`-qualified path rustc prints for its function, so
+/// `cargo verif --file src/lib.rs` verifies a crate's modules, not just the root.
+///
+/// A module file that cannot be read (or a cycle) is left as the bare `mod name;`
+/// line, so the functions in it are reported `missing` -- never silently passed. The
+/// `line` a contract carries is the line within the module file, so a multi-file
+/// line number is best-effort; the *verdict* and its keying are exact.
+pub fn extract_crate(root: &Path, root_src: &str) -> Specs {
+    let dir = root.parent().unwrap_or_else(|| Path::new("."));
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let (inlined, line_map) = inline_external_modules(root_src, root, dir, dir, &mut seen);
+    let mut specs = extract(&inlined);
+    specs.snapshot = inlined;
+    specs.line_map = line_map;
+    specs
+}
+
+/// Replace each `mod name;` line with an inline `mod name { <file contents> }`.
+///
+/// A `#[path = "…"]` attribute on the line above (or on the same line as) the `mod`
+/// names the file directly; the attribute is dropped, because `#[path]` is only valid
+/// on an out-of-line `mod`, so leaving it above an inlined `mod name { … }` would be a
+/// compile error. A `#[path]` whose file cannot be read leaves a bare `mod name;` (its
+/// functions are then reported `missing`, which is visible), never a silently empty
+/// module. A `mod child;` *inside* an inline `mod parent { … }` is not inlined here (the
+/// scanner is line-based, not brace-aware) and is left as `mod child;` -- also a visible
+/// `missing`; see `ROADMAP.md`.
+/// The net brace depth change of one line, with strings and comments masked so a `{`
+/// or `}` inside them does not miscount. `in_block` carries an open `/* */` across lines.
+/// Char literals are not tracked: a `{`/`}` inside one is rare and would only shift the
+/// inliner's file-scope heuristic, never a verdict on a body that parses.
+/// The net brace depth change of a *masked* code line (see [`code_of_line`]): strings and
+/// comments are already spaces, so only real code braces are counted.
+fn brace_delta_code(code: &str) -> i32 {
+    code.bytes().fold(0, |d, c| match c {
+        b'{' => d + 1,
+        b'}' => d - 1,
+        _ => d,
+    })
+}
+
+fn inline_external_modules(src: &str, file: &Path, src_dir: &Path, child_dir: &Path, seen: &mut Vec<PathBuf>) -> (String, Vec<(PathBuf, usize)>) {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut lex = Lex { block: 0, lit: Lit::None };
+    let mut starts: Vec<(i32, Lit)> = Vec::with_capacity(lines.len());
+    let mut codes: Vec<String> = Vec::with_capacity(lines.len());
+    for line in &lines {
+        starts.push((lex.block, lex.lit));
+        codes.push(code_of_line(line, &mut lex));
+    }
+    let mut out = String::new();
+    let mut map: Vec<(PathBuf, usize)> = Vec::new();
+    let mut i = 0;
+    let mut depth = 0i32;
+    while i < lines.len() {
+        let line = lines[i];
+        let code = &codes[i];
+        let (b0, l0) = starts[i];
+        let at_file_scope = depth == 0 && b0 == 0 && matches!(l0, Lit::None);
+        if at_file_scope {
+            if code.trim_start().starts_with("#[path") {
+                // The attribute may wrap (`#[path =` then `"alt.rs"]` on a later line),
+                // and the `mod name;` may follow on another line. Join forward to read
+                // the path literal, then bind it to the module declaration -- parsing it
+                // rather than panicking or falling back to a same-named conventional file.
+                let mut j = i;
+                let mut joined = line.to_string();
+                // `masked` is the same span with string literals blanked, so a `]` inside
+                // the filename is not mistaken for the attribute's closing bracket.
+                let mut masked = code.to_string();
+                while path_attr(&joined).is_none() && j + 1 < lines.len() && j - i < 4 {
+                    j += 1;
+                    joined.push('\n');
+                    joined.push_str(lines[j]);
+                    masked.push('\n');
+                    masked.push_str(&codes[j]);
+                }
+                let Some(attr_path) = path_attr(&joined) else {
+                    // Truly unreadable (rustc would reject it): emit the line as-is.
+                    out.push_str(line);
+                    out.push('\n');
+                    map.push((file.to_path_buf(), i + 1));
+                    i += 1;
+                    continue;
+                };
+                // The `mod name;` after the attribute's closing `]`: on a joined line, or
+                // on a later file-scope line.
+                let (mod_decl, consumed) = if let Some(x) = path_attr_mod(&joined, &masked) {
+                    (Some(x), j - i + 1)
+                } else {
+                    // Only an external `mod name;` (after at most blank trivia) takes the
+                    // file. An inline module (`#[path="dir"] mod x {}`) changes where its
+                    // children resolve -- not a file to substitute -- and any other item
+                    // is left to the normal loop, which tracks brace depth so a nested
+                    // declaration is not resolved at crate scope.
+                    let mut k = j;
+                    while k + 1 < lines.len() && k - i < 6 && codes[k + 1].trim().is_empty() {
+                        k += 1;
+                    }
+                    let found = if k + 1 < lines.len()
+                        && starts[k + 1].0 == 0
+                        && matches!(starts[k + 1].1, Lit::None)
+                    {
+                        external_mod(&codes[k + 1])
+                    } else {
+                        None
+                    };
+                    match found {
+                        Some(x) => (Some(x), k + 1 - i + 1),
+                        None => (None, j - i + 1),
+                    }
+                };
+                if let Some((vis, name)) = mod_decl {
+                    let mfile = src_dir.join(&attr_path);
+                    let m_child = mfile.parent().unwrap_or(src_dir).to_path_buf();
+                    match read_and_inline(&mfile, &m_child, seen) {
+                        Some((body, bmap)) => push_wrapped(&mut out, &mut map, &format!("{vis}mod {name}"), file, &body, &bmap),
+                        None => {
+                            out.push_str(&format!("{vis}mod {name};\n"));
+                            map.push((file.to_path_buf(), 0));
+                        }
+                    }
+                    i += consumed;
+                    continue;
+                }
+                // No module declaration after the attribute: emit the consumed lines as-is
+                // so conventional lookup never runs on a bare `mod`.
+                for (off, l) in lines[i..(i + consumed).min(lines.len())].iter().enumerate() {
+                    out.push_str(l);
+                    out.push('\n');
+                    map.push((file.to_path_buf(), i + off + 1));
+                }
+                i += consumed;
+                continue;
+            }
+            if let Some((vis, name)) = external_mod(code) {
+                let trailing = line.find(';').map(|p| &line[p + 1..]).unwrap_or("");
+                let candidates = [child_dir.join(format!("{name}.rs")), child_dir.join(&name).join("mod.rs")];
+                if let Some(mfile) = candidates.iter().find(|p| p.is_file()) {
+                    let m_child = child_dir.join(&name);
+                    if let Some((body, bmap)) = read_and_inline(mfile, &m_child, seen) {
+                        push_wrapped(&mut out, &mut map, &format!("{vis}mod {name}"), file, &body, &bmap);
+                        if !trailing.trim().is_empty() {
+                            out.push_str(trailing);
+                            out.push('\n');
+                            map.push((file.to_path_buf(), 0));
+                        }
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+        map.push((file.to_path_buf(), i + 1));
+        depth += brace_delta_code(code);
+        i += 1;
+    }
+    (out, map)
+}
+
+/// Emit an inlined module as `{header} {` + its body + `}`, recording one line-map entry
+/// per emitted line. The two wrapper lines are synthetic (line 0, the parent file); the
+/// body lines keep their own `(file, line)` from `bmap`, which is what makes a method's
+/// original `impl` line recoverable.
+fn push_wrapped(out: &mut String, map: &mut Vec<(PathBuf, usize)>, header: &str, parent_file: &Path, body: &str, bmap: &[(PathBuf, usize)]) {
+    out.push_str(header);
+    out.push_str(" {\n");
+    map.push((parent_file.to_path_buf(), 0));
+    out.push_str(body);
+    map.extend(bmap.iter().cloned());
+    out.push_str("}\n");
+    map.push((parent_file.to_path_buf(), 0));
+}
+
+/// The path in a `#[path = "…"]` attribute on this line, if any.
+fn path_attr(line: &str) -> Option<String> {
+    // Rust allows any whitespace around `=`: `#[path="x"]` and `#[path = "x"]` are the
+    // same attribute. Parsing the name, `=`, and path in sequence (not an exact prefix)
+    // keeps the compact form from panicking.
+    let t = line.trim_start();
+    let rest = t.strip_prefix("#[path")?;
+    let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+    // A raw string (`r"x"`, `r#"x"#`, …) is a valid path too; parse it so the explicit
+    // file is not dropped and the conventional `name.rs` read instead.
+    if let Some(after_r) = rest.strip_prefix('r') {
+        let hashes = after_r.chars().take_while(|c| *c == '#').count();
+        let body = after_r[hashes..].strip_prefix('"')?;
+        let end: String = std::iter::once('"').chain(std::iter::repeat_n('#', hashes)).collect();
+        let idx = body.find(&end)?;
+        return Some(body[..idx].to_string());
+    }
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// The `mod name;` on the *same* line as a `#[path]` attribute, if any. The attribute's
+/// closing `]` sits between the path's quote and the `mod`, so it is stripped first.
+fn path_attr_mod(line: &str, code: &str) -> Option<(String, String)> {
+    path_attr(line)?;
+    // The attribute's closing `]` is *outside* the path literal; find it in the masked
+    // code (the string is spaces), so a `]` inside the filename is not the delimiter.
+    // `code_of_line` keeps one space per char, so the offset is valid in `line` too.
+    let close = code.find(']')?;
+    // Slice the *masked* text, not the original: `code_of_line` keeps one space per
+    // char, so a byte offset valid in `code` can land inside a multibyte character of
+    // the original and panic. The declaration is ASCII, so masking it changes nothing.
+    external_mod(code[close + 1..].trim_start())
+}
+
+/// Read `file` and inline it as a module body whose plain children resolve in `m_child`,
+/// honouring `seen` as an *active recursion stack* (popped on return), so two `#[path]`
+/// modules that share one file are both scanned rather than the second read as a cycle.
+fn read_and_inline(file: &Path, m_child: &Path, seen: &mut Vec<PathBuf>) -> Option<(String, Vec<(PathBuf, usize)>)> {
+    let canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    if seen.contains(&canonical) {
+        return None;
+    }
+    let sub = std::fs::read_to_string(file).ok()?;
+    seen.push(canonical);
+    let src_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let body = inline_external_modules(&sub, file, src_dir, m_child, seen);
+    let _ = seen.pop();
+    Some(body)
+}
+
+/// Match a bare external-module declaration `[pub[(..)] ] mod name;`, returning the
+/// visibility prefix (with a trailing space, or empty) and the module name. Returns
+/// `None` for an inline `mod name { … }` and for anything that is not that shape.
+fn external_mod(line: &str) -> Option<(String, String)> {
+    let t = line.trim();
+    let (vis, rest) = if let Some(r) = t.strip_prefix("pub(crate) ") {
+        ("pub(crate) ", r)
+    } else if let Some(r) = t.strip_prefix("pub(super) ") {
+        ("pub(super) ", r)
+    } else if let Some(r) = t.strip_prefix("pub(self) ") {
+        ("pub(self) ", r)
+    } else if let Some(r) = t.strip_prefix("pub ") {
+        ("pub ", r)
+    } else {
+        ("", t)
+    };
+    let rest = rest.strip_prefix("mod ")?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    if rest[name.len()..].trim_start().starts_with(';') {
+        Some((vis.to_string(), name))
+    } else {
+        None
+    }
+}
+
+/// Read every contract from a single source string, keyed by the `mod`-qualified
+/// path rustc prints for each function. For a multi-file crate use [`extract_crate`],
+/// which inlines external `mod` declarations first.
 pub fn extract(source: &str) -> Specs {
     let mut specs = Specs::default();
+    let mut seen_contract_keys: BTreeSet<String> = BTreeSet::new();
     let mut pending = FnContract::default();
     let mut in_block_comment = false;
     // Which `const` items are declared at the crate root, before any brace opens.
@@ -2371,6 +2880,13 @@ pub fn extract(source: &str) -> Specs {
                         } else {
                             if !fn_has_body(&lines, lineno) {
                                 specs.bodyless.insert(key.clone());
+                            }
+                            // A second declaration of the same qualified path is a
+                            // `#[cfg]`-alternative (Rust compiles exactly one). Mark it
+                            // ambiguous so `contract_for_fn` refuses rather than applying
+                            // the inactive module's claim.
+                            if !seen_contract_keys.insert(key.clone()) {
+                                specs.ambiguous.insert(key.clone());
                             }
                             specs.by_fn.insert(key, std::mem::take(&mut pending));
                         }
@@ -3077,6 +3593,215 @@ fn fn_signature(line: &str) -> (Vec<(String, Ty)>, Option<Ty>) {
 /// keeps the reader's signature honest about that rather than repeating a
 /// three-element tuple at each use. See [`fn_signature_full`].
 type SourceSignature = (Vec<(String, Ty)>, Option<Ty>, Option<Vec<ParamSlot>>);
+
+/// The parameter list of a **free** function in `source`, by its report name.
+///
+/// Used by `cargo verif --emit-test` (U3) to build a call to a refuted function
+/// from a counterexample: the *values* come from the counterexample, the *order*
+/// from this. `None` for a method (a report key containing `::` -- the receiver
+/// makes the positional call ambiguous), for a name not found, or for a list the
+/// reader cannot read whole. A caller must refuse on `None` rather than guess an
+/// order: a call with the wrong argument order is a test that does not reproduce
+/// the counterexample.
+pub fn function_params(source: &str, name: &str) -> Option<Vec<(String, Ty)>> {
+    if name.contains("::") {
+        return None;
+    }
+    let needle = format!("fn {name}(");
+    let mut depth: i32 = 0;
+    let mut lex = Lex { block: 0, lit: Lit::None };
+    for line in source.lines() {
+        // Comments (line and block, the latter across lines) are removed first, so a
+        // `// fn bad(b, a)` or a `/* … { … */` above the real declaration neither
+        // matches nor unbalances the brace count.
+        let code = code_of_line(line, &mut lex);
+        if let Some(pos) = code.find(&needle) {
+            // A *top-level* declaration only: a `fn` inside `impl`/`trait` is a method
+            // and inside `mod` is a module item, neither callable as a bare name.
+            // Depth is taken *at the `fn`*, not at the line start, so a one-line
+            // `impl S { fn m(..) {} }` is seen as nested.
+            let at_top = depth + count_braces(&code[..pos]) == 0;
+            let word_before =
+                code[..pos].chars().last().is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if at_top && !word_before {
+                // `fn_signature_full` returns `None` slots for a list it could not
+                // read whole; an empty-but-readable list is `Some(vec![])`.
+                let (params, _ret, slots) = fn_signature_full(&code[pos..]);
+                return slots.map(|_| params);
+            }
+        }
+        depth = (depth + count_braces(&code)).max(0);
+    }
+    None
+}
+
+/// The carried lexer state for [`code_of_line`]: block-comment depth and the open literal.
+#[derive(Clone, Copy)]
+struct Lex {
+    block: i32,
+    lit: Lit,
+}
+
+#[derive(Clone, Copy)]
+enum Lit {
+    None,
+    Str,
+    Chr,
+    Raw(usize),
+}
+
+/// The code part of a line, for declaration search and brace counting: line and block
+/// comments are removed and **literal contents are masked to spaces**, so a `{` or a
+/// `fn bad(` inside a string cannot contribute a brace or a fake signature. The `Lex`
+/// state is carried across lines (nested block comments, multiline literals). Masking
+/// keeps one space per char, so an offset into the result is the same offset in the
+/// original for the code spans, and the real signature is read back from that offset.
+fn code_of_line(line: &str, lex: &mut Lex) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if lex.block > 0 {
+            if c == '/' && chars.get(i + 1) == Some(&'*') {
+                lex.block += 1;
+                i += 2;
+            } else if c == '*' && chars.get(i + 1) == Some(&'/') {
+                lex.block -= 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        match lex.lit {
+            Lit::Str => {
+                out.push(' ');
+                if c == '\\' {
+                    if chars.get(i + 1).is_some() {
+                        out.push(' ');
+                        i += 2;
+                        continue;
+                    }
+                } else if c == '"' {
+                    lex.lit = Lit::None;
+                }
+                i += 1;
+                continue;
+            }
+            Lit::Chr => {
+                out.push(' ');
+                if c == '\\' {
+                    if chars.get(i + 1).is_some() {
+                        out.push(' ');
+                        i += 2;
+                        continue;
+                    }
+                } else if c == '\'' {
+                    lex.lit = Lit::None;
+                }
+                i += 1;
+                continue;
+            }
+            Lit::Raw(n) => {
+                out.push(' ');
+                if c == '"' && (1..=n).all(|k| chars.get(i + k) == Some(&'#')) {
+                    for _ in 0..n {
+                        out.push(' ');
+                    }
+                    i += n + 1;
+                    lex.lit = Lit::None;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            Lit::None => {}
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            break;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            lex.block = 1;
+            i += 2;
+            continue;
+        }
+        // A raw string `r#*"..."#*` (or `br#*"..."#*`), which may span lines.
+        let raw_from = if c == 'r' {
+            Some(i + 1)
+        } else if c == 'b' && chars.get(i + 1) == Some(&'r') {
+            Some(i + 2)
+        } else {
+            None
+        };
+        if let Some(from) = raw_from {
+            let mut h = from;
+            while chars.get(h) == Some(&'#') {
+                h += 1;
+            }
+            if chars.get(h) == Some(&'"') {
+                for _ in i..=h {
+                    out.push(' ');
+                }
+                lex.lit = Lit::Raw(h - from);
+                i = h + 1;
+                continue;
+            }
+        }
+        if c == 'b' && chars.get(i + 1) == Some(&'"') {
+            out.push(' ');
+            out.push(' ');
+            lex.lit = Lit::Str;
+            i += 2;
+            continue;
+        }
+        if c == '"' {
+            lex.lit = Lit::Str;
+            out.push(' ');
+            i += 1;
+            continue;
+        }
+        if c == '\'' && is_char_literal_start(&chars, i) {
+            lex.lit = Lit::Chr;
+            out.push(' ');
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Is the `'` at `i` the start of a char literal (`'x'`, `'\n'`) rather than a lifetime
+/// (`'a`, `'static`)? A lifetime has no closing `'` a couple of chars on.
+fn is_char_literal_start(chars: &[char], i: usize) -> bool {
+    match chars.get(i + 1) {
+        Some('\\') => true,
+        Some(_) => chars.get(i + 2) == Some(&'\''),
+        None => false,
+    }
+}
+
+/// The net `{` minus `}` count of a `code_of_line`-masked line.
+///
+/// `code_of_line` has already replaced string/char literal contents and comments with
+/// spaces, so every `{`/`}` left in `code` is structural and a direct count is correct.
+/// Re-interpreting quotes here is not: a lifetime (`&'static str`) has an apostrophe that
+/// a quote scanner mistakes for a char literal's opening delimiter, masking the `{` after
+/// it -- which mis-counted the depth and let a same-named function in the wrong scope
+/// supply the signature (a panic replay with the wrong arguments).
+fn count_braces(code: &str) -> i32 {
+    let mut d = 0i32;
+    for c in code.chars() {
+        match c {
+            '{' => d += 1,
+            '}' => d -= 1,
+            _ => {}
+        }
+    }
+    d
+}
 
 /// The signature reader, keeping the *positions*.
 ///
@@ -4025,7 +4750,7 @@ impl FieldEnv {
     ) -> Option<Var> {
         // `elem_w == 0` is the unmodelled-width sentinel (a generic `&[T]`): the
         // length is still a value, so it is bound, but no element can be, which is
-        // what keeps `v.len()`/`v.is_empty()` answerable while `v[0]` stays refused.
+        // what keeps `v.len()` answerable while `v[0]` stays refused.
         if elem_w != 0 && !(1..=64).contains(&elem_w) {
             return None;
         }
@@ -8458,6 +9183,27 @@ pub fn field_env_named(
             }
             continue;
         }
+        // A `Vec<T>` argument: like a slice, its length is a symbolic input and its
+        // elements are distinct inputs per index -- the caller chose the length and
+        // the contents. Binding the length is what makes `v.len()` and `v[0]` in a
+        // contract readable, and what the executor's `Index` bounds check needs to
+        // be discharged rather than refused. The container identity is the *full*
+        // standard path (`std::vec::Vec` / `alloc::vec::Vec`), so a user type
+        // spelled `Vec` falls through to the struct path and is never read as the
+        // container.
+        if let Ty::Other(name) = base {
+            if let Some(elem) = crate::mir::exec::vec_elem_ty_loose(name) {
+                match elem.width() {
+                    Some(w) => {
+                        env.bind_indexed_len(l, &arg, w, elem.is_signed());
+                    }
+                    None => {
+                        env.bind_indexed_len(l, &arg, 0, false);
+                    }
+                }
+                continue;
+            }
+        }
         let Ty::Other(name) = base else { continue };
         // An enum argument: its tag is a symbolic input with the enum's arity as
         // its domain, and each variant's payload is its own input. Checked before
@@ -8722,8 +9468,397 @@ pub fn arg_name_of(
         .map(|(_, name, _)| name)
 }
 
+/// The source name of *any* argument local, width-bearing or not.
+///
+/// `arg_name_of` omits a widthless argument (a `Vec`/slice has no single word), but a
+/// `Vec`'s *length* still needs a name: the postcondition's `v.len()` must be rebound
+/// to the post-state length, and the key is `{name}__len`.
+pub fn arg_name_any(
+    f: &crate::mir::parse::MirFn,
+    rename: Option<&ArgRename>,
+    local: crate::mir::parse::LocalIdx,
+) -> Option<String> {
+    if !f.arg_locals.contains(&local) {
+        return None;
+    }
+    Some(
+        rename
+            .and_then(|r| r.name_of(local))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| f.name_of(local)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn function_params_ignores_a_comment_declaration() {
+        let src = "// fn bad(b: u8, a: u8)\npub fn bad(a: u8, b: u8) -> u8 { 0 }\n";
+        let names: Vec<String> = super::function_params(src, "bad")
+            .expect("a free function")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["a", "b"], "the real declaration, not the comment above it");
+    }
+
+    #[test]
+    fn function_params_is_comment_aware_across_lines() {
+        // A block comment with an unmatched `{` above the declaration must not leave
+        // the scanner at depth > 0 (which would make the real `fn` look nested).
+        let src = "/* match the delimiter { */\npub fn bad(a: u8, b: u8) -> u8 { 0 }\n";
+        let names: Vec<String> = super::function_params(src, "bad")
+            .expect("a free function")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["a", "b"]);
+    }
+
+    #[test]
+    fn function_params_masks_literal_braces_and_fake_signatures() {
+        // A brace and a fake `fn bad(b, a)` inside a multiline raw string must be masked,
+        // so neither the depth nor the declaration search is fooled.
+        let src = "const T: &str = r#\"\n/* { */\nfn bad(b: u8, a: u8) {}\n\"#;\n\n\
+                   pub fn bad(a: u8, b: u8) -> u8 { 0 }\n";
+        let names: Vec<String> = super::function_params(src, "bad")
+            .expect("a free function")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["a", "b"], "a brace/signature inside a literal must be masked");
+    }
+
+    #[test]
+    fn function_params_tolerates_a_multiline_string_with_comment_tokens() {
+        // A raw string whose content has two `/*` and one `*/` must not leave the
+        // scanner inside a comment when the real declaration follows.
+        let src = "const S: &str = r#\"\na /* b /* c */\n\"#;\n\n\
+                   pub fn bad(a: u8, b: u8) -> u8 { 0 }\n";
+        let names: Vec<String> = super::function_params(src, "bad")
+            .expect("a free function")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["a", "b"]);
+    }
+
+    #[test]
+    fn function_params_ignores_a_nested_block_comment() {
+        // Rust block comments nest; stopping at the first `*/` would expose the inner
+        // `fn bad(b, a)` example as the declaration and swap the replay arguments.
+        let src = "/* Example /* draft */ fn bad(b: u8, a: u8) {} */\n\
+                   pub fn bad(a: u8, b: u8) -> u8 { 0 }\n";
+        let names: Vec<String> = super::function_params(src, "bad")
+            .expect("a free function")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["a", "b"], "the nested-comment example must not be read");
+    }
+
+    #[test]
+    fn function_params_sees_past_a_lifetime_and_raw_string_to_the_root_fn() {
+        // A nested helper returning `&'static str` whose body is a multiline raw string,
+        // then a same-named `fn bad()` in the module and the real `pub fn bad(n)` at the
+        // crate root. The lifetime's apostrophe must not be read as a char-literal
+        // delimiter (which masked the helper's `{` and mis-counted the depth), so the root
+        // `bad(n)` -- not the module's `bad()` -- supplies the replay signature.
+        let src = "#[cfg(test)]\nmod tests {\n    \
+                   fn banner() -> &'static str { r#\"first\nsecond\"# }\n    \
+                   fn bad() {}\n}\n\n\
+                   pub fn bad(n: u8) -> u8 { 100 / (n - 5) }\n";
+        let names: Vec<String> = super::function_params(src, "bad")
+            .expect("the root free function")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(
+            names,
+            ["n"],
+            "the root `bad(n)` must supply the signature, not the module's `bad()`"
+        );
+    }
+
+    #[test]
+    fn function_params_refuses_a_method() {
+        let src = "impl S { fn m(&self, x: u8) {} }\n";
+        assert!(
+            super::function_params(src, "m").is_none(),
+            "a method is not callable as a bare name, so replay must refuse it"
+        );
+    }
+    /// A multi-file crate: `mod a;` in the root is inlined from `a.rs`, so a
+    /// contract written in the module file is read and keyed `a::f` -- the path
+    /// rustc prints for it. Without this, a crate's modules verified *nothing* and
+    /// the report still said "all contracts held".
+    #[test]
+    fn extract_crate_reads_external_module_contracts() {
+        let dir = std::env::temp_dir().join(format!(
+            "verif-extract-crate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "spec! { requires: x <= 100, ensures: ret <= 100, }\npub fn clampish(x: u8) -> u8 { x }\n",
+        )
+        .unwrap();
+        let root = dir.join("lib.rs");
+        std::fs::write(&root, "pub mod a;\n").unwrap();
+        let specs = extract_crate(&root, "pub mod a;\n");
+        let keys: Vec<_> = specs.by_fn.keys().cloned().collect();
+        assert!(specs.by_fn.contains_key("a::clampish"), "keys: {keys:?}");
+        let c = specs.by_fn.get("a::clampish").unwrap();
+        assert!(!c.ensures.is_empty(), "the module contract must be read, not just the name");
+        // `extract` alone (the root text) sees nothing in the module.
+        assert!(!extract("pub mod a;\n").by_fn.contains_key("a::clampish"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_crate_honours_a_path_attribute() {
+        // `#[path = "alt.rs"] pub mod a;` names the file directly; the contract must be
+        // read from `alt.rs`, not the `a.rs` the plain convention would look for.
+        let dir = std::env::temp_dir().join(format!(
+            "verif-extract-path-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("alt.rs"),
+            "spec! { requires: x <= 100, ensures: ret <= 100, }\npub fn clampish(x: u8) -> u8 { x }\n",
+        )
+        .unwrap();
+        let root_text = "#[path = \"alt.rs\"]\npub mod a;\n";
+        let root = dir.join("lib.rs");
+        std::fs::write(&root, root_text).unwrap();
+        let specs = extract_crate(&root, root_text);
+        assert!(
+            specs.by_fn.contains_key("a::clampish"),
+            "keys: {:?}",
+            specs.by_fn.keys().collect::<Vec<_>>()
+        );
+        // The attribute is dropped: a `#[path]` above an inline `mod a { … }` is a compile
+        // error, so it must not survive into the inlined snapshot.
+        assert!(!specs.snapshot.contains("#[path"), "the attribute must be dropped: {}", specs.snapshot);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn crate_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "verif-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn extract_crate_honours_a_same_line_path_attribute() {
+        // `#[path = "alt.rs"] pub mod a;` on one line: the closing `]` between the path's
+        // quote and the `mod` must be stripped, or `a` is missed and its contracts land on
+        // whatever bare module follows (a misassignment) or vanish.
+        let dir = crate_dir("extract-oneline");
+        std::fs::write(dir.join("alt.rs"), "spec! { ensures: ret <= 1, }\npub fn f() -> u8 { 1 }\n").unwrap();
+        let root_text = "#[path = \"alt.rs\"] pub mod a;\npub mod b;\n";
+        std::fs::write(dir.join("b.rs"), "pub fn g() -> u8 { 2 }\n").unwrap();
+        let root = dir.join("lib.rs");
+        std::fs::write(&root, root_text).unwrap();
+        let specs = extract_crate(&root, root_text);
+        assert!(specs.by_fn.contains_key("a::f"), "keys: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_crate_resolves_a_path_relative_to_its_source_file() {
+        // A `#[path]` inside `parent.rs` resolves relative to *that file's* directory, not
+        // `parent/`. `lib.rs` -> `mod parent;` -> `parent.rs` -> `#[path = "alt.rs"] mod child;`
+        // must read `dir/alt.rs`, not `dir/parent/alt.rs`.
+        let dir = crate_dir("extract-nested-path");
+        std::fs::write(dir.join("lib.rs"), "pub mod parent;\n").unwrap();
+        std::fs::write(dir.join("parent.rs"), "#[path = \"alt.rs\"] pub mod child;\n").unwrap();
+        std::fs::write(dir.join("alt.rs"), "spec! { ensures: ret <= 1, }\npub fn f() -> u8 { 1 }\n").unwrap();
+        // A decoy at the wrong location that must NOT be read.
+        let _ = std::fs::create_dir_all(dir.join("parent"));
+        std::fs::write(dir.join("parent").join("alt.rs"), "spec! { ensures: ret == 99, }\npub fn f() -> u8 { 99 }\n").unwrap();
+        let root = dir.join("lib.rs");
+        let specs = extract_crate(&root, "pub mod parent;\n");
+        assert!(specs.by_fn.contains_key("parent::child::f"), "keys: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        let c = specs.by_fn.get("parent::child::f").unwrap();
+        assert!(c.ensures.iter().any(|e| e.contains("1")), "the real alt.rs contract (`<= 1`), not the decoy: {:?}", c.ensures);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_crate_scans_a_file_shared_by_two_path_modules() {
+        // Two `#[path]` modules that share one file are each compiled in their own scope,
+        // so both must be scanned; `seen` is an active stack (popped on return), not a
+        // permanent "already read" set.
+        let dir = crate_dir("extract-shared");
+        std::fs::write(dir.join("common.rs"), "spec! { ensures: ret <= 1, }\npub fn f() -> u8 { 1 }\n").unwrap();
+        let root_text = "#[path = \"common.rs\"] pub mod a;\n#[path = \"common.rs\"] pub mod b;\n";
+        std::fs::write(dir.join("lib.rs"), root_text).unwrap();
+        let root = dir.join("lib.rs");
+        let specs = extract_crate(&root, root_text);
+        assert!(specs.by_fn.contains_key("a::f"), "keys: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        assert!(specs.by_fn.contains_key("b::f"), "the second inclusion must also be scanned: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_nested_path_module_is_not_inlined_from_the_enclosing_directory() {
+        // A `#[path]`/`mod` on its *own* line, indented inside an inline `mod { }` (brace
+        // depth 1), resolves relative to that module's own directory in Rust, which the
+        // scanner does not track. Inlining it from the enclosing directory would attach a
+        // sibling file's contract (a false proof); depth 1 keeps `outer::child::f` missing.
+        // (The one-line form would be vacuous -- the scanner never sees a standalone decl.)
+        let dir = crate_dir("nested-inline");
+        let src = "pub mod outer {\n    #[path = \"alt.rs\"]\n    pub mod child;\n}\n";
+        std::fs::write(dir.join("lib.rs"), src).unwrap();
+        std::fs::write(dir.join("alt.rs"), "spec! { ensures: ret == 2, }\npub fn f() -> u8 { 2 }\n").unwrap();
+        let root = dir.join("lib.rs");
+        let specs = extract_crate(&root, src);
+        assert!(
+            !specs.by_fn.contains_key("outer::child::f"),
+            "a nested #[path] (depth > 0) must not be inlined: {:?}",
+            specs.by_fn.keys().collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_indented_file_scope_path_attribute_is_still_honoured() {
+        // An indented `#[path]` above an *unindented* `mod` is still file scope (brace
+        // depth 0). It must be honoured -- read `actual.rs`, the file Rustc compiles --
+        // not dropped to read the conventional `platform.rs` (which would be a wrong
+        // contract). This is the shape an indentation-based gate got wrong.
+        let dir = crate_dir("indented-path");
+        let src = "    #[path = \"actual.rs\"]\npub mod platform;\n";
+        std::fs::write(dir.join("lib.rs"), src).unwrap();
+        std::fs::write(dir.join("actual.rs"), "spec! { ensures: ret == 2, }\npub fn f() -> u8 { 2 }\n").unwrap();
+        std::fs::write(dir.join("platform.rs"), "spec! { ensures: ret == 1, }\npub fn f() -> u8 { 1 }\n").unwrap();
+        let root = dir.join("lib.rs");
+        let specs = extract_crate(&root, src);
+        let c = specs.by_fn.get("platform::f").expect("platform::f must be contracted");
+        assert!(
+            c.ensures.iter().any(|e| e.contains("ret == 2")),
+            "an indented file-scope #[path] must be honoured (actual.rs, ret==2), got {:?}",
+            c.ensures
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bare_name_is_refused_when_an_ambiguous_key_shares_its_tail() {
+        // A bare MIR `f` cannot be distinguished from a `#[cfg]`-alternative `platform::f`
+        // that rustc shortened to `f`, so it must be refused even when a crate-root `f`
+        // also exists. Refusing a genuinely separate root `f` is a safe lost proof; using
+        // it for the shortened module body would be a false proof.
+        let mut s = Specs::default();
+        s.by_fn.insert("f".into(), FnContract::default());
+        s.by_fn.insert("platform::f".into(), FnContract::default());
+        s.ambiguous.insert("platform::f".into());
+        assert_eq!(s.ambiguous_key("f"), Some("platform::f"), "a bare `f` sharing an ambiguous tail must be refused");
+        assert_eq!(s.ambiguous_key("platform::f"), Some("platform::f"));
+        // With no ambiguous key, a bare name is not refused.
+        let mut ok = Specs::default();
+        ok.by_fn.insert("f".into(), FnContract::default());
+        assert!(ok.ambiguous_key("f").is_none());
+    }
+
+    #[test]
+    fn a_multiline_string_does_not_hide_a_module_contract() {
+        // A `{` on a continuation line of a multiline string must not raise the brace depth,
+        // which would skip the following module and leave its contract unchecked.
+        let dir = crate_dir("multiline-str");
+        let src = "const BANNER: &str = \"line one\n{\nline three\";\npub mod checks;\n";
+        std::fs::write(dir.join("lib.rs"), src).unwrap();
+        std::fs::write(dir.join("checks.rs"), "spec! { ensures: ret == 2, }\npub fn f() -> u8 { 1 }\n").unwrap();
+        let root = dir.join("lib.rs");
+        let specs = extract_crate(&root, src);
+        assert!(
+            specs.by_fn.keys().any(|k| k.ends_with("checks::f")),
+            "a `{{` inside a multiline string must not hide the module: {:?}",
+            specs.by_fn.keys().collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_module_inside_a_block_comment_is_not_inlined() {
+        // `mod setup; /*` opens a block comment; the `mod legacy;` inside it must not be
+        // inlined (its contract would otherwise be paired with an unrelated body). Tested
+        // on `inline_external_modules` directly so it does not depend on `extract`'s scope
+        // walk.
+        let dir = crate_dir("comment-mod2");
+        std::fs::write(dir.join("setup.rs"), "pub fn s() {}\n").unwrap();
+        std::fs::write(dir.join("legacy.rs"), "pub fn f() {}\n").unwrap();
+        let src = "mod setup; /*\nmod legacy;\n*/\n";
+        let out = inline_external_modules(src, &dir.join("lib.rs"), &dir, &dir, &mut Vec::new()).0;
+        assert!(out.contains("mod setup {"), "setup must be inlined: {out}");
+        assert!(!out.contains("mod legacy {"), "legacy (inside a comment) must not be inlined: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_compact_path_attribute_is_honoured_without_panicking() {
+        // `#[path="x"]` (no spaces around `=`) is valid Rust; it must not panic and must
+        // be honoured.
+        let dir = crate_dir("compact-path");
+        std::fs::write(dir.join("alt.rs"), "spec! { ensures: ret == 2, }\npub fn f() -> u8 { 2 }\n").unwrap();
+        let src = "#[path=\"alt.rs\"]\npub mod a;\n";
+        let root = dir.join("lib.rs");
+        std::fs::write(&root, src).unwrap();
+        let specs = extract_crate(&root, src);
+        assert!(specs.by_fn.contains_key("a::f"), "compact #[path] must be honoured: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_trailing_comment_does_not_merge_module_and_root_scopes() {
+        // `mod setup; /* init */` must inline `setup` and leave a later root `f` at file
+        // scope -- not fold it into `setup` (which would make the two contracts collide).
+        let dir = crate_dir("trailing-comment");
+        std::fs::write(dir.join("setup.rs"), "spec! { ensures: ret == 1, }\npub fn f() -> u8 { 1 }\n").unwrap();
+        let src = "mod setup; /* init */\n/// ensures: ret == 2\npub fn f() -> u8 { 2 }\n";
+        let out = inline_external_modules(src, &dir.join("lib.rs"), &dir, &dir, &mut Vec::new()).0;
+        let specs = extract(&out);
+        assert!(specs.by_fn.contains_key("setup::f"), "setup::f must be present: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        assert!(specs.by_fn.contains_key("f"), "the root `f` must be at file scope, not `setup::f`: {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bracketed_filename_is_not_misrouted() {
+        // `]` inside a `#[path]` filename is legal; the attribute's `]` is the delimiter,
+        // found in the masked code so the `]` in the filename is not mistaken for it.
+        // `alt].rs` promises `ret == 1` (returns 0) and `b.rs` promises `ret == 2`
+        // (returns 1) -- the exact misrouting trap: if `alt].rs` were read under `b`,
+        // `b`'s body (returns 1) would be checked against `ret == 1` and wrongly pass.
+        let dir = crate_dir("bracket-name");
+        std::fs::write(dir.join("alt].rs"), "spec! { ensures: ret == 1, }\npub fn check() -> u8 { 0 }\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "spec! { ensures: ret == 2, }\npub fn check() -> u8 { 1 }\n").unwrap();
+        // WITH a following plain module: `a` from `alt].rs` (ret==1), `b` from `b.rs` (ret==2).
+        let src = "#[path = \"alt].rs\"] mod a;\nmod b;\n";
+        let out = inline_external_modules(src, &dir.join("lib.rs"), &dir, &dir, &mut Vec::new()).0;
+        let specs = extract(&out);
+        assert!(specs.by_fn.get("a::check").is_some_and(|c| c.ensures.iter().any(|e| e.contains("ret == 1"))), "a::check must be alt].rs's contract (ret==1): {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        assert!(specs.by_fn.get("b::check").is_some_and(|c| c.ensures.iter().any(|e| e.contains("ret == 2"))), "b::check must be b.rs's contract (ret==2): {:?}", specs.by_fn.keys().collect::<Vec<_>>());
+        // WITHOUT a following module: `a` alone is still read from `alt].rs`.
+        let src2 = "#[path = \"alt].rs\"] mod a;\n";
+        let out2 = inline_external_modules(src2, &dir.join("lib.rs"), &dir, &dir, &mut Vec::new()).0;
+        let specs2 = extract(&out2);
+        assert!(specs2.by_fn.get("a::check").is_some_and(|c| c.ensures.iter().any(|e| e.contains("ret == 1"))), "without a following module, a::check must still be alt].rs's (ret==1): {:?}", specs2.by_fn.keys().collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A contract written as a `spec! { … }` block is read from the source text,
     /// and it must read *exactly* like the `///` spelling.
     ///

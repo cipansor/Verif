@@ -364,6 +364,93 @@ pub enum Intrinsic {
     /// *array*'s length is a constant, so `a.last()` is the exact element `a[N-1]`
     /// and is modelled as that element rather than a fresh one.
     SliceLast,
+    /// `IntoIterator::into_iter` / `slice::iter`: begin iterating a slice.
+    ///
+    /// `for x in xs` (with `xs: &[T]`) desugars to
+    /// `<&[T] as IntoIterator>::into_iter(xs)` then `Iterator::next` on the
+    /// resulting `std::slice::Iter`, so the model holds a *cursor* -- the base
+    /// slice local and a position -- that `next` advances. The position is a
+    /// concrete `u64`, so each iteration names the element at a constant index
+    /// (`s[0]`, `s[1]`, ...), which is the same element variable a contract's
+    /// `s[0]` names. A loop cut havocs the cursor (dropping it), so a `for` loop
+    /// with an `invariant:` -- where the position would be symbolic -- refuses
+    /// `next` rather than reading an arbitrary element.
+    SliceIntoIter,
+    /// `Iterator::next` on a `std::slice::Iter`: `Option<&T>` -- `Some(&s[pos])`
+    /// when `pos < len`, `None` otherwise, advancing the cursor.
+    ///
+    /// The guard is the slice's own length variable, so `next` cannot disagree
+    /// with `len`/`is_empty`/`first`. The element is the store's element at the
+    /// concrete `pos`, recorded in `slice_elem_ref` so the loop body's
+    /// `*_payload` read resolves to it.
+    SliceNext,
+    /// `Iterator::copied` on a slice/array cursor: the identity adapter.
+    ///
+    /// `xs.iter().copied()` wraps the cursor in a `Copied<Iter>` that yields `T`
+    /// by value instead of `&T`. The model treats a reference as its referent, so
+    /// the *cursor* is unchanged -- the adapter only carries it to the destination
+    /// -- and `next` on the result reads the same element. The element type must be
+    /// `Copy` for `.copied()` to compile, so nothing is skipped.
+    SliceCopied,
+    /// `Iterator::rev` on a cursor: a direction flag, carried like `copied`.
+    SliceRev,
+    /// `Iterator::skip(n)` on a cursor: advances the position by `n`.
+    SliceSkip,
+    /// `Iterator::step_by(n)` on a cursor: advances the position by `n` each step.
+    SliceStepBy,
+    /// `Iterator::take(n)` on a cursor: caps the effective end at `pos + n`.
+    SliceTake,
+    /// `Iterator::fold(init, f)` on a cursor: folds a modelled reducer closure.
+    SliceFold,
+    /// `Iterator::map(f)` on a cursor: a lazy element transform (closure).
+    SliceMap,
+    /// `Iterator::filter(f)` on a cursor: a lazy element predicate (closure).
+    SliceFilter,
+    /// `Iterator::all(f)` on a cursor: true iff the predicate holds for every element.
+    SliceAll,
+    /// `Iterator::any(f)` on a cursor: true iff the predicate holds for some element.
+    SliceAny,
+    /// `Iterator::count` on a slice/array cursor: `len - pos`.
+    ///
+    /// The cursor is a concrete position, so the remaining count is the length
+    /// minus it, on the slice's own length variable -- the same one `len`/
+    /// `is_empty`/`first` read. Exact even when the length is symbolic, because
+    /// `pos <= len` always holds.
+    SliceCount,
+    /// `Iterator::sum::<T>` on a slice/array cursor: the sum of the remaining
+    /// elements, `s[pos] + ... + s[len-1]`.
+    ///
+    /// The number of addends is the *length*, so this is modelled only when that
+    /// length is a constant -- an array's type length, or a slice whose length the
+    /// precondition pinned (`requires: xs.len() == N`). A symbolic length has no
+    /// fixed number of addends to build a term from, so it is refused rather than
+    /// summed over a wrong range. Each element is the store's element at that
+    /// concrete index, so the sum is over the same variables a contract's `xs[k]`
+    /// names.
+    SliceSum,
+    /// `Iterator::last` on a slice/array cursor: `Option<&T>` -- `Some` of the last
+    /// remaining element when the cursor has not run out, `None` otherwise.
+    ///
+    /// An array's length is a constant, so the element is the exact `s[N-1]`; a
+    /// slice's length is symbolic, so the element is a single fresh variable per
+    /// slice (keyed by a sentinel), the same over-approximation `slice::last` uses.
+    SliceIterLast,
+    /// `Iterator::nth(k)` on a slice/array cursor: `Option<&T>` of the element `k`
+    /// places past the cursor, advancing it.
+    ///
+    /// `k` must be a *constant*: a slice's length is symbolic, so a symbolic offset
+    /// names no single index and reading "some element" would be a wrong value. The
+    /// element is the store's element at `pos + k`, the same variable a contract's
+    /// `s[pos + k]` names.
+    SliceNth,
+    /// `Iterator::max` / `Iterator::min` on a slice/array cursor: `Option<T>` /
+    /// `Option<&T>` of the extreme remaining element.
+    ///
+    /// A fold of comparisons over the remaining elements, so (like `sum`) it needs
+    /// a *constant* length. The payload is the extreme *value*; for a reference
+    /// payload the element identity is a `Select` tree over the elements, so a
+    /// deref reads the same value. A slice of symbolic length is refused.
+    SliceExtreme(ExtremeKind),
     /// A method on a `Vec<T>`: `new`, `push` or `len`.
     ///
     /// A `Vec` has no bit-vector value (its fields -- a heap pointer, a length
@@ -377,6 +464,33 @@ pub enum Intrinsic {
     /// The *path* is checked (see [`names_vec_impl`]) so a user type spelled
     /// `Vec` is refused, and the same-dump lookup answers a real body first.
     VecMethod(VecMethod),
+    /// `String::{new, from, push_str, len, is_empty}`: the `String` *length* model.
+    ///
+    /// A `String` is a `Vec<u8>` underneath, and its fields are not printed by the
+    /// dump, so only the length is tracked -- `new` is `0`, `push_str` adds the
+    /// appended `&str`'s byte length, `from` is that length, and `len`/`is_empty`
+    /// read it. A `&str`'s byte length is a *symbolic* input when it is an
+    /// argument (the same variable `str::len` reads) and a constant when it is a
+    /// literal (`const "ab"` is `2`). The bytes are not modelled, so a call whose
+    /// result depends on the *contents* is refused. The path is checked (see
+    /// [`names_string_impl`]) so a user type spelled `String` is refused, and the
+    /// same-dump lookup answers a real body first.
+    StringMethod(StringMethod),
+    /// `Box::<T>::new`: the boxed-value model.
+    ///
+    /// A `Box<T>` is a pointer to a heap `T`, and the dump never prints the
+    /// allocation, so the model tracks the *boxed value* the executor stored at
+    /// construction and makes the pointer a nonzero token. The compiler's null
+    /// check before the deref (`Ne(SIZE, 0) && Eq(ptr, 0)`) is then discharged, and
+    /// `*b` reads the stored value. A `Box<T>`'s drop glue is `T`'s, so a
+    /// `Box<u8>` is glue-free while a `Box<PanicOnDrop>` is not.
+    BoxMethod(BoxMethod),
+    /// `std::mem::drop::<T>(v)`: the explicit drop. A glue-free `T` has no
+    /// observable destructor, so the call is a no-op; a `T` with drop glue the
+    /// tool cannot run is refused (a no-op would hide a panicking destructor).
+    /// Answered by the executor (see `mem_drop`), which holds the declared
+    /// layouts the bare-name check needs.
+    MemDrop,
     /// `iN::abs_diff`: the absolute difference of two operands, as the type.
     ///
     /// Its result is *unsigned* even on a signed type -- `i8::abs_diff(-128, 127)`
@@ -635,10 +749,75 @@ pub enum VecMethod {
     /// `Vec::is_empty(&self) -> bool` -> the length is zero.
     IsEmpty,
     /// `Vec::pop(&mut self) -> Option<T>` -> the length decreases by one when it
-    /// is non-zero. The *popped element* is not modelled (the dump prints no
-    /// elements), so the `Some` payload stays unknown while the tag and the new
-    /// length are exact.
+    /// is non-zero, and the element at the old `len - 1` is the payload when the
+    /// length is a constant the model can pin.
     Pop,
+    /// `Vec::clear(&mut self)` -> an empty vector, length `0`. Total (no panic),
+    /// so it is a plain length reset; the elements become unreachable, which the
+    /// bounds check already enforces.
+    Clear,
+    /// `<Vec<T> as Index<usize>>::index(&self, i) -> &T`, the call `v[i]` lowers
+    /// to. The element is the store's own `i`-th variable, and the result is a
+    /// *reference* to it, recorded in `slice_elem_ref` so a later `*` reads the
+    /// element rather than the reference local. A constant index is exact; a
+    /// symbolic one is refused (the store has no chain for a `Vec`).
+    Index,
+    /// `<Vec<T> as Deref>::deref(&self) -> &[T]`, which `v.first()`/`v.get(k)`/
+    /// `v.len()` (when not the inherent method) go through. The destination is the
+    /// same `indexed` store as the vector -- a *copy* of it, sharing the element
+    /// variables that exist at the point of the deref, so `v.first()` and `v[0]`
+    /// name one element.
+    Deref,
+    /// `Vec::as_slice(&self) -> &[T]`, the explicit spelling of [`Self::Deref`].
+    AsSlice,
+}
+
+/// A method on a `String`, modelled by its *length* only.
+///
+/// A `String` is a `Vec<u8>` underneath and its fields are not printed, so the
+/// model tracks the length exactly as [`VecMethod`] does: `new` is `0`,
+/// `push_str` adds the appended `&str`'s byte length, `from` is that length, and
+/// `len`/`is_empty` read it. The bytes are not modelled, so a method whose result
+/// depends on the contents is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StringMethod {
+    /// `String::new()` -> an empty string, length `0`.
+    New,
+    /// `String::from(&str)` (spelled `<String as From<&str>>::from`) -> a string
+    /// whose length is the source's byte length.
+    From,
+    /// `String::push_str(&mut self, &str)` -> the length grows by the appended
+    /// slice's byte length.
+    PushStr,
+    /// `String::len(&self) -> usize` -> the tracked length.
+    Len,
+    /// `String::is_empty(&self) -> bool` -> the length is zero.
+    IsEmpty,
+    /// `String::clear(&mut self)` -> an empty string, length `0`. Total (no panic).
+    Clear,
+}
+
+/// The one `Box` method modelled: `Box::new`.
+///
+/// A `Box<T>` is a pointer to a heap `T`; the dump never prints the allocation, so
+/// the model tracks the *boxed value* the executor stored at construction and makes
+/// the pointer a nonzero token (so the null check `Ne(SIZE, 0) && Eq(ptr, 0)` the
+/// compiler inserts before the deref is discharged). The deref `*b` then reads the
+/// stored value. `T`'s own drop glue is honoured by `drop_is_noop`, so a `Box<T>`
+/// is glue-free exactly when `T` is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoxMethod {
+    /// `Box::<T>::new(v)` -> a box holding `v`.
+    New,
+}
+
+/// Which extreme `Iterator::max`/`Iterator::min` computes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtremeKind {
+    /// `Iterator::max`: the greatest remaining element.
+    Max,
+    /// `Iterator::min`: the least remaining element.
+    Min,
 }
 
 /// A method on a `for`-loop range.
@@ -1268,8 +1447,44 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             "len" => return Some(Intrinsic::VecMethod(VecMethod::Len)),
             "is_empty" => return Some(Intrinsic::VecMethod(VecMethod::IsEmpty)),
             "pop" => return Some(Intrinsic::VecMethod(VecMethod::Pop)),
+            "as_slice" => return Some(Intrinsic::VecMethod(VecMethod::AsSlice)),
+            "clear" => return Some(Intrinsic::VecMethod(VecMethod::Clear)),
             _ => {}
         }
+    }
+    // `String::{new, push_str, len, is_empty}`: the `String` length model. The
+    // `from(&str)` constructor is the `<String as From<&str>>::from` spelling and
+    // is intercepted in the conversion branch below.
+    if names_string_impl(name) {
+        match short {
+            "new" => return Some(Intrinsic::StringMethod(StringMethod::New)),
+            "push_str" => return Some(Intrinsic::StringMethod(StringMethod::PushStr)),
+            "len" => return Some(Intrinsic::StringMethod(StringMethod::Len)),
+            "is_empty" => return Some(Intrinsic::StringMethod(StringMethod::IsEmpty)),
+            "clear" => return Some(Intrinsic::StringMethod(StringMethod::Clear)),
+            _ => {}
+        }
+    }
+    // `Box::<T>::new(v)`: the boxed-value model.
+    if names_box_impl(name) && short == "new" {
+        return Some(Intrinsic::BoxMethod(BoxMethod::New));
+    }
+    if names_mem_drop(name) {
+        return Some(Intrinsic::MemDrop);
+    }
+    // `v[i]` and `v.first()`/`v.get(k)` reach `Vec` through a *trait* projection
+    // (`<Vec<u8> as Index<usize>>::index`, `<Vec<u8> as Deref>::deref`), which
+    // carries no `vec::Vec` path, so the bare-`Vec` head is matched separately and
+    // only on the standard library's trait (`Index`/`Deref`) to keep a user type
+    // spelled `Vec` from being read as the container.
+    if short == "index" && names_vec_trait(name, "Index") {
+        return Some(Intrinsic::VecMethod(VecMethod::Index));
+    }
+    if short == "deref" && names_vec_trait(name, "Deref") {
+        return Some(Intrinsic::VecMethod(VecMethod::Deref));
+    }
+    if short == "as_slice" && names_vec_trait_head(name) {
+        return Some(Intrinsic::VecMethod(VecMethod::AsSlice));
     }
     // The standard library's `Option`/`Result` methods. Like the slice shapes
     // these read the receiver's own state rather than a bit-vector operand -- the
@@ -1325,6 +1540,80 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
             "next" => return Some(Intrinsic::Range(RangeMethod::Next)),
             _ => {}
         }
+    }
+    // `for x in xs` over a *slice*: `<&[T] as IntoIterator>::into_iter` /
+    // `slice::<impl [T]>::iter` begin the cursor, and `<slice::Iter<..> as
+    // Iterator>::next` advances it. The *path* is checked (`&[`/`[` head for the
+    // slice, `slice::Iter` for the cursor) so a user iterator is refused, and the
+    // range `next` above is matched first so this cannot shadow it. The same-dump
+    // lookup still answers a real body first.
+    if short == "into_iter" && (names_slice_into_iter(name) || names_slice_iter_into_iter(name)) {
+        return Some(Intrinsic::SliceIntoIter);
+    }
+    if names_slice_iter_impl(name) && short == "iter" {
+        return Some(Intrinsic::SliceIntoIter);
+    }
+    if short == "next" && names_slice_iter_next(name) {
+        return Some(Intrinsic::SliceNext);
+    }
+    // The cursor-preserving `copied` adapter and the two value-consuming methods
+    // `count`/`sum`. All are trait calls on a slice/array cursor (or an adapter over
+    // one), so the *receiver* type and the `Iterator` trait are checked. `sum`'s
+    // tail carries its type argument (`sum::<u8>`), which `short` already strips.
+    if short == "copied" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceCopied);
+    }
+    if short == "rev" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceRev);
+    }
+    if short == "skip" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceSkip);
+    }
+    if short == "step_by" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceStepBy);
+    }
+    if short == "take" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceTake);
+    }
+    if short == "fold" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceFold);
+    }
+    if short == "map" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceMap);
+    }
+    if short == "filter" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceFilter);
+    }
+    if short == "all" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceAll);
+    }
+    if short == "any" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceAny);
+    }
+    if short == "count" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceCount);
+    }
+    // `enumerate()` is a cursor identity, like `copied()`: it wraps the iterator in
+    // `Enumerate<..>` but the cursor (base + position) is unchanged. The payload
+    // *shape* differs -- `next` yields `(usize, &T)` -- and `next` decides that from
+    // the call name.
+    if short == "enumerate" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceCopied);
+    }
+    if short == "sum" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceSum);
+    }
+    if short == "last" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceIterLast);
+    }
+    if short == "nth" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceNth);
+    }
+    if short == "max" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceExtreme(ExtremeKind::Max));
+    }
+    if short == "min" && names_slice_iter_ty(name) {
+        return Some(Intrinsic::SliceExtreme(ExtremeKind::Min));
     }
     // `Try::branch` and `FromResidual::from_residual`, the two calls the `?`
     // operator's desugaring makes. Both are *trait* methods -- the dump spells
@@ -1409,6 +1698,23 @@ pub fn classify(name: &str) -> Option<Intrinsic> {
     if short == "from" || short == "into" {
         if !names_conversion_trait(name) {
             return None;
+        }
+        // `<String as From<&str>>::from` is the `String` constructor, not an
+        // integer conversion: its self type is `String` and its parameter is a
+        // `&str`. Intercept it here, before the integer `Conversion` model, which
+        // would refuse it ("converts a type the model does not hold"). The check is
+        // on the *name* only -- the executor reads the argument's byte length.
+        if short == "from" {
+            if let Some((self_part, after_as)) = name.rsplit_once(" as ") {
+                let self_is_string = self_part
+                    .trim_start_matches('<')
+                    .trim()
+                    .ends_with("String");
+                let param_is_str = after_as.contains("str");
+                if self_is_string && param_is_str {
+                    return Some(Intrinsic::StringMethod(StringMethod::From));
+                }
+            }
         }
         let kind = if short == "from" { Conversion::From } else { Conversion::Into };
         return Some(Intrinsic::Conversion(kind));
@@ -1682,6 +1988,114 @@ pub fn names_slice_impl(name: &str) -> bool {
     name.contains("slice::<impl [")
 }
 
+/// True for `<&[T] as IntoIterator>::into_iter` (and the `[T]`, `[T; N]`,
+/// `&[T; N]` spellings).
+///
+/// `into_iter` is spelled on many types, so the *head* is checked: a slice or
+/// array's `IntoIterator` impl is the only one printed with a `[` immediately
+/// after `&` (or at the start). A user type cannot produce a `[T]`/`[T; N]` head,
+/// so this cannot collide. The element is a reference for a `&[T]`/`&[T; N]`
+/// receiver and a value for a `[T; N]` one; the executor reads the same element
+/// variable either way, so both are modelled.
+pub fn names_slice_into_iter(name: &str) -> bool {
+    let Some(inner) = name.strip_prefix('<') else { return false };
+    let Some((ty, rest)) = inner.split_once(" as ") else { return false };
+    let trait_path = rest.split(['<', '>']).next().unwrap_or(rest).trim();
+    if !(trait_path == "IntoIterator" || trait_path.ends_with("::IntoIterator")) {
+        return false;
+    }
+    let ty = ty.trim();
+    let ty = ty.strip_prefix('&').unwrap_or(ty);
+    ty.strip_prefix('[').and_then(|s| s.strip_suffix(']')).is_some()
+}
+
+/// True when `ty` (the part before ` as ` in a call name) is a slice/array
+/// iterator cursor or a cursor-preserving adapter over one.
+///
+/// The cursor types are `std::slice::Iter` and `array::IntoIter`; the adapters the
+/// model treats as a cursor transform are `Copied<..>` and `Enumerate<..>`, and
+/// their *payload* must itself be a slice/array iterator, so a user
+/// `Copied<MyIter>` is not read as one.
+fn is_cursor_ty(ty: &str) -> bool {
+    let head = ty.split('<').next().unwrap_or(ty).trim();
+    let is_core = head == "slice::Iter"
+        || head.ends_with("::slice::Iter")
+        || head == "array::IntoIter"
+        || head.ends_with("::array::IntoIter");
+    if is_core {
+        return true;
+    }
+    let is_adapter = head == "Copied"
+        || head.ends_with("::Copied")
+        || head == "Enumerate"
+        || head.ends_with("::Enumerate")
+        || head == "Rev"
+        || head.ends_with("::Rev")
+        || head == "Skip"
+        || head.ends_with("::Skip")
+        || head == "StepBy"
+        || head.ends_with("::StepBy")
+        || head == "Take"
+        || head.ends_with("::Take")
+        || head == "Map"
+        || head.ends_with("::Map")
+        || head == "Filter"
+        || head.ends_with("::Filter");
+    is_adapter && (ty.contains("slice::Iter") || ty.contains("array::IntoIter"))
+}
+
+/// True for `<slice::Iter<..> as IntoIterator>::into_iter` (or `<array::IntoIter<..>
+/// as IntoIterator>`, or an adapter over one), the identity call `for x in
+/// xs.iter()` / `for x in xs.iter().copied()` makes (an iterator is already an
+/// `IntoIterator`).
+pub fn names_slice_iter_into_iter(name: &str) -> bool {
+    let Some(inner) = name.strip_prefix('<') else { return false };
+    let Some((ty, rest)) = inner.split_once(" as ") else { return false };
+    if !is_cursor_ty(ty.trim()) {
+        return false;
+    }
+    let trait_path = rest.split(['<', '>']).next().unwrap_or(rest).trim();
+    trait_path == "IntoIterator" || trait_path.ends_with("::IntoIterator")
+}
+
+/// True when a call names the inherent `iter` on a slice: `core::slice::<impl
+/// [T]>::iter`. A `Vec::iter` reaches the slice through `Deref` first, so it is
+/// printed against the slice too; a user `iter` has no `slice::<impl [` path.
+pub fn names_slice_iter_impl(name: &str) -> bool {
+    name.contains("slice::<impl [")
+}
+
+/// True when a call names a method on a *slice/array iterator cursor*: a
+/// `std::slice::Iter`, an `array::IntoIter`, or one of the adapters modelled as a
+/// cursor transform (`Copied<..>`, and the `Enumerate<..>` spelling, which must
+/// still contain a slice/array iterator so a user `Enumerate` is refused).
+///
+/// The receiver is the type before ` as `, and the trait must be the standard
+/// library's `Iterator` (or `IntoIterator` for the identity `into_iter`). A user
+/// iterator named `Iter`/`Copied` in a local module has no `slice::Iter`/
+/// `array::IntoIter` segment, so it is refused.
+pub fn names_slice_iter_ty(name: &str) -> bool {
+    let Some(inner) = name.strip_prefix('<') else { return false };
+    let Some((ty, rest)) = inner.split_once(" as ") else { return false };
+    let trait_path = rest.split(['<', '>']).next().unwrap_or(rest).trim();
+    if !(trait_path == "Iterator" || trait_path.ends_with("::Iterator")) {
+        return false;
+    }
+    is_cursor_ty(ty.trim())
+}
+
+/// True for `<slice::Iter<..> as Iterator>::next` (or the `core::slice` spelling),
+/// the by-value array iterator `<array::IntoIter<..> as Iterator>::next`, and the
+/// same call on a cursor adapter (`Copied<..>`/`Enumerate<..>`).
+///
+/// The `next` tail is also the range desugaring's, but that is matched by
+/// `names_range` *before* this in `classify`, so the only thing this adds is the
+/// slice/array cursor. A user iterator named `Iter` in a local module is `m::Iter`,
+/// which has no `slice::Iter`/`array::IntoIter` segment, and is refused.
+pub fn names_slice_iter_next(name: &str) -> bool {
+    names_slice_iter_ty(name)
+}
+
 /// True when a call names an inherent method on `str`.
 ///
 /// `len` and `is_empty` are spelled the same on `[T]`, `Vec`, `String` and many
@@ -1711,6 +2125,79 @@ pub fn names_str_impl(name: &str) -> bool {
 /// with a `Vec` length they do not have.
 pub fn names_vec_impl(name: &str) -> bool {
     name.contains("vec::Vec") || name.starts_with("Vec::")
+}
+
+/// True when a call names an inherent method on the standard library's `String`.
+///
+/// `new`/`len`/`is_empty`/`push_str` are spelled on many types, so the *path* is
+/// checked: rustc prints a `String` method as `String::new` (the shortened spelling
+/// when nothing shadows it) or `alloc::string::String::push_str` /
+/// `std::string::String::len`. A user type spelled `String` in a local module is
+/// `m::String::new`, which has neither a leading `String::` nor a `string::String`
+/// segment, and is refused; the same-dump lookup answers a real body first. A
+/// `String::from(&str)` is the `<String as From<&str>>::from` spelling, handled in
+/// `classify`'s conversion branch, not here.
+pub fn names_string_impl(name: &str) -> bool {
+    if name.contains("string::String") {
+        return true;
+    }
+    match name.strip_prefix("String::") {
+        Some(rest) => !rest.contains("::"),
+        None => false,
+    }
+}
+
+/// True when a call names the standard library's `Box`.
+///
+/// `Box::<u8>::new` is printed with the type argument (`Box::<u8>::new`) or as
+/// `alloc::boxed::Box::<u8>::new`, so the *path* is checked: a `boxed::Box` segment
+/// or a bare `Box::` head. A user type spelled `Box` in a local module is
+/// `m::Box::new`, which has neither, and the same-dump lookup answers a real body
+/// first regardless.
+/// `std::mem::drop::<T>` / `core::mem::drop::<T>`: the explicit drop. A bare
+/// `drop` is a user function and is refused, so only the standard paths match.
+pub fn names_mem_drop(name: &str) -> bool {
+    let head = name.split("::<").next().unwrap_or(name);
+    head == "std::mem::drop" || head == "core::mem::drop"
+}
+
+pub fn names_box_impl(name: &str) -> bool {
+    name.contains("boxed::Box") || name.starts_with("Box::")
+}
+
+/// The head of a type spelled `<Vec<T> …>` is the standard container.
+///
+/// rustc prints a `Vec`'s *trait* call with the bare type (`<Vec<u8> as
+/// Deref>::deref`) or the full path (`<std::vec::Vec<u8> as …>`), never a user
+/// type's module-qualified name (`<m::Vec<u8> as …>`, which has a `::` in the
+/// head and is refused). The same-dump lookup answers a local `Vec`'s own body
+/// first, so this only has to keep a *bodiless* user `Vec` from being answered by
+/// the model.
+fn vec_head_is_std(ty: &str) -> bool {
+    let head = ty.split('<').next().unwrap_or(ty).trim();
+    head == "Vec" || head.ends_with("vec::Vec")
+}
+
+/// True for `<Vec<T> as Trait<…>>::method`, with the standard library's `Trait`.
+fn names_vec_trait(name: &str, tr: &str) -> bool {
+    let Some(inner) = name.strip_prefix('<') else { return false };
+    let Some((ty, rest)) = inner.split_once(" as ") else { return false };
+    if !vec_head_is_std(ty) {
+        return false;
+    }
+    let trait_path = rest.split(['<', '>']).next().unwrap_or(rest).trim();
+    trait_path == tr || trait_path.ends_with(&format!("::{tr}"))
+}
+
+/// True for an `as_slice`-style call whose head is the standard `Vec`, whether it
+/// is printed as `Vec::<u8>::as_slice` or `<Vec<u8>>::as_slice`.
+fn names_vec_trait_head(name: &str) -> bool {
+    if names_vec_impl(name) {
+        return true;
+    }
+    let Some(inner) = name.strip_prefix('<') else { return false };
+    let ty = inner.split('>').next().unwrap_or(inner);
+    vec_head_is_std(ty)
 }
 
 /// True when a call names an inherent method on the standard library's `Option`.
@@ -1922,7 +2409,24 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         | Intrinsic::SliceIsEmpty
         | Intrinsic::SliceFirst
         | Intrinsic::SliceGet
-        | Intrinsic::SliceLast => true,
+        | Intrinsic::SliceLast
+        | Intrinsic::SliceIntoIter
+        | Intrinsic::SliceNext
+        | Intrinsic::SliceCopied
+        | Intrinsic::SliceRev
+        | Intrinsic::SliceSkip
+        | Intrinsic::SliceStepBy
+        | Intrinsic::SliceTake
+        | Intrinsic::SliceFold
+        | Intrinsic::SliceMap
+        | Intrinsic::SliceFilter
+        | Intrinsic::SliceAll
+        | Intrinsic::SliceAny
+        | Intrinsic::SliceCount
+        | Intrinsic::SliceSum
+        | Intrinsic::SliceIterLast
+        | Intrinsic::SliceNth
+        | Intrinsic::SliceExtreme(_) => true,
         // The `Vec` methods. Like the slice shapes they read a length the
         // executor tracks rather than an operand term, so there is no width or
         // sign to check here; `eval` never sees them and the executor answers
@@ -1930,6 +2434,12 @@ pub fn is_modelled(op: Intrinsic, w: u8, signed: bool) -> bool {
         // hold). Total here so an `is_modelled` probe does not report them
         // unmodelled.
         Intrinsic::VecMethod(_) => true,
+        // The `String` length model is store-based, answered by the executor.
+        Intrinsic::StringMethod(_) => true,
+        // The `Box` model is store-based, answered by the executor.
+        Intrinsic::BoxMethod(_) => true,
+        // The explicit drop is answered by the executor (glue check).
+        Intrinsic::MemDrop => true,
         // The `Option` methods. They read the receiver's tag and payload, which
         // live in the executor's stores rather than in an operand term, so there is
         // no width or sign to check here -- `eval` never sees them and the
@@ -2149,6 +2659,23 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
             | Intrinsic::SliceFirst
             | Intrinsic::SliceGet
             | Intrinsic::SliceLast
+            | Intrinsic::SliceIntoIter
+            | Intrinsic::SliceNext
+            | Intrinsic::SliceCopied
+            | Intrinsic::SliceRev
+            | Intrinsic::SliceSkip
+            | Intrinsic::SliceStepBy
+            | Intrinsic::SliceTake
+            | Intrinsic::SliceFold
+            | Intrinsic::SliceMap
+            | Intrinsic::SliceFilter
+            | Intrinsic::SliceAll
+            | Intrinsic::SliceAny
+            | Intrinsic::SliceCount
+            | Intrinsic::SliceSum
+            | Intrinsic::SliceIterLast
+            | Intrinsic::SliceNth
+            | Intrinsic::SliceExtreme(_)
     ) {
         return None;
     }
@@ -2156,6 +2683,19 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
     // term, so `eval` has nothing to compute for them. The executor answers them
     // (see `vec_method`).
     if matches!(op, Intrinsic::VecMethod(_)) {
+        return None;
+    }
+    // The `String` methods read the length the executor tracks, so `eval` has
+    // nothing to compute. The executor answers them (see `string_method`).
+    if matches!(op, Intrinsic::StringMethod(_)) {
+        return None;
+    }
+    // The `Box` model reads the boxed value the executor stored, so `eval` has
+    // nothing to compute. The executor answers it (see `box_method`).
+    if matches!(op, Intrinsic::BoxMethod(_)) {
+        return None;
+    }
+    if matches!(op, Intrinsic::MemDrop) {
         return None;
     }
     // The `Option` methods read the receiver's tag and payload from the executor's
@@ -2184,6 +2724,11 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         return None;
     }
     Some(match op {
+        // The `String` length model is answered by the executor's `string_method`;
+        // the early return above keeps it from reaching here.
+        Intrinsic::StringMethod(_) => unreachable!("String methods are answered by the executor"),
+        Intrinsic::BoxMethod(_) => unreachable!("Box methods are answered by the executor"),
+        Intrinsic::MemDrop => unreachable!("the explicit drop is answered by the executor"),
         // Answered by `eval_slice` from the executor's length variable; the early
         // return above keeps them from reaching here.
         Intrinsic::SliceLen
@@ -2192,6 +2737,25 @@ pub fn eval(op: Intrinsic, x: Var, y: Var, w: u8, signed: bool, result_w: u8) ->
         | Intrinsic::SliceGet
         | Intrinsic::SliceLast => {
             unreachable!("slice shapes are answered from the executor's stores")
+        }
+        Intrinsic::SliceIntoIter
+        | Intrinsic::SliceNext
+        | Intrinsic::SliceCopied
+        | Intrinsic::SliceRev
+        | Intrinsic::SliceSkip
+        | Intrinsic::SliceStepBy
+        | Intrinsic::SliceTake
+        | Intrinsic::SliceFold
+        | Intrinsic::SliceMap
+        | Intrinsic::SliceFilter
+        | Intrinsic::SliceAll
+        | Intrinsic::SliceAny
+        | Intrinsic::SliceCount
+        | Intrinsic::SliceSum
+        | Intrinsic::SliceIterLast
+        | Intrinsic::SliceNth
+        | Intrinsic::SliceExtreme(_) => {
+            unreachable!("slice iteration is answered from the executor's cursor store")
         }
         // Answered by the executor's `enum_method` from the discriminant/payload
         // stores; the early return above keeps them from reaching here.
@@ -5881,8 +6445,36 @@ mod tests {
         assert_eq!(classify("Vec::<u8>::len"), Some(Intrinsic::VecMethod(VecMethod::Len)));
         assert_eq!(classify("Vec::<u8>::new"), Some(Intrinsic::VecMethod(VecMethod::New)));
         assert_eq!(classify("Vec::<u8>::push"), Some(Intrinsic::VecMethod(VecMethod::Push)));
+        // The trait calls `v[i]`, `v.first()` and `v.as_slice()` lower to. The head
+        // is a *bare* `Vec`, so the trait path is what distinguishes the standard
+        // container from a user type spelled `Vec`.
+        assert_eq!(
+            classify("<Vec<u8> as Index<usize>>::index"),
+            Some(Intrinsic::VecMethod(VecMethod::Index))
+        );
+        assert_eq!(
+            classify("<Vec<u8> as std::ops::Index<usize>>::index"),
+            Some(Intrinsic::VecMethod(VecMethod::Index))
+        );
+        assert_eq!(
+            classify("<Vec<u8> as Deref>::deref"),
+            Some(Intrinsic::VecMethod(VecMethod::Deref))
+        );
+        assert_eq!(
+            classify("<Vec<u8> as core::ops::Deref>::deref"),
+            Some(Intrinsic::VecMethod(VecMethod::Deref))
+        );
+        assert_eq!(
+            classify("Vec::<u8>::as_slice"),
+            Some(Intrinsic::VecMethod(VecMethod::AsSlice))
+        );
         // A user type spelled `Vec` in a local module is not the standard one.
         assert!(classify("m::Vec::<u8>::len").is_none());
+        assert!(classify("<m::Vec<u8> as Index<usize>>::index").is_none());
+        // `Vec` is not `Index` of any other trait, and `index` of a slice is not the
+        // `Vec` model.
+        assert!(classify("<Vec<u8> as MyIndex<usize>>::index").is_none());
+        assert!(classify("<[u8] as Index<usize>>::index").is_none());
         // `String`/`str` also spell `len` and have neither `vec::Vec` nor a bare
         // `Vec::` head, so they are not answered by the `Vec` model.
         assert!(classify("str::len").is_none());
@@ -5915,6 +6507,123 @@ mod tests {
         assert!(classify("core::num::<impl u8>::overflowing_shr").is_none());
         assert!(classify("core::num::<impl u8>::saturating_shl").is_none());
     }
+    /// Slice iteration classifies on the *path*, so a user iterator is refused.
+    ///
+    /// `for x in xs` desugars to `into_iter` + `next`; the two heads that must be
+    /// read are the slice/array and the cursor types (`slice::Iter`,
+    /// `array::IntoIter`). A user `struct Slice`/`Iter` with the same method tails
+    /// must not be answered by the model, so each is checked as a near miss.
+    #[test]
+    fn slice_iteration_classifies_and_a_user_iterator_does_not() {
+        assert_eq!(
+            classify("<&[u8] as IntoIterator>::into_iter"),
+            Some(Intrinsic::SliceIntoIter)
+        );
+        assert_eq!(
+            classify("<&[u8; 4] as IntoIterator>::into_iter"),
+            Some(Intrinsic::SliceIntoIter)
+        );
+        assert_eq!(
+            classify("<[u8; 4] as IntoIterator>::into_iter"),
+            Some(Intrinsic::SliceIntoIter)
+        );
+        assert_eq!(classify("core::slice::<impl [u8]>::iter"), Some(Intrinsic::SliceIntoIter));
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::next"),
+            Some(Intrinsic::SliceNext)
+        );
+        assert_eq!(
+            classify("<std::array::IntoIter<u8, 2> as Iterator>::next"),
+            Some(Intrinsic::SliceNext)
+        );
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as IntoIterator>::into_iter"),
+            Some(Intrinsic::SliceIntoIter)
+        );
+        // A user type spelled `Iter`/`Slice` (a module-qualified head) is refused.
+        assert!(classify("<m::Slice<u8> as IntoIterator>::into_iter").is_none());
+        assert!(classify("<m::Iter<u8> as Iterator>::next").is_none());
+        // The range desugaring's `next` is still the range model, not this one.
+        assert_eq!(
+            classify("<std::ops::RangeInclusive<u32> as Iterator>::next"),
+            Some(Intrinsic::Range(RangeMethod::Next))
+        );
+        // The cursor-preserving `copied` adapter and the value consumers `count`/
+        // `sum`, on a slice iterator and on an adapter over one. `sum`'s tail
+        // carries its type argument.
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::copied::<'_, u8>"),
+            Some(Intrinsic::SliceCopied)
+        );
+        // `rev` reverses the cursor's direction; it is the same cursor trait call
+        // as `copied`, and the reversed cursor's terminals (`sum`/`count`/`last`/…)
+        // still classify because `is_cursor_ty` accepts the `Rev` adapter.
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::rev"),
+            Some(Intrinsic::SliceRev)
+        );
+        assert_eq!(
+            classify("<std::iter::Rev<std::slice::Iter<'_, u8>> as Iterator>::last"),
+            Some(Intrinsic::SliceIterLast)
+        );
+        // `skip`/`step_by` are cursor adapters too; their terminals still classify.
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::skip"),
+            Some(Intrinsic::SliceSkip)
+        );
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::step_by"),
+            Some(Intrinsic::SliceStepBy)
+        );
+        assert_eq!(
+            classify("<std::iter::StepBy<std::slice::Iter<'_, u8>> as Iterator>::count"),
+            Some(Intrinsic::SliceCount)
+        );
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::take"),
+            Some(Intrinsic::SliceTake)
+        );
+        assert_eq!(
+            classify("<std::iter::Take<std::slice::Iter<'_, u8>> as Iterator>::last"),
+            Some(Intrinsic::SliceIterLast)
+        );
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::fold"),
+            Some(Intrinsic::SliceFold)
+        );
+        assert_eq!(
+            classify("<Copied<std::slice::Iter<'_, u8>> as Iterator>::map::<u8, {closure@a}>"),
+            Some(Intrinsic::SliceMap)
+        );
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::filter::<{closure@a}>"),
+            Some(Intrinsic::SliceFilter)
+        );
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::count"),
+            Some(Intrinsic::SliceCount)
+        );
+        assert_eq!(
+            classify("<std::slice::Iter<'_, u8> as Iterator>::sum::<u8>"),
+            Some(Intrinsic::SliceSum)
+        );
+        assert_eq!(
+            classify("<Copied<std::slice::Iter<'_, u8>> as Iterator>::sum::<u8>"),
+            Some(Intrinsic::SliceSum)
+        );
+        assert_eq!(
+            classify("<std::array::IntoIter<u8, 3> as Iterator>::sum::<u8>"),
+            Some(Intrinsic::SliceSum)
+        );
+        // The identity `into_iter` on an adapter is still the cursor identity.
+        assert_eq!(
+            classify("<Copied<std::slice::Iter<'_, u8>> as IntoIterator>::into_iter"),
+            Some(Intrinsic::SliceIntoIter)
+        );
+        // A user adapter over a user iterator is refused.
+        assert!(classify("<m::Copied<m::Iter> as Iterator>::sum::<u8>").is_none());
+    }
+
     /// The module header's "what is modelled" list must match the tables below it.
     ///
     /// The header claimed `abs_diff`, `rotate_*` and `is_ascii_*` "remain absent"

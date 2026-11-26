@@ -670,6 +670,77 @@ fn eval_elem_id(id: &ElemId, read: &impl Fn(ElemRef) -> Option<Val>) -> Option<V
     }
 }
 
+/// A slice iterator's cursor: the base slice local and a concrete position.
+///
+/// `next` reads `base`'s element at `pos` and advances `pos`. The position is
+/// concrete on purpose -- it makes each iteration name a constant index, so the
+/// element is the same variable a contract's `s[k]` names, and a loop cut that
+/// would make it symbolic drops the cursor (refusing `next`) rather than reading
+/// an arbitrary element.
+#[derive(Clone, Copy, Debug)]
+struct IterState {
+    base: u32,
+    /// The next element's *base* position when not reversed; when reversed, the
+    /// distance from the end (`base index = len-1-pos`). Only `next`/`last`/`nth`
+    /// read the direction; `count`/`sum`/`max`/`min` are order-independent.
+    pos: u64,
+    /// `Iterator::rev`. Reverses which base index a sequence position names.
+    rev: bool,
+    /// `Iterator::step_by`'s stride (1 unless a `step_by` was applied).
+    step: u64,
+    /// `Iterator::take`'s absolute end (exclusive), or `None` for the slice's own
+    /// length. A `take` needs a constant length so the effective end is constant.
+    end: Option<u64>,
+    /// `Iterator::map`'s lazy element transform, or `None`.
+    map: Option<MapOp>,
+    /// `Iterator::filter`'s lazy element predicate, or `None`.
+    filter: Option<FilterOp>,
+    /// The `pos` when `Iterator::enumerate` was applied, so the yielded index is
+    /// `pos - enum_start` (0, 1, ... from the enumerate's own start) rather than the
+    /// raw slice position -- `skip(2).enumerate()` must yield index 0 first.
+    enum_start: Option<u64>,
+    /// Whether a `take` cap was applied while `rev` was *off* (`take(k).rev()`), so
+    /// the `rev` reverses the *taken forward prefix* (`hi-1-pos`) rather than the whole
+    /// slice (`len-1-pos`). `rev().take(k)` leaves this `false`.
+    taken_forward: bool,
+}
+
+impl IterState {
+    /// The base index a sequence position `p` names. Forward is `p`; a plain `rev`
+    /// (or `rev().take(k)`) is `n-1-p`; a `take(k).rev()` -- which reverses the *taken
+    /// forward prefix* -- is `hi-1-p`, where `hi` is the take cap. Without the last case
+    /// `take(k).rev()` would read the slice's suffix (a false proof).
+    fn base_of(&self, p: u64, n: u64) -> u64 {
+        if self.rev {
+            if self.taken_forward {
+                self.end.map_or(n, |e| e.min(n)).saturating_sub(1).saturating_sub(p)
+            } else {
+                n.saturating_sub(1).saturating_sub(p)
+            }
+        } else {
+            p
+        }
+    }
+}
+
+/// A `map` closure's transform: `|x| x <op> rhs` (or `rhs <op> x`), checked or
+/// `wrapping_*`.
+#[derive(Clone, Copy, Debug)]
+struct MapOp {
+    op: BinOp,
+    checked: bool,
+    rhs: u64,
+    rhs_left: bool,
+}
+
+/// A `filter` closure's predicate: `|x| x <op> rhs` (or `rhs <op> x`).
+#[derive(Clone, Copy, Debug)]
+struct FilterOp {
+    op: BinOp,
+    rhs: u64,
+    rhs_left: bool,
+}
+
 /// Local-to-symbolic environment, with side maps for aggregate parts.
 #[derive(Clone, Debug)]
 struct Env {
@@ -783,6 +854,17 @@ struct Env {
     /// distinct inputs per index, so `xs[0]` and `xs[1]` are two values and
     /// `xs[0] == xs[1]` is not provable; see `Indexed::elems`.
     indexed: BTreeMap<u32, Indexed>,
+    /// A slice iterator's cursor (`std::slice::Iter`), keyed by the local that
+    /// holds the iterator.
+    ///
+    /// `for x in xs` desugars to `into_iter` (which starts the cursor at position
+    /// 0 over the base slice local) and `next` (which reads the element at the
+    /// current position and advances it). The position is a *concrete* `u64`, so
+    /// each iteration names the element at a constant index -- the same element
+    /// variable a contract's `s[k]` names. A loop cut havocs the cursor (drops
+    /// it), so a `for` loop with an `invariant:` -- where the position would be
+    /// symbolic -- refuses `next` rather than reading an arbitrary element.
+    iters: BTreeMap<u32, IterState>,
     /// A local that carries a reference to a slice *element* (`slice::first`/`get`
     /// produce `Option<&T>`), mapped to the element it names: `(indexed local,
     /// index)`.
@@ -841,25 +923,36 @@ struct Env {
     /// spelling. Kept raw -- not decoded -- because the decode needs the argument
     /// count, which only the consuming call knows.
     tmpl_bytes: BTreeMap<u32, Vec<u8>>,
+    /// The value each `Box` local holds, keyed by the box local. `Box::<T>::new(v)`
+    /// stores `v` here; the compiler's null check reads a nonzero pointer token from
+    /// the box's field 0, and the deref `*b` reads this back.
+    boxed: BTreeMap<u32, Val>,
+    /// The pointer local a `Box`'s deref goes through, mapped to the box local.
+    /// `_3 = (_2.0) as *const u8` records `_3 -> _2`, so `*_3` reads `boxed[_2]`.
+    box_refs: BTreeMap<u32, u32>,
     /// The string pieces of each `promoted` constant, copied from
     /// [`crate::mir::parse::MirProgram::promoted_strs`] so `eval_rvalue` can read
     /// a `const NAME::promoted[0]` operand without the whole program in hand.
     promoted: BTreeMap<String, Vec<String>>,
-    /// The tracked length of a `Vec<T>` local, keyed by local.
-    ///
-    /// A `Vec`'s fields are not printed by the dump, so the only thing the model
-    /// can hold is the length `Vec::new`/`Vec::push` set and `Vec::len` reads.
-    /// The element type is not stored: no element operation is modelled, so
-    /// there is nothing to size.
-    vec_len: BTreeMap<u32, Var>,
 }
 
-/// A modelled value with a length and elements: a slice or an array.
+/// A modelled value with a length and elements: a slice, an array, or a `Vec`.
 #[derive(Clone, Debug)]
 struct Indexed {
     /// The length. A symbolic input for a slice, the type's constant for an
     /// array; the executor only needs it to be a word of `usize` width.
     len: Var,
+    /// Whether the length can change (`Vec::push`/`pop`) rather than being fixed
+    /// by the type or by the caller (`[T; N]`, `&[T]`).
+    ///
+    /// This is what a `Vec` adds to the slice model, and it is load-bearing in two
+    /// places. The loop-header havoc must replace a mutable length with a fresh
+    /// `usize` -- a loop that pushes changes the length, and leaving the entry
+    /// length at the exit edge is a *false proof* (`ret == 0` for a real `ret == 3`,
+    /// the hole the length havoc exists for). A whole-value write must *drop* a
+    /// mutable length rather than poison it -- poisoning keeps the length, so
+    /// `v = other; v.len()` would read the old one.
+    len_mutable: bool,
     /// The width of one element, which is the *referent's* width (`u8` for
     /// `&[u8]` or `[u8; 4]`), not the length's. Taking it from `len` would make
     /// every element 64 bits wide and mis-size every read.
@@ -925,6 +1018,7 @@ impl Env {
             ref_origin: BTreeMap::new(),
             arg_source: BTreeMap::new(),
             indexed: BTreeMap::new(),
+            iters: BTreeMap::new(),
             slice_elem_ref: BTreeMap::new(),
 
             whole_writes: BTreeSet::new(),
@@ -934,8 +1028,9 @@ impl Env {
             strs: BTreeMap::new(),
             piece_sets: BTreeMap::new(),
             tmpl_bytes: BTreeMap::new(),
+            boxed: BTreeMap::new(),
+            box_refs: BTreeMap::new(),
             promoted: BTreeMap::new(),
-            vec_len: BTreeMap::new(),
         }
     }
 
@@ -1389,11 +1484,13 @@ impl Env {
             self.payloads.iter().filter(|((l, _), _)| *l == s).map(|((_, k), v)| (*k, *v)).collect();
         let disc = self.discriminants.get(&s).copied();
         let indexed = self.indexed.get(&s).cloned();
-        // A tracked `Vec` length is part of the value too: `let w = v` moves the
-        // vector, so the destination has to inherit the length or `w.len()` reads a
-        // receiver with no modelled length. The length is a `usize` word, so it
-        // copies like a part rather than being dropped.
-        let vec_len = self.vec_len.get(&s).copied();
+        // A slice-iterator cursor is a part of the local too: `_4 = move _3` copies
+        // the iterator out of the temp, and without carrying the cursor the later
+        // `next` would find none and refuse.
+        let iter = self.iters.get(&s).copied();
+        // A `Vec` is an `indexed` entry like a slice, so a move (`let w = v`)
+        // carries its length *and* elements with the `indexed` copy above -- the
+        // same transfer a slice's store gets. Nothing extra is needed here.
         // Nested paths are parts too, keyed by the local *and* the chain. A copy
         // that moved only the single-field parts would leave `c`'s own `c.i.v`
         // seed in place after `c = d`, so a later `c.i.v` would read `c`'s
@@ -1431,7 +1528,7 @@ impl Env {
             || !elem_parts.is_empty()
             || disc.is_some()
             || indexed.is_some()
-            || vec_len.is_some();
+            || iter.is_some();
         self.forget_parts(dst);
         for (k, chain, v) in elem_parts {
             self.elem_parts.insert((dst, k, chain), v);
@@ -1457,8 +1554,8 @@ impl Env {
         if let Some(ix) = indexed {
             self.indexed.insert(dst, ix);
         }
-        if let Some(len) = vec_len {
-            self.vec_len.insert(dst, len);
+        if let Some(it) = iter {
+            self.iters.insert(dst, it);
         }
         any
     }
@@ -1673,6 +1770,11 @@ impl Env {
                             };
                             return eval_elem_id(id, &read).unwrap_or(Val::Unknown);
                         }
+                        // A `Box`'s deref: `_3` was built from a box's field 0, so
+                        // `*_3` is the boxed value the executor stored at `new`.
+                        if let Some(&boxl) = self.box_refs.get(&p.local) {
+                            return self.boxed.get(&boxl).copied().unwrap_or(Val::Unknown);
+                        }
                     }
                     if i != 0 || !self.deref_ok.contains_key(&p.local) {
                         return Val::Unknown;
@@ -1709,6 +1811,31 @@ impl Env {
         // read of the target meet in one store.
         let resolved = self.resolve(p);
         let p = &resolved;
+        // A write through a `Box` pointer: `*b = v` lowers to `(*_b) = v`, and `*b`
+        // reads `boxed[boxl]` (see the read arm above). Without this arm the write was
+        // dropped and a later `*b` returned the value the box held at `new` -- a stale
+        // read, so `requires: *b == 0` / `ensures: ret == 0` was proved against a body
+        // that returns 7.
+        if p.proj.as_slice() == [Proj::Deref] {
+            if let Some(&boxl) = self.box_refs.get(&p.local) {
+                // Keep the box's field-0 pointer token across the forget: `forget_parts`
+                // would drop it, and the read's own null check (`(_1.0) as *const u8` ->
+                // `Eq(.., 0)`) then reads `Unknown`, so the read is `unmodelled assert`.
+                // The token is the box's *pointer*, not a part of the boxed value.
+                // Forget the *old* boxed value's parts and value first, THEN store the
+                // new one: `forget_parts` also does `boxed.remove(boxl)`, so inserting
+                // before it erased the value the write just produced (`*b = 7` left the
+                // box empty and a later `*b` read `Unknown`). The field-0 pointer token
+                // is restored after, since `forget_parts` drops it too.
+                let tok = self.fields.get(&(boxl, 0)).copied();
+                self.forget_parts(boxl);
+                self.boxed.insert(boxl, v);
+                if let Some(t) = tok {
+                    self.fields.insert((boxl, 0), t);
+                }
+                return;
+            }
+        }
         // A write to the *whole* referent through a reference -- `(*_1) = v`, how
         // `*v = 5` lowers for `v: &mut u8` -- is a whole-place write to `_1`,
         // because `Ty::Ref` is modelled as its referent (`_1` *is* the value
@@ -2001,16 +2128,21 @@ impl Env {
         self.payloads.retain(|(l, _), _| *l != local);
         self.discriminants.remove(&local);
         self.tag_widths.remove(&local);
-        // A tracked `Vec` length is part of the value the header havocs, so it is
-        // replaced by a fresh `usize`. Leaving it at the entry length would let the
-        // *exit* edge read a length the loop no longer has: an inductive loop that
-        // pushes three times would prove `ret == 0` for the real `ret == 3` -- a
-        // false proof. The fresh variable is the "arbitrary length at the header"
-        // the invariant did not constrain.
-        if let Some(len) = self.vec_len.get_mut(&local) {
-            *len = smt::var(USIZE_WIDTH);
-        }
+        // A slice-iterator cursor over this local is dropped: the header is an
+        // arbitrary state, so the position is no longer a concrete index, and a
+        // `next` that read an arbitrary element would be a wrong value.
+        self.iters.retain(|l, it| *l != local && it.base != local);
+        // A mutable-length container (`Vec`) has its length refreshed to a fresh
+        // `usize`, and its elements dropped. The header is an arbitrary state, so a
+        // loop that pushes must not let the *exit* edge read the entry length: an
+        // inductive loop that pushes three times would otherwise prove `ret == 0`
+        // for the real `ret == 3`. A slice's or array's length is fixed by the
+        // caller or the type, so it is left alone -- refreshing it would be a
+        // needless loss of information.
         if let Some(s) = self.indexed.get_mut(&local) {
+            if s.len_mutable {
+                s.len = smt::var(USIZE_WIDTH);
+            }
             s.elems.clear();
             s.poisoned = true;
         }
@@ -2034,16 +2166,24 @@ impl Env {
         self.strs.remove(&local);
         self.piece_sets.remove(&local);
         self.tmpl_bytes.remove(&local);
+        self.boxed.remove(&local);
+        self.box_refs.remove(&local);
+        self.iters.remove(&local);
         // A `Vec` local overwritten as a whole place is no longer the value the
-        // length was tracking, so the length is dropped rather than kept: a
-        // `v = other_vec` must not leave the old length readable.
-        self.vec_len.remove(&local);
-        if let Some(s) = self.indexed.get_mut(&local) {
-            s.elems.clear();
-            // The seeded elements are gone, so a later read must not find them.
-            // Poisoning is the honest state: the store cannot say what the
-            // elements are now, only that it does not know.
-            s.poisoned = true;
+        // length and elements were tracking, so the whole entry is dropped rather
+        // than kept: `v = other_vec` must not leave the old length readable. A
+        // slice's entry is kept but poisoned -- its length is fixed by the caller,
+        // so only its elements became unknown.
+        match self.indexed.get(&local) {
+            Some(s) if s.len_mutable => {
+                self.indexed.remove(&local);
+            }
+            Some(_) => {
+                let s = self.indexed.get_mut(&local).expect("checked above");
+                s.elems.clear();
+                s.poisoned = true;
+            }
+            None => {}
         }
     }
 
@@ -2826,7 +2966,7 @@ pub fn verify_fn<F>(
     rec: Option<Recursion>,
 ) -> MirReport
 where
-    F: Fn(Option<Var>, &[(u32, Var)], &[(u64, Var)], &[(u32, Var)]) -> Result<Pred, String>,
+    F: Fn(Option<Var>, &[(u32, Var)], &[(u64, Var)], &[(u32, Var)], &[u32]) -> Result<Pred, String>,
 {
     let mut report = MirReport { function: f.name.clone(), ..Default::default() };
 
@@ -2934,10 +3074,18 @@ where
         // The two are separate lists because they mean different things: the first
         // is proved, the second is a fact about the type.
         let slice_steps = seeds.slice_steps.iter().find(|(l, _)| *l == local).map(|(_, n)| *n);
+        // A `Vec` argument's length is mutable (`push`/`pop` change it); a slice's
+        // or an array's is fixed. The type is the only place the distinction lives,
+        // so it is read here rather than carried in a second seed list.
+        let len_mutable = f
+            .ty_of(local)
+            .map(|t| matches!(t.referent(), Ty::Other(n) if vec_elem_ty_loose(n).is_some()))
+            .unwrap_or(false);
         env.indexed.insert(
             local,
             Indexed {
                 len,
+                len_mutable,
                 elem_w,
                 elem_signed,
                 elems: BTreeMap::new(),
@@ -5676,6 +5824,1130 @@ fn slice_element(
     Ok(Vec::new())
 }
 
+/// The context a slice-iterator call needs beyond its receiver: the function (for
+/// the destination's type), the precondition's pins (for `sum`'s length), and the
+/// current path (for a `sum` step's overflow obligation). Bundled so the helper
+/// stays within clippy's argument limit.
+struct IterCall<'a> {
+    f: &'a MirFn,
+    pins: &'a [(u32, u64)],
+    path: Pred,
+    /// The call's full argument list, so `nth(k)` can read its constant offset.
+    args: &'a [Operand],
+    /// The whole program, so a `fold`'s reducer closure can be resolved to its
+    /// `MirFn` (a closure body is a separate function in the dump).
+    prog: &'a MirProgram,
+}
+
+/// Model `for x in xs` over a slice: `into_iter`/`iter` starts a cursor, `next`
+/// advances it and yields `Option<&T>`.
+///
+/// The cursor is a concrete position into the *base* slice local, so each
+/// iteration names the element at a constant index -- the same element variable a
+/// contract's `s[k]` names, so a contract about `xs[0] + xs[1]` and a body that
+/// sums `for &x in xs` are about the same values. `next`'s `None` guard is the
+/// slice's own length variable (`pos >= len`), so it cannot disagree with
+/// `len`/`is_empty`/`first`. A cursor whose base is not a modelled slice (a
+/// havoced iterator, a user iterator) is refused rather than read as an arbitrary
+/// element.
+///
+/// `copied` is the identity on the cursor; `count` is `len - pos`; `sum` folds the
+/// remaining elements with a checked `+` (see [`slice_sum`]).
+/// Resolve a `fold`'s reducer operand to the `MirFn` it names.
+///
+/// A non-capturing closure prints as `const ZeroSized: {closure@FILE:L:C: L:C}`,
+/// so it is matched to the `MirFn` whose first argument type is exactly that
+/// closure type (rustc prints the closure's own `&mut {closure@…}` argument with
+/// the same string). A function item prints as a bare name and is matched on its
+/// tail. An ambiguous or unrecognised operand is refused -- a wrong reducer is a
+/// wrong value.
+fn closure_fn<'a>(prog: &'a MirProgram, arg: Option<&Operand>) -> Option<&'a MirFn> {
+    let Operand::Const(Const::Other(s)) = arg? else {
+        return None;
+    };
+    if let Some(rest) = s.split("ZeroSized: {closure@").nth(1) {
+        let ty = format!("{{closure@{rest}");
+        return prog.fns.iter().find(|f| {
+            f.arg_locals
+                .first()
+                .and_then(|&l| f.ty_of(l))
+                .is_some_and(|t| match t {
+                    Ty::Ref(inner) => matches!(**inner, Ty::Other(ref o) if *o == ty),
+                    Ty::Other(o) => *o == ty,
+                    _ => false,
+                })
+        });
+    }
+    let tail = s.rsplit("::").next().unwrap_or(s.as_str());
+    let mut hits = prog
+        .fns
+        .iter()
+        .filter(|f| f.name == *s || f.name.rsplit("::").next() == Some(tail));
+    let first = hits.next()?;
+    // Refuse an ambiguous tail rather than pick one.
+    if hits.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
+/// The reducer a `fold` closure denotes: `(op, checked)` for `|acc, x| acc <op> x`.
+/// Only a checked binary op (with its overflow `assert`) or a `wrapping_*` call on
+/// `(_2, _3)` in that order is accepted; anything else is refused.
+/// How many arithmetic operations or call terminators the closure performs. The
+/// iterator model reads *one* operation as the whole closure; a body with more
+/// (`|x| { let y = x + 1; y * 2 }`) would be modelled as its first op, so only a
+/// single-operation body is accepted.
+fn closure_op_count(f: &MirFn) -> usize {
+    let mut n = 0;
+    for b in &f.blocks {
+        for st in &b.stmts {
+            if matches!(st, Stmt::Assign(_, Rvalue::Binary(..) | Rvalue::CheckedBinary(..))) {
+                n += 1;
+            }
+        }
+        if matches!(&b.term, Term::Call { .. }) {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn closure_binop(f: &MirFn) -> Option<(BinOp, bool)> {
+    if f.arg_locals.len() != 3 || closure_op_count(f) != 1 {
+        return None;
+    }
+    let (acc, x) = (f.arg_locals[1], f.arg_locals[2]);
+    let is_arg = |o: &Operand, l: u32| {
+        matches!(o, Operand::Copy(p) | Operand::Move(p) if p.local == l && p.proj.is_empty())
+    };
+    for b in &f.blocks {
+        for st in &b.stmts {
+            if let Stmt::Assign(_, Rvalue::CheckedBinary(op, a, c)) = st {
+                if is_arg(a, acc) && is_arg(c, x) {
+                    return Some((*op, true));
+                }
+            }
+        }
+        if let Term::Call { callee: Callee::Name(n), args, .. } = &b.term {
+            if let (Some(a), Some(c)) = (args.first(), args.get(1)) {
+                if is_arg(a, acc) && is_arg(c, x) {
+                    let op = match n.rsplit("::").next().unwrap_or(n.as_str()) {
+                        "wrapping_add" => BinOp::Add,
+                        "wrapping_sub" => BinOp::Sub,
+                        "wrapping_mul" => BinOp::Mul,
+                        _ => continue,
+                    };
+                    return Some((op, false));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A constant operand's value, if it is a numeric literal.
+fn const_val(o: &Operand) -> Option<u64> {
+    match o {
+        Operand::Const(Const::UInt(v, _)) => Some(*v as u64),
+        _ => None,
+    }
+}
+
+/// The local a `Copy`/`Move` operand reads, treating one leading `Deref` as
+/// transparent (a reference is modelled as its referent).
+fn arg_local(o: &Operand) -> Option<u32> {
+    match o {
+        Operand::Copy(p) | Operand::Move(p)
+            if p.proj.is_empty() || (p.proj.len() == 1 && matches!(p.proj[0], Proj::Deref)) =>
+        {
+            Some(p.local)
+        }
+        _ => None,
+    }
+}
+
+/// Follow `Use` assignments so a local that is only copied from another (the
+/// `_3 = copy (*_2)` indirection a closure body introduces) resolves to its source.
+fn assign_source(f: &MirFn, local: u32) -> Option<Operand> {
+    for b in &f.blocks {
+        for st in &b.stmts {
+            if let Stmt::Assign(pl, Rvalue::Use(src)) = st {
+                if pl.local == local && pl.proj.is_empty() {
+                    return Some(src.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve an operand through `Use` copies (deref-transparent) to the constant or
+/// argument it ultimately reads.
+fn resolve_operand(f: &MirFn, o: &Operand) -> Operand {
+    let mut cur = o.clone();
+    for _ in 0..32 {
+        let Some(l) = arg_local(&cur) else {
+            return cur;
+        };
+        match assign_source(f, l) {
+            Some(src) => cur = src,
+            None => return cur,
+        }
+    }
+    cur
+}
+
+/// Read a `map` closure `|x| x <op> k` (or `k <op> x`), checked or `wrapping_*`.
+fn closure_map(f: &MirFn) -> Option<MapOp> {
+    if f.arg_locals.len() != 2 || closure_op_count(f) != 1 {
+        return None;
+    }
+    let x = f.arg_locals[1];
+    let op_from = |op: BinOp, a: &Operand, b: &Operand| -> Option<MapOp> {
+        let (ra, rb) = (resolve_operand(f, a), resolve_operand(f, b));
+        if arg_local(&ra) == Some(x) {
+            const_val(&rb).map(|rhs| MapOp { op, checked: true, rhs, rhs_left: false })
+        } else if arg_local(&rb) == Some(x) {
+            const_val(&ra).map(|rhs| MapOp { op, checked: true, rhs, rhs_left: true })
+        } else {
+            None
+        }
+    };
+    for b in &f.blocks {
+        for st in &b.stmts {
+            if let Stmt::Assign(_, Rvalue::CheckedBinary(op, a, c)) = st {
+                if let Some(m) = op_from(*op, a, c) {
+                    return Some(m);
+                }
+            }
+        }
+        if let Term::Call { callee: Callee::Name(n), args, .. } = &b.term {
+            if let (Some(a), Some(c)) = (args.first(), args.get(1)) {
+                let op = match n.rsplit("::").next().unwrap_or(n.as_str()) {
+                    "wrapping_add" => BinOp::Add,
+                    "wrapping_sub" => BinOp::Sub,
+                    "wrapping_mul" => BinOp::Mul,
+                    _ => continue,
+                };
+                if let Some(m) = op_from(op, a, c) {
+                    return Some(MapOp { checked: false, ..m });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read a `filter` closure `|x| x <op> k` (or `k <op> x`) as a predicate.
+fn closure_filter(f: &MirFn) -> Option<FilterOp> {
+    if f.arg_locals.len() != 2 || closure_op_count(f) != 1 {
+        return None;
+    }
+    let x = f.arg_locals[1];
+    for b in &f.blocks {
+        for st in &b.stmts {
+            if let Stmt::Assign(_, Rvalue::Binary(op, a, c)) = st {
+                let (ra, rb) = (resolve_operand(f, a), resolve_operand(f, c));
+                if arg_local(&ra) == Some(x) {
+                    if let Some(rhs) = const_val(&rb) {
+                        return Some(FilterOp { op: *op, rhs, rhs_left: false });
+                    }
+                } else if arg_local(&rb) == Some(x) {
+                    if let Some(rhs) = const_val(&ra) {
+                        return Some(FilterOp { op: *op, rhs, rhs_left: true });
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Refuse a terminal that reads base elements when the cursor still carries a lazy
+/// `map`/`filter` it does not apply, so `map(..).next()` is a refusal rather than the
+/// untransformed element (a wrong value).
+fn reject_adapters(it: &IterState, name: &str) -> Result<(), String> {
+    if it.map.is_some() || it.filter.is_some() {
+        return Err(format!("`{name}` after `map`/`filter` is not modelled"));
+    }
+    Ok(())
+}
+
+fn slice_iter(
+    name: &str,
+    op: intrinsics::Intrinsic,
+    receiver: &Place,
+    dest: &Place,
+    env: &mut Env,
+    cx: &IterCall<'_>,
+) -> Result<Vec<Obligation>, String> {
+    use intrinsics::Intrinsic;
+    let recv = env.pointee(receiver);
+    match op {
+        Intrinsic::SliceIntoIter => {
+            // `for x in xs.iter()` calls `into_iter` on the `Iter` itself, which is
+            // the identity: carry the existing cursor to the destination.
+            if let Some(it) = env.iters.get(&recv.local).copied() {
+                env.iters.insert(dest.local, it);
+                return Ok(Vec::new());
+            }
+            let Some(s) = env.indexed.get(&recv.local) else {
+                return Err(format!("`{name}` on a receiver whose elements are not modelled"));
+            };
+            if s.elem_w == 0 {
+                return Err(format!("`{name}` on a slice whose element width is not modelled"));
+            }
+            env.iters.insert(dest.local, IterState { base: recv.local, pos: 0, rev: false, step: 1, end: None, map: None, filter: None, enum_start: None, taken_forward: false });
+            Ok(Vec::new())
+        }
+        // `copied()` wraps the cursor in an adapter that yields `T` instead of `&T`.
+        // A reference is modelled as its referent, so the cursor is unchanged -- the
+        // adapter only carries it to the destination. A receiver with no cursor is a
+        // non-modelled iterator, refused rather than guessed.
+        Intrinsic::SliceCopied => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            // `enumerate()` rides this arm (its cursor is unchanged), but it records
+            // where its own index count starts, so `skip(2).enumerate()` yields index
+            // 0 first rather than the raw slice position 2.
+            let next = if name.contains("enumerate") {
+                IterState { enum_start: Some(it.pos), ..it }
+            } else {
+                it
+            };
+            env.iters.insert(dest.local, next);
+            Ok(Vec::new())
+        }
+        // `rev()` flips the cursor's direction. `rev().rev()` on a *plain* cursor is the
+        // identity; `take(k).rev().rev()` cancels back to the forward `take(k)`.
+        //
+        // The cursor stores one `pos`, which means a skipped count forward but a
+        // distance-from-the-end under `rev`. So two orders cannot be represented and are
+        // refused rather than mis-modelled:
+        //   * `skip(n).rev()` -- `pos` is the skipped count, which `rev` would read as a
+        //     distance from the end (so it read the wrong element, or a window edge).
+        //   * `rev().take(k).rev()` -- the take capped the *reversed* prefix, which
+        //     cancelling to a forward take would silently turn into the forward prefix.
+        Intrinsic::SliceRev => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            if it.rev {
+                // Turning `rev` off.
+                if it.end.is_some() && !it.taken_forward {
+                    return Err(format!(
+                        "`{name}` after a `take` on a reversed cursor is not modelled"
+                    ));
+                }
+                // A `skip` on the reversed cursor advanced `pos` relative to the
+                // *reversed* sequence; flipping back to forward with the same `pos`
+                // would read from the front, outside the window --
+                // `take(3).rev().skip(1).rev()` read `xs[1]` = 20 where the real next
+                // element is 10 (a false proof). Only a `rev` with no intervening skip
+                // (`pos == 0`) cancels cleanly.
+                if it.pos > 0 {
+                    return Err(format!(
+                        "`{name}` after a `skip` on a reversed cursor is not modelled"
+                    ));
+                }
+                // `take(k).rev().rev()` -> forward `take(k)` (keep `taken_forward`, so a
+                // further `rev` is `take(k).rev()` again, not `rev().take(k)`).
+                env.iters.insert(dest.local, IterState { rev: false, ..it });
+            } else {
+                // Turning `rev` on: a preceding `skip` cannot be represented.
+                if it.pos > 0 {
+                    return Err(format!(
+                        "`{name}` after a `skip` is not modelled (a skipped cursor cannot be reversed)"
+                    ));
+                }
+                env.iters.insert(dest.local, IterState { rev: true, ..it });
+            }
+            Ok(Vec::new())
+        }
+        // `skip(n)` advances the position by `n`; `step_by(n)` sets the stride.
+        // Both read a *constant* `n` and carry the cursor to the destination.
+        Intrinsic::SliceSkip | Intrinsic::SliceStepBy => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            let Some(n) = constant_operand(cx.args.get(1), env) else {
+                return Err(format!("`{name}` needs a constant argument"));
+            };
+            let next = if matches!(op, Intrinsic::SliceSkip) {
+                // `skip(n)` skips n *yielded* elements, each `step` apart in the base
+                // index -- so the base advance is `n*step`, not `n` (which under-skips
+                // after `step_by`). With `step == 1` (skip before step_by) it is `n`.
+                IterState { pos: it.pos.saturating_add(n.saturating_mul(it.step)), ..it }
+            } else {
+                if n == 0 {
+                    return Err(format!("`{name}` with a zero step is a panic and is not modelled"));
+                }
+                IterState { step: it.step.saturating_mul(n), ..it }
+            };
+            env.iters.insert(dest.local, next);
+            Ok(Vec::new())
+        }
+        // `take(n)` caps the effective end at `pos + n`. It needs a constant length
+        // so the end is a constant (a symbolic length would make it symbolic).
+        Intrinsic::SliceTake => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            let Some(k) = constant_operand(cx.args.get(1), env) else {
+                return Err(format!("`{name}` needs a constant argument"));
+            };
+            let const_len = env
+                .indexed
+                .get(&it.base)
+                .is_some_and(|s| iterator_const_len(s, cx.pins).is_some());
+            if !const_len {
+                return Err(format!("`{name}` on a slice whose length is not a constant"));
+            }
+            // `take(k)` takes k *yielded* elements, each `step` apart, so the base cap is
+            // `pos + k*step` -- a bare `pos + k` under-counts after `step_by`.
+            let cap = it.pos.saturating_add(k.saturating_mul(it.step));
+            let end = Some(it.end.map_or(cap, |e| e.min(cap)));
+            // A `take` while `rev` is *off* caps the forward prefix; `rev` then reverses
+            // that prefix (`take(k).rev()`). A `take` while `rev` is *on* caps the reversed
+            // prefix (`rev().take(k)`). `base_of` reads this flag.
+            let taken_forward = !it.rev;
+            env.iters.insert(dest.local, IterState { end, taken_forward, ..it });
+            Ok(Vec::new())
+        }
+        // `fold(init, f)` folds a modelled reducer closure over the cursor:
+        // `acc = init; acc = f(acc, x)` per element. A *checked* reducer raises a
+        // reachable-panic obligation per step (exactly as `sum` does for `+`); a
+        // `wrapping_*` reducer does not. Needs a constant length (a fixed addend
+        // count) and a constant `init`.
+        Intrinsic::SliceFold => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            reject_adapters(&it, name)?;
+            if it.rev {
+                return Err(format!("`{name}` over a reversed iterator is not modelled"));
+            }
+            let Some(s) = env.indexed.get(&it.base) else {
+                return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+            };
+            let (elem_w, elem_signed) = (s.elem_w, s.elem_signed);
+            let Some(n) = iterator_const_len(s, cx.pins) else {
+                return Err(format!(
+                    "`{name}` over a slice whose length is not a constant (write \
+                     `requires: <slice>.len() == N`)"
+                ));
+            };
+            if n > MAX_SUM_LEN {
+                return Err(format!("`{name}` over {n} elements is past the {MAX_SUM_LEN}-element limit"));
+            }
+            let hi = it.end.map_or(n, |e| e.min(n));
+            let Some(init) = constant_operand(cx.args.get(1), env) else {
+                return Err(format!("`{name}` needs a constant initial accumulator"));
+            };
+            let Some(closure) = closure_fn(cx.prog, cx.args.get(2)) else {
+                return Err(format!("`{name}` over a reducer closure that is not modelled"));
+            };
+            let Some((op, checked)) = closure_binop(closure) else {
+                return Err(format!("`{name}` over a reducer closure this frontend does not model"));
+            };
+            let sign = Sign::of_bool(elem_signed);
+            let mut acc = smt::word(init, elem_w);
+            let mut obligations = Vec::new();
+            let mut k = it.pos;
+            while k < hi {
+                let Some((elem, _)) = env.index_elem(it.base, k) else {
+                    return Err(format!("`{name}` on an iterator whose elements are not modelled"));
+                };
+                if checked {
+                    let Some(over) = overflow_pred(op, Val::Sym(acc, sign), Val::Sym(elem, sign), elem_w)
+                    else {
+                        return Err(format!("`{name}` overflow predicate is not modelled"));
+                    };
+                    obligations.push(Obligation {
+                        kind: ObligationKind::Panic { message: format!("`{name}` closure overflows") },
+                        verdict: find_obligation(smt::and(cx.path, over), cx.pins),
+                    });
+                }
+                let Val::Sym(v, _) = eval_binary(op, Val::Sym(acc, sign), Val::Sym(elem, sign), Some(elem_w))
+                else {
+                    return Err(format!("`{name}` closure step is not modelled"));
+                };
+                acc = v;
+                k += it.step;
+            }
+            env.set(dest, Val::Sym(acc, sign));
+            env.iters.remove(&recv.local);
+            Ok(obligations)
+        }
+        // `map(f)` / `filter(f)` are lazy: they set a transform/predicate on the
+        // cursor and carry it. The value terminals apply it (`sum` the transform,
+        // `count` the predicate); anything else is a refusal.
+        Intrinsic::SliceMap => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            // A second `map` (or a `map` after `filter`) would overwrite or mix adapters
+            // the consumers read one at a time -- `map(f).map(g)` was modelled as `g`
+            // alone (a false proof), so any second/mixed adapter is refused.
+            if it.map.is_some() || it.filter.is_some() {
+                return Err(format!("`{name}` after `map`/`filter` is not modelled"));
+            }
+            let Some(closure) = closure_fn(cx.prog, cx.args.get(1)) else {
+                return Err(format!("`{name}` over a closure that is not modelled"));
+            };
+            let Some(m) = closure_map(closure) else {
+                return Err(format!("`{name}` over a transform this frontend does not model"));
+            };
+            env.iters.insert(dest.local, IterState { map: Some(m), ..it });
+            Ok(Vec::new())
+        }
+        Intrinsic::SliceFilter => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            if it.map.is_some() || it.filter.is_some() {
+                return Err(format!("`{name}` after `map`/`filter` is not modelled"));
+            }
+            let Some(closure) = closure_fn(cx.prog, cx.args.get(1)) else {
+                return Err(format!("`{name}` over a closure that is not modelled"));
+            };
+            let Some(fl) = closure_filter(closure) else {
+                return Err(format!("`{name}` over a predicate this frontend does not model"));
+            };
+            env.iters.insert(dest.local, IterState { filter: Some(fl), ..it });
+            Ok(Vec::new())
+        }
+        // `all(f)` / `any(f)`: a predicate fold to a `bool` -- `all` is the
+        // conjunction of `pred(x)` over the elements, `any` the disjunction. Reuses
+        // the `filter` predicate reader; needs a constant length.
+        Intrinsic::SliceAll | Intrinsic::SliceAny => {
+            let is_all = matches!(op, Intrinsic::SliceAll);
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            reject_adapters(&it, name)?;
+            let Some(s) = env.indexed.get(&it.base) else {
+                return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+            };
+            let (elem_w, elem_signed) = (s.elem_w, s.elem_signed);
+            let Some(n) = iterator_const_len(s, cx.pins) else {
+                return Err(format!("`{name}` over a slice whose length is not a constant"));
+            };
+            let hi = it.end.map_or(n, |e| e.min(n));
+            let Some(closure) = closure_fn(cx.prog, cx.args.get(1)) else {
+                return Err(format!("`{name}` over a closure that is not modelled"));
+            };
+            let Some(fl) = closure_filter(closure) else {
+                return Err(format!("`{name}` over a predicate this frontend does not model"));
+            };
+            let sign = Sign::of_bool(elem_signed);
+            let mut acc = smt::truth(is_all);
+            // A `rev` cursor yields base `n-1-pos`, `n-1-pos-step`, ...; read the
+            // reversed base so `rev().take(k).any/all` folds the reversed prefix, not the
+            // forward one (a false proof of the wrong verdict).
+            let base_of = |p: u64| it.base_of(p, n);
+            let mut k = it.pos;
+            while k < hi {
+                let Some((elem, _)) = env.index_elem(it.base, base_of(k)) else {
+                    return Err(format!("`{name}` on an iterator whose elements are not modelled"));
+                };
+                let pred = filter_pred(fl, elem, elem_w, sign)?;
+                acc = if is_all { smt::and(acc, pred) } else { smt::or(acc, pred) };
+                k += it.step;
+            }
+            env.set(dest, Val::Bool(acc));
+            env.iters.remove(&recv.local);
+            Ok(Vec::new())
+        }
+        Intrinsic::SliceNext => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!(
+                    "`{name}` on a receiver that is not a modelled slice iterator"
+                ));
+            };
+            reject_adapters(&it, name)?;
+            let (base, pos) = (it.base, it.pos);
+            let Some(s) = env.indexed.get(&base) else {
+                return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+            };
+            let (len, elem_w) = (s.len, s.elem_w);
+            // The base index the sequence position `pos` names: `pos` itself, or
+            // `len-1-pos` when reversed. `rev` needs a *constant* length so the
+            // index is a constant (a symbolic one would need the ite chain), and a
+            // symbolic-length reversed cursor is refused rather than guessed.
+            let (idx, tag) = if it.rev {
+                let Some(n) = iterator_const_len(s, cx.pins) else {
+                    return Err(format!(
+                        "`{name}` with `rev` on a slice whose length is not a constant"
+                    ));
+                };
+                let hi = it.end.map_or(n, |e| e.min(n));
+                if pos < hi {
+                    (it.base_of(pos, n), smt::word(intrinsics::SOME_TAG, 1))
+                } else {
+                    (0, smt::word(0, 1))
+                }
+            } else if let Some(e) = it.end {
+                // A `take` cursor: `Some` iff `pos < min(len, end)`, which is a
+                // constant because `take` needs a constant length.
+                let Some(n) = iterator_const_len(s, cx.pins) else {
+                    return Err(format!("`{name}` on a `take`d slice whose length is not a constant"));
+                };
+                let hi = e.min(n);
+                let tag = if pos < hi {
+                    smt::word(intrinsics::SOME_TAG, 1)
+                } else {
+                    smt::word(0, 1)
+                };
+                (pos, tag)
+            } else {
+                // `None` exactly when `pos >= len` (a concrete `pos`); `Some`
+                // otherwise. The tag is one bit like `first`/`get`.
+                (
+                    pos,
+                    smt::ite(
+                        smt::ule_const(len, pos),
+                        smt::word(0, 1),
+                        smt::word(intrinsics::SOME_TAG, 1),
+                    ),
+                )
+            };
+            let (elem, sign) = env.index_elem(base, idx).ok_or_else(|| {
+                format!("`{name}` on an iterator whose elements are not modelled")
+            })?;
+            env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+            if name.contains("Enumerate") {
+                // `Enumerate::next` yields `Option<(usize, &T)>`. The payload is a
+                // *tuple*: component 0 is the concrete index, component 1 the element.
+                // The body destructures it directly -- `((_7 as Some).0).0` and
+                // `((_7 as Some).0).1` -- so the two components go in the tuple store
+                // (`elems`, the same store a tuple literal writes and a `Field(j)`
+                // read falls back to), and the payload itself is `Val::Agg` so a
+                // whole-payload copy does not read a wrong single word. The element
+                // identity is recorded so `*((_7 as Some).0).1` resolves to `xs[pos]`.
+                env.elems.insert(
+                    (dest.local, 0),
+                    Val::Sym(
+                        smt::word(pos.saturating_sub(it.enum_start.unwrap_or(0)), 64),
+                        Sign::Unsigned,
+                    ),
+                );
+                env.elems.insert((dest.local, 1), Val::Sym(elem, sign));
+                env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Agg, 0);
+            } else {
+                env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(elem, sign), elem_w);
+            }
+            env.slice_elem_ref.insert(dest.local, ElemId::Leaf((base, idx)));
+            if let Some(it) = env.iters.get_mut(&recv.local) {
+                it.pos = it.pos.saturating_add(it.step);
+            }
+            Ok(Vec::new())
+        }
+        Intrinsic::SliceCount => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            let Some(s) = env.indexed.get(&it.base) else {
+                return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+            };
+            let len = s.len;
+            let w = smt::bits(len);
+            // `filter(pred).count()` counts the elements the predicate accepts.
+            if let Some(fl) = it.filter {
+                let (elem_w, elem_signed) = (s.elem_w, s.elem_signed);
+                let Some(n) = iterator_const_len(s, cx.pins) else {
+                    return Err(format!(
+                        "`{name}` over a filtered slice whose length is not a constant"
+                    ));
+                };
+                let hi = it.end.map_or(n, |e| e.min(n));
+                let sign = Sign::of_bool(elem_signed);
+                let mut acc = smt::word(0, w);
+                let mut k = it.pos;
+                while k < hi {
+                    let Some((elem, _)) = env.index_elem(it.base, k) else {
+                        return Err(format!("`{name}` on an iterator whose elements are not modelled"));
+                    };
+                    let pred = filter_pred(fl, elem, elem_w, sign)?;
+                    acc = smt::add(acc, smt::ite(pred, smt::word(1, w), smt::word(0, w)));
+                    k += it.step;
+                }
+                env.set(dest, Val::Sym(acc, Sign::Unsigned));
+                env.iters.remove(&recv.local);
+                return Ok(Vec::new());
+            }
+            let count = if it.step != 1 || it.end.is_some() {
+                // A stride or a `take` needs a *constant* length to count exactly.
+                let Some(n) = iterator_const_len(s, cx.pins) else {
+                    return Err(format!(
+                        "`{name}` with `step_by`/`take` on a slice whose length is not a constant"
+                    ));
+                };
+                let hi = it.end.map_or(n, |e| e.min(n));
+                let c = if it.pos < hi { (hi - 1 - it.pos) / it.step + 1 } else { 0 };
+                smt::word(c, w)
+            } else if it.pos == 0 {
+                // `len - pos`, guarded so a cursor already advanced past the end (a
+                // `next` that returned `None` still advances the position) counts
+                // zero rather than underflowing.
+                len
+            } else {
+                smt::ite(
+                    smt::ule_const(len, it.pos),
+                    smt::word(0, w),
+                    smt::sub(len, smt::word(it.pos, w)),
+                )
+            };
+            env.set(dest, Val::Sym(count, Sign::Unsigned));
+            // The iterator is consumed by value; its cursor has no further use.
+            env.iters.remove(&recv.local);
+            Ok(Vec::new())
+        }
+        Intrinsic::SliceSum => slice_sum(name, &recv, dest, env, cx),
+        Intrinsic::SliceIterLast => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            let Some(s) = env.indexed.get(&it.base) else {
+                return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+            };
+            let (len, elem_w) = (s.len, s.elem_w);
+            // An array's length is a constant, and a slice's is modelled here when the
+            // precondition pinned it (`requires: xs.len() == N`), so in either case the
+            // last element is the exact `s[n-1]` -- the same variable a contract's
+            // `xs[n-1]` names. Only a *symbolic*-length slice falls back to the single
+            // fresh `LAST_INDEX` variable, the same over-approximation `slice::last`
+            // uses. `None` exactly when the cursor has run out (`pos >= len`).
+            let (idx, tag) = if it.rev {
+                let Some(n) = iterator_const_len(s, cx.pins) else {
+                    return Err(format!(
+                        "`{name}` with `rev` on a slice whose length is not a constant"
+                    ));
+                };
+                // The remaining reversed sequence yields bases `n-1-pos`, `n-1-pos-step`,
+                // ...; `last()` is its final element, at the largest stride position below
+                // the effective end `hi`. A bare `pos` ignored `step` and the `take` cap,
+                // so `rev().take(2).last()` named the wrong element (a false refutation).
+                let hi = it.end.map_or(n, |e| e.min(n));
+                if it.pos < hi {
+                    let last_pos = it.pos + ((hi - 1 - it.pos) / it.step) * it.step;
+                    (it.base_of(last_pos, n), smt::word(intrinsics::SOME_TAG, 1))
+                } else {
+                    (0, smt::word(0, 1))
+                }
+            } else {
+                let const_n = iterator_const_len(s, cx.pins);
+                let idx = match const_n {
+                    Some(0) => 0,
+                    Some(n) if it.pos < it.end.map_or(n, |e| e.min(n)) => {
+                        // The last index the stride reaches from `pos`, capped by a
+                        // `take` end: `pos + m*step`, `m = (hi-1-pos)/step`.
+                        let hi = it.end.map_or(n, |e| e.min(n));
+                        it.pos + ((hi - 1 - it.pos) / it.step) * it.step
+                    }
+                    Some(_) => 0,
+                    None => LAST_INDEX,
+                };
+                // `Some` iff the cursor has a remaining element: `pos < hi`, with a
+                // `take` cap folded into `hi`. A constant length decides this; a
+                // symbolic one (no take cap) stays `len <= pos -> None`. A bare
+                // `pos < len` ignored the cap, so `take(0).last()` wrongly returned `Some`.
+                let tag = match const_n {
+                    Some(n) => {
+                        let hi = it.end.map_or(n, |e| e.min(n));
+                        if it.pos < hi {
+                            smt::word(intrinsics::SOME_TAG, 1)
+                        } else {
+                            smt::word(0, 1)
+                        }
+                    }
+                    None => smt::ite(
+                        smt::ule_const(len, it.pos),
+                        smt::word(0, 1),
+                        smt::word(intrinsics::SOME_TAG, 1),
+                    ),
+                };
+                (idx, tag)
+            };
+            let (elem, sign) = env.index_elem(it.base, idx).ok_or_else(|| {
+                format!("`{name}` on an iterator whose elements are not modelled")
+            })?;
+            env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+            env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(elem, sign), elem_w);
+            env.slice_elem_ref.insert(dest.local, ElemId::Leaf((it.base, idx)));
+            env.iters.remove(&recv.local);
+            Ok(Vec::new())
+        }
+        Intrinsic::SliceNth => {
+            let Some(it) = env.iters.get(&recv.local).copied() else {
+                return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+            };
+            let Some(s) = env.indexed.get(&it.base) else {
+                return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+            };
+            let (len, elem_w) = (s.len, s.elem_w);
+            let Some(k) = constant_operand(cx.args.get(1), env) else {
+                return Err(format!(
+                    "`{name}` with a non-constant offset is not modelled"
+                ));
+            };
+            let j = it.pos.saturating_add(k.saturating_mul(it.step));
+            let (idx, tag) = if it.rev || it.end.is_some() {
+                let Some(n) = iterator_const_len(s, cx.pins) else {
+                    return Err(format!(
+                        "`{name}` on a `rev`/`take`d slice whose length is not a constant"
+                    ));
+                };
+                let hi = it.end.map_or(n, |e| e.min(n));
+                if j < hi {
+                    let idx = it.base_of(j, n);
+                    (idx, smt::word(intrinsics::SOME_TAG, 1))
+                } else {
+                    (0, smt::word(0, 1))
+                }
+            } else {
+                (
+                    j,
+                    smt::ite(
+                        smt::ule_const(len, j),
+                        smt::word(0, 1),
+                        smt::word(intrinsics::SOME_TAG, 1),
+                    ),
+                )
+            };
+            let (elem, sign) = env.index_elem(it.base, idx).ok_or_else(|| {
+                format!("`{name}` on an iterator whose elements are not modelled")
+            })?;
+            env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+            env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(elem, sign), elem_w);
+            env.slice_elem_ref.insert(dest.local, ElemId::Leaf((it.base, idx)));
+            // `nth(k)` consumes the k+1 yielded elements, each `step` apart, so the next
+            // yield is at `j + step` -- a bare `j + 1` under-advances after `step_by`.
+            if let Some(it) = env.iters.get_mut(&recv.local) {
+                it.pos = j.saturating_add(it.step);
+            }
+            Ok(Vec::new())
+        }
+        Intrinsic::SliceExtreme(kind) => slice_extreme(name, &recv, dest, env, cx, kind),
+        _ => Err(format!("`{name}` is not a slice iterator method")),
+    }
+}
+
+/// The largest slice length `sum`/`max`/`min` will unroll. Each addend (or
+/// comparison) grows the term, so a length past this is refused rather than turned
+/// into a term the solver cannot hold.
+const MAX_SUM_LEN: u64 = 256;
+
+/// The bound a *symbolic*-length sum is unrolled to. The precondition must prove
+/// `<slice>.len() <= MAX_SYMBOLIC_LEN`; past it the shape is refused.
+const MAX_SYMBOLIC_LEN: u64 = 8;
+
+/// A constant `u64` from an operand: a literal, or a local the run pinned to a
+/// constant (a `smt::evaluate` of its value). `None` for anything symbolic, which
+/// the callers refuse rather than guess.
+fn constant_operand(o: Option<&Operand>, env: &Env) -> Option<u64> {
+    match o? {
+        Operand::Const(Const::UInt(v, _)) => u64::try_from(*v).ok(),
+        Operand::Copy(p) | Operand::Move(p) => match env.locals.get(&p.local) {
+            Some(Val::Sym(v, _)) => smt::evaluate(*v, |_| None),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The constant length of a slice/array cursor's base: an array's type length, or a
+/// slice whose length the precondition pinned (`requires: xs.len() == N`). `None`
+/// for a symbolic slice length, which `sum`/`max`/`min` refuse.
+fn iterator_const_len(s: &Indexed, pins: &[(u32, u64)]) -> Option<u64> {
+    if let Some(n) = s.fixed_len {
+        return Some(n);
+    }
+    // A *constant* length -- a `Vec` whose length folds to a literal -- is that value.
+    // `smt::index` on a constant returns its *value*, so looking a pin up by it would
+    // match an unrelated argument's pin (a one-element Vec modeled as empty). Only a
+    // *variable* length (a slice's symbolic length) can carry a pin.
+    if let Some(k) = smt::evaluate(s.len, |_| None) {
+        return Some(k);
+    }
+    if !smt::is_var(s.len) {
+        return None;
+    }
+    pins.iter().find(|(i, _)| *i == smt::index(s.len)).map(|(_, k)| *k)
+}
+
+/// `Iterator::max`/`Iterator::min` over a slice/array cursor: a fold of comparisons
+/// over the remaining elements.
+///
+/// Needs a *constant* length (the number of comparisons is the length). The payload
+/// is the extreme *value*; the element identity is a `Select` tree over the same
+/// elements, so a deref of a reference payload (`Option<&T>`) reads the same value a
+/// direct read of `Option<T>` does. `None` exactly when the cursor has run out.
+fn slice_extreme(
+    name: &str,
+    recv: &Place,
+    dest: &Place,
+    env: &mut Env,
+    cx: &IterCall<'_>,
+    kind: intrinsics::ExtremeKind,
+) -> Result<Vec<Obligation>, String> {
+    use intrinsics::ExtremeKind;
+    let Some(it) = env.iters.get(&recv.local).copied() else {
+        return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+    };
+    let Some(s) = env.indexed.get(&it.base) else {
+        return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+    };
+    let (len, elem_w, elem_signed) = (s.len, s.elem_w, s.elem_signed);
+    let Some(n) = iterator_const_len(s, cx.pins) else {
+        return Err(format!(
+            "`{name}` over a slice whose length is not a constant (write \
+             `requires: <slice>.len() == N`)"
+        ));
+    };
+    if n > MAX_SUM_LEN {
+        return Err(format!("`{name}` over {n} elements is past the {MAX_SUM_LEN}-element limit"));
+    }
+    let sign = Sign::of_bool(elem_signed);
+    let hi = it.end.map_or(n, |e| e.min(n));
+    let tag = if it.end.is_some() {
+        smt::word(if it.pos < hi { intrinsics::SOME_TAG } else { 0 }, 1)
+    } else {
+        smt::ite(
+            smt::ule_const(len, it.pos),
+            smt::word(0, 1),
+            smt::word(intrinsics::SOME_TAG, 1),
+        )
+    };
+    env.set_discriminant(dest.local, Val::Sym(tag, Sign::Unsigned));
+    if it.pos < hi {
+        // A `rev` cursor yields base `n-1-pos`, `n-1-pos-step`, ...; read the element at
+        // the reversed base so `rev().take(k).max()` folds the reversed prefix, not the
+        // forward one (a false refutation of the true extreme).
+        let base_of = |p: u64| it.base_of(p, n);
+        let (first, _) = env
+            .index_elem(it.base, base_of(it.pos))
+            .ok_or_else(|| format!("`{name}` on an iterator whose elements are not modelled"))?;
+        let mut acc = first;
+        let mut tree = ElemId::Leaf((it.base, base_of(it.pos)));
+        let mut k = it.pos + it.step;
+        while k < hi {
+            let idx_k = base_of(k);
+            let (elem, _) = env.index_elem(it.base, idx_k).ok_or_else(|| {
+                format!("`{name}` on an iterator whose elements are not modelled")
+            })?;
+            // `keep` is "the running extreme beats the new element", so the `ite`
+            // keeps `acc` when true and takes `elem` otherwise -- and the `Select`
+            // tree picks the same branch, so the payload and a deref of it agree.
+            let keep = match kind {
+                ExtremeKind::Max => {
+                    if elem_signed {
+                        smt::slt(elem, acc)
+                    } else {
+                        smt::ult(elem, acc)
+                    }
+                }
+                ExtremeKind::Min => {
+                    if elem_signed {
+                        smt::slt(acc, elem)
+                    } else {
+                        smt::ult(acc, elem)
+                    }
+                }
+            };
+            acc = smt::ite(keep, acc, elem);
+            tree = ElemId::Select(keep, Box::new(tree), Box::new(ElemId::Leaf((it.base, idx_k))));
+            k += it.step;
+        }
+        env.set_payload(dest.local, intrinsics::SOME_TAG, Val::Sym(acc, sign), elem_w);
+        env.slice_elem_ref.insert(dest.local, tree);
+    } else {
+        // Empty remaining: `None`, and the payload is never read.
+        env.set_payload(
+            dest.local,
+            intrinsics::SOME_TAG,
+            Val::Sym(smt::word(0, elem_w), sign),
+            elem_w,
+        );
+    }
+    env.iters.remove(&recv.local);
+    Ok(Vec::new())
+}
+
+/// `Iterator::sum::<T>` over a slice/array cursor: `s[pos] + ... + s[len-1]`.
+///
+/// The number of addends is the length, so this is modelled only when that length
+/// is a *constant* -- an array's type length, or a slice whose length the
+/// precondition pinned (`requires: xs.len() == N`). A symbolic length has no fixed
+/// number of addends, so it is refused. Each step is a checked `+`: `sum` uses
+/// `Add::add`, which panics on overflow in a debug build, so each partial sum
+/// raises a reachable-panic obligation -- a model that summed with a silent wrap
+/// would hide a panic, which this frontend must never do.
+/// Apply a `map` transform to one element, returning the mapped value and any
+/// overflow obligation the transform itself raises.
+fn apply_map(
+    m: MapOp,
+    elem: Var,
+    w: u8,
+    sign: Sign,
+    path: Pred,
+    pins: &[(u32, u64)],
+) -> Result<(Var, Vec<Obligation>), String> {
+    let rhs = smt::word(m.rhs, w);
+    let (a, b) = if m.rhs_left {
+        (Val::Sym(rhs, sign), Val::Sym(elem, sign))
+    } else {
+        (Val::Sym(elem, sign), Val::Sym(rhs, sign))
+    };
+    let mut obs = Vec::new();
+    if m.checked {
+        let Some(over) = overflow_pred(m.op, a, b, w) else {
+            return Err("`map` overflow predicate is not modelled".into());
+        };
+        obs.push(Obligation {
+            kind: ObligationKind::Panic { message: "`map` closure overflows".into() },
+            verdict: find_obligation(smt::and(path, over), pins),
+        });
+    }
+    match eval_binary(m.op, a, b, Some(w)) {
+        Val::Sym(v, _) => Ok((v, obs)),
+        _ => Err("`map` step is not modelled".into()),
+    }
+}
+
+/// Evaluate a `filter` predicate on one element.
+fn filter_pred(fl: FilterOp, elem: Var, w: u8, sign: Sign) -> Result<Pred, String> {
+    let rhs = smt::word(fl.rhs, w);
+    let (a, b) = if fl.rhs_left {
+        (Val::Sym(rhs, sign), Val::Sym(elem, sign))
+    } else {
+        (Val::Sym(elem, sign), Val::Sym(rhs, sign))
+    };
+    match eval_binary(fl.op, a, b, Some(w)) {
+        Val::Bool(p) => Ok(p),
+        _ => Err("`filter` predicate is not modelled".into()),
+    }
+}
+
+fn slice_sum(
+    name: &str,
+    recv: &Place,
+    dest: &Place,
+    env: &mut Env,
+    cx: &IterCall<'_>,
+) -> Result<Vec<Obligation>, String> {
+    let IterCall { f, pins, path, .. } = *cx;
+    let Some(it) = env.iters.get(&recv.local).copied() else {
+        return Err(format!("`{name}` on a receiver that is not a modelled slice iterator"));
+    };
+    let Some(s) = env.indexed.get(&it.base) else {
+        return Err(format!("`{name}` on an iterator whose slice is not modelled"));
+    };
+    let (elem_w, elem_signed) = (s.elem_w, s.elem_signed);
+    let Some(dest_w) = type_of_place(f, dest).and_then(|t| t.width()) else {
+        return Err(format!("`{name}` on a destination whose width is not modelled"));
+    };
+    // The element type must be the sum's own type: `Sum<&u8> for u8` sums `u8`s at
+    // `u8` width, and a mismatched width would be a different operation.
+    if elem_w != dest_w {
+        return Err(format!(
+            "`{name}` over `{elem_w}`-bit elements into a `{dest_w}`-bit sum is not modelled"
+        ));
+    }
+    if it.filter.is_some() {
+        return Err(format!("`{name}` over a filtered iterator is not modelled"));
+    }
+    if it.rev {
+        return Err(format!("`{name}` over a reversed iterator is not modelled"));
+    }
+    // The number of addends. A *constant* length is unrolled exactly. A *symbolic*
+    // length is unrolled to a bound `K` and each step is guarded by `k < len`, which
+    // is exact exactly when the length is at most `K` -- so the precondition must
+    // *prove* `len <= K`; otherwise the sum would silently miss elements, which is a
+    // wrong value, so the shape is refused.
+    let len = s.len;
+    let (hi, symbolic) = match iterator_const_len(s, pins) {
+        Some(n) => {
+            if n > MAX_SUM_LEN {
+                return Err(format!("`{name}` over {n} elements is past the {MAX_SUM_LEN}-element limit"));
+            }
+            (it.end.map_or(n, |e| e.min(n)), false)
+        }
+        None => {
+            if it.step != 1 || it.end.is_some() {
+                return Err(format!(
+                    "`{name}` over a symbolic-length slice with `step_by`/`take` is not modelled"
+                ));
+            }
+            let within = smt::ule_const(len, MAX_SYMBOLIC_LEN);
+            if !matches!(find_obligation(smt::and(path, smt::not(within)), pins), Verdict::Unsat) {
+                return Err(format!(
+                    "`{name}` over a slice whose length is not bounded (write \
+                     `requires: <slice>.len() <= {MAX_SYMBOLIC_LEN}`)"
+                ));
+            }
+            (MAX_SYMBOLIC_LEN, true)
+        }
+    };
+    let sign = Sign::of_bool(elem_signed);
+    let mut acc = smt::word(0, dest_w);
+    let mut obligations = Vec::new();
+    let mut k = it.pos;
+    while k < hi {
+        let Some((elem, _)) = env.index_elem(it.base, k) else {
+            return Err(format!("`{name}` on an iterator whose elements are not modelled"));
+        };
+        // The per-step guard: for a symbolic length only `k < len` is a real element;
+        // padding contributes 0. Exact because `len <= MAX_SYMBOLIC_LEN` was proved.
+        let within = if symbolic {
+            smt::not(smt::ule_const(len, k))
+        } else {
+            smt::truth(true)
+        };
+        // A `map` transform is applied to each *real* element, then the mapped value is
+        // guarded -- the other order (`map` after the guard) applied `map(0)` to the
+        // padding, so `x + 1` added `MAX - len` extra and `x - 1` underflowed: a wrong
+        // value, and a spurious overflow. The map's overflow obligation is under
+        // `within`, so padding cannot raise a panic it does not reach.
+        let elem = if let Some(m) = it.map {
+            let (v, obs) = apply_map(m, elem, elem_w, sign, smt::and(path, within), pins)?;
+            obligations.extend(obs);
+            v
+        } else {
+            elem
+        };
+        let elem = if symbolic {
+            smt::ite(within, elem, smt::word(0, elem_w))
+        } else {
+            elem
+        };
+        // `Add::add` panics on overflow in a debug build, so each step is a
+        // reachable-panic obligation, exactly as the `overflowing_*` family's own
+        // `assert` would be. A step whose overflow predicate cannot be built is
+        // *refused* rather than summed without a check -- a silent wrap would hide a
+        // panic.
+        let Some(over) = overflow_pred(
+            BinOp::Add,
+            Val::Sym(acc, sign),
+            Val::Sym(elem, sign),
+            dest_w,
+        ) else {
+            return Err(format!("`{name}` overflow predicate is not modelled"));
+        };
+        obligations.push(Obligation {
+            kind: ObligationKind::Panic { message: format!("`{name}` overflows") },
+            verdict: find_obligation(smt::and(path, over), pins),
+        });
+        acc = smt::add(acc, elem);
+        k += it.step;
+    }
+    env.set(dest, Val::Sym(acc, sign));
+    env.iters.remove(&recv.local);
+    Ok(obligations)
+}
+
 /// The element type of a `Vec<T>`, from its printed name.
 ///
 /// rustc prints the standard container's *type* as `std::vec::Vec<u8>` (or
@@ -5688,7 +6960,7 @@ fn slice_element(
 ///
 /// `None` for a name that is not the standard `Vec`, or one whose arguments
 /// cannot be read.
-fn vec_elem_ty(name: &str) -> Option<Ty> {
+pub(crate) fn vec_elem_ty(name: &str) -> Option<Ty> {
     // The head before the generic arguments is the path; the standard container's
     // is `std::vec::Vec` or `alloc::vec::Vec`. A bare `Vec` is a user type (rustc
     // always qualifies the standard one), so it is refused.
@@ -5699,76 +6971,340 @@ fn vec_elem_ty(name: &str) -> Option<Ty> {
     crate::mir::spec::angle_inner(name).map(Ty::parse)
 }
 
-/// The `Vec<T>` length model: `new` sets the length to zero, `push` adds one,
-/// `len` reads it.
+/// Like [`vec_elem_ty`], but also accepts the *bare* `Vec<T>` spelling.
 ///
-/// A `Vec`'s fields (a heap pointer, a length, a capacity) are not printed by
-/// the dump, so the length is all the model holds (see `Env::vec_len`).
-/// `new`/`push`/`len` are the calls the corpus uses; every other `Vec` method
-/// stays unmodelled rather than being guessed.
+/// rustc prints a `Vec` local's type by its shortest crate-unique path, which is
+/// the bare `Vec<u8>` when nothing shadows it, and only the `drop`-glue identity
+/// check needs the full path (a user `struct Vec` must not be treated as the
+/// container and skipped). For the *length and element* model a bare `Vec` is the
+/// standard one unless a same-dump body answers first: reading its length as a
+/// fresh input and its `v[0]` as a fresh element is an over-approximation, so a
+/// user `Vec` mis-read here would be a lost proof, never a false one.
+pub(crate) fn vec_elem_ty_loose(name: &str) -> Option<Ty> {
+    let head = name.split('<').next().unwrap_or(name).trim();
+    if head != "Vec" && head != "std::vec::Vec" && head != "alloc::vec::Vec" {
+        return None;
+    }
+    crate::mir::spec::angle_inner(name).map(Ty::parse)
+}
+
+/// The element type of a standard `Box<T>`, from its printed name.
 ///
-/// The receiver of `push`/`len` is a reference, so the length lives on the
-/// *referent* local -- `pointee` follows `&mut v`/`&v` to the storage the caller
-/// owns, which is the same local `new` wrote. A receiver whose length the run
-/// never set (a `Vec` argument, or one built by an unmodelled call) is refused,
-/// never given an invented number.
-fn vec_method(
+/// The head is checked against the *full* path (`std::boxed::Box` /
+/// `alloc::boxed::Box`), because a user `struct Box` must not be treated as the
+/// container: a `Box<T>`'s drop glue is `T`'s, so a user `Box` mis-read here would
+/// be a false "glue-free" and hide a panicking destructor.
+pub(crate) fn box_elem_ty(name: &str) -> Option<Ty> {
+    let head = name.split('<').next().unwrap_or(name).trim();
+    if head != "std::boxed::Box" && head != "alloc::boxed::Box" {
+        return None;
+    }
+    crate::mir::spec::angle_inner(name).map(Ty::parse)
+}
+
+/// `std::mem::drop::<T>(v)`: consume `v`. A glue-free `T` runs no destructor, so
+/// the call is a no-op; a `T` whose drop glue the tool cannot represent is
+/// *refused* rather than assumed inert (a panicking destructor would be hidden).
+///
+/// The type is read from the call's own name (`drop::<T>`), the same source the
+/// `Box` model uses for its element. A *bare* container name (`Box<u8>`,
+/// `String`) is the standard type only when the crate declares no struct of that
+/// name -- `std_container_glue_free` takes the layouts, so a shadowing user type
+/// with a destructor is refused rather than read as glue-free.
+fn mem_drop(
     name: &str,
-    kind: intrinsics::VecMethod,
+    structs: &BTreeMap<String, spec::StructDef>,
+) -> Result<Vec<Obligation>, String> {
+    let ty = crate::mir::spec::angle_inner(name)
+        .map(Ty::parse)
+        .unwrap_or(Ty::Unit);
+    if drop_is_noop(&ty) || std_container_glue_free(&ty, structs) {
+        return Ok(Vec::new());
+    }
+    Err(format!(
+        "`{name}` destroys a value whose drop glue is not modelled"
+    ))
+}
+
+/// The `Box<T>` model: `Box::<T>::new` stores the boxed value and a nonzero token
+/// pointer, so the compiler's null and alignment checks are discharged and `*b`
+/// reads the stored value (see the `Box` section of `AGENTS.md`).
+fn box_method(
+    name: &str,
+    kind: intrinsics::BoxMethod,
     args: &[Operand],
     dest: &Place,
     env: &mut Env,
 ) -> Result<Vec<Obligation>, String> {
-    use intrinsics::VecMethod;
-    // The storage the receiver names, following one reference. `new` is the
-    // exception: it is an associated function with no receiver, so its length is
-    // written to the destination.
+    match kind {
+        intrinsics::BoxMethod::New => {
+            let Some(a) = args.first() else {
+                return Err(format!("`{name}` with no argument"));
+            };
+            let v = operand(env, a);
+            env.boxed.insert(dest.local, v);
+            // The compiler reads the box's field 0 as the pointer, then checks it
+            // against null. A nonzero token makes `Eq(ptr, 0)` false, so the null
+            // check (with `Ne(SIZE, 0)`) is discharged and the deref is reachable.
+            // A large power of two: nonzero (the null check passes) and a multiple
+            // of any primitive alignment up to 2^24 (the alignment check
+            // `addr & (ALIGN - 1) == 0` passes for every `T` the model holds).
+            env.fields
+                .insert((dest.local, 0), Val::Sym(smt::word(1 << 24, 64), Sign::Unsigned));
+            Ok(Vec::new())
+        }
+    }
+}
+
+fn string_method(
+    name: &str,
+    kind: intrinsics::StringMethod,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+    f: &MirFn,
+) -> Result<Vec<Obligation>, String> {
+    use intrinsics::StringMethod;
+    // The string's tracked length, read through one reference (`len`/`is_empty`
+    // take `&self`, `push_str` `&mut self`). `new` has no receiver.
     let receiver = |env: &Env| -> Result<u32, String> {
         match args.first() {
             Some(Operand::Copy(p)) | Some(Operand::Move(p)) => Ok(env.pointee(p).local),
             _ => Err(format!("unmodelled receiver for `{name}`")),
         }
     };
+    let length = |env: &Env, l: u32| -> Result<Var, String> {
+        match env.indexed.get(&l) {
+            Some(s) => Ok(s.len),
+            None => Err(format!("`{name}` on a receiver whose length is not modelled")),
+        }
+    };
+    // A `&str`'s byte length, as the same variable `str::len` reads: a symbolic
+    // input for an argument, a constant for a literal. A source whose length is
+    // not modelled is refused rather than given an invented number.
+    let str_len = |env: &Env, a: Option<&Operand>| -> Result<Var, String> {
+        // A literal reaches the call either directly (`from(const "abc")`) or
+        // through a local (`_4 = const "ab"; push_str(_, move _4)`).
+        if let Some(Operand::Const(Const::Str(text))) = a {
+            return Ok(smt::word(text.len() as u64, USIZE_WIDTH));
+        }
+        let p = match a {
+            Some(Operand::Copy(p)) | Some(Operand::Move(p)) => p.clone(),
+            _ => return Err(format!("unmodelled argument to `{name}`")),
+        };
+        match length_of(env, f, &p) {
+            Val::Sym(v, _) => Ok(v),
+            _ => Err(format!("`{name}` on a `&str` whose length is not modelled")),
+        }
+    };
+    match kind {
+        StringMethod::New => {
+            env.indexed.insert(
+                dest.local,
+                Indexed {
+                    len: smt::word(0, USIZE_WIDTH),
+                    len_mutable: true,
+                    elem_w: 8,
+                    elem_signed: false,
+                    elems: BTreeMap::new(),
+                    fixed_len: None,
+                    slice_steps: None,
+                    poisoned: false,
+                },
+            );
+            Ok(Vec::new())
+        }
+        StringMethod::From => {
+            let len = str_len(env, args.first())?;
+            env.indexed.insert(
+                dest.local,
+                Indexed {
+                    len,
+                    len_mutable: true,
+                    elem_w: 8,
+                    elem_signed: false,
+                    elems: BTreeMap::new(),
+                    fixed_len: None,
+                    slice_steps: None,
+                    poisoned: false,
+                },
+            );
+            Ok(Vec::new())
+        }
+        StringMethod::PushStr => {
+            let l = receiver(env)?;
+            let add = str_len(env, args.get(1))?;
+            let cur = length(env, l)?;
+            if let Some(s) = env.indexed.get_mut(&l) {
+                s.len = smt::add(cur, add);
+            }
+            Ok(Vec::new())
+        }
+        StringMethod::Clear => {
+            let l = receiver(env)?;
+            let _ = length(env, l)?;
+            if let Some(s) = env.indexed.get_mut(&l) {
+                s.len = smt::word(0, USIZE_WIDTH);
+            }
+            Ok(Vec::new())
+        }
+        StringMethod::Len => {
+            let l = receiver(env)?;
+            let len = length(env, l)?;
+            env.set(dest, Val::Sym(len, Sign::Unsigned));
+            Ok(Vec::new())
+        }
+        StringMethod::IsEmpty => {
+            let l = receiver(env)?;
+            let len = length(env, l)?;
+            env.set(dest, Val::Bool(smt::eq_const(len, 0)));
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// The `Vec<T>` model: a length plus the elements, an `indexed` store exactly as a
+/// slice has.
+///
+/// A `Vec`'s fields (a heap pointer, a length, a capacity) are not printed by the
+/// dump, so the model holds the length the calls set and the elements they wrote.
+/// `new`/`push`/`len`/`is_empty`/`pop` are the inherent methods; `Index` and
+/// `Deref`/`as_slice` are the trait calls `v[i]` and `v.first()`/`v.get(k)` lower
+/// to, so a pushed value can be read back -- the half of C11 the length-only model
+/// left out.
+///
+/// The receiver of `push`/`len`/`pop` is a reference, so the state lives on the
+/// *referent* local -- `pointee` follows `&mut v`/`&v` to the storage the caller
+/// owns, the same local `new` wrote. A receiver whose store the run never set (a
+/// `Vec` argument that was never bound) is refused, never given an invented value.
+///
+/// Three soundness points:
+///
+/// * `push` records the pushed value at the *current* length only when that length
+///   is a constant. A symbolic length (a `Vec` argument) means the store cannot pin
+///   the index, so it poisons the elements -- a stale element would be a wrong
+///   value, not a missing one. The length still advances exactly.
+/// * `Index` emits the bounds panic (`k >= len`) as a reachable-failure obligation.
+///   `v[k]` panics inside `core`, not in the dump, so a model that skipped it would
+///   report an out-of-bounds read panic-free -- a false proof.
+/// * `Deref` copies the store to the destination, sharing the element variables
+///   that exist at that point, so `v.first()` and `v[0]` name one element. A push
+///   *after* a deref is not seen by the deref'd slice, which is correct: Rust does
+///   not let a `&[T]` borrow coexist with a `&mut Vec`. An element the *contract*
+///   named (or one `v[k]` created before the deref) is shared; an element first
+///   created by a deref'd read is not the one a later `v[k]` creates, so
+///   `v.first() == v[0]` is a lost proof in that one ordering -- never a false one.
+#[allow(clippy::too_many_arguments)]
+fn vec_method(
+    name: &str,
+    kind: intrinsics::VecMethod,
+    args: &[Operand],
+    dest: &Place,
+    env: &mut Env,
+    path: Pred,
+    pins: &[(u32, u64)],
+    f: &MirFn,
+) -> Result<Vec<Obligation>, String> {
+    use intrinsics::VecMethod;
+    // The storage the receiver names, following one reference. `new` is the
+    // exception: it is an associated function with no receiver.
+    let receiver = |env: &Env| -> Result<u32, String> {
+        match args.first() {
+            Some(Operand::Copy(p)) | Some(Operand::Move(p)) => Ok(env.pointee(p).local),
+            _ => Err(format!("unmodelled receiver for `{name}`")),
+        }
+    };
+    // The vector's `(length, element width, element sign, poisoned)`.
+    let shape = |env: &Env, l: u32| -> Result<(Var, u8, bool, bool), String> {
+        match env.indexed.get(&l) {
+            Some(s) => Ok((s.len, s.elem_w, s.elem_signed, s.poisoned)),
+            None => Err(format!("`{name}` on a receiver whose length is not modelled")),
+        }
+    };
     match kind {
         VecMethod::New => {
-            env.vec_len.insert(dest.local, smt::word(0, USIZE_WIDTH));
+            let ty = f.ty_of(dest.local).cloned().unwrap_or(Ty::Other("?".into()));
+            let ty = match ty {
+                Ty::Ref(inner) => *inner,
+                other => other,
+            };
+            let elem = match &ty {
+                Ty::Other(s) => vec_elem_ty_loose(s),
+                _ => None,
+            }
+            .ok_or_else(|| format!("`{name}` on a type whose element is not modelled"))?;
+            env.indexed.insert(
+                dest.local,
+                Indexed {
+                    len: smt::word(0, USIZE_WIDTH),
+                    len_mutable: true,
+                    elem_w: elem.width().unwrap_or(0),
+                    elem_signed: elem.is_signed(),
+                    elems: BTreeMap::new(),
+                    fixed_len: None,
+                    slice_steps: None,
+                    poisoned: false,
+                },
+            );
             Ok(Vec::new())
         }
         VecMethod::Push => {
             let l = receiver(env)?;
-            let Some(len) = env.vec_len.get(&l).copied() else {
-                return Err(format!("`{name}` on a receiver whose length is not modelled"));
+            let (len, elem_w, _, poisoned) = shape(env, l)?;
+            let pushed = match args.get(1).map(|a| operand(env, a)) {
+                Some(Val::Sym(v, _)) => Some(v),
+                Some(Val::Bool(p)) => Some(smt::ite(p, smt::word(1, 1), smt::word(0, 1))),
+                _ => None,
             };
-            // The length is a `usize` and `+ 1` cannot overflow at 64 bits for any
-            // vector a program can build, so this is exact rather than saturating.
-            env.vec_len.insert(l, smt::add(len, smt::word(1, USIZE_WIDTH)));
+            // The index the push writes is the length *before* the increment. Only a
+            // constant length pins it; a symbolic one cannot be recorded per index.
+            let k = smt::evaluate(len, |_| None);
+            let s = env.indexed.get_mut(&l).expect("checked by `shape`");
+            s.len = smt::add(len, smt::word(1, USIZE_WIDTH));
+            match (k, pushed) {
+                (Some(k), Some(v)) if elem_w != 0 && smt::bits(v) == elem_w && !poisoned => {
+                    s.elems.insert(k, v);
+                }
+                _ => {
+                    s.elems.clear();
+                    s.poisoned = true;
+                }
+            }
+            Ok(Vec::new())
+        }
+        VecMethod::Clear => {
+            let l = receiver(env)?;
+            let (_, elem_w, _, _) = shape(env, l)?;
+            // `clear` destroys every element immediately. A glue-free scalar element (a
+            // modelled width) has no destructor, so the reset is exact; an element with
+            // no modelled width may have a `Drop` that panics, so refuse rather than
+            // report the reset panic-free.
+            if elem_w == 0 {
+                return Err(format!(
+                    "`{name}` on a Vec whose element may have drop glue is not modelled"
+                ));
+            }
+            if let Some(s) = env.indexed.get_mut(&l) {
+                s.len = smt::word(0, USIZE_WIDTH);
+                s.elems.clear();
+            }
             Ok(Vec::new())
         }
         VecMethod::Len => {
             let l = receiver(env)?;
-            let Some(len) = env.vec_len.get(&l).copied() else {
-                return Err(format!("`{name}` on a receiver whose length is not modelled"));
-            };
+            let (len, ..) = shape(env, l)?;
             env.set(dest, Val::Sym(len, Sign::Unsigned));
             Ok(Vec::new())
         }
         VecMethod::IsEmpty => {
             let l = receiver(env)?;
-            let Some(len) = env.vec_len.get(&l).copied() else {
-                return Err(format!("`{name}` on a receiver whose length is not modelled"));
-            };
+            let (len, ..) = shape(env, l)?;
             env.set(dest, Val::Bool(smt::eq_const(len, 0)));
             Ok(Vec::new())
         }
         VecMethod::Pop => {
             let l = receiver(env)?;
-            let Some(len) = env.vec_len.get(&l).copied() else {
-                return Err(format!("`{name}` on a receiver whose length is not modelled"));
-            };
-            // `pop` returns `None` exactly when the vector is empty, and decrements
-            // the length otherwise. The popped element is not modelled (the dump
-            // prints no elements), so no payload is recorded: a `Some` payload read
-            // downstream is unknown, never a fabricated element.
+            let (len, elem_w, _, poisoned) = shape(env, l)?;
             let empty = smt::eq_const(len, 0);
             let nonempty = smt::not(empty);
             env.set_discriminant(
@@ -5782,8 +7318,82 @@ fn vec_method(
                     Sign::Unsigned,
                 ),
             );
-            env.vec_len
-                .insert(l, smt::ite(nonempty, smt::sub(len, smt::word(1, USIZE_WIDTH)), len));
+            // The popped element is the last one, so it can be pinned only when the
+            // length is a constant. `pop` removes it, so the record goes too.
+            if let Some(k) = smt::evaluate(len, |_| None) {
+                if k > 0 && !poisoned {
+                    if let Some((elem, sign)) = env.index_elem(l, k - 1) {
+                        env.set_payload(
+                            dest.local,
+                            intrinsics::SOME_TAG,
+                            Val::Sym(elem, sign),
+                            elem_w,
+                        );
+                    }
+                    if let Some(s) = env.indexed.get_mut(&l) {
+                        s.elems.remove(&(k - 1));
+                    }
+                }
+            }
+            if let Some(s) = env.indexed.get_mut(&l) {
+                s.len = smt::ite(nonempty, smt::sub(len, smt::word(1, USIZE_WIDTH)), len);
+            }
+            Ok(Vec::new())
+        }
+        VecMethod::Index => {
+            let l = receiver(env)?;
+            let (len, ..) = shape(env, l)?;
+            // `v[i]` — the index must be a constant. A `Vec` has no finite domain to
+            // enumerate (its length is a tracked term, not a type constant), so a
+            // symbolic index has no chain to build and is refused.
+            let k = match args.get(1) {
+                Some(Operand::Const(Const::UInt(v, _))) => u64::try_from(*v).ok(),
+                Some(Operand::Copy(p) | Operand::Move(p)) => match env.locals.get(&p.local) {
+                    Some(Val::Sym(v, _)) => smt::evaluate(*v, |_| None),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(k) = k else {
+                return Err(format!("`{name}` with an index that is not a constant is not modelled"));
+            };
+            let (elem, sign) = env
+                .index_elem(l, k)
+                .ok_or_else(|| format!("`{name}` on a receiver whose elements are not modelled"))?;
+            // `v[k]` returns `&T`; model the reference as its referent and record the
+            // element identity so a later `*` reads the element.
+            env.set(dest, Val::Sym(elem, sign));
+            env.slice_elem_ref.insert(dest.local, ElemId::Leaf((l, k)));
+            // The bounds check `k < len` is `core`'s, not the dump's, so the model
+            // must emit it: an out-of-range index panics, and a model that skipped
+            // the check would call it panic-free.
+            let out_of_bounds = smt::ule_const(len, k);
+            Ok(vec![Obligation {
+                kind: ObligationKind::Panic {
+                    message: format!("index out of bounds: the index is {k}"),
+                },
+                verdict: find_obligation(smt::and(path, out_of_bounds), pins),
+            }])
+        }
+        VecMethod::Deref | VecMethod::AsSlice => {
+            let l = receiver(env)?;
+            let s = env
+                .indexed
+                .get(&l)
+                .cloned()
+                .ok_or_else(|| format!("`{name}` on a receiver whose length is not modelled"))?;
+            // The destination is the same store viewed as a slice: the element
+            // variables are shared (same `Var`s), and the length is the vector's
+            // current length, fixed for this borrow.
+            env.indexed.insert(
+                dest.local,
+                Indexed {
+                    len_mutable: false,
+                    fixed_len: None,
+                    slice_steps: None,
+                    ..s
+                },
+            );
             Ok(Vec::new())
         }
     }
@@ -6043,6 +7653,44 @@ fn try_intrinsic(
                 | intrinsics::Intrinsic::TryBranch
                 | intrinsics::Intrinsic::FromResidual
                 | intrinsics::Intrinsic::VecMethod(_)
+                // The `String` length model is an inherent method on the standard
+                // `String` (`String::new`, `String::push_str`, …) and `String::from`
+                // is `<String as From<&str>>::from` -- neither carries `<impl`, so
+                // both need the exception. `classify` accepts only the standard
+                // `String` path (`names_string_impl`, and the `String`/`&str` types
+                // in the conversion branch), and the same-dump lookup answers a real
+                // body first, which keeps a local type spelled `String` out.
+                | intrinsics::Intrinsic::StringMethod(_)
+                // `Box::<T>::new` is an inherent method on the standard `Box` and
+                // carries no `<impl`, so it needs the exception too. `classify`
+                // accepts it only for the standard `Box` path (`names_box_impl`),
+                // and the same-dump lookup answers a real body first.
+                | intrinsics::Intrinsic::BoxMethod(_)
+                // `std::mem::drop::<T>` carries no `<impl`, so it needs the
+                // exception too; `classify` accepts only the standard path.
+                | intrinsics::Intrinsic::MemDrop
+                // Slice iteration is a *trait* call too (`<&[u8] as
+                // IntoIterator>::into_iter`, `<slice::Iter as Iterator>::next`), so
+                // it has no `<impl`. `classify` accepts it only for a `[T]` head or
+                // a `slice::Iter` head, and the same-dump lookup answers a real body
+                // first, so a user iterator cannot be answered by the model.
+                | intrinsics::Intrinsic::SliceIntoIter
+                | intrinsics::Intrinsic::SliceNext
+                | intrinsics::Intrinsic::SliceCopied
+                | intrinsics::Intrinsic::SliceRev
+                | intrinsics::Intrinsic::SliceSkip
+                | intrinsics::Intrinsic::SliceStepBy
+                | intrinsics::Intrinsic::SliceTake
+                | intrinsics::Intrinsic::SliceFold
+                | intrinsics::Intrinsic::SliceMap
+                | intrinsics::Intrinsic::SliceFilter
+                | intrinsics::Intrinsic::SliceAll
+                | intrinsics::Intrinsic::SliceAny
+                | intrinsics::Intrinsic::SliceCount
+                | intrinsics::Intrinsic::SliceSum
+                | intrinsics::Intrinsic::SliceIterLast
+                | intrinsics::Intrinsic::SliceNth
+                | intrinsics::Intrinsic::SliceExtreme(_)
         );
     if !name.contains("<impl") && !trait_method {
         return None;
@@ -6082,14 +7730,29 @@ fn try_intrinsic(
     if let intrinsics::Intrinsic::Conversion(kind) = op {
         return Some(convert(name, kind, args, dest, env).map(|()| Vec::new()));
     }
-    // The `Vec` methods. They read a length the executor tracks, not a bit-vector
-    // operand, so they are answered before the generic operand read below -- a
-    // `Vec` receiver has no width to read, and `Vec::new()` has *no* argument at
-    // all, so it must run before the `args.first()?` that the operand read needs.
-    if let intrinsics::Intrinsic::VecMethod(kind) = op {
-        return Some(vec_method(name, kind, args, dest, env));
-    }
+    // The `Vec` methods. They read a length and elements the executor tracks, not a
+    // bit-vector operand, so they are answered before the generic operand read
+    // below -- a `Vec` receiver has no width to read, and `Vec::new()` has *no*
+    // argument at all, so it must run before the `args.first()?` that the operand
+    // read needs.
     let cur = &prog.fns[func];
+    if let intrinsics::Intrinsic::VecMethod(kind) = op {
+        return Some(vec_method(name, kind, args, dest, env, path, pins, cur));
+    }
+    // The `String` length model. Like `Vec`, it reads a length the executor tracks
+    // rather than an operand term, and `String::new()` has no argument, so it runs
+    // before the operand read.
+    if let intrinsics::Intrinsic::StringMethod(kind) = op {
+        return Some(string_method(name, kind, args, dest, env, cur));
+    }
+    // The `Box` model. `Box::<T>::new` stores the boxed value and a nonzero
+    // pointer token; the deref reads it back (see `get`'s `Deref` arm).
+    if let intrinsics::Intrinsic::BoxMethod(kind) = op {
+        return Some(box_method(name, kind, args, dest, env));
+    }
+    if let intrinsics::Intrinsic::MemDrop = op {
+        return Some(mem_drop(name, callees.structs()));
+    }
     // The operand width, from the first argument's declared type. It is not the
     // destination's: `checked_add` on a `u8` writes an `Option<u8>`, and taking
     // the width from there would ask the engine for a 64-bit overflow test.
@@ -6143,6 +7806,42 @@ fn try_intrinsic(
             Operand::Const(_) => return Some(Err(format!("unmodelled argument to `{name}`"))),
         };
         return Some(slice_element(name, op, p, args, dest, env, cur));
+    }
+    // `for x in xs` over a slice: `into_iter`/`iter` starts a cursor over the
+    // slice local, `next` advances it. Answered from the executor's cursor store,
+    // not an operand term.
+    if matches!(
+        op,
+        intrinsics::Intrinsic::SliceIntoIter
+            | intrinsics::Intrinsic::SliceNext
+            | intrinsics::Intrinsic::SliceCopied
+            | intrinsics::Intrinsic::SliceRev
+            | intrinsics::Intrinsic::SliceSkip
+            | intrinsics::Intrinsic::SliceStepBy
+            | intrinsics::Intrinsic::SliceTake
+            | intrinsics::Intrinsic::SliceFold
+            | intrinsics::Intrinsic::SliceMap
+            | intrinsics::Intrinsic::SliceFilter
+            | intrinsics::Intrinsic::SliceAll
+            | intrinsics::Intrinsic::SliceAny
+            | intrinsics::Intrinsic::SliceCount
+            | intrinsics::Intrinsic::SliceSum
+            | intrinsics::Intrinsic::SliceIterLast
+            | intrinsics::Intrinsic::SliceNth
+            | intrinsics::Intrinsic::SliceExtreme(_)
+    ) {
+        let p = match first {
+            Operand::Copy(p) | Operand::Move(p) => p,
+            Operand::Const(_) => return Some(Err(format!("unmodelled argument to `{name}`"))),
+        };
+        return Some(slice_iter(
+            name,
+            op,
+            p,
+            dest,
+            env,
+            &IterCall { f: cur, pins, path, args, prog },
+        ));
     }
     // The standard library's `Option`/`Result` methods. The receiver is an
     // `Option<T>`/`Result<T, E>` whose tag and payload the model's own
@@ -6670,13 +8369,9 @@ fn seed_callee_env(
             if let Some(store) = caller_env.indexed.get(&sl).cloned() {
                 env.indexed.insert(l, store);
             }
-            // A `Vec` argument's tracked length, carried in for the same reason
-            // the element store is: a helper that reads `v.len()` through its
-            // argument (`&Vec<u8>`) must see the caller's length. Without this the
-            // callee read `Unknown` and its contract was unreadable.
-            if let Some(len) = caller_env.vec_len.get(&sl).copied() {
-                env.vec_len.insert(l, len);
-            }
+            // A `Vec` is an `indexed` entry, so the clone above already carried its
+            // length and elements in; nothing extra is needed for a helper that
+            // reads `v.len()` or `v[0]` through its argument.
             for ((l0, f), v) in caller_env.fields.iter() {
                 if *l0 == sl {
                     env.fields.insert((l, *f), *v);
@@ -6823,7 +8518,7 @@ fn run_state<F>(
     unwind_declared: bool,
 )
 where
-    F: Fn(Option<Var>, &[(u32, Var)], &[(u64, Var)], &[(u32, Var)]) -> Result<Pred, String>,
+    F: Fn(Option<Var>, &[(u32, Var)], &[(u64, Var)], &[(u32, Var)], &[u32]) -> Result<Pred, String>,
 {
     let cur = &prog.fns[st.frame.func];
     // A path that cannot be taken is not a path. Pruning it is what lets
@@ -6978,6 +8673,13 @@ where
                 if let Rvalue::Use(Operand::Const(Const::Bytes(b))) = rv {
                     st.env.tmpl_bytes.insert(dest.local, b.clone());
                 }
+                // A `&str` literal reaches `str::len`/`String::from`/`push_str` through
+                // a local (`_4 = const "ab"`), so its byte length is kept in the string
+                // store -- recorded *after* `set`, because a whole-place write forgets
+                // the destination's parts. `length_of` reads it back as the length.
+                if let Rvalue::Use(Operand::Const(Const::Str(text))) = rv {
+                    st.env.strs.insert(dest.local, text.clone());
+                }
                 // A *nested* aggregate assignment moves the source's parts under the
                 // destination's path. Two shapes need it: a struct literal into a nested field
                 // (`o.i = Inner { v: 9 }` -> `(_1.0) = move _2`), and a nested-to-nested move
@@ -7010,6 +8712,55 @@ where
                             st.env.rebase_elem_parts(q, dest.local, k);
                         }
                     }
+                }
+                // A `Box`'s pointer, recorded *last* in the arm because every step
+                // above may forget the destination's parts (`set` drops them, and
+                // `rebase_parts` drops them again) -- and `forget_parts` also clears
+                // `box_refs`. Two spellings name the box's pointer, and both must
+                // link `dest -> box` so a later `*dest` reads the boxed value:
+                //
+                // * current stable: `_3 = (_2.0) as *const u8` (`BoxDerefTransmute`);
+                // * the MSRV (1.85): `_3 = copy (((_2.0).0).0)` -- `Box`'s
+                //   `Unique`/`NonNull`/`*const` fields walked one by one, no cast.
+                //
+                // An all-field chain rooted at a boxed local is that pointer
+                // whichever spelling reaches it. Without the `Use` form the MSRV's
+                // `box_new_reads_its_value` was `incomplete` (the return value was
+                // not known) while stable verified it -- a toolchain-shaped gap gate
+                // 14 (the suite on 1.85) caught.
+                match rv {
+                    Rvalue::Cast(Operand::Copy(q) | Operand::Move(q), _)
+                        if q.proj.as_slice() == [Proj::Field(0)] =>
+                    {
+                        if st.env.boxed.contains_key(&q.local) {
+                            // Set the pointer's *value* to the box's field-0 token too,
+                            // not only the deref link: the null-check assert reads the
+                            // pointer as a usize (`Eq(ptr_as_usize, 0)`), and without the
+                            // value that `Eq` is `Unknown`, so `assert(!null)` is
+                            // `unmodelled` and the box write/read is never reached (a
+                            // lost proof, and the reason the Box write test had no teeth).
+                            if let Some(tok) = st.env.fields.get(&(q.local, 0)).copied() {
+                                st.env.set(dest, tok);
+                            }
+                            st.env.box_refs.insert(dest.local, q.local);
+                        }
+                    }
+                    Rvalue::Use(Operand::Copy(q) | Operand::Move(q))
+                        if st.env.boxed.contains_key(&q.local)
+                            && !q.proj.is_empty()
+                            && q.proj.iter().all(|p| matches!(p, Proj::Field(_))) =>
+                    {
+                        // The MSRV also emits an *alignment* assert (`AlignOf`,
+                        // `BitAnd`, `Eq`) reading the pointer's address, so `dest`
+                        // needs the pointer token's *value* (not just the deref link)
+                        // or the check is `unmodelled assert condition`. The token is
+                        // the box's field 0.
+                        if let Some(tok) = st.env.fields.get(&(q.local, 0)).copied() {
+                            st.env.set(dest, tok);
+                        }
+                        st.env.box_refs.insert(dest.local, q.local);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -7141,12 +8892,53 @@ where
                         // are collected: a reference to an aggregate has no single
                         // word, and a by-value argument cannot be written by the
                         // body, so neither needs a second binding.
+                        // A `&mut Vec` argument that the body *rebinds* (`v = w`) aliases
+                        // the new target, and the model tracks no alias: a later push
+                        // through `v` would grow `w`'s storage without updating `w`'s
+                        // length, so any Vec length is unreliable once one is rebound. In
+                        // that case every `&mut Vec` length in the postcondition is
+                        // *refused* (unbound), never read back from the entry value -- the
+                        // entry fallback was a false proof for `v.push(1); v = w`.
+                        let any_mut_vec_rebound = cur.arg_locals.iter().any(|&l| {
+                            st.env.indexed.get(&l).is_some_and(|s| s.len_mutable)
+                                && st.env.whole_writes.contains(&l)
+                        });
+                        let ref_len_unknown: Vec<u32> = if any_mut_vec_rebound {
+                            cur.arg_locals
+                                .iter()
+                                .copied()
+                                .filter(|&l| st.env.indexed.get(&l).is_some_and(|s| s.len_mutable))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                         let mut ref_final: Vec<(u32, Var)> = Vec::new();
                         for &l in &cur.arg_locals {
-                            if !matches!(cur.ty_of(l), Some(Ty::Ref(_))) {
+                            let Some(ty) = cur.ty_of(l) else { continue };
+                            if !matches!(ty, Ty::Ref(_)) {
                                 continue;
                             }
-                            if cur.ty_of(l).and_then(|t| t.referent().width()).is_none() {
+                            // A `&Vec`/`&mut Vec`/`&[T]` argument: the postcondition's
+                            // `v.len()` must read the *post-state* length, not the entry
+                            // length. A `&mut Vec` the body pushes to has a final length
+                            // the entry value does not describe, so reading the entry
+                            // length was a false proof (`requires: v.len() == 0` /
+                            // `ensures: v.len() == 0` over `v.push(1)` verified though
+                            // the length is 1). A slice/array's length cannot change, so
+                            // this is a no-op for it.
+                            let pointee = st.env.pointee(&Place::new(l)).local;
+                            if let Some(s) = st.env.indexed.get(&pointee) {
+                                // Only a `Vec`'s length can change (`push`/`pop`), so only a
+                                // Vec rebinds to the final length -- unless a Vec was
+                                // rebound (aliased), when every Vec length is refused.
+                                if s.len_mutable && !any_mut_vec_rebound {
+                                    ref_final.push((l, s.len));
+                                }
+                                continue;
+                            }
+                            // A reference-to-scalar argument: its *value* is the
+                            // post-state value.
+                            if ty.referent().width().is_none() {
                                 continue;
                             }
                             // A `&mut bool` target is a `Val::Bool` predicate, not a
@@ -7162,7 +8954,7 @@ where
                                 _ => {}
                             }
                         }
-                        match post(rv, &projs, &ret_payloads, &ref_final) {
+                        match post(rv, &projs, &ret_payloads, &ref_final, &ref_len_unknown) {
                             Ok(p) => {
                                 report.obligations.push(Obligation {
                                     kind: ObligationKind::Postcondition,
@@ -7230,16 +9022,6 @@ where
                         if rest.is_empty() {
                             if let Some(s) = st.env.indexed.get(cal) {
                                 env.indexed.insert(cl, s.clone());
-                            }
-                        }
-                        // A `Vec` length the callee changed through a reference
-                        // (`push(&mut v)`). Only a *whole-local* target: a sub-place
-                        // target (`&mut v.len()`) is not a shape a `Vec` length is
-                        // ever handed over as, and re-keying an unrepresentable
-                        // length would invent a key.
-                        if rest.is_empty() {
-                            if let Some(len) = st.env.vec_len.get(cal).copied() {
-                                env.vec_len.insert(cl, len);
                             }
                         }
                         // A whole-referent write (`*v = x`). The whole place was
@@ -7527,23 +9309,19 @@ where
                             }
                         }
                         env.set(dest, ret);
-                        // A returned `Vec` carries its tracked length in the
-                        // callee's `_0`, and the value itself is `Val::Unknown`
-                        // (a `Vec`'s fields are not printed), so this is *not*
-                        // inside the `Val::Agg` guard below. Without the transfer
-                        // `let v = mk(); v.len()` reads a receiver with no modelled
-                        // length -- the same hole the move path (`copy_parts`) had.
-                        // Only a whole-local destination can hold a `Vec`, and a
-                        // returned value replaces what the destination held, so the
-                        // destination's old length is dropped rather than kept.
+                        // A returned `Vec` carries its length and elements in the
+                        // callee's `_0` as an `indexed` entry, and the value itself
+                        // is `Val::Unknown` (a `Vec`'s fields are not printed), so
+                        // this is *not* inside the `Val::Agg` guard below. Without
+                        // the transfer `let v = mk(); v.len()` reads a receiver with
+                        // no modelled length -- the same hole the move path
+                        // (`copy_parts`) had. Only a whole-local destination can hold
+                        // a `Vec`, and a returned value replaces what the destination
+                        // held, so the destination's old entry is dropped first.
                         if dest.proj.is_empty() {
-                            match st.env.vec_len.get(&0).copied() {
-                                Some(len) => {
-                                    env.vec_len.insert(dest.local, len);
-                                }
-                                None => {
-                                    env.vec_len.remove(&dest.local);
-                                }
+                            env.forget_parts(dest.local);
+                            if let Some(s) = st.env.indexed.get(&0) {
+                                env.indexed.insert(dest.local, s.clone());
                             }
                         }
                         // A tuple return has components, and the callee stored
@@ -7686,7 +9464,7 @@ where
                 report.unknown_paths.push("drop of a place with no modelled type".into());
                 return;
             };
-            if drop_is_noop(&ty) {
+            if drop_is_noop(&ty) || std_container_glue_free(&ty, callees.structs()) {
                 let next = State { block: *target, ..st };
                 advance(prog, next, *target, report, work, pins);
                 return;
@@ -8106,6 +9884,30 @@ where
 /// of which has a destructor. Treating it as nothing to run would be a false
 /// proof whenever that destructor is observable, so it is refused instead. A
 /// user `impl Drop` for it is found by [`drop_destructor`] and executed; a
+/// A *bare* standard container whose destructor runs no `Drop` (`Box<T>`,
+/// `String`, `Vec<T>` with a glue-free element).
+///
+/// rustc prints a function *argument*'s type by its shortest crate-unique path, so
+/// a `Box<u8>` argument's `drop` names `Box<u8>` rather than `std::boxed::Box<u8>`.
+/// A bare name is only the standard type when the crate declares no struct of that
+/// name: a user `struct Box` shadowing it would otherwise be read as glue-free and
+/// hide a panicking destructor, which is a false proof. The declared layouts are
+/// what settle it, so this takes them.
+fn std_container_glue_free(ty: &Ty, structs: &BTreeMap<String, spec::StructDef>) -> bool {
+    let Ty::Other(name) = ty else { return false };
+    let head = name.split('<').next().unwrap_or(name).trim();
+    let elem = || crate::mir::spec::angle_inner(name).map(|t| drop_is_noop(&Ty::parse(t)));
+    match head {
+        "std::boxed::Box" | "alloc::boxed::Box" => elem().unwrap_or(false),
+        "Box" => !structs.contains_key(head) && elem().unwrap_or(false),
+        "std::string::String" | "alloc::string::String" => true,
+        "String" => !structs.contains_key(head),
+        "std::vec::Vec" | "alloc::vec::Vec" => elem().unwrap_or(false),
+        "Vec" => !structs.contains_key(head) && elem().unwrap_or(false),
+        _ => false,
+    }
+}
+
 /// container is refused. See the `Term::Drop` executor arm.
 fn drop_is_noop(ty: &Ty) -> bool {
     match ty {
@@ -8134,10 +9936,77 @@ fn drop_is_noop(ty: &Ty) -> bool {
         // type (`Ty::Other`) is *not* glue-free by this test, which is the
         // conservative direction -- it is refused by the `has_field_glue` check
         // rather than assumed to be a no-op.
-        Ty::Other(name) => match vec_elem_ty(name) {
-            Some(elem) => drop_is_noop(&elem),
-            None => false,
-        },
+        Ty::Other(name) => {
+            // A slice iterator holds a reference (glue-free); an array iterator
+            // holds `T`s, so it is glue-free exactly when `T` is.
+            if name.contains("slice::Iter") {
+                return true;
+            }
+            // A standard `String` is a `Vec<u8>` underneath: its destructor only
+            // frees the byte buffer, which runs no `Drop`, so it is glue-free. The
+            // *qualified* path is checked (`std::string::String`), so a user
+            // `struct String` is not treated as the container.
+            if name.contains("string::String") {
+                return true;
+            }
+            // A `Box<T>` runs `T`'s destructor, so it is glue-free exactly when `T`
+            // is: `Box<u8>` yes, `Box<PanicOnDrop>` no. The head is the full path,
+            // so a user `struct Box` is not the container.
+            if let Some(elem) = box_elem_ty(name) {
+                return drop_is_noop(&elem);
+            }
+            if let Some(elem) = array_into_iter_elem(name) {
+                return drop_is_noop(&elem);
+            }
+            match vec_elem_ty(name) {
+                Some(elem) => drop_is_noop(&elem),
+                None => false,
+            }
+        }
+    }
+}
+
+/// The `size_of` a `SizedTypeProperties::SIZE` constant names, from its path
+/// `<T as std::mem::SizedTypeProperties>::SIZE`.
+///
+/// Only `SIZE != 0` is used (the compiler's null check before a `Box` deref), so a
+/// primitive's size is exact and any other type is a nonzero placeholder -- a
+/// zero-sized type's `SIZE` is `0`, but the null check folds to `false` either way.
+fn size_of_type_name(name: &str) -> u64 {
+    let ty = name
+        .split_once('<')
+        .and_then(|(_, r)| r.split_once(" as "))
+        .map(|(t, _)| t.trim())
+        .unwrap_or("");
+    match ty {
+        "u8" | "i8" | "bool" => 1,
+        "u16" | "i16" => 2,
+        "u32" | "i32" | "char" | "f32" => 4,
+        "u64" | "i64" | "usize" | "isize" | "f64" => 8,
+        "u128" | "i128" => 16,
+        _ => 1,
+    }
+}
+
+/// The `align_of` a `SizedTypeProperties::ALIGN` constant names, from its path
+/// `<T as std::mem::SizedTypeProperties>::ALIGN`.
+///
+/// The deref's alignment check is `address & (ALIGN - 1) == 0`, and the pointer
+/// token the model stores is a large power of two, so any alignment up to that
+/// power passes. An unknown type's alignment is `1` (no mask), the conservative
+/// value: it never makes an aligned pointer look misaligned.
+fn align_of_type_name(name: &str) -> u64 {
+    let ty = name
+        .split_once('<')
+        .and_then(|(_, r)| r.split_once(" as "))
+        .map(|(t, _)| t.trim())
+        .unwrap_or("");
+    match ty {
+        "u16" | "i16" => 2,
+        "u32" | "i32" | "char" | "f32" => 4,
+        "u64" | "i64" | "usize" | "isize" | "f64" => 8,
+        "u128" | "i128" => 16,
+        _ => 1,
     }
 }
 
@@ -8271,6 +10140,14 @@ fn has_drop_glue(
             if drop_destructor(prog, ty).is_some() {
                 return Ok(true);
             }
+            // A slice iterator holds a reference (glue-free); an array iterator
+            // holds `T`s, so its glue is `T`'s.
+            if name.contains("slice::Iter") {
+                return Ok(false);
+            }
+            if let Some(elem) = array_into_iter_elem(name) {
+                return has_drop_glue(prog, structs, &elem);
+            }
             match spec::struct_lookup(structs, name) {
                 Some(def) => {
                     for (_, fty) in &def.fields {
@@ -8333,6 +10210,12 @@ fn has_field_glue(
         }
         Ty::Array(inner, _) | Ty::Slice(inner) => has_drop_glue(prog, structs, inner),
         Ty::Other(name) => {
+            if name.contains("slice::Iter") {
+                return Ok(false);
+            }
+            if let Some(elem) = array_into_iter_elem(name) {
+                return has_field_glue(prog, structs, &elem);
+            }
             match spec::struct_lookup(structs, name) {
                 Some(def) => {
                     for (_, fty) in &def.fields {
@@ -8366,6 +10249,21 @@ fn receiver_error_type(f: &MirFn, p: &Place) -> Option<Ty> {
     let inner = spec::angle_inner(name)?;
     let args = crate::mir::parse::split_top_level(inner, ',');
     args.get(1).map(|e| Ty::parse(e.trim()))
+}
+
+/// The `T` of a `std::array::IntoIter<T, N>` type, for the drop-glue check.
+///
+/// `for x in a` (by value) owns an `array::IntoIter<T, N>`, whose drop destroys
+/// the *remaining* elements -- so its glue is `T`'s glue. Reading `T` off the name
+/// is what lets that drop be a no-op for a glue-free `T` and still refuse a
+/// panicking one. Any other type yields `None`.
+fn array_into_iter_elem(name: &str) -> Option<Ty> {
+    if !name.contains("array::IntoIter") {
+        return None;
+    }
+    let inner = spec::angle_inner(name)?;
+    let args = crate::mir::parse::split_top_level(inner, ',');
+    args.first().map(|t| Ty::parse(t.trim()))
 }
 
 /// The `T` of a `Result<T, E>` receiver's declared type, for the drop-glue check
@@ -8496,7 +10394,19 @@ fn operand(env: &mut Env, o: &Operand) -> Val {
             // expression rather than a literal -- stays unknown; the enum case is
             // resolved by the caller in `eval_rvalue`, which knows the
             // destination's width.
-            Const::Other(name) => match env.consts.get(name) {
+            Const::Other(name) => {
+                // `<T as std::mem::SizedTypeProperties>::SIZE` is the compiler's
+                // `size_of` in the null check before a `Box` deref. Only `!= 0` is
+                // used, so the primitive sizes are exact and anything else is a
+                // nonzero placeholder.
+                if name.contains("SizedTypeProperties>::SIZE") {
+                    return Val::Sym(smt::word(size_of_type_name(name), 64), Sign::Unsigned);
+                }
+                // The alignment the deref's mask is built from (`ALIGN - 1`).
+                if name.contains("SizedTypeProperties>::ALIGN") {
+                    return Val::Sym(smt::word(align_of_type_name(name), 64), Sign::Unsigned);
+                }
+                match env.consts.get(name) {
                 Some(Const::UInt(v, ty)) => match ty.as_ref().and_then(|t| t.width()) {
                     Some(1) => Val::Bool(smt::truth(*v == 1)),
                     Some(w) => {
@@ -8507,7 +10417,8 @@ fn operand(env: &mut Env, o: &Operand) -> Val {
                 },
                 Some(Const::Bool(b)) => Val::Bool(smt::truth(*b)),
                 _ => Val::Unknown,
-            },
+                }
+            }
             Const::Unit => Val::Unknown,
         },
     }
@@ -8669,12 +10580,36 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             if matches!(ty, Ty::Ref(_)) {
                 if let Operand::Copy(q) | Operand::Move(q) = o {
                     let target = env.resolve(q);
-                    if let Some(p) = env.addressed.get(&target.local).cloned() {
-                        env.addressed.insert(dest.local, p);
-                    }
+                    // A reference cast preserves the *address*, which is what the
+                    // source points at. When the source is itself an `addressed`
+                    // reference the target is recorded; otherwise the source is a
+                    // reference *argument* (modelled as its referent, so `pointee`
+                    // is the argument itself), and the destination must point at it
+                    // too. Without this, `let s = xs as &[u8]` (an unsize coercion)
+                    // left `s` with no address, so `xs.iter()`/`s.len()` on the
+                    // array argument could not reach the array's elements.
+                    let p = env
+                        .addressed
+                        .get(&target.local)
+                        .cloned()
+                        .unwrap_or_else(|| env.pointee(&target));
+                    env.addressed.insert(dest.local, p);
                 }
             }
             let v = operand(env, o);
+            // A cast to a raw pointer (`*const T`/`*mut T`) is a reinterpretation
+            // of a 64-bit word: the `Box` deref's `(_2.0) as *const u8` and the
+            // `as *const ()` / `as usize` chain that follows the null check all
+            // carry one token. `Ty::width` has no width for a pointer type, so the
+            // numeric arms below would refuse it; the pointer value is a `u64`.
+            if let Ty::Other(s) = ty {
+                if s.starts_with("*const ") || s.starts_with("*mut ") {
+                    return match v {
+                        Val::Sym(x, _) => Val::Sym(smt::truncate(x, 64), Sign::Unsigned),
+                        _ => Val::Unknown,
+                    };
+                }
+            }
             // The cast's *result* has the target type, so its sign is the
             // target's. The source's sign comes out of the value, which is what
             // decides whether a widening sign-extends or zero-fills.
@@ -8934,7 +10869,14 @@ fn length_of(env: &Env, f: &MirFn, p: &Place) -> Val {
         // writes `a.len() == 4` on an `a: [u8; 4]` has something to agree with.
         None => match type_of_place(f, &p) {
             Some(Ty::Array(_, n)) => Val::Sym(smt::word(n, USIZE_WIDTH), Sign::Unsigned),
-            _ => Val::Unknown,
+            // A string literal (`const "ab"`) has a *constant* byte length, kept
+            // in the string store. It is the receiver of `str::len`/`is_empty` and
+            // the source of `String::from`/`push_str`, so its length is read here
+            // rather than left unknown.
+            _ => match env.strs.get(&p.local) {
+                Some(text) => Val::Sym(smt::word(text.len() as u64, USIZE_WIDTH), Sign::Unsigned),
+                None => Val::Unknown,
+            },
         },
     }
 }
@@ -9505,6 +11447,28 @@ mod tests {
             // refutes it and hands back one of them.
             smt::find_model(smt::ult_const(x, 3))
         })
+    }
+
+    /// `iterator_const_len` reads a *folded* length as its value, not as a pin index.
+    /// A one-element `Vec` (whose length folds to the literal `1`) must be length 1 --
+    /// the old code looked a pin up by `smt::index(1) == 1`, so it borrowed arg-1's pin
+    /// of 0 and modeled the vec as empty (a false proof).
+    #[test]
+    fn iterator_const_len_reads_a_folded_length_not_a_pin() {
+        let ix = Indexed {
+            len: smt::word(1, USIZE_WIDTH),
+            len_mutable: true,
+            elem_w: 8,
+            elem_signed: false,
+            elems: std::collections::BTreeMap::new(),
+            fixed_len: None,
+            slice_steps: None,
+            poisoned: false,
+        };
+        assert_eq!(iterator_const_len(&ix, &[(1, 0)]), Some(1u64), "a folded length of 1 must not borrow arg-1's pin");
+        let sym = Indexed { len: smt::var_named(7, USIZE_WIDTH), ..ix.clone() };
+        assert_eq!(iterator_const_len(&sym, &[(7, 3)]), Some(3u64), "a symbolic length reads its pin");
+        assert_eq!(iterator_const_len(&sym, &[(1, 0)]), None, "a symbolic length ignores an unrelated pin");
     }
 
     /// The signedness a `Val` is *built* with comes from the operand's own type.
@@ -10972,6 +12936,7 @@ fn count_via_helper(_1: u8) -> u8 {
                 2,
                 Indexed {
                     len,
+                    len_mutable: false,
                     elem_w: 8,
                     elem_signed: false,
                     elems,

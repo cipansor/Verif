@@ -78,6 +78,20 @@ std = []
 # `tools/ferrocene/run.sh`), which is the whole point of the file: the prover is code in
 # the artifact, so it has to build for the artifact's target. `cargo test --example
 # bare_metal` still runs its `#[cfg(test)]` module on the host.
+# `cargo verif`: the command-line entry point (U2). It needs `std` for the MIR
+# frontend and for `std::process`, so it is built only when the `std` feature is
+# on -- `required-features` makes cargo skip it under `--no-default-features`, so
+# the bare-metal build is unaffected.
+[[bin]]
+name = "cargo-verif"
+path = "src/bin/cargo-verif.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "verif-wrap"
+path = "src/bin/verif-wrap.rs"
+required-features = ["std"]
+
 [[example]]
 name = "bare_metal"
 crate-type = ["lib"]

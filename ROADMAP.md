@@ -19,8 +19,8 @@ output decides the number, so the table is a measurement rather than a claim:
 | Corpus | Command | Verified / total |
 |---|---|---|
 | `examples/mir_targets/actuator.rs` | `cargo run --features std --example mir_coverage -- examples/mir_targets/actuator.rs` | 18 / 33 |
-| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 630 / 1148 |
-| `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **18 / 21 (86%)** |
+| `examples/mir_targets/realistic.rs` | same, `realistic.rs` | 694 / 1252 |
+| `examples/mir_targets/everyday.rs` | same, `everyday.rs` | **21 / 24 (87%)** |
 
 This table is the *current* measurement and is the only number to quote. The
 `N of M` figures inside the per-item progress notes below are the value *at the
@@ -43,11 +43,18 @@ small change:
   ~186 s with `MAX_APPLY_STEPS` raised 32× (to `1 << 24`) and after 5.7 s with the
   SAT conflict budget raised to 20 000 000 — so it is an engine wall (C7), not a
   budget knob. `n / d` at `u32` is equally undecided, which is the same fact.
-- `sum_iter` (`v.iter().sum()`) is **not verifiable at all**: an unbounded slice
-  sum can overflow, so the honest verdict for a total postcondition is a panic,
-  not `verified` — a bare `a + b` under `requires: true` fails the same way. The
-  `incomplete` is the unmodelled `iter`/`sum` (C10); modelling them would move the
-  entry to `FAILED`, never to `verified`, and so would not change this score.
+- `sum_iter` (`v.iter().sum()`) is `incomplete` because its length is **unbounded**
+  (`requires: true`). The `iter`/`sum` path is modelled now (C11 symbolic-length
+  iteration), and a slice sum is unrolled to `MAX_SYMBOLIC_LEN` steps guarded by
+  `k < len` — exact only when the precondition *proves* `len <= 8`. An unbounded
+  length cannot be unrolled (a shorter unroll would silently miss elements, a wrong
+  value), so `sum_iter` stays an honest refusal. A **guarded** sum decides:
+  `symbolic_sum_no_overflow` (`len <= 4`, elements `<= 10`) **verifies** (the sum
+  cannot overflow — a real panic-freedom proof over a runtime-length slice),
+  `symbolic_sum_tripwire` (bounded length, unbounded elements) is **refuted** with
+  an overflow witness, and `symbolic_sum_unbounded_refused` is the honest refusal.
+  So the entry is decided *for the guarded shape*; `sum_iter` itself is a
+  length-unbounded refusal, not an unmodelled `sum`.
 - `tri` (`s += i` over `0..=n`, `n <= 100`, `ret <= 5050`) needs an **inductive**
   loop invariant, and the invariant that is inductive for a running sum is
   *nonlinear* (`s <= i(i+1)/2`). `s <= 5050` is not inductive (from `s == 5050`
@@ -157,8 +164,11 @@ keeps growing.
   - Who has it: Kani, Prusti, Creusot, Verus, SPARK (finalization).
   - Move: **build**.
 - **C2. `Option`/`Result` and `?`.** · P0 · in progress · Kani, Verus, Prusti, Creusot
-  - Gap: `?`, `map`/`map_err`/`and_then`/`unwrap_or_else` (closures) are
-    unmodelled; `unwrap`, `unwrap_or`, `expect`, `ok_or`/`ok`/`err`, `is_some`,
+  - Gap: the *closure-taking* methods (`map`/`map_err`/`and_then`/`unwrap_or_else`)
+    are unmodelled because a closure body is an indirect call the frontend does not
+    inline -- that is C10 (closures), not this item. `?` is modelled
+    (`TryBranch`/`FromResidual`); `unwrap`, `unwrap_or`, `unwrap_or_default`,
+    `expect`, `ok_or`/`ok`/`err`, `is_some`,
     the enum-return discriminant methods and bare payload reads are modelled (see
     the progress notes). Evidence: `checked_or_max` verified, `div_unwrap`
     incomplete (the divider wall, not the `Option`).
@@ -462,7 +472,7 @@ keeps growing.
   - Exit: `next_mode` decided (`verified`), plus the refuted fixture
     `guarded_match_tripwire` in `realistic.rs`.
   - Move: **built**.
-- **C6. The everyday `core` surface.** · P0 · in progress · Kani, Verus (`vstd`)
+- **C6. The everyday `core` surface.** · P0 · **done** · Kani, Verus (`vstd`)
   - Gap: `Ord::min/max/clamp`, `PartialEq`/`PartialOrd` comparisons,
     `iN::abs`, `abs_diff`, `rotate_*`, `is_ascii_*`,
     `is_negative`/`is_positive`, `<[T]>::len/is_empty/first/get`. Evidence:
@@ -852,6 +862,21 @@ keeps growing.
     one tripwire), pinned by `a_bool_conversion_is_the_zero_extended_bit`.
     `realistic.rs` **626 of 1141** (from **623 of 1137**; four new fixtures, three
     verified and one refuted).
+  - Progress (measured, done): the surface is complete for the *stable* integer
+    API. Every method the three corpora call classifies; a sweep of ~30 standard
+    methods (`checked_/saturating_/wrapping_/overflowing_`, the shifts, the counts,
+    `abs`/`abs_diff`/`signum`, `min`/`max`/`clamp`/`cmp`, `rotate_*`, `pow`,
+    `div_ceil`/`div_euclid`/`rem_euclid`, `midpoint`, `next_multiple_of`,
+    `next_power_of_two`, `ilog*`, `to_be`/`to_le`, `is_ascii_*`, `is_multiple_of`,
+    the `cast_signed`/`cast_unsigned` pair) is `classify`-able, and the only
+    unmodelled call across `everyday.rs`/`actuator.rs`/`realistic.rs` is a
+    *deliberate* refusal (`<Self as …>::set`, a `Self` receiver). `unwrap_or_default`
+    on a `Result<u8, Boom>` where `Boom: Drop` is refused *because dropping `Boom`
+    panics* -- a sound refusal, not a gap. The boundaries that remain are deliberate
+    and named: `div_floor` is unstable (`int_roundings`) and cannot be
+    differential-tested on the gate's toolchains, so it is refused; the `_bytes`
+    forms return an array and are refused rather than modelled as a word. See
+    `mir::intrinsics` tests `classify`/`the_new_shapes_are_modelled_only_on_the_types_that_have_them`.
 - **C7. Arithmetic scale and speed.** · P0 · in progress · Kani, Boolector,
   Bitwuzla
   - Gap: `u32::wrapping_mul` is past the 32-bit model; `clamp_std` takes 9.9 s.
@@ -934,7 +959,7 @@ keeps growing.
 Exit: one real `no_std` crate with a dependency verified end to end with
 `cargo verif`; Kani agrees on every function both tools decide.
 
-- **C8. Cargo, multi-module crates and dependencies.** · P1 · todo · Kani
+- **C8. Cargo, multi-module crates and dependencies.** · P1 · **done** · Kani
   (`cargo kani`)
   - Gap: the frontend runs `rustc --crate-type=lib` on one file, without
     `--extern`, so a crate that `use`s another crate, or a file whose
@@ -942,9 +967,53 @@ Exit: one real `no_std` crate with a dependency verified end to end with
   - Approach: a `cargo verif` subcommand through `cargo rustc`/`RUSTC_WRAPPER`,
     emitting MIR for the target crate with its real flags. Dependency calls are
     answered through contracts (C2), not bodies.
+  - Progress (multi-module, done): `spec::extract_crate` inlines every external
+    `mod name;` declaration (`name.rs` / `name/mod.rs`, recursively) before scanning,
+    so a contract written in a *module file* is read and keyed by the `mod`-qualified
+    path rustc prints for it (`a::clampish`). `cargo verif --file src/lib.rs` on a
+    crate with `pub mod a;` now verifies `a`'s functions instead of reporting "all
+    contracts held" over zero checked functions -- which was a silent pass, the worst
+    direction. A module file that cannot be read stays a bare `mod name;`, so its
+    functions are reported `missing`, never silently passed. Pinned by
+    `extract_crate_reads_external_module_contracts` (the keying) and
+    `a_multi_module_crate_is_verified_through_its_root` (a clean module exits 0, a
+    false one exits 1, each naming the module function).
+  - Progress (dependencies, done): `verify::crate_options` reads the crate's own
+    `[dependencies]` table (`dependency_names`: `name = "1"`, `name = { … }`, and the
+    `[dependencies.name]` sub-table; dev/build deps skipped) and, for each, finds its
+    newest `lib<name>-*.rlib` under `target/<profile>/deps` *or* a
+    `target/<profile>/build/<pkg>/<hash>/out` (the build-script layout this container's
+    cargo uses for a path dependency), then *probes* the whole set with the emitting
+    compiler (`extern_compiles`). `cargo-verif` passes the result as `--extern`/`-L`,
+    so a file that `use`s another crate compiles and its contract is checked. A crate
+    whose deps are not built, or whose rlibs are stale, falls back to
+    `MirOptions::default()` and the honest `E0432`/`E0514` -- never a guessed path.
+    Pinned by `dependency_names_reads_the_dependencies_table_only` (the parser) and
+    `a_crate_with_a_dependency_is_verified` (a path-dep crate verifies; a false
+    contract is still refuted, so the dependency did not hide the check).
+  - Progress (RUSTC_WRAPPER, done): `src/bin/verif-wrap.rs` is a `RUSTC_WRAPPER`
+    entry point. `RUSTC_WRAPPER=/path/to/verif-wrap cargo build` forwards every
+    rustc call and, for the *primary* package (`CARGO_PRIMARY_PACKAGE=1`, which cargo
+    sets for the crate under development and never for a dependency), also runs the
+    frontend on the crate source, failing the build on a false contract. The source
+    path is canonicalised first, because cargo passes it relative and `crate_options`
+    walks up from it to find the manifest's `target/`. Pinned by
+    `tests/rustc_wrapper.rs`: a true contract builds, a false one fails the build
+    naming the obligation, and a *dependency's* false contract does not fail the
+    build (the primary-package guard).
+  - Progress (external crate, done): `tools/external-demo/run.sh` builds a throwaway
+    `no_std` crate that depends on `embedded-hal = "=1.0.0"` and `use`s it, then runs
+    `cargo verif` on it. Recorded output: `clamp_percent: verified (1 obligation(s))`
+    and `all contracts held` (exit 0) for the true contract, `FAILED` (exit 1) for a
+    false one. It found and fixed a real defect: a hyphenated manifest key
+    (`embedded-hal`) was passed as `--extern embedded-hal=…`, which names nothing the
+    source can `use`; `extern_name` now underscores it (`embedded_hal`), pinned by
+    `a_hyphenated_dependency_name_is_an_underscored_extern`. The demo exits 2 (a
+    reported skip, not a pass) when there is no network to fetch the crate.
   - Exit: one function in a real `no_std` crate with at least one dependency
     (an `embedded-hal` driver, say) verified end to end with `cargo verif`.
-  - Move: **build**.
+    **Met** -- `tools/external-demo/run.sh`.
+  - Move: **done**.
 - **C9. References and aliasing.** · P1 · **done** (scalar referents) · Prusti
     (ownership), Creusot (prophecies)
   - Gap: reference arguments are refused ("no aliasing model"), yet `&`/`&mut`
@@ -983,7 +1052,9 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     exposed through contracts for `Vec::{new, push, pop, len, get, index}`.
   - Exit: `make` verified. **Met** — `make` verifies (18 of 21 in `everyday.rs`).
   - Done: the **length** half. `Vec::{new, push, len}` are modelled from a
-    per-local length the executor tracks (`Env::vec_len`), since a `Vec`'s fields
+    per-local length the executor tracks (now the `indexed` store's `len`, with
+    `len_mutable` set for a `Vec`; it began as a separate `Env::vec_len` and was
+    folded into `Indexed` when the element model landed), since a `Vec`'s fields
     (a heap pointer, a length, a capacity) are not printed by the dump. The
     length is `usize` and `push` is `+ 1`, which cannot overflow at 64 bits, so it
     is exact rather than saturating. `drop` of a `Vec<T>` is a no-op exactly when
@@ -1001,14 +1072,258 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     no longer reads the entry length at the exit (`ret == 0` for `ret == 3`); and
     a `Vec` move (`let w = v`) and a returned vector transfer the length to the
     destination rather than dropping it.
-  - Remaining: the **element** model (`get`/`index`, so a `push`ed value can be
-    read back), `String`, `Box`, and symbolic-length slices. (`pop` and `is_empty`
-    are done — see the progress note below.)
+  - Remaining: symbolic-length slices. (`Box<T>` and `String` are done — see the
+    progress notes below. Iteration, `pop`, `is_empty` and the **element** model
+    are done.)
+  - Progress (`Box<T>`): `Box::<T>::new` + the deref `*b` are modelled. The dump
+    never prints the allocation, so `Box::new` stores the boxed value and makes
+    the pointer a large power-of-two token (nonzero, so the compiler's null check
+    `Ne(SIZE, 0) && Eq(ptr, 0)` is discharged, and a multiple of every primitive
+    alignment, so the `addr & (ALIGN-1) == 0` check is too); the deref
+    `_5 = (_2.0) as *const u8; *_5` reads the stored value. Two parser fixes were
+    needed and are general: a cast is now recognised *before* the copy/move-place
+    attempt (a cast of an *annotated* place, `copy (_2.0: Unique<u8>) as *const u8`,
+    was being swallowed as a bare place and the cast dropped), and a cast's
+    trailing kind annotation (` (BoxDerefTransmute)`, ` (PtrToPtr)`) is stripped
+    so `*const u8` is not truncated to `*const`. `SizedTypeProperties::{SIZE,
+    ALIGN}` are modelled from the type in the constant's path. A `Box<T>`'s drop
+    glue is `T`'s, so `drop_is_noop(Box<u8>)` is true while `Box<PanicOnDrop>` is
+    not; the *bare* `Box<u8>` spelling an argument prints is treated as the
+    standard one only when the crate declares no `struct Box` (a shadow would
+    otherwise be read as glue-free and hide a panicking destructor). Fixtures:
+    `box_new_reads_its_value`, `box_guarded_inc`, `box_u32_reads_its_value`,
+    `owns_box_glue_free` and their two tripwires, pinned by
+    `a_box_new_deref_decides`. An explicit `std::mem::drop(b)` call and a
+    symbolic-length `sum` remain refusals (honest incompletenesses); `realistic.rs`
+    656/1198 → 660/1204.
+    - **MSRV fix.** On the 1.85 floor the deref lowers differently -- the pointer
+      is reached by a *field chain* `_3 = copy (((_2.0).0).0)` (no cast) and an
+      *alignment* assert is emitted (`AlignOf`/`BitAnd`/`Eq`) that current stable
+      const-folds away. The `box_refs` link now records for either spelling (a
+      cast of `_2.0` or an all-`Field` chain rooted at a boxed local) and is
+      recorded *last* in the `Stmt::Assign` arm (`set`/`rebase_parts` clear it), and
+      `parse_rvalue` reads `AlignOf(T)` as the alignment constant (a primitive's
+      alignment is its byte size). Both box fixtures verify on 1.85 *and* stable;
+      gate 14 (the suite on the MSRV) went red→green. See the AGENTS.md section.
+  - Progress (**iterator method form** and **explicit drop**): `xs.iter()` on a
+    `&[T; N]` now starts the same cursor the `for` desugaring does. The unsize
+    coercion `xs as &[u8]` is a reference cast, and the cast arm carried the
+    address only when the *source* was already `addressed`; a reference
+    *argument* is modelled as its referent and is not, so the cast fell through
+    and the `iter` receiver had no elements. The cast now falls back to
+    `pointee(src)` (the referent), which is what a reference cast preserves. With
+    that, `xs.iter().count()` and `xs.iter().copied().sum()` over a constant-length
+    array decide (`sum` carries its real overflow obligation, so it verifies only
+    under guards that rule the overflow out, and refutes otherwise). The
+    `map`/`filter`/`fold` adapters are still unmodelled: their bodies live in
+    `core`, not the dump, so they need closure execution the leaf intrinsic
+    handlers cannot do. `std::mem::drop::<T>` is now modelled: a glue-free `T`
+    (`Box<u8>`, `String`, `Vec<u8>`, a scalar) is a no-op, and a `T` with
+    unrepresentable glue (`Rc<u8>`, a user `Drop`) is refused. Fixtures:
+    `array_iter_count`, `array_iter_sum`, `explicit_drop_box`,
+    `explicit_drop_string` and their two tripwires, pinned by
+    `a_slice_iter_and_explicit_drop_decide`. The same fix unlocked the rest of
+    the already-modelled `slice::Iter` surface on a constant-length array --
+    `.max()`, `.min()`, `.last()`, `.nth(k)` (`array_iter_max`, `array_iter_min`,
+    `array_iter_last`, `array_iter_nth` and three tripwires) -- and the total
+    `clear` methods (`Vec::clear`, `String::clear`) are modelled as a length
+    reset. `realistic.rs` 660/1204 → **670/1219**.
   - Progress (`pop`, `is_empty`): `Vec::is_empty` reads the tracked length;
     `Vec::pop` returns `None` iff the length is zero and decrements it on the
-    non-empty path (the popped element is not modelled, so no payload is
-    fabricated). Fixtures `vec_is_empty_new`, `vec_not_empty_after_push`,
+    non-empty path; on a constant-length vector the popped element is the payload.
+    Fixtures `vec_is_empty_new`, `vec_not_empty_after_push`,
     `vec_pop_empty_then_len`, `vec_pop_one_is_some` and their twins.
+  - Progress (the **element** model, C11's last hard half): a `Vec` is now an
+    `Indexed` store exactly as a slice is — `len_mutable` distinguishes it from a
+    slice/array, and `push` records the pushed value at the *current* length. The
+    element is read back by `v[k]` (`<Vec as Index>::index`), `v.first()`/
+    `v.get(k)` (`<Vec as Deref>::deref` and `as_slice`), and `pop`. A `Vec`
+    *argument* binds a symbolic length (`v.len()` in a contract) and a distinct
+    element per index, so `v[0]` in a contract agrees with the body's `v[0]`.
+    Three soundness points pin it: `push` records an element only at a *constant*
+    length (a symbolic one poisons the elements rather than pinning a wrong
+    index), `v[k]` emits the `core` bounds panic as a reachable-failure obligation
+    (`v[0]` on a vector the precondition proves empty is refuted as a *panic*,
+    with the length in the witness), and the store crosses a call boundary and a
+    loop havoc exactly as the length does. Fixtures: the `vec_index_reads_pushed`
+    / `vec_first_reads_pushed` / `vec_get_reads_pushed` / `vec_pop_reads_pushed` /
+    `vec_arg_{index,first}_matches_contract` families and their `_cannot_prove_this`
+    twins, plus `vec_index_empty_is_a_panic`. `realistic.rs` **630/1148 →
+    637/1163**; `tests/mir.rs` `a_vec_element_is_read_back_through_index_first_get_and_pop`
+    pins every direction, and the `Vec` argument's length moving from a refusal to
+    a symbolic input is pinned by `arg_len_reflexive` (verifies) against
+    `arg_len_refused` (now a refutation, not a refusal).
+  - Progress (**iteration**): `for x in xs` over a slice, a `&[T; N]`, a `[T; N]`
+    (by value) and `xs.iter()` now decides. The desugaring is `IntoIterator::
+    into_iter` + `Iterator::next`, so the model holds a *cursor* -- the base slice
+    local and a **concrete** `u64` position -- that `next` advances. A concrete
+    position makes each iteration name the element at a constant index, the same
+    variable a contract's `xs[k]` names, so `for_slice_sum`'s `xs[0] + xs[1]`
+    agrees with the body. `next`'s `None` guard is the slice's own length variable
+    (`pos >= len`), so it cannot disagree with `len`/`is_empty`/`first`. A loop cut
+    havocs the cursor (drops it), so a `for` loop with an `invariant:` -- where the
+    position would be symbolic -- refuses `next` rather than reading an arbitrary
+    element. A by-value `[T; N]` loop owns an `array::IntoIter`, whose drop is a
+    no-op exactly when `T` is glue-free (the glue check reads `T` off the name).
+    `classify` accepts the calls only for a `[T]`/`[T; N]`/`slice::Iter`/
+    `array::IntoIter` head, so a user iterator is refused. `vec_iter_sum` and
+    `for_over_slice` now **verify** (as do `make`, `for_array_sum`,
+    `for_array_by_value_sum`, `for_slice_iter_sum`, `for_slice_count`,
+    `for_slice_max`). `realistic.rs` **637/1163 → 643/1174**;
+    `tests/mir.rs` `a_for_loop_over_a_slice_is_modelled` (five verified, three
+    refuted) and `a_for_loop_with_an_invariant_refuses_the_iterator` pin both
+    directions, and `slice_iteration_classifies_and_a_user_iterator_does_not`
+    pins the path guard.
+  - Progress (**iterator consumers**): `Iterator::{sum, count}` and the
+    cursor-preserving `copied` adapter now decide on a slice/array cursor.
+    `count` is `len - pos` on the slice's own length variable (exact even when the
+    length is symbolic, since `pos <= len`). `sum::<T>` folds the remaining
+    elements `s[pos] + ... + s[len-1]` with a **checked** `+`, so each partial sum
+    raises a reachable-panic obligation -- an unguarded `xs.iter().sum()` over
+    `u8`s is *refuted* as a panic (it overflows for `[200, 100]`), not proved; a
+    contract that bounds the elements discharges the two additions and verifies.
+    The number of addends is the length, so `sum` is modelled only when that length
+    is a constant (an array's type length, or a slice the precondition pinned with
+    `requires: xs.len() == N`); a symbolic length has no fixed addend count and is
+    refused. `copied` is the identity on the cursor (a reference is modelled as its
+    referent), and `next`/`sum`/`count`/`into_iter` accept an adapter over a
+    slice/array iterator (`Copied<..>`, and the `Enumerate<..>` spelling is
+    classified for `next` though the tuple payload is not yet modelled), so
+    `xs.iter().copied().sum()` and `for x in xs.iter().copied()` decide. `classify`
+    checks the receiver *type* (`slice::Iter`/`array::IntoIter`, or an adapter whose
+    payload is one) and the `Iterator`/`IntoIterator` trait, so a user iterator is
+    refused. `realistic.rs` **643/1174 → 647/1181**; `tests/mir.rs`
+    `a_slice_iterator_sum_and_count_are_modelled` pins four verified, two
+    postcondition refutations, the overflow *panic* refutation, and the
+    symbolic-length refusal.
+  - Progress (**extremes and offsets**): `Iterator::{last, nth, max, min}` now
+    decide on the cursor. `last`/`nth` name the *exact* element when the length is
+    known (an array's type length, or a slice the precondition pinned) -- the same
+    variable a contract's `xs[len-1]`/`xs[pos+k]` names -- and fall back to the
+    single fresh `LAST_INDEX` variable only for a symbolic-length slice, the same
+    over-approximation `slice::last` uses. `nth(k)` needs a *constant* offset (a
+    symbolic one names no single index) and advances the cursor past the returned
+    element. `max`/`min` are folds of comparisons over the remaining elements, so
+    (like `sum`) they need a constant length; the payload is the extreme *value*,
+    and a reference payload (`Option<&T>`) also carries a `Select` tree over the
+    same elements, so a deref reads the same value a direct `Option<T>` read does.
+    The comparison is `slt`/`ult` by the element's sign -- `i8::MIN` is the
+    smallest signed value but the largest unsigned byte, so an unsigned comparison
+    would pick the wrong element. `realistic.rs` **647/1181 → 652/1190**;
+    `tests/mir.rs` `a_slice_iterator_extremes_and_offsets_are_modelled` pins six
+    verified (incl. signed `i8` and a reference payload), five postcondition
+    refutations, and the symbolic-length refusal.
+  - Progress (**`rev`**): `Iterator::rev` is a direction flag on the cursor
+    (`IterState::rev`), carried like `copied`; `rev().rev()` toggles it back to the
+    identity. Only the order-dependent terminals read it: `next` names base index
+    `len-1-pos` (so a `for x in xs.iter().rev()` loop walks back-to-front), `last`
+    names `s[pos]` (the first *remaining* element, so `rev().last()` is `xs[0]`),
+    and `nth(k)` names `s[len-1-(pos+k)]`. `count`/`sum`/`max`/`min` are
+    order-independent and unchanged. `rev` needs a *constant* length so the index
+    is a constant (a symbolic-length reversed cursor is refused, the honest
+    direction); `is_cursor_ty` accepts the `Rev` adapter, so the reversed cursor's
+    terminals still classify. `tests/mir.rs::an_iterator_can_be_reversed` pins five
+    verified (`last`/`nth`/
+    `for`/`rev().rev()`/`count`) and one refuted tripwire, and
+    `mir::intrinsics` pins the classification without a toolchain.
+
+  - Progress (**`skip`/`step_by`**): `skip(n)` advances the cursor's position by
+    `n`; `step_by(n)` sets its stride (`IterState::step`, composed as `step*n` when
+    chained). The stride is read by every order/count-sensitive terminal: `next`
+    advances `pos += step`, `nth(k)` names `pos + k*step`, `last` names the last
+    strided index `pos + ((n-1-pos)/step)*step`, `count` is
+    `(n-1-pos)/step + 1` (both need a *constant* length, which `skip` does not),
+    and `sum`/`max`/`min` fold the strided positions. A zero step is a Rust panic
+    and is refused. `is_cursor_ty` accepts the `Skip`/`StepBy` adapters.
+    `tests/mir.rs::an_iterator_can_be_skipped_and_stepped` pins five verified
+    (`skip`/`step_by` over `last`/`count`/`sum`) and one refuted tripwire, and
+    `mir::intrinsics` pins the classification without a toolchain.
+
+  - Progress (**`take`**): `take(n)` caps the cursor's effective end at
+    `pos + n` (`IterState::end`, an absolute exclusive bound). It needs a *constant*
+    length so the cap is constant; every terminal reads the capped end -- `next`
+    stops at `min(len, end)`, `count` is `(hi-1-pos)/step + 1`, `last` names the
+    last strided index below `hi`, `nth(k)` is valid iff `pos+k < hi`, and
+    `sum`/`max`/`min` fold `pos..hi`. `is_cursor_ty` accepts the `Take` adapter.
+    `tests/mir.rs::an_iterator_can_be_taken` pins five verified (incl. `take(10)`
+    over four elements = all four) and one refuted tripwire, and `mir::intrinsics`
+    pins the classification without a toolchain. Measured after all three adapter
+    increments (rev, skip/step_by, take): `realistic.rs` **685 of 1237**.
+
+  - Progress (**`fold` with a reducer closure**): `Iterator::fold(init, f)` folds a
+    modelled reducer closure. A non-capturing closure prints as
+    `const ZeroSized: {closure@FILE:L:C: L:C}`, so `closure_fn` resolves it to the
+    `MirFn` whose first argument type is exactly that closure type (a function
+    item is matched on its tail, and an ambiguous tail is refused). `closure_binop`
+    reads the reducer shape `|acc, x| acc <op> x` -- a *checked* `Add`/`Sub`/`Mul`
+    (with its overflow `assert`, so the fold raises a reachable-panic obligation
+    per step, exactly as `sum` does for `+`) or a `wrapping_*` call (no
+    obligation). Needs a constant length and a constant `init`. Anything else is
+    refused, because a wrong reducer is a wrong value.
+    `tests/mir.rs::an_iterator_can_be_folded_with_a_closure` pins three verified
+    (checked sum, `wrapping_add`, a non-zero init) and one refuted tripwire (an
+    unguarded fold overflows), and `mir::intrinsics` pins the classification.
+
+  - Progress (**symbolic-length `sum`**): a slice whose length is a *symbolic*
+    input (`v: &[T]`, `v.iter().sum()`) is summed by unrolling to
+    `MAX_SYMBOLIC_LEN` (8) steps, each guarded by `k < len` (`ite(k < len, v[k],
+    0)`), which is exact **iff** the precondition proves `len <= 8`; the handler
+    proves `path => len <= 8` with `find_obligation` and **refuses** the shape
+    otherwise (a shorter unroll would silently miss elements — a wrong value, so
+    the direction is a refusal). The elements are created on demand
+    (`index_elem`), so a guarded sum of small elements is a real panic-freedom
+    proof over a runtime-length slice. `step_by`/`take` on a symbolic length are
+    refused (they need a constant count). Pinned by
+    `a_symbolic_length_sum_is_bounded_by_its_precondition` (verified / refuted /
+    refused).
+
+  - Progress (**`map`/`filter`**): `map(f)`/`filter(f)` are lazy: they set a
+    transform/predicate on the cursor and carry it. `sum` applies the transform
+    per element (with the transform's own overflow obligation, checked or
+    `wrapping_*`), and `count` counts the elements the predicate accepts
+    (`Σ ite(pred(x), 1, 0)`). The closure is resolved by `closure_fn`; the
+    transform/predicate is read by `closure_map`/`closure_filter`, which follow
+    the body's `_3 = copy (*_2)` copies (`resolve_operand`) to the element and a
+    constant. Needs a constant length; anything else is refused.
+    `tests/mir.rs::an_iterator_can_be_mapped_and_filtered` pins three verified
+    (checked map, `wrapping_mul` map, filter-count) and one refuted tripwire (the
+    filter accepts all four, so a count of two is refuted), and `mir::intrinsics`
+    pins the classification.
+
+  - Progress (**`all`/`any`**): `all(f)`/`any(f)` fold a predicate closure to a
+    `bool` -- `all` is the conjunction of `pred(x)` over the elements, `any` the
+    disjunction. Reuses the `filter` predicate reader (`closure_filter`); needs a
+    constant length. `tests/mir.rs::an_iterator_can_be_tested_with_all_and_any`
+    pins two verified and two refuted tripwires (all-true claimed false, and an
+    unguarded `any` claimed true).
+
+  - Progress (**`enumerate`**): `Iterator::enumerate` is a cursor identity whose
+    `next` yields `Option<(usize, &T)>`. `next` writes the concrete index and the
+    element into the tuple store and sets the payload to an aggregate, so the
+    direct `((_2 as Some).0).0` / `.1` destructure reads the index and `xs[pos]`.
+    Modelling it exposed a *parser* bug: a nested place whose group holds a
+    downcast *and* a tail (`((_2 as Some).0).0`) was split on its last ` as ` and
+    came back `None`, so the whole read was unknown. `parse_place` now splits a
+    group only on a *top-level* ` as ` (`find_top_level_as`), so the inner
+    `(_2 as Some).0` recurses to the real downcast. `realistic.rs` **652/1190 →
+    654/1194**; `mir::parse::tests::a_nested_downcast_with_a_tail_parses_whole`
+    pins the parse without a toolchain and
+    `a_slice_iterator_enumerate_carries_the_index_and_element` pins the verdicts.
+  - Progress (**`String`**, the length half): a `String` is a `Vec<u8>` underneath
+    and its fields are not printed, so the model tracks its **length** only --
+    `String::new` is `0`, `push_str` adds the appended `&str`'s byte length, the
+    `<String as From<&str>>::from` constructor is that length, and `len`/`is_empty`
+    read it. A `&str`'s byte length is a symbolic input for an argument (the same
+    variable `str::len` reads) and a **constant** for a literal (`const "abc"` is
+    `3`, kept in the string store and read back by `length_of`). A `String` drop is
+    glue-free (like `Vec<u8>`), so a `String`-using function decides. The path is
+    checked (`names_string_impl`, and the `String`/`&str` types in the conversion
+    branch) so a user type spelled `String` is refused, and the same-dump lookup
+    answers a real body first. The bytes are not modelled, so a method whose result
+    depends on the *contents* stays refused. `realistic.rs` **654/1194 →
+    656/1198**; `tests/mir.rs` `a_string_length_model_decides_new_from_push_len`
+    pins eight verified (incl. a `&str`-argument reflexive length) and two
+    refutations, so the model is exact rather than a constant the claim accepts.
   - Move: **build**.
 - **C12. A specification language that can say more.** · P1 · in progress · Verus,
   Creusot, Prusti, SPARK
@@ -1064,17 +1379,60 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     change.)
   - Exit: `cargo add verif` works. ✅
   - Move: **build**.
-- **U2. `cargo verif`.** · P1 · todo · Kani (`cargo kani`)
+- **U2. `cargo verif`.** · P1 · done · Kani (`cargo kani`)
+  - Gap: there was no command-line entry point; a user had to write an example
+    that called `verify_file_with`.
+  - Progress: `src/bin/cargo-verif.rs` (a `[[bin]]` gated on `std`, so the
+    bare-metal build is unaffected) is the entry point. `cargo verif [--file P]
+    [--function N] [--format human|json]` verifies a file (default `src/lib.rs`)
+    and maps the report to a distinct exit code: `0` clean, `1` a failure /
+    incomplete / skipped / missing, `2` the tool could not run. `--format json`
+    emits one machine-readable object (`file`, `outcomes`, `missing`, `summary`)
+    with hand-written escaping (the crate is zero-dependency). Pinned end to end
+    by `tests/cargo_verif.rs`, which runs the *built* binary (`CARGO_BIN_EXE_…`)
+    on a throwaway crate: a true contract exits 0, a false one exits 1 and names
+    the postcondition, a `--function` filter ignores a broken sibling, and the
+    JSON carries the summary.
+  - Progress (SARIF): `--format sarif` emits a SARIF 2.1.0 document -- one
+    `result` per non-`verified` outcome, `error` for a failure and `warning` for
+    an incomplete/skipped/missing function, each located at the file, and an empty
+    `results` array on a clean run -- so `github/codeql-action/upload-sarif` can
+    annotate a pull request. Pinned by
+    `sarif_output_is_a_2_1_0_run_with_one_result_per_failure`.
+  - Progress (the Action, done): the reusable composite action
+    `.github/actions/verif/action.yml` wires `--format sarif` to
+    `github/codeql-action/upload-sarif` (pinned to a commit SHA). It builds
+    `cargo-verif` from its own checkout, runs it, uploads the report (skippable with
+    `upload: false`), and fails the step on any finding (`fail-on-findings: false`
+    to report without failing); a *skipped* contract is a failure by default. This
+    repository dogfoods it in the `sarif` CI job, and `scripts/check_sarif.py`
+    asserts the produced report is a well-formed SARIF 2.1.0 run naming the failing
+    function, so a run that silently reports nothing fails there. The action's YAML
+    is validated (composite, every `uses:` pinned) and `scripts/check_actions_pinned.py`
+    scans it. The only piece not exercised in CI is the `upload-sarif` call itself
+    (it needs code scanning enabled on the repo), which is why the dogfood runs with
+    `upload: false` -- the report it would upload is what `check_sarif.py` checks.
   - Exit: `cargo verif --format json|sarif` plus a GitHub Action that annotates a
     PR.
   - Move: **build**.
-- **U3. A counterexample becomes a test.** · P1 · in progress · Kani (concrete
+- **U3. A counterexample becomes a test.** · P1 · **done** · Kani (concrete
     playback)
   - Gap: the replay machinery exists in `tests/mir.rs`; make it a user feature
     that emits a `#[test]`.
+  - Progress (done): `cargo verif --emit-test <fn>` prints a `#[test]` that calls the
+    refuted function at the counterexample's inputs (`mir::verify::emit_test_source`).
+    The *values* come from the rendered counterexample (`n = 0`), the argument *order*
+    from the source's parameter list (`mir::spec::function_params`), so the emitted
+    call is the one the verifier refuted. It is deliberately scoped to a **panic**
+    obligation with a concrete witness: a postcondition failure has no call to
+    reproduce, and re-stating the postcondition in Rust is not modelled, so it is
+    refused (exit 2) rather than guessed. A method, a non-scalar (reference)
+    argument, or a counterexample that does not assign a parameter is refused too.
   - Exit: a reported counterexample is emitted as a compiling, failing-then-fixed
-    `#[test]`.
-  - Move: **build**.
+    `#[test]`. **Met** -- `tests/mir.rs::a_counterexample_becomes_a_failing_then_fixed_test`
+    compiles the emitted test, runs it against the buggy body (it fails, the call
+    panics) and against the fixed body (it passes).
+  - Move: **done**.
 - **U4. Readable counterexamples.** · P1 · in progress · —
   - Gap: a report says `v1:u8 = 224`, not `x = 224`. The `debug x => _1` names
     exist; the stable text dump has no per-statement spans, so line numbers come
@@ -1086,9 +1444,15 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     [`Obligation::failure_detail_named`]; pinned by
     `a_counterexample_is_rendered_with_source_names`. The README's `mir_demo`
     transcript is regenerated from the run.
-  - What remains: source *line* numbers in the report (the second half of the
-    exit). The stable text dump has none, so this needs the source scanner or the
-    `rustc_public` path; the name half is done.
+  - Progress (lines): the source *line* of each function is now carried out of
+    the scanner (`FileReport::lines`, from `FnContract::line`) and shown by
+    `cargo verif` -- `wrong:3` in the human report and a SARIF
+    `region.startLine` -- so a code-scanning annotation points at the function
+    rather than at the file. The stable text dump has no per-statement spans, so
+    this is the function's `fn` line, not the failing statement; that is the
+    honest granularity the scanner can supply.
+  - What remains: per-*statement* line numbers (a failing statement's line, not
+    just the function's), which needs the `rustc_public` path.
   - Move: **build**.
 - **U5. A test harness that never passes vacuously.** · P0 · done · —
   - Gap: about 21 tests in `tests/mir.rs` use
@@ -1102,17 +1466,59 @@ Exit: one real `no_std` crate with a dependency verified end to end with
     tests run either way. ✅
   - Exit: `cargo test --features std` never passes vacuously.
   - Move: **build**.
-- **U6. Documentation size.** · P1 · todo · —
-  - Gap: the README is ~166 KB and `AGENTS.md` ~586 KB. Split into a short README,
+- **U6. Documentation size.** · P1 · **done** · —
+  - Gap: the README was ~166 KB and `AGENTS.md` ~586 KB. Split into a short README,
     a user guide, `ROADMAP.md` (this file), `SOUNDNESS.md`, and design notes.
-  - Exit: a README under ~30 KB with links to the rest.
+  - Done: the README is now **25.7 KB** (under the ~30 KB exit). The long sections
+    moved verbatim into `docs/` — `internals.md` (verification conditions + the
+    engine-honesty war stories), `mir.md` (the MIR frontend), `layout.md`,
+    `testing.md`, `comparison.md`, `build-time.md` — each linked from the README's
+    contents, each headed with a back-link. `scripts/check_doc_links.py` was
+    extended to check `docs/*.md` too, and its file-tree check now runs on
+    `docs/layout.md` (where the tree moved) rather than only `README.md`; both
+    were teeth-checked (a broken anchor and a bogus tree entry each fail). The
+    `README.md`-anchored tests (`tests/readme.rs`) still read the sections that
+    stayed (`Installation`).
+  - `AGENTS.md` is deliberately **not** split: it is the agent-facing record, not a
+    published page, and the exit names the README.
   - Move: **build**.
-- **U7. Proof caching.** · P1 · todo · —
+- **U7. Proof caching.** · P1 · **done** · —
   - Exit: unchanged MIR plus unchanged contracts reuses the verdict across runs.
-  - Move: **build**.
-- **U8. A public scoreboard.** · P1 · todo · Kani
+  - Progress (done): `mir::cache` stores each file's *decided* outcomes
+    (`Verified`/`Failed`) under a key that folds in the MIR text, the source text (the
+    contracts), the edition **and the engine hash** — the last baked by `build.rs` from
+    `src/**` + `Cargo.toml`. A change to any of the four is a *miss*, never a stale hit,
+    which is what makes reuse sound: a cached `verified` cannot survive a change to the
+    rule that produced it. Only `Verified`/`Failed` are stored (they carry no arena
+    handles); `Incomplete`/`Skipped` are re-derived every run. Opt-in via
+    `MirOptions.cache` / `cargo verif --cache <dir>`; a `--function` run merges rather
+    than drops the other entries.
+  - Exit met -- `tests/mir.rs::the_proof_cache_reuses_a_decided_verdict_and_a_change_is_a_miss`
+    proves both halves: a *tampered* cache entry shows through (the cache is consulted),
+    and a change to the source is a *miss* (the real verdict returns). `mir::cache`'s
+    unit test pins that every key part changes the key, and that a tab/newline round-trips
+    through the line format.
+  - Move: **done**.
+- **U8. A public scoreboard.** · P1 · in progress · Kani
   - Exit: `everyday.rs`, an SV-COMP-style set, and `verify-rust-std` functions
     scored for verif **and** Kani on the same inputs, updated by CI.
+  - Progress (the verif half, done): `scripts/scoreboard.py` runs `mir_coverage` on
+    the three MIR corpora and prints a markdown table of verified/total, with
+    `--check` failing if a corpus drops below `scripts/scoreboard-floor.txt`
+    (a *regression* floor: verdicts are stable across the gate's toolchains, so a
+    drop means a change un-verified a function). `--write-floor` records a raised
+    count. Current: everyday 21/24, actuator 18/33, realistic 694/1252. The
+    everyday `div_unwrap`/`sum_iter`/`tri` are C7/C11/C12.
+  - Progress (CI, done): `.github/workflows/ci.yml` has a `scoreboard` job that runs
+    `python3 scripts/scoreboard.py --check`, so the regression floor is enforced on
+    every push rather than only when someone remembers. It is a separate job, not a
+    gate step, because it takes minutes; the action pins are checked by
+    `scripts/check_actions_pinned.py` like every other `uses:`. Measured locally:
+    `everyday 21/24, actuator 18/33, realistic 694/1252`, `every corpus is at or above
+    its floor`, exit 0.
+  - Remaining: the Kani column on the *same* inputs (Kani is already an oracle in
+    `examples/kanidiff.rs`, but not a per-function coverage score), an SV-COMP-style
+    set, and `verify-rust-std` functions.
   - Move: **build**.
 - **U9. Contracts written in the code, not only in doc comments.** · P1 · done · —
   - Gap: a `///` clause is unchecked prose. A typo in a *keyword* is now refused
@@ -1178,19 +1584,39 @@ scoreboard against Kani is live.
     this obligation as a Lean/Coq goal" a user-facing option.
   - Exit: one obligation from `everyday.rs` re-checked by a kernel.
   - Move: **bridge**.
-- **A4. A trusted computing base and a semantics.** · P1 · todo · —
+- **A4. A trusted computing base and a semantics.** · P1 · in progress · —
   - Write down what is trusted (parser, MIR-printer stability, executor, blasters,
     solvers), a short formal semantics of the supported MIR subset, and back both
     with mutation testing (exists) and external review before any 1.0 claim.
-  - Exit: a `SECURITY.md`-style TCB document and an external review.
+  - Progress (the document, done): [`docs/tcb.md`](docs/tcb.md) enumerates the TCB
+    (rustc's MIR, the text parser, the contract scanner, the executor, both
+    blasters, the CDCL solver, the SMT-LIB2 exporter) with the check behind each,
+    states the semantics of the supported MIR subset (bit-vector values with an
+    explicit `Sign`, a path condition, and per-construct obligations), and lists
+    what is refused. Linked from `README.md` and `SECURITY.md`.
+  - Remaining: the **external review** the exit names. The document is not a
+    substitute for it, and `docs/tcb.md` says so.
   - Move: **build**.
-- **A5. A qualification path.** · P2 · todo · SPARK (the only one with
+- **A5. A qualification path.** · P2 · **done** (draft) · SPARK (the only one with
     qualification kits)
   - Approach: draft Tool Operational Requirements and a DO-330 TQL-5 / ISO 26262
     TCL plan. Together with Ferrocene, this is the most credible embedded-safety
     differentiator.
-  - Exit: a drafted TOR and qualification plan.
-  - Move: **build** (long term).
+  - Progress (draft, done): `docs/qualification.md` is the drafted TOR and plan. It
+    states why a verifier is a tool that must itself be qualified, gives the TOR as a
+    table whose every row names the gate or oracle that *already* demonstrates it
+    (soundness -> `SOUNDNESS.md` + the differential oracles; refusal-over-guessing ->
+    `Verdict::Unknown`; determinism -> the scoreboard floor; bounded resources -> the
+    budget regression tests; no silent drops -> `assert_not_dropped`; toolchain honesty
+    -> gates 9 and 14; reproducibility -> `smtscript` + the z3/Kani/Verus/Coq/Lean
+    oracles), and lists what a real qualification still needs -- an independent
+    assessment and a signed tool accomplishment summary, both human actions a commit
+    cannot supply. It is explicit that `verif` is **not** qualified and that Ferrocene
+    qualifies the compiler, not the verifier.
+  - Exit: a drafted TOR and qualification plan. **Met** -- `docs/qualification.md`
+    (draft).
+  - Move: **done** (the draft; the independent assessment is the remaining human step,
+    recorded in the doc rather than as a code task).
 - **A6. Kani as a standing oracle for the frontend.** · P1 · todo · Kani
   - Approach: run Kani on every function in `everyday.rs` and `realistic.rs` in
     CI and require agreement whenever both decide. The engine already has Kani and
@@ -1270,3 +1696,230 @@ gap table (§6), and the phased exit criteria (§7). The comparison to Kani, Ver
 Prusti, Creusot, Coq/Rocq, Lean, SPARK, Flux, VeriFast/RefinedRust/ESBMC and the
 `contracts` crate is in §6 of that review and is summarised in the **Competitor**
 field of each item.
+
+## Review findings (round 9): fixed and tracked
+
+A soundness-focused review of the C8/U3/U7 work and the MIR frontend raised ~50 items.
+The false-proof / false-pass ones and the cheap tooling ones are fixed with regressions;
+the deep executor and multi-file ones are tracked here.
+
+**Fixed (regression test named):**
+- Cache keyed on the root source, not the inlined module text → a contract-only edit in
+  a module reused a stale verdict. Now keyed on `Specs::snapshot`
+  (`a_contract_only_edit_in_a_module_invalidates_the_cache`).
+- Cache keyed by the report label, so two trait impls of one method shared a verdict.
+  Now keyed by the MIR definition name
+  (`two_trait_impls_of_one_method_get_distinct_cached_verdicts`).
+- `verif-wrap` did not forward `--cfg`, so a feature-flipped `cfg!` could pass the build.
+  `MirOptions.rustc_args` forwards `--cfg`/`--target`
+  (`a_feature_that_flips_a_cfg_makes_the_contract_fail`).
+- `--emit-test` replay used a comment declaration / swapped args, and emitted `0` for
+  `false`, `255` for `-1i8`. `function_params` reads a real top-level `fn` (skips
+  comments and methods) and `render_arg` types each value
+  (`a_replay_call_uses_the_real_declaration_not_a_comment`,
+  `function_params_ignores_a_comment_declaration`, `function_params_refuses_a_method`,
+  `render_arg_types_a_counterexample_value`).
+- `cargo verif --emit-test` requires a name, strips `verif` only as the subcommand, and
+  requests verification of its target.
+- `scoreboard.py --check --write-floor` checks before writing (no silent downgrade).
+- `dependency_names` handles dotted keys and quoted sub-tables.
+- `build.rs` includes `TARGET` in the engine hash (endianness-dependent `to_be`/`to_le`).
+- external-demo always rebuilds, asserts `clamp_percent ... verified`, and gives each
+  fixture an explicit target dir.
+- The `everyday.rs` "wall" pin no longer rejects a *sound* `Verified` (the contracts are
+  sound; only a false `Failed` is forbidden).
+
+**Round 10 (also fixed):** `verif-wrap` refuses a cross target whose pointer width or
+endianness the model does not represent; `function_params` is comment-aware across lines
+(a `/* { */` no longer blocks replay); `extern_compiles` imports every `--extern`;
+`dependency_names` splits before stripping quotes (`"dep".path`); `cargo-verif` errors on
+an unmatched `--function`/`--emit-test`; the `everyday.rs` pin allows a panic finding for
+`sum_iter`; the TCB path test skips inside a packaged crate; the action fails on exit 2
+regardless of `fail-on-findings`; the SARIF smoke test requires an `error` level; docs
+(build-time `verif-wrap`, CLI dependency resolution, TQL-5 objectives, TCB executor
+evidence = panic replay, input-selection trust). Regressions:
+`function_params_is_comment_aware_across_lines`,
+`dependency_names_reads_dotted_and_quoted_keys`,
+`a_32_bit_target_is_refused_and_the_host_is_not`.
+
+**Round 11 (also fixed):** `--function`/`--emit-test` accepts a module function by its
+short name (the unmatched-name guard tail-matches, like `select`); the action fails on any
+exit other than 0/1 (a `cargo-verif`-not-on-PATH 101 is no longer a pass); `code_of_line`
+tracks **nested** block comments (`/* /* */ */`); the extern probe is `#![no_std]` (a
+panic-handler dependency no longer clashes with the probe's std); the `sum_iter` panic
+exception is scoped to `sum_iter` alone (`tri`/`div_unwrap` are panic-free under their
+preconditions); the TCB path check gates on `[workspace]` in the manifest, not a missing
+directory; the README action ref is `@main`. Regressions:
+`a_function_filter_accepts_a_module_function_by_its_short_name`,
+`function_params_ignores_a_nested_block_comment`.
+
+**Round 12 (also fixed):** the README action ref is a commit-SHA placeholder (no mutable
+`@main`); the extern probe aliases each artifact with a synthetic name (`__verif_probe_N`),
+so a dependency named `core`/`std` no longer redirects the probe's prelude; `verif-wrap`'s
+`source_arg` finds a custom target path by `is_file()` (not a `.rs` suffix); `code_of_line`
+carries string/char/raw-string state across lines, so a multiline literal containing `/*`
+no longer leaves the scanner in a comment. Regression:
+`function_params_tolerates_a_multiline_string_with_comment_tokens`.
+
+**Round 13 (also fixed):** `verif-wrap`'s `source_arg` consumes option values, so a
+`--crate-name <path>` whose value is an existing file is not mistaken for the input
+(`source_arg_skips_a_crate_name_value_that_is_an_existing_file`); `code_of_line` masks
+literal contents to spaces, so a `{` or a fake `fn bad(b, a)` inside a multiline string
+neither unbalances the depth nor supplies a signature
+(`function_params_masks_literal_braces_and_fake_signatures`); the README action ref is
+already a commit-SHA placeholder. Regressions:
+`source_arg_finds_a_custom_extension_path`.
+
+**Round 14 (deep fixes):**
+- `verif-wrap` now forwards the invocation's **own** `--extern`/`-L dependency=` to the
+  MIR emit (Cargo's exact artifacts for this target/profile/feature set), instead of
+  re-deriving from `[dependencies]` and ranking rlibs by mtime. This closes *wrapped builds
+  lose resolved dependencies* (a binary's own library), *wrong dependency build*, *missing
+  workspace/custom target artifacts* and *renamed dependencies* — the alias is the `--extern`
+  name, not the artifact basename. Tests: `a_binary_that_imports_its_own_library_builds`.
+- `verif-wrap` forwards a **build script** (`--crate-name build_script_build`) unchanged, so a
+  `[build-dependencies]` script is not verified without its deps. Test:
+  `a_build_script_with_a_build_only_dependency_is_forwarded`.
+- Cached-build isolation is documented (a dedicated `CARGO_TARGET_DIR` per mode) and pinned by
+  `enabling_verification_after_an_unwrapped_build_still_rejects_a_false_contract`.
+- Executor fail-closed guards: `reject_adapters` (a terminal that reads base elements after a
+  `map`/`filter` it does not apply is refused), `closure_op_count` (a closure with more than
+  one operation is refused, so a compound `map` is not read as its first op), reversed checked
+  reductions refused, and `Vec::clear` of an element that may have drop glue refused.
+  `iterator_adapter_shortcuts_are_refused_not_mis_modelled` — `filter(..).next().is_some()` on a
+  zeroed slice was a **false proof** (`Verified`, reporting `false` as `true`); it is now
+  refused (teeth confirmed by disabling the guard). `clearing_a_vec_of_droppable_elements_is_not_proved_panic_free`.
+
+**Round 15:**
+- The emitted-test replay (`compile_emitted_test`) now compiles with
+  `-C overflow-checks=on`, so a counterexample that is a subtraction underflow panics
+  regardless of the test profile (a release `--test` without checks could otherwise pass
+  before the function was fixed).
+- `Env::set` gained a lone-`Deref`-of-a-box arm: a write through a `Box` pointer (`*b = v`)
+  lands in the `boxed` store the read consults, so a later `*b` never returns the value the
+  box held at `new`. The shape is currently refused before the write (an unmodelled
+  null-deref assert), so the pinned invariant is the soundness one
+  (`a_write_through_a_box_pointer_is_seen_by_a_later_read`).
+
+**Round 16 — mutable-`Vec` postcondition length (was a known false proof; FIXED).**
+`pub fn f(v: &mut Vec<u8>) { v.push(1); }` with `requires: v.len() == 0` /
+`ensures: v.len() == 0` used to be **Verified** (the real length after `push` is 1) while the
+true `ensures: v.len() == 1` was refuted: a `&mut Vec`'s contract length read the *entry* value.
+The fix mirrors the scalar-ref `ref_final`: the executor now passes each `&Vec`/`&mut Vec`/`&[T]`
+argument's *final* length in `ref_final`, and the `post` closure rebinds `{arg}__len` to it
+(`spec::arg_name_any` supplies the widthless arg's source name, which `arg_name_of` omits). A
+slice/array length cannot change, so the rebind is a no-op there; only a `&mut Vec`'s is the
+pushed length. Pinned both ways by `a_mut_vec_postcondition_reads_the_final_length` (false `== 0`
+refuted, true `== 1` verified).
+
+**Round 17 — `enumerate` index counts from the enumerate's own start (FIXED).**
+`skip(1).enumerate().next().0` reported the raw slice position (`1`) instead of the
+enumerate index (`0`), and `rev().enumerate()` likewise. `IterState` gained `enum_start`
+(set to `pos` when `enumerate` is applied, which rides the `SliceCopied` arm); the yielded
+index is `pos - enum_start`. `enumerate().skip(1)` still yields `1` (skip advances `pos`
+after the enumerate recorded its start). Pinned by
+`an_enumerate_index_counts_from_the_enumerates_start` (skip/rev index 0, the old raw-position
+value refuted, `enumerate().skip(1)` index 1).
+
+**Round 18 — mapped symbolic-length sum no longer includes the padding (FIXED).**
+A `map(...).sum()` over a slice with a *symbolic* length zeroed the padding (indices `>= len`)
+to 0 and then applied the `map`, so `map(0)` (e.g. `0 - 1`) contributed to the padding: a wrong
+value and a spurious overflow. The `map` now applies to the *real* element and the *mapped* value
+is guarded to 0; the map's overflow obligation is under the per-step guard, so padding raises no
+panic. Pinned by `a_mapped_symbolic_sum_does_not_include_the_padding` (verified `ret <= 1`; the
+control `ret == 0` refuted; verified to fail without the fix — the old order reports `ret = 8`).
+
+**Fixed already (rounds 10–17):** compound-closure refusals, `Vec::clear` of droppable
+elements, `*b = v` through a `Box`, mutable-`Vec` postcondition length (16), adapter-chain/
+reversed-reduction refusals, `enumerate` index (17), wrapper `--extern`/`-L` forwarding +
+build-script forwarding, custom source path, action ref, literal-masking replay lexer,
+`source_arg` option-value parsing.
+
+**Tracked (open):**
+- **Round 23 (fixed):** the MIR check now passes CI (the null-pointer panic is normalised on
+  both sides); `cargo metadata`'s path is read as one string (not per byte) and escaped quotes
+  no longer end it early; `take(k).rev()` reverses the taken prefix; a valid crate-name test;
+  the reusable-action example names a release tag.
+- **Round 24 (review findings):** fixed three executor false proofs -- `skip(n).take(k).rev()` /
+  `skip(n).rev()` (the single-`pos` cursor mis-windowed; now refused), a rebound `&[T]`/`&mut Vec`
+  reading the replacement's length (now the caller's entry length), and `map(f).map(g)` modelled as
+  `g` alone (now refused). `take(k).rev().rev()` now cancels to the forward `take(k)`. Stale (already
+  refusals, pinned): compound closures, `Vec::clear` on a drop-glue element, a `*b = v` Box write,
+  `map().next()`, `all()` then `next()`, `rev().sum()`. `#[path]` on an external `mod` is now honoured;
+  a method contract in an external module is a visible `missing` (a lost proof, never a false proof);
+  `iterator_chain_differential_agrees_with_rustc` checks every `Verified` chain against real execution.
+- **Round 25 (round-24 re-review):** re-probed every finding with the reviewer's *exact*
+  shapes. Most were already refused (`Incomplete`: compound closures, `Vec::clear` on drop
+  glue, a Box write, `filter().next()`, `enumerate().map`, `skip.take.rev.last()`, `rev().sum()`;
+  `take.rev().all` and `filter().count()` are correct). Two were real false proofs and are now
+  refused: `take(k).rev().skip(1).rev()` (read `xs[1]` = 20 vs real 10; `rev()` refuses when
+  `pos > 0`) and `v.push(1); v = w` (a rebound `&mut Vec` read the entry length; the length is
+  now refused when any Vec arg is rebound). Multi-file: a one-line `#[path]` (closing `]`), a
+  `#[path]` relative to its source file, and a file shared by two `#[path]` modules are fixed.
+  The differential harness now also submits a FALSE postcondition. Still open (documented): the
+  inlining line-map (a multi-file method is a visible `missing`), `--emit-test` for a
+  module-qualified function, nested Cargo wrappers, and SARIF per-file paths.
+- **Round 26 (second, fuller review -- 27 findings):** re-verified each with its exact
+  shape. Three more **real false proofs** fixed (refused): a `#[cfg]`-alternative module
+  whose *inactive* contract overwrote the active one (compiled body checked against the
+  wrong module's claim); a *refused* `&mut Vec` length falling through to a crate
+  `const <name>__len`; and `iterator_const_len` reading a pin off a *folded* length (a
+  one-element Vec modeled as empty). One wrong-contract fixed: an indented `#[path]`/`mod`
+  inside an inline `mod {}` was inlined from the enclosing directory (now refused). The
+  differential harness now also rejects a false *refutation* of a true postcondition. The
+  rest were already refused/correct (compound closures, `Vec::clear` on drop glue, a Box
+  write, `filter().next()`, `enumerate`, `skip.take.rev.last`, `rev().sum()`,
+  `take.rev().all/any`, `all`/`any` cursor discard, `take.rev.rev`). **Known over-refusal
+  (safe lost proof):** a shared `&Vec` rebind discards its length (`Ty::Ref` carries no
+  mutability, so `&Vec` and `&mut Vec` cannot be told apart) -- refused, never wrongly
+  proved. Still open: `--emit-test`, nested wrappers, cached builds. (The inlining line-map
+  and SARIF per-file paths are now DONE -- see Round 27.)
+- **Round 27 (line-map, per-file SARIF, Box write):** `extract_crate`/`inline_external_modules`
+  record a map from each snapshot line to the original `(file, line)`; `resolve_targets` and
+  the contract lookup (`snapshot_impl_loc`) translate through it, so a method in a module file
+  and a root method below a `mod` declaration pair with their own body (true -> `Verified`,
+  false -> `Failed`; before, a multi-file method was a visible `missing`). `report.lines`
+  carries `(file, line)`, so `print_sarif` points `artifactLocation`/`region.startLine` at the
+  module a method lives in, and `check_sarif.py --root` asserts a non-root URI with a positive
+  line. The `Box` write now reaches its store: `set`'s box arm forgot the value it had just
+  stored (`forget_parts` does `boxed.remove`) and erased the field-0 pointer token, so
+  `*b = 7; *b` read unknown and the stale value could be proved; forget-then-insert, keep the
+  token, and set the pointer's value in the `Cast` arm fix it. The Box and Vec-rebind tests are
+  two-way with teeth (mutating the store write / `any_mut_vec_rebound` turns them red).
+  Commit `b16a719`. Follow-ups (commit `59bebea`): `contract_conflict` translates its line
+  through `snapshot_impl_loc` (a module-file method carrying its own and an inherited trait
+  contract now refuses, and an imported trait's `crate::` path matches `by_trait`), and
+  `impl_file_matches`/`snapshot_line_for` compare the full path only (two same-basename files
+  in different directories no longer cross-match). Still open (safe over-refusal): a shared
+  `&Vec` rebind discards its length (`Ty::Ref` carries no mutability -- optional item 5, not done).
+- Executor/iterator: `iterator_const_len` pin reuse; cross-adapter chains (`rev().step_by()`, …).
+  **Same-adapter chaining is verified composing** (round 20): `take` by `min`, `skip`
+  additively, `step_by` multiplicatively -- `take(2).take(3)` yields 2, not 3 -- pinned by
+  `chained_same_adapters_compose` (the `== 3` twin is refuted). The audit's "chained
+  same-adapter overwrite" is not a bug. (`all`/`any` audited — they consume
+  the iterator by removing the cursor, which is correct.)
+- Spec multi-file: `#[path]` on an external `mod` is now inlined
+  (`extract_crate_honours_a_path_attribute`). Still open: a `mod child;` *inside* an inline
+  `mod parent { … }` (line-based scanner, not brace-aware); method matching after external
+  declarations (the inlined line != the MIR's `impl at FILE:L:C`, a visible `missing` pinned by
+  `a_multifile_method_contract_is_reported_missing_not_verified` -- needs a line map); and
+  `--emit-test` for a module-qualified function (`function_params` returns `None` for a `::`).
+- `verif-wrap`: nested Cargo wrappers, cached-build invalidation (documented, not fixed).
+  Inactive `#[cfg]` contracts are a *deliberate* conservative choice, not a bug: the scanner
+  reads text (it cannot evaluate an arbitrary `cfg`), so a contract in a `#[cfg]`-disabled
+  branch is collected and its (absent) body is reported `missing` -- *visible*, so it is never
+  silently verified. `a_cfg_excluded_contract_does_not_steal_a_compiled_body` pins the stronger
+  part: when an excluded contract could suffix-match a *compiled* body, both are refused rather
+  than paired (a wrong pairing would be a false proof). A `#[cfg]` line does not leak the
+  contract onto the next function. A probe confirmed the pre/post behaviour (a `#[cfg(any())]`
+  fn is reported `missing`, and its `requires` does not reach the next fn).
+**Round 19 — `cargo verif` (CLI) dependency resolution (renamed deps + target dir; FIXED).**
+`crate_options` read only the `[dependencies]` *key* and searched `<crate_root>/target`, so a
+renamed dependency (`foo = { package = "bar" }`, rlib `libbar-*.rlib`) was missed, and a
+custom `[build] target-dir`/`CARGO_TARGET_DIR`/workspace `target/` was never searched. It now
+returns `(extern_key, package)` pairs (`dependency_packages`) and links the rlib by *package*
+name as `--extern key=…`, and resolves the target directory via `CARGO_TARGET_DIR` then
+`cargo metadata`'s `target_directory` (falling back to `<crate_root>/target`). Pinned by
+`dependency_packages_reads_a_rename` and `target_directory_from_metadata_reads_the_field`.
+- Docs/tooling: SARIF module paths (open); iterator differential harness (`iterator_chain_differential_agrees_with_rustc`, added round 24); `checked_ilog` base
+  (audited — `checked_ilog(base)` is refused, not mis-modelled).

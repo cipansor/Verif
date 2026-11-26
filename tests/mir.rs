@@ -1215,6 +1215,50 @@ fn the_independent_corpus_does_not_regress() {
          --features std --example mir_coverage -- {EVERYDAY}",
         report.outcomes.len()
     );
+
+    // The three original gaps are *walls*, not budget problems: each is a claim the
+    // engine cannot decide at the width the source uses, and a `verified` on any of
+    // them would be a false proof of an unbounded claim. The corpus keeps the gap and
+    // adds a *decidable companion* per gap rather than editing the original, so both
+    // halves are pinned: the wall stays undecided, and the companion verifies. A
+    // change that "fixes" a wall by widening a budget would turn the first assertion
+    // red, and one that breaks the bounded shape turns the second red.
+    let outcome_of = |name: &str| {
+        report
+            .outcomes
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, o)| o)
+            .unwrap_or_else(|| panic!("`{name}` must be reported by `everyday.rs`"))
+    };
+    for gap in ["div_unwrap", "sum_iter", "tri"] {
+        let o = outcome_of(gap);
+        // These three are *completeness* limits today (`Incomplete`), not soundness
+        // ones: their contracts are sound, so a future `Verified` is a *good* outcome.
+        // `sum_iter` has no precondition, so it can legitimately overflow (a panic
+        // finding is fine there); `tri` and `div_unwrap` are panic-free under their
+        // declared preconditions, so *any* failure there would be a false finding.
+        let false_finding = match gap {
+            "sum_iter" => matches!(
+                o,
+                FnOutcome::Failed { kind, .. }
+                    if !(kind.starts_with("panic") || kind.starts_with("reachable"))
+            ),
+            _ => matches!(o, FnOutcome::Failed { .. }),
+        };
+        assert!(
+            !false_finding,
+            "`{gap}` has a sound contract; a contract failure (or, for the panic-free \
+             `tri`/`div_unwrap`, a panic finding) would be a false finding, got: {o}"
+        );
+    }
+    for companion in ["div_unwrap_byte", "sum_iter_bounded", "tri_bounded"] {
+        let o = outcome_of(companion);
+        assert!(
+            o.is_verified(),
+            "`{companion}` is the decidable companion of a wall and must verify, got: {o}"
+        );
+    }
 }
 
 /// Every edition compiles the corpus to the same verdicts (review E4).
@@ -6991,6 +7035,106 @@ fn verify_src(name: &str, src: &str) -> Option<FnOutcome> {
     o
 }
 
+/// A `&mut Vec` argument's postcondition `v.len()` must read the *final* length, not the
+/// entry length. Before the fix the entry length (0) was used, so `ensures: v.len() == 0`
+/// over `v.push(1)` was a false proof and the true `== 1` was refuted.
+#[test]
+fn a_mut_vec_postcondition_reads_the_final_length() {
+    let Some(f) = verify_src(
+        "mv_false",
+        "/// requires: v.len() == 0\n/// ensures: v.len() == 0\npub fn mv_false(v: &mut Vec<u8>) { v.push(1); }",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(f, FnOutcome::Failed { .. }),
+        "the final length is 1, so `v.len() == 0` must be refuted, got {f}"
+    );
+    let Some(t) = verify_src(
+        "mv_true",
+        "/// requires: v.len() == 0\n/// ensures: v.len() == 1\npub fn mv_true(v: &mut Vec<u8>) { v.push(1); }",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(t, FnOutcome::Verified { .. }),
+        "the final length is 1, so `v.len() == 1` must verify, got {t}"
+    );
+}
+
+/// A write through a `Box` pointer (`*b = v`) reaches the boxed store, so a later `*b`
+/// reads the *new* value: a true contract (`ret == 7`) verifies and the stale one
+/// (`ret == 0`) is refuted. The write actually runs -- it is not refused at the null
+/// check -- and its teeth are the true direction: dropping the boxed-store write (or the
+/// forget/insert reorder that keeps it) makes `ret == 7` stop verifying.
+#[test]
+fn a_write_through_a_box_pointer_is_seen_by_a_later_read() {
+    let t = verify_src(
+        "bw_true",
+        "/// requires: true\n/// ensures: ret == 7\npub fn bw_true() -> u8 { let mut b = Box::new(3u8); *b = 7; *b }",
+    );
+    let Some(t) = t else { return };
+    assert!(matches!(t, FnOutcome::Verified { .. }), "the box write must be seen (ret == 7), got {t}");
+    let f = verify_src(
+        "bw_false",
+        "/// requires: true\n/// ensures: ret == 0\npub fn bw_false() -> u8 { let mut b = Box::new(3u8); *b = 7; *b }",
+    );
+    let Some(f) = f else { return };
+    assert!(matches!(f, FnOutcome::Failed { .. }), "the stale box value must be refuted (ret == 0), got {f}");
+}
+
+/// `Vec::clear` destroys its elements; with a panicking `Drop` that is a real panic, so
+/// the reset must be refused rather than reported panic-free.
+#[test]
+fn clearing_a_vec_of_droppable_elements_is_not_proved_panic_free() {
+    let Some(o) = verify_src("reset", r#"
+struct Boom;
+impl Drop for Boom { fn drop(&mut self) { panic!("boom"); } }
+pub fn reset(v: &mut Vec<Boom>) { v.clear(); }
+"#) else { return };
+    assert!(
+        !matches!(o, FnOutcome::Verified { .. }),
+        "clearing a Vec<Boom> must not be reported panic-free, got {o}"
+    );
+}
+
+/// A compound closure and an adapter-before-terminal are refused rather than
+/// mis-modelled. `filter(..).next()` was a *false proof* before the guard: on a
+/// 3-element slice of zeros it is `false`, but the unguarded model read the base length
+/// and returned `true`, so `ensures: ret == true` was proved.
+#[test]
+fn iterator_adapter_shortcuts_are_refused_not_mis_modelled() {
+    let Some(o) = verify_src("pfilt", r#"
+/// requires: xs.len() == 3
+/// ensures: ret == true
+pub fn pfilt(xs: &[u8]) -> bool { xs.iter().filter(|x| **x > 10).next().is_some() }
+"#) else { return };
+    assert!(
+        !matches!(o, FnOutcome::Verified { .. }),
+        "`filter(..).next()` must be refused, got {o}"
+    );
+
+    let Some(o) = verify_src("pmapc", r#"
+/// requires: xs.len() == 2
+/// ensures: ret == xs[0] + xs[1]
+pub fn pmapc(xs: &[u8]) -> u8 { xs.iter().copied().map(|x| { let y = x + 1; y * 2 }).sum::<u8>() }
+"#) else { return };
+    assert!(
+        !matches!(o, FnOutcome::Verified { .. }),
+        "a compound map closure must be refused, got {o}"
+    );
+
+    let Some(o) = verify_src("prev", r#"
+/// requires: xs.len() == 3
+/// ensures: ret == xs[0] + xs[1] + xs[2]
+pub fn prev(xs: &[i8]) -> i8 { xs.iter().rev().copied().sum::<i8>() }
+"#) else { return };
+    assert!(
+        !matches!(o, FnOutcome::Verified { .. }),
+        "a reversed checked sum must be refused, got {o}"
+    );
+}
+
 /// A source file may *name* `verif` -- `use verif::spec;` above an in-code
 /// contract block -- but the frontend runs `rustc` on a single file with no Cargo
 /// graph behind it, so without an `--extern` entry that import is `E0432`. This
@@ -7297,6 +7441,12 @@ pub fn arg_len_refused(v: &Vec<u8>) -> usize { v.len() }
 
 spec! {
     requires: true,
+    ensures: ret == v.len(),
+}
+pub fn arg_len_reflexive(v: &Vec<u8>) -> usize { v.len() }
+
+spec! {
+    requires: true,
     ensures: ret == 1,
 }
 pub fn is_empty_new_ok() -> u8 { Vec::<u8>::new().is_empty() as u8 }
@@ -7387,19 +7537,108 @@ pub fn pop_nonempty_is_some_bad() -> u8 { let mut v = Vec::<u8>::new(); v.push(9
              not proved; got: {o}"
         );
     }
-    // A `Vec` argument's length is not a value the run holds, so a `len` on it is
-    // a refusal -- never an invented number.
+    // A `Vec` argument's length is a symbolic input -- the caller chose it -- so
+    // `len == 0` is refuted with a witness rather than refused, and a contract
+    // that relates the length to itself verifies. Before the element model the
+    // length was tracked only for a *local* vector, so `v.len()` on an argument
+    // was a refusal; now it is a real input.
     let Some(o) = verify_src("arg_len_refused", src) else { return };
     assert!(
-        !o.is_verified(),
-        "a `Vec` argument's length is unmodelled and must not verify; got: {o}"
+        matches!(o, FnOutcome::Failed { .. }),
+        "a `Vec` argument's length is a symbolic input, so `len == 0` must be \
+         refuted with a witness; got: {o}"
     );
+    let Some(o) = verify_src("arg_len_reflexive", src) else { return };
+    assert!(o.is_verified(), "`v.len() == v.len()` must verify; got: {o}");
+}
+
+/// The `Vec` *element* model: a pushed value is read back by `v[k]`, `v.first()`,
+/// `v.get(k)` and `pop`.
+///
+/// Each true direction has a false twin that claims a *different* value, so a model
+/// that stored the wrong element (or a constant) would refute the true one or prove
+/// the false one. The empty-index case is a *panic*, and it must be reported as one:
+/// `v[0]` on a vector the precondition proves empty unwinds, and a model that
+/// skipped `core`'s bounds check would call it panic-free.
+#[test]
+fn a_vec_element_is_read_back_through_index_first_get_and_pop() {
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! { requires: true, ensures: ret == 3, }
+pub fn index_ok() -> u8 { let mut v = Vec::new(); v.push(3u8); v[0] }
+
+spec! { requires: true, ensures: ret == 4, }
+pub fn index_bad() -> u8 { let mut v = Vec::new(); v.push(3u8); v[0] }
+
+spec! { requires: true, ensures: ret == 7, }
+pub fn second_ok() -> u8 { let mut v = Vec::new(); v.push(3u8); v.push(7u8); v[1] }
+
+spec! { requires: true, ensures: ret == 3, }
+pub fn second_bad() -> u8 { let mut v = Vec::new(); v.push(3u8); v.push(7u8); v[1] }
+
+spec! { requires: true, ensures: ret == 9, }
+pub fn first_ok() -> u8 { let mut v = Vec::new(); v.push(9u8); *v.first().unwrap() }
+
+spec! { requires: true, ensures: ret == 8, }
+pub fn first_bad() -> u8 { let mut v = Vec::new(); v.push(9u8); *v.first().unwrap() }
+
+spec! { requires: true, ensures: ret == 4, }
+pub fn get_ok() -> u8 { let mut v = Vec::new(); v.push(4u8); v.push(8u8); *v.get(0).unwrap() }
+
+spec! { requires: true, ensures: ret == 5, }
+pub fn get_bad() -> u8 { let mut v = Vec::new(); v.push(4u8); v.push(8u8); *v.get(0).unwrap() }
+
+spec! { requires: true, ensures: ret == 5, }
+pub fn pop_ok() -> u8 { let mut v = Vec::new(); v.push(3u8); v.push(5u8); v.pop().unwrap() }
+
+spec! { requires: true, ensures: ret == 3, }
+pub fn pop_bad() -> u8 { let mut v = Vec::new(); v.push(3u8); v.push(5u8); v.pop().unwrap() }
+
+spec! { requires: true, ensures: ret == 3, }
+pub fn as_slice_ok() -> u8 { let mut v = Vec::new(); v.push(3u8); let s = v.as_slice(); s[0] }
+
+spec! { requires: v.len() > 0, ensures: ret == v[0], }
+pub fn arg_index_ok(v: &Vec<u8>) -> u8 { v[0] }
+
+spec! { requires: v.len() > 0, ensures: ret == v[0] + 1, }
+pub fn arg_index_bad(v: &Vec<u8>) -> u8 { v[0] }
+
+spec! { requires: v.len() > 0, ensures: ret == v[0], }
+pub fn arg_first_ok(v: &Vec<u8>) -> u8 { *v.first().unwrap() }
+
+spec! { requires: v.len() > 0, ensures: ret == v[0] + 1, }
+pub fn arg_first_bad(v: &Vec<u8>) -> u8 { *v.first().unwrap() }
+
+spec! { requires: v.len() == 0, ensures: true, }
+pub fn index_empty_panics(v: &Vec<u8>) -> u8 { v[0] }
+"#;
+    for name in ["index_ok", "second_ok", "first_ok", "get_ok", "pop_ok", "as_slice_ok", "arg_index_ok", "arg_first_ok"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    for name in ["index_bad", "second_bad", "first_bad", "get_bad", "pop_bad", "arg_index_bad", "arg_first_bad"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` claims an element the vector does not hold and must be refuted; got: {o}"
+        );
+    }
+    // `v[0]` on a vector the precondition proves empty is a real panic, not a proof.
+    let Some(o) = verify_src("index_empty_panics", src) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.starts_with("panic"),
+            "an out-of-bounds `v[0]` must fail as a panic; got kind `{kind}`"
+        ),
+        other => panic!("an out-of-bounds `v[0]` must be refuted with a panic; got: {other}"),
+    }
 }
 
 /// Three soundness holes in the `Vec` length model, each a *false proof*.
 ///
-/// The model tracks a length per local (`Env::vec_len`). Each of these had the
-/// length survive a place it should not, so a false postcondition was proved:
+/// The model tracks a length per local in the `indexed` store (a `Vec` is an
+/// `Indexed` with `len_mutable`). Each of these had the length survive a place it
+/// should not, so a false postcondition was proved:
 ///
 /// * **A user `Vec` is not the container.** A local `struct Vec<T>` whose `Drop`
 ///   panics was treated as glue-free (the model matched the bare `Vec`), so the
@@ -7544,6 +7783,335 @@ pub fn returned_ok() -> usize { let v = mk(); v.len() }
     // The returned vector: the caller's destination inherits the length.
     let Some(o) = verify_src("returned_ok", src) else { return };
     assert!(o.is_verified(), "a returned vector keeps its length; got: {o}");
+}
+
+/// `for` loops over slices and arrays are modelled: `into_iter`/`iter` starts a
+/// cursor at a *concrete* position and `next` reads the element there, so each
+/// iteration names the same element variable a contract's `xs[k]` names.
+///
+/// The false twins are the teeth: a model that read a fresh (unconstrained)
+/// element per iteration would *refute* the true sum, and one that read a fixed
+/// element would *verify* the false twins. Both directions are asserted.
+#[test]
+fn a_for_loop_over_a_slice_is_modelled() {
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! { requires: xs.len() == 2, ensures: ret == xs[0].wrapping_add(xs[1]), }
+pub fn sum2(xs: &[u8]) -> u8 { let mut s = 0u8; for &x in xs { s = s.wrapping_add(x); } s }
+
+spec! { requires: xs.len() == 2, ensures: ret == xs[0], }
+pub fn sum2_bad(xs: &[u8]) -> u8 { let mut s = 0u8; for &x in xs { s = s.wrapping_add(x); } s }
+
+spec! { requires: xs.len() <= 3, ensures: ret == xs.len() as u8, }
+pub fn count(xs: &[u8]) -> u8 { let mut n = 0u8; for _x in xs { n = n.wrapping_add(1); } n }
+
+spec! { requires: true, ensures: ret == a[0].wrapping_add(a[1]), }
+pub fn arr_sum(a: [u8; 2]) -> u8 { let mut s = 0u8; for &x in &a { s = s.wrapping_add(x); } s }
+
+spec! { requires: true, ensures: ret == a[1], }
+pub fn arr_sum_bad(a: [u8; 2]) -> u8 { let mut s = 0u8; for &x in &a { s = s.wrapping_add(x); } s }
+
+spec! { requires: true, ensures: ret == a[0].wrapping_add(a[1]), }
+pub fn arr_val_sum(a: [u8; 2]) -> u8 { let mut s = 0u8; for x in a { s = s.wrapping_add(x); } s }
+
+spec! { requires: xs.len() == 2, ensures: ret == xs[0].wrapping_add(xs[1]), }
+pub fn iter_sum(xs: &[u8]) -> u8 { let mut s = 0u8; for &x in xs.iter() { s = s.wrapping_add(x); } s }
+
+spec! { requires: xs.len() == 2, ensures: ret == xs[0], }
+pub fn iter_sum_bad(xs: &[u8]) -> u8 { let mut s = 0u8; for &x in xs.iter() { s = s.wrapping_add(x); } s }
+"#;
+    for name in ["sum2", "count", "arr_sum", "arr_val_sum", "iter_sum"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    // The false twins must be *refuted*, not merely undecided: a refusal would
+    // also satisfy "not verified" and would check nothing.
+    for name in ["sum2_bad", "arr_sum_bad", "iter_sum_bad"] {
+        let Some(o) = verify_src(name, src) else { return };
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "`{name}` must fail on its postcondition; got `{kind}`"
+            ),
+            other => panic!(
+                "`{name}` claims the sum is one element and must be refuted, got: {other}"
+            ),
+        }
+    }
+}
+
+/// A `for` loop with an `invariant:` is refused, not read as an arbitrary
+/// element: the loop cut havocs the iterator cursor, so `next` finds none and the
+/// function is `Incomplete`. This is the honest answer -- the position would be
+/// symbolic, and reading "some element" would be a wrong value.
+#[test]
+fn a_for_loop_with_an_invariant_refuses_the_iterator() {
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! { requires: xs.len() <= 2, invariant: s <= 255, ensures: ret <= 255, }
+pub fn sum_inv(xs: &[u8]) -> u8 { let mut s = 0u8; for &x in xs { s = s.wrapping_add(x); } s }
+"#;
+    let Some(o) = verify_src("sum_inv", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Incomplete { .. }),
+        "a `for` loop with an invariant must be refused (the cursor is havoced), got: {o}"
+    );
+}
+
+/// Iterator *consumers* on a slice/array cursor: `sum`, `count`, and the `copied`
+/// adapter.
+///
+/// `sum` folds with a *checked* `+`, so an unguarded sum over `u8`s is a reachable
+/// panic (refuted, not proved) -- the model must not hide it. The sum's length must
+/// be a constant (an array's type length, or a slice length the precondition
+/// pinned), so a symbolic-length sum is refused rather than summed over a wrong
+/// range. `count` is `len - pos`, exact even with a symbolic length.
+#[test]
+fn a_slice_iterator_sum_and_count_are_modelled() {
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! { requires: xs.len() == 2, requires: xs[0] <= 10, requires: xs[1] <= 10, ensures: ret == xs[0] + xs[1], }
+pub fn sum2(xs: &[u8]) -> u8 { xs.iter().sum() }
+
+spec! { requires: xs.len() == 2, requires: xs[0] <= 10, requires: xs[1] <= 10, ensures: ret == xs[0], }
+pub fn sum2_bad(xs: &[u8]) -> u8 { xs.iter().sum() }
+
+spec! { requires: a[0] <= 10, requires: a[1] <= 10, ensures: ret == a[0] + a[1], }
+pub fn arr_sum(a: [u8; 2]) -> u8 { a.into_iter().sum() }
+
+spec! { requires: xs.len() == 2, requires: xs[0] <= 10, requires: xs[1] <= 10, ensures: ret == xs[0] + xs[1], }
+pub fn copied_sum(xs: &[u8]) -> u8 { xs.iter().copied().sum() }
+
+spec! { requires: xs.len() <= 3, ensures: ret == xs.len(), }
+pub fn count2(xs: &[u8]) -> usize { xs.iter().count() }
+
+spec! { requires: xs.len() <= 3, ensures: ret == xs.len() + 1, }
+pub fn count2_bad(xs: &[u8]) -> usize { xs.iter().count() }
+
+spec! { requires: xs.len() == 2, ensures: true, }
+pub fn sum_may_overflow(xs: &[u8]) -> u8 { xs.iter().sum() }
+
+spec! { requires: true, ensures: true, }
+pub fn sum_symbolic(xs: &[u8]) -> u8 { xs.iter().sum() }
+"#;
+    for name in ["sum2", "arr_sum", "copied_sum", "count2"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    for name in ["sum2_bad", "count2_bad"] {
+        let Some(o) = verify_src(name, src) else { return };
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "`{name}` must fail on its postcondition; got `{kind}`"
+            ),
+            other => panic!("`{name}` is a false claim and must be refuted, got: {other}"),
+        }
+    }
+    // An unguarded sum overflows for `[200, 100]` and must be refuted as a *panic*,
+    // not proved -- the model sums with a checked `+`.
+    let Some(o) = verify_src("sum_may_overflow", src) else { return };
+    match o {
+        FnOutcome::Failed { kind, .. } => assert!(
+            kind.starts_with("panic"),
+            "an unguarded `sum` must fail as a reachable panic; got `{kind}`"
+        ),
+        other => panic!(
+            "`sum` over unbounded `u8`s can overflow and must be refuted as a panic, \
+             got: {other} -- a `verified` here is a hidden panic"
+        ),
+    }
+    // A symbolic-length sum has no fixed number of addends and is refused.
+    let Some(o) = verify_src("sum_symbolic", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Incomplete { .. }),
+        "a symbolic-length `sum` must be refused, got: {o}"
+    );
+}
+
+/// Iterator consumers `last`, `nth`, `max` and `min` on a slice/array cursor.
+///
+/// `last`/`nth` name the exact element when the length is known (an array's type
+/// length, or a slice the precondition pinned); `max`/`min` are folds of
+/// comparisons, so they need a constant length too. The signed cases are pinned
+/// because `i8::MIN` is the *smallest* signed value but the largest unsigned byte,
+/// so an unsigned comparison would pick the wrong element.
+#[test]
+fn a_slice_iterator_extremes_and_offsets_are_modelled() {
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! { requires: xs.len() == 2, ensures: ret == xs[1], }
+pub fn last_slice(xs: &[u8]) -> u8 { *xs.iter().last().unwrap() }
+
+spec! { requires: xs.len() == 2, ensures: ret == xs[0], }
+pub fn last_slice_bad(xs: &[u8]) -> u8 { *xs.iter().last().unwrap() }
+
+spec! { requires: xs.len() == 3, ensures: ret == xs[2], }
+pub fn nth_slice(xs: &[u8]) -> u8 { *xs.iter().nth(2).unwrap() }
+
+spec! { requires: xs.len() == 3, ensures: ret == xs[0], }
+pub fn nth_slice_bad(xs: &[u8]) -> u8 { *xs.iter().nth(2).unwrap() }
+
+spec! { requires: a[0] <= a[1], requires: a[1] <= a[2], ensures: ret == a[2], }
+pub fn max_arr(a: [u8; 3]) -> u8 { a.into_iter().max().unwrap() }
+
+spec! { requires: a[0] <= a[1], requires: a[1] <= a[2], ensures: ret == a[0], }
+pub fn max_arr_bad(a: [u8; 3]) -> u8 { a.into_iter().max().unwrap() }
+
+spec! { requires: a[0] <= a[1], requires: a[1] <= a[2], ensures: ret == a[0], }
+pub fn min_arr(a: [u8; 3]) -> u8 { a.into_iter().min().unwrap() }
+
+spec! { requires: a[0] <= a[1], requires: a[1] <= a[2], ensures: ret == a[2], }
+pub fn min_arr_bad(a: [u8; 3]) -> u8 { a.into_iter().min().unwrap() }
+
+spec! { requires: a[0] <= a[1], requires: a[1] <= a[2], ensures: ret == a[2], }
+pub fn smax_arr(a: [i8; 3]) -> i8 { a.into_iter().max().unwrap() }
+
+spec! { requires: a[0] <= a[1], requires: a[1] <= a[2], ensures: ret == a[0], }
+pub fn smax_arr_bad(a: [i8; 3]) -> i8 { a.into_iter().max().unwrap() }
+
+spec! { requires: xs.len() == 2, requires: xs[0] <= xs[1], ensures: ret == xs[1], }
+pub fn max_ref(xs: &[u8]) -> u8 { match xs.iter().max() { Some(&m) => m, None => 0 } }
+
+spec! { requires: true, ensures: true, }
+pub fn max_symbolic(xs: &[u8]) -> u8 { *xs.iter().max().unwrap() }
+"#;
+    for name in ["last_slice", "nth_slice", "max_arr", "min_arr", "smax_arr", "max_ref"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    for name in [
+        "last_slice_bad",
+        "nth_slice_bad",
+        "max_arr_bad",
+        "min_arr_bad",
+        "smax_arr_bad",
+    ] {
+        let Some(o) = verify_src(name, src) else { return };
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "`{name}` must fail on its postcondition; got `{kind}`"
+            ),
+            other => panic!("`{name}` is a false claim and must be refuted, got: {other}"),
+        }
+    }
+    // `max` over a symbolic-length slice has no fixed comparison count and is refused.
+    let Some(o) = verify_src("max_symbolic", src) else { return };
+    assert!(
+        matches!(o, FnOutcome::Incomplete { .. }),
+        "a symbolic-length `max` must be refused, got: {o}"
+    );
+}
+
+
+/// `enumerate()` is a cursor identity whose `next` yields `Option<(usize, &T)>`.
+///
+/// The tuple payload is the interesting part: the body destructures it directly
+/// (`((_2 as Some).0).0` for the index, `.1` for the element), a *nested place*
+/// whose group holds a downcast and a tail. The first parse split that group on its
+/// last ` as ` and the place came back unknown; the index is the concrete cursor
+/// position and the element is `xs[pos]`, so a sum of indices is `0+1+..+(n-1)` and
+/// a sum of elements is the slice sum. Both directions are pinned, and a symbolic
+/// length is refused because the loop must be unwound to a constant.
+#[test]
+fn a_slice_iterator_enumerate_carries_the_index_and_element() {
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! { requires: xs.len() == 3, ensures: ret == 3, }
+pub fn idx_sum(xs: &[u8]) -> u8 { let mut s = 0u8; for (i, _) in xs.iter().enumerate() { s = s.wrapping_add(i as u8); } s }
+
+spec! { requires: xs.len() == 3, ensures: ret == 1, }
+pub fn idx_sum_bad(xs: &[u8]) -> u8 { let mut s = 0u8; for (i, _) in xs.iter().enumerate() { s = s.wrapping_add(i as u8); } s }
+
+spec! { requires: xs.len() == 2, requires: xs[0] <= 10, requires: xs[1] <= 10, ensures: ret == xs[0] + xs[1], }
+pub fn val_sum(xs: &[u8]) -> u8 { let mut s = 0u8; for (_, &x) in xs.iter().enumerate() { s = s.wrapping_add(x); } s }
+
+spec! { requires: xs.len() == 2, requires: xs[0] <= 10, requires: xs[1] <= 10, ensures: ret == xs[0], }
+pub fn val_sum_bad(xs: &[u8]) -> u8 { let mut s = 0u8; for (_, &x) in xs.iter().enumerate() { s = s.wrapping_add(x); } s }
+
+spec! { requires: xs.len() >= 1, ensures: ret == 0, }
+pub fn first_index(xs: &[u8]) -> u8 { match xs.iter().enumerate().next() { Some((i, _)) => i as u8, None => 0 } }
+
+spec! { requires: true, ensures: true, }
+pub fn idx_symbolic(xs: &[u8]) -> u8 { let mut s = 0u8; for (i, _) in xs.iter().enumerate() { s = s.wrapping_add(i as u8); } s }
+"#;
+    for name in ["idx_sum", "val_sum", "first_index"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    for name in ["idx_sum_bad", "val_sum_bad"] {
+        let Some(o) = verify_src(name, src) else { return };
+        match o {
+            FnOutcome::Failed { kind, .. } => assert!(
+                kind.contains("postcondition"),
+                "`{name}` must fail on its postcondition; got `{kind}`"
+            ),
+            other => panic!("`{name}` is a false claim and must be refuted, got: {other}"),
+        }
+    }
+    // A symbolic-length enumerate loop must be unwound to a constant and is refused.
+    let Some(o) = verify_src("idx_symbolic", src) else { return };
+    assert!(
+        !o.is_verified(),
+        "a symbolic-length enumerate loop must not be verified, got: {o}"
+    );
+}
+
+/// `String` is modelled by its **length** only: `new` is `0`, `push_str` adds the
+/// appended `&str`'s byte length, `from` is that length, and `len`/`is_empty` read
+/// it. A `&str`'s byte length is a symbolic input when it is an argument and a
+/// constant when it is a literal (`const "abc"` is `3`). The bytes are not
+/// modelled, so a method whose result depends on the *contents* stays refused --
+/// the length model is exact for what it claims and silent about the rest.
+#[test]
+fn a_string_length_model_decides_new_from_push_len() {
+    let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
+
+spec! { requires: true, ensures: ret == 3, }
+pub fn lit_len() -> usize { "abc".len() }
+spec! { requires: true, ensures: ret == true, }
+pub fn lit_empty() -> bool { "".is_empty() }
+spec! { requires: true, ensures: ret == 0, }
+pub fn new_len() -> usize { String::new().len() }
+spec! { requires: true, ensures: ret == true, }
+pub fn new_empty() -> bool { String::new().is_empty() }
+spec! { requires: true, ensures: ret == 3, }
+pub fn from_len() -> usize { String::from("abc").len() }
+spec! { requires: true, ensures: ret == 2, }
+pub fn push_len() -> usize { let mut s = String::new(); s.push_str("ab"); s.len() }
+spec! { requires: true, ensures: ret == false, }
+pub fn push_nonempty_empty() -> bool { let mut s = String::new(); s.push_str("x"); s.is_empty() }
+spec! { requires: true, ensures: ret == s.len(), }
+pub fn str_arg_len(s: &str) -> usize { s.len() }
+
+spec! { requires: true, ensures: ret == 2, }
+pub fn from_len_bad() -> usize { String::from("abc").len() }
+spec! { requires: true, ensures: ret == 3, }
+pub fn push_len_bad() -> usize { let mut s = String::new(); s.push_str("ab"); s.len() }
+"#;
+    for name in [
+        "lit_len",
+        "lit_empty",
+        "new_len",
+        "new_empty",
+        "from_len",
+        "push_len",
+        "push_nonempty_empty",
+        "str_arg_len",
+    ] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(o.is_verified(), "`{name}` must verify; got: {o}");
+    }
+    // The length model must be *exact*: a wrong length is refuted, so the tests
+    // above are not passing because `len` returns a constant the claim accepts.
+    for name in ["from_len_bad", "push_len_bad"] {
+        let Some(o) = verify_src(name, src) else { return };
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` is a false length claim and must be refuted, got: {o}"
+        );
+    }
 }
 
 /// A user type spelled `Vec` is not the container, and its *methods* are answered
@@ -12410,11 +12978,14 @@ pub fn guarded(x: u8) -> u8 {
 
 /// C1: a container whose destructor the tool cannot represent is *refused*.
 ///
-/// A `String` local frees the heap, which is not a bit-vector fact. Assuming the
-/// `drop` were a no-op would be a false proof whenever the destructor's effect is
-/// observable, so the honest answer is a refusal -- not a verdict. This is the
-/// case the dump cannot tell apart from a struct holding a user-`Drop` field (both
-/// print `drop(_x) -> [return: …]`), which is why the no-op is not taken here.
+/// An `Rc<T>` local's destructor decrements a refcount and may free the
+/// allocation, which is not a bit-vector fact. Assuming the `drop` were a no-op
+/// would be a false proof whenever the destructor's effect is observable, so the
+/// honest answer is a refusal -- not a verdict. This is the case the dump cannot
+/// tell apart from a struct holding a user-`Drop` field (both print
+/// `drop(_x) -> [return: …]`), which is why the no-op is not taken here.
+/// (A `String` and a `Box<u8>` *are* glue-free, so they are no longer this
+/// example; an `Rc` has no modelled field set.)
 #[test]
 fn an_unmodelled_drop_is_refused_not_assumed_away() {
     let src = r#"macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }
@@ -12423,19 +12994,308 @@ spec! {
     requires: true,
     ensures: ret == 1,
 }
-pub fn owns_string(s: String) -> u8 {
-    let _owned = s;
+pub fn owns_rc(r: std::rc::Rc<u8>) -> u8 {
+    let _owned = r;
     1
 }
 "#;
-    let Some(o) = verify_src("owns_string", src) else { return };
+    let Some(o) = verify_src("owns_rc", src) else { return };
     match o {
         FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. } => {}
         other => panic!(
-            "a `String` drop is not representable and must be refused, got: {other} -- \
+            "an `Rc` drop is not representable and must be refused, got: {other} -- \
              a verdict here would be a false proof"
         ),
     }
+}
+
+/// C11 `Box<T>`: `Box::new` stores the value, the deref reads it back, the
+/// compiler's null/alignment checks are discharged, and a glue-free `Box<T>`
+/// argument's drop is a no-op.
+///
+/// Each true direction must verify and each tripwire must be refuted, so the model
+/// is pinned in both directions -- a `Box` deref that read a constant would prove
+/// the tripwires, and one that read `Unknown` would leave the true directions
+/// undecided.
+#[test]
+fn a_box_new_deref_decides() {
+    let names = [
+        "box_new_reads_its_value",
+        "box_new_reads_its_value_tripwire",
+        "box_guarded_inc",
+        "box_guarded_inc_tripwire",
+        "box_u32_reads_its_value",
+        "owns_box_glue_free",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in [
+        "box_new_reads_its_value",
+        "box_guarded_inc",
+        "box_u32_reads_its_value",
+        "owns_box_glue_free",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in ["box_new_reads_its_value_tripwire", "box_guarded_inc_tripwire"] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` claims a false result and must be refuted, got: {o}"
+        );
+    }
+}
+
+/// C11 iteration: `xs.iter().count()` and `xs.iter().copied().sum()` over a
+/// constant-length array decide (the cursor starts at the array's elements), and
+/// an explicit `std::mem::drop` of a glue-free container is a no-op.
+///
+/// The true directions must verify and the tripwires must be refuted, so a model
+/// that read a constant or a wrong element would fail one of them.
+#[test]
+fn a_slice_iter_and_explicit_drop_decide() {
+    let names = [
+        "array_iter_count",
+        "array_iter_count_tripwire",
+        "array_iter_sum",
+        "array_iter_sum_tripwire",
+        "array_iter_max",
+        "array_iter_max_tripwire",
+        "array_iter_min",
+        "array_iter_last",
+        "array_iter_last_tripwire",
+        "array_iter_nth",
+        "explicit_drop_box",
+        "explicit_drop_string",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in [
+        "array_iter_count",
+        "array_iter_sum",
+        "array_iter_max",
+        "array_iter_min",
+        "array_iter_last",
+        "array_iter_nth",
+        "explicit_drop_box",
+        "explicit_drop_string",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in [
+        "array_iter_count_tripwire",
+        "array_iter_sum_tripwire",
+        "array_iter_max_tripwire",
+        "array_iter_last_tripwire",
+    ] {
+        let o = outcome(&report, name);
+        assert!(
+            matches!(o, FnOutcome::Failed { .. }),
+            "`{name}` claims a false result and must be refuted, got: {o}"
+        );
+    }
+}
+
+/// C11 iteration: `Iterator::rev` reverses the direction a sequence position
+/// names. `last`/`nth`/a `for` loop are order-dependent, so they pin the mapping
+/// (`rev().last()` is the *first* element); `count` is order-independent.
+#[test]
+fn an_iterator_can_be_reversed() {
+    let names = [
+        "array_iter_rev_last",
+        "array_iter_rev_last_tripwire",
+        "array_iter_rev_nth",
+        "array_iter_rev_for",
+        "array_iter_rev_rev_last",
+        "array_iter_rev_count",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in [
+        "array_iter_rev_last",
+        "array_iter_rev_nth",
+        "array_iter_rev_for",
+        "array_iter_rev_rev_last",
+        "array_iter_rev_count",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let o = outcome(&report, "array_iter_rev_last_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`array_iter_rev_last_tripwire` claims the unreversed last element and must be refuted, got: {o}"
+    );
+}
+
+/// C11 iteration: `skip` advances the cursor's position and `step_by` sets its
+/// stride. `last`/`count`/`sum` read the stride, so the fixtures pin the mapping
+/// (e.g. `step_by(2).last()` is index 2 of 0..4, not 3).
+#[test]
+fn an_iterator_can_be_skipped_and_stepped() {
+    let names = [
+        "array_iter_skip_last",
+        "array_iter_skip_count",
+        "array_iter_step_count",
+        "array_iter_step_last",
+        "array_iter_step_last_tripwire",
+        "array_iter_step_sum",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in [
+        "array_iter_skip_last",
+        "array_iter_skip_count",
+        "array_iter_step_count",
+        "array_iter_step_last",
+        "array_iter_step_sum",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let o = outcome(&report, "array_iter_step_last_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`array_iter_step_last_tripwire` claims the un-strided last element and must be refuted, got: {o}"
+    );
+}
+
+/// C11 iteration: `Iterator::take` caps the cursor's end at `pos + n`. It needs a
+/// constant length so the cap is constant; `last`/`count`/`sum`/`nth` read it.
+#[test]
+fn an_iterator_can_be_taken() {
+    let names = [
+        "array_iter_take_last",
+        "array_iter_take_last_tripwire",
+        "array_iter_take_count",
+        "array_iter_take_over",
+        "array_iter_take_nth",
+        "array_iter_take_sum",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in [
+        "array_iter_take_last",
+        "array_iter_take_count",
+        "array_iter_take_over",
+        "array_iter_take_nth",
+        "array_iter_take_sum",
+    ] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let o = outcome(&report, "array_iter_take_last_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`array_iter_take_last_tripwire` claims past the cap and must be refuted, got: {o}"
+    );
+}
+
+/// C11 symbolic-length iteration: a slice sum is unrolled to `MAX_SYMBOLIC_LEN`
+/// steps, each guarded by `k < len`, which is exact only when the precondition
+/// proves `len <= 8`. A guarded sum of small elements is panic-free (verified); a
+/// bounded length with unbounded elements overflows (refuted); an unbounded length
+/// cannot be unrolled and is refused.
+#[test]
+fn a_symbolic_length_sum_is_bounded_by_its_precondition() {
+    let names = [
+        "symbolic_sum_no_overflow",
+        "symbolic_sum_tripwire",
+        "symbolic_sum_unbounded_refused",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    let o = outcome(&report, "symbolic_sum_no_overflow");
+    assert!(o.is_verified(), "`symbolic_sum_no_overflow` must verify, got: {o}");
+    let o = outcome(&report, "symbolic_sum_tripwire");
+    assert!(matches!(o, FnOutcome::Failed { .. }), "`symbolic_sum_tripwire` must be refuted, got: {o}");
+    let o = outcome(&report, "symbolic_sum_unbounded_refused");
+    assert!(!o.is_verified(), "`symbolic_sum_unbounded_refused` must not verify, got: {o}");
+}
+
+/// C11 iteration: `Iterator::all`/`any` fold a predicate to a `bool` -- `all` is
+/// the conjunction over the elements, `any` the disjunction. The tripwires claim
+/// the opposite of what the predicate fold yields.
+#[test]
+fn an_iterator_can_be_tested_with_all_and_any() {
+    let names = [
+        "array_iter_all_lt",
+        "array_iter_all_lt_tripwire",
+        "array_iter_any_gt",
+        "array_iter_any_gt_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in ["array_iter_all_lt", "array_iter_any_gt"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    for name in ["array_iter_all_lt_tripwire", "array_iter_any_gt_tripwire"] {
+        let o = outcome(&report, name);
+        assert!(matches!(o, FnOutcome::Failed { .. }), "`{name}` must be refuted, got: {o}");
+    }
+}
+
+/// C11 iteration: `Iterator::map`/`filter` are lazy transforms the value
+/// terminals apply -- `map(f).sum()` folds the mapped elements, `filter(f).count()`
+/// counts the accepted ones. The tripwire's filter accepts all four elements.
+#[test]
+fn an_iterator_can_be_mapped_and_filtered() {
+    let names = [
+        "array_iter_map_sum",
+        "array_iter_map_wrapping_sum",
+        "array_iter_filter_count",
+        "array_iter_filter_count_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in ["array_iter_map_sum", "array_iter_map_wrapping_sum", "array_iter_filter_count"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let o = outcome(&report, "array_iter_filter_count_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`array_iter_filter_count_tripwire` must be refuted, got: {o}"
+    );
+}
+
+/// C11 iteration: `Iterator::fold(init, f)` folds a modelled reducer closure
+/// (`|acc, x| acc <op> x`, checked or `wrapping_*`). The checked reducer raises a
+/// panic obligation per step; the tripwire's unguarded fold can overflow.
+#[test]
+fn an_iterator_can_be_folded_with_a_closure() {
+    let names = [
+        "array_iter_fold_sum",
+        "array_iter_fold_wrapping",
+        "array_iter_fold_from_one",
+        "array_iter_fold_tripwire",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in ["array_iter_fold_sum", "array_iter_fold_wrapping", "array_iter_fold_from_one"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let o = outcome(&report, "array_iter_fold_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`array_iter_fold_tripwire` folds unguarded and must be refuted, got: {o}"
+    );
+}
+
+/// C11 containers: `Vec::clear`/`String::clear` reset the tracked length to zero,
+/// and the tripwire that claims the pre-clear length is refuted.
+#[test]
+fn container_clear_resets_the_length() {
+    let names = [
+        "vec_clear_reads_zero",
+        "vec_clear_tripwire",
+        "string_clear_reads_zero",
+    ];
+    let Some(report) = verify_realistic(&names) else { return };
+    for name in ["vec_clear_reads_zero", "string_clear_reads_zero"] {
+        let o = outcome(&report, name);
+        assert!(o.is_verified(), "`{name}` must verify, got: {o}");
+    }
+    let o = outcome(&report, "vec_clear_tripwire");
+    assert!(
+        matches!(o, FnOutcome::Failed { .. }),
+        "`vec_clear_tripwire` claims the pre-clear length and must be refuted, got: {o}"
+    );
 }
 
 /// C1, on the corpus: the `Drop` fixtures decide, and the false ones are refuted.
@@ -12453,7 +13313,7 @@ fn the_drop_fixtures_decide_and_the_false_ones_are_refuted() {
         "destructor_panic_guarded",
         "guard_misguarded_cannot_prove_this",
         "destructor_panic_cannot_prove_this",
-        "string_drop_is_refused",
+        "rc_drop_is_refused",
     ];
     let Some(report) = verify_realistic(&names) else { return };
 
@@ -12482,9 +13342,9 @@ fn the_drop_fixtures_decide_and_the_false_ones_are_refuted() {
         }
     }
     // A container drop is a refusal, not a verdict.
-    match outcome(&report, "string_drop_is_refused") {
+    match outcome(&report, "rc_drop_is_refused") {
         FnOutcome::Incomplete { .. } | FnOutcome::Skipped { .. } => {}
-        other => panic!("a `String` drop must be refused, got: {other}"),
+        other => panic!("an `Rc` drop must be refused, got: {other}"),
     }
 }
 
@@ -13522,4 +14382,863 @@ fn a_comment_and_a_non_ascii_name_cannot_smuggle_a_false_proof() {
             "a clause naming a variable the body does not return must be refuted, got: {outcome:?}"
         );
     }
+}
+
+/// U3: a counterexample becomes a compiling, failing-then-fixed `#[test]`.
+///
+/// The emitted test calls the refuted function at the counterexample's inputs.
+/// While the bug exists the call panics, so the test **fails**; fixing the body
+/// makes the *same* test **pass** -- which is what makes it a regression test and
+/// not a restatement of the bug. The two halves are the point: a test that passes
+/// on both versions proves nothing.
+#[test]
+fn a_counterexample_becomes_a_failing_then_fixed_test() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif_emit_test_{}_{seq}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    let buggy = "/// ensures: ret <= 100\n\
+                 pub fn bad(n: u8) -> u8 {\n    100 / (n - 5)\n}\n";
+    let file = dir.join("buggy.rs");
+    std::fs::write(&file, buggy).expect("write fixture");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts())
+        .expect("verify the fixture");
+    let emitted = verify::emit_test_source(&file, &report, "bad")
+        .expect("a panic counterexample must become a test");
+    assert!(emitted.contains("#[test]"), "must be a `#[test]`:\n{emitted}");
+    assert!(
+        emitted.contains("bad(0)"),
+        "must call at the counterexample input (`n = 0`):\n{emitted}"
+    );
+
+    // The buggy body: the emitted test compiles and *fails* (the call panics).
+    let buggy_src = format!("{buggy}\n{emitted}");
+    let buggy_bin = dir.join("buggy_test");
+    compile_emitted_test(&rustc, &dir, "buggy_test.rs", &buggy_src, &buggy_bin);
+    let out = std::process::Command::new(&buggy_bin).output().expect("run the test binary");
+    assert!(
+        !out.status.success(),
+        "the emitted test must FAIL on the buggy function (it panics), but it passed"
+    );
+
+    // The fixed body: the *same* test passes.
+    let fixed = "/// ensures: ret <= 100\n\
+                 pub fn bad(n: u8) -> u8 {\n    if n < 5 { 0 } else { 100 / (n - 5) }\n}\n";
+    let fixed_src = format!("{fixed}\n{emitted}");
+    let fixed_bin = dir.join("fixed_test");
+    compile_emitted_test(&rustc, &dir, "fixed_test.rs", &fixed_src, &fixed_bin);
+    let out = std::process::Command::new(&fixed_bin).output().expect("run the test binary");
+    assert!(
+        out.status.success(),
+        "the same test must PASS on the fixed function, got:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Compile a `#[test]`-bearing source with `rustc --test` into an executable.
+fn compile_emitted_test(rustc: &str, dir: &std::path::Path, name: &str, src: &str, out: &std::path::Path) {
+    let path = dir.join(name);
+    std::fs::write(&path, src).expect("write test source");
+    let status = std::process::Command::new(rustc)
+        .args(["--test", "--edition", "2024", "-C", "overflow-checks=on", "-o"])
+        .arg(out)
+        .arg(&path)
+        .status()
+        .expect("spawn rustc");
+    assert!(status.success(), "the emitted test must compile: {}", path.display());
+}
+
+/// U7: the proof cache reuses a decided verdict when nothing changed, and a change
+/// to the program invalidates it.
+///
+/// A cached `verified` surviving a change to the rule that produced it would be a
+/// false proof, so the test proves both halves: the cache *is* consulted (a tampered
+/// entry shows through), and a change to the source is a *miss* (the real verdict
+/// returns). The key covers the MIR, the contracts, the edition and the engine.
+#[test]
+fn the_proof_cache_reuses_a_decided_verdict_and_a_change_is_a_miss() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif_cache_{}_{seq}", std::process::id()));
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let file = dir.join("f.rs");
+    let src = "/// ensures: ret == n\npub fn id(n: u8) -> u8 { n }\n\n\
+               /// ensures: ret == 7\npub fn wrong(n: u8) -> u8 { n }\n";
+    std::fs::write(&file, src).expect("write fixture");
+
+    let mut opts = probe_opts();
+    opts.cache = Some(cache.clone());
+
+    let kind = |r: &verify::FileReport, name: &str| {
+        r.outcomes.iter().find(|(n, _)| n == name).map(|(_, o)| match o {
+            FnOutcome::Verified { .. } => "verified",
+            FnOutcome::Failed { .. } => "failed",
+            FnOutcome::Incomplete { .. } => "incomplete",
+            FnOutcome::Skipped { .. } => "skipped",
+        })
+    };
+
+    // First run: real verdicts, and a cache entry is written.
+    let r1 = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    assert_eq!(kind(&r1, "id"), Some("verified"), "id holds");
+    assert_eq!(kind(&r1, "wrong"), Some("failed"), "wrong is refuted");
+    let entry = std::fs::read_dir(&cache)
+        .expect("cache dir")
+        .next()
+        .expect("one entry")
+        .unwrap()
+        .path();
+
+    // Second run: same verdicts (reused or recomputed, the answers must agree).
+    let r2 = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    assert_eq!(kind(&r2, "id"), Some("verified"));
+    assert_eq!(kind(&r2, "wrong"), Some("failed"));
+
+    // Tamper the cache: `id` marked Failed{TAMPERED}. If the cache is consulted the
+    // tampered kind shows through -- the only way to observe a hit without timing,
+    // and it is exactly the stale value a wrong key would trust.
+    std::fs::write(&entry, "F\tid\tTAMPERED\tx\n").expect("tamper cache");
+    let r3 = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    let id3 = r3.outcomes.iter().find(|(n, _)| n == "id").map(|(_, o)| o).unwrap();
+    assert!(
+        matches!(id3, FnOutcome::Failed { kind, .. } if kind.contains("TAMPERED")),
+        "the cache must be consulted: a tampered entry should show through, got {id3:?}"
+    );
+
+    // Change the source: a new key, so a *miss* -- the real verdict returns, not the
+    // tampered one.
+    let src2 = "/// ensures: ret == n\npub fn id(n: u8) -> u8 { n }\n\n\
+                /// ensures: ret == 8\npub fn wrong(n: u8) -> u8 { n }\n";
+    std::fs::write(&file, src2).expect("rewrite fixture");
+    let r4 = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    assert_eq!(
+        kind(&r4, "id"),
+        Some("verified"),
+        "a changed source is a cache miss, so the real verdict returns (not the tampered one)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A1: a contract-only edit in an external module must invalidate the cache.
+///
+/// The contract lives in the *inlined module text*, not the root source and not the
+/// MIR, so keying the cache on the root source alone would let the edit reuse the
+/// old verdict — a false proof. The key fingerprints the combined snapshot.
+#[test]
+fn a_contract_only_edit_in_a_module_invalidates_the_cache() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif_modcache_{}_{seq}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let cache = dir.join("cache");
+    let lib = dir.join("lib.rs");
+    let math = dir.join("math.rs");
+    std::fs::write(&lib, "pub mod math;\n").expect("root");
+    std::fs::write(&math, "/// ensures: ret == 7\npub fn seven() -> u8 { 7 }\n").expect("math");
+    let mut opts = probe_opts();
+    opts.cache = Some(cache.clone());
+
+    fn seven(r: &verify::FileReport) -> Option<&FnOutcome> {
+        r.outcomes.iter().find(|(k, _)| k == "math::seven" || k == "seven").map(|(_, o)| o)
+    }
+    let r1 = verify::verify_file_with_opts(&rustc, &lib, &[], &opts).expect("verify");
+    assert!(
+        matches!(seven(&r1), Some(FnOutcome::Verified { .. })),
+        "cold: the module contract holds; got {:?}",
+        r1.outcomes
+    );
+    // Edit *only* the module's contract. The MIR is unchanged; the snapshot is not.
+    std::fs::write(&math, "/// ensures: ret == 8\npub fn seven() -> u8 { 7 }\n").expect("math2");
+    let r2 = verify::verify_file_with_opts(&rustc, &lib, &[], &opts).expect("verify");
+    assert!(
+        matches!(seven(&r2), Some(FnOutcome::Failed { .. })),
+        "a contract-only module edit must invalidate the cache (else a stale `verified` \
+         proves a false contract); got {:?}",
+        r2.outcomes
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A2: two trait impls of one method share a *report label* (`S::check`) but must
+/// keep *distinct* cache entries — keyed by the MIR definition name, not the label.
+#[test]
+fn two_trait_impls_of_one_method_get_distinct_cached_verdicts() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif_traitcache_{}_{seq}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let cache = dir.join("cache");
+    let file = dir.join("lib.rs");
+    let src = "pub struct S;\n\
+               pub trait A { fn check(&self) -> u8; }\n\
+               pub trait B { fn check(&self) -> u8; }\n\
+               impl A for S {\n    /// ensures: ret == 9\n    fn check(&self) -> u8 { 1 }\n}\n\
+               impl B for S {\n    /// ensures: ret == 1\n    fn check(&self) -> u8 { 1 }\n}\n";
+    std::fs::write(&file, src).expect("fixture");
+    let mut opts = probe_opts();
+    opts.cache = Some(cache.clone());
+
+    let tally = |r: &verify::FileReport| {
+        let (mut v, mut f) = (0, 0);
+        for (k, o) in &r.outcomes {
+            if k == "S::check" {
+                match o {
+                    FnOutcome::Verified { .. } => v += 1,
+                    FnOutcome::Failed { .. } => f += 1,
+                    _ => {}
+                }
+            }
+        }
+        (v, f)
+    };
+    let r1 = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    assert_eq!(tally(&r1), (1, 1), "cold: one pass, one fail; got {:?}", r1.outcomes);
+    let r2 = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    assert_eq!(
+        tally(&r2),
+        (1, 1),
+        "warm: the two impls must keep their own verdicts, not share one; got {:?}",
+        r2.outcomes
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// U3/finding 3: the emitted replay call uses the *real* declaration's parameter
+/// order, not a comment above it that reads the parameters the other way round.
+#[test]
+fn a_replay_call_uses_the_real_declaration_not_a_comment() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif_replay_{}_{seq}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let file = dir.join("f.rs");
+    // The comment swaps the order; the real declaration is (a, b). `requires: b == 1`
+    // makes the panic happen at `a == 0, b == 1`, so the right call is `bad(0, 1)`.
+    std::fs::write(
+        &file,
+        "// fn bad(b: u8, a: u8)\n/// requires: b == 1\npub fn bad(a: u8, b: u8) -> u8 { 100 / a }\n",
+    )
+    .expect("fixture");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &probe_opts()).expect("verify");
+    let emitted = verify::emit_test_source(&file, &report, "bad").expect("a panic counterexample");
+    assert!(
+        emitted.contains("bad(0, 1)"),
+        "the real parameter order (a, b) must be used, not the comment's; got:\n{emitted}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `enumerate`'s index counts from the enumerate's own start (0, 1, ...), not the raw
+/// slice position: `skip(1).enumerate().next().0` is 0 and `rev().enumerate().next().0`
+/// is 0, while `enumerate().skip(1).next().0` is 1. Using `pos` for the index made the
+/// first two report the slice position (`skip`'s 1), so that old value is a tripwire.
+#[test]
+fn an_enumerate_index_counts_from_the_enumerates_start() {
+    let skip = verify_src(
+        "ei_skip",
+        "/// requires: xs.len() == 2\n/// ensures: ret == 0\npub fn ei_skip(xs: &[u8]) -> usize { match xs.iter().skip(1).enumerate().next() { Some((i, _)) => i, None => 99 } }",
+    );
+    let Some(skip) = skip else { return };
+    assert!(matches!(skip, FnOutcome::Verified { .. }), "skip(1).enumerate().next().0 is 0, got {skip}");
+    let old = verify_src(
+        "ei_old",
+        "/// requires: xs.len() == 2\n/// ensures: ret == 1\npub fn ei_old(xs: &[u8]) -> usize { match xs.iter().skip(1).enumerate().next() { Some((i, _)) => i, None => 99 } }",
+    );
+    let Some(old) = old else { return };
+    assert!(matches!(old, FnOutcome::Failed { .. }), "1 is the raw slice position, not the enumerate index; must be refuted, got {old}");
+    let after = verify_src(
+        "ei_after",
+        "/// requires: xs.len() == 2\n/// ensures: ret == 1\npub fn ei_after(xs: &[u8]) -> usize { match xs.iter().enumerate().skip(1).next() { Some((i, _)) => i, None => 99 } }",
+    );
+    let Some(after) = after else { return };
+    assert!(matches!(after, FnOutcome::Verified { .. }), "enumerate().skip(1).next().0 is 1, got {after}");
+    let rev = verify_src(
+        "ei_rev",
+        "/// requires: xs.len() == 2\n/// ensures: ret == 0\npub fn ei_rev(xs: &[u8]) -> usize { match xs.iter().rev().enumerate().next() { Some((i, _)) => i, None => 99 } }",
+    );
+    let Some(rev) = rev else { return };
+    assert!(matches!(rev, FnOutcome::Verified { .. }), "rev().enumerate().next().0 is 0, got {rev}");
+}
+
+/// A mapped sum over a *symbolic*-length slice must apply the `map` to the real
+/// elements only: the padding (indices `>= len`) contributes 0, never `map(0)`. With
+/// `requires: xs.len() <= 1 && xs[0] == 0`, `map(|x| x + 1).sum()` is 0 (len 0) or 1
+/// (len 1). Applying the map *after* the zero-guard added `MAX_SYMBOLIC_LEN - len`
+/// extra (map(0) = 1), so `ret <= 1` was refuted -- a wrong value.
+#[test]
+fn a_mapped_symbolic_sum_does_not_include_the_padding() {
+    let ok = verify_src(
+        "mapped_sum_pad",
+        "/// requires: xs.len() <= 1 && xs[0] == 0\n/// ensures: ret <= 1\npub fn mapped_sum_pad(xs: &[u8]) -> u8 { xs.iter().copied().map(|x| x + 1).sum() }",
+    );
+    let Some(ok) = ok else { return };
+    assert!(
+        matches!(ok, FnOutcome::Verified { .. }),
+        "map(|x| x + 1).sum() over len <= 1 with xs[0] == 0 is <= 1, got {ok}"
+    );
+    let bad = verify_src(
+        "mapped_sum_pad_bad",
+        "/// requires: xs.len() <= 1 && xs[0] == 0\n/// ensures: ret == 0\npub fn mapped_sum_pad_bad(xs: &[u8]) -> u8 { xs.iter().copied().map(|x| x + 1).sum() }",
+    );
+    let Some(bad) = bad else { return };
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "the sum is 1 at len 1, so == 0 must be refuted, got {bad}"
+    );
+}
+
+/// Chained same-adapter calls compose: `take` by `min`, `skip` additively, `step_by`
+/// multiplicatively. `take(2).take(3)` must yield 2 elements (the minimum), not 3 (the
+/// second `take`'s count) -- so a "second take overwrites the end" model is refuted by
+/// the false twin. This pins the audit's "chained same-adapter overwrite" concern as
+/// resolved (the model composes; the adapters do not clobber each other).
+#[test]
+fn chained_same_adapters_compose() {
+    let ok = |name: &str, body: &str, n: u64| {
+        verify_src(name, &format!("/// requires: xs.len() == 5\n/// ensures: ret == {n}\npub fn {name}(xs: &[u8]) -> usize {{ {body} }}"))
+    };
+    // take composes by min: 2, and the 3 is refuted (the teeth).
+    assert!(ok("ct", "xs.iter().take(2).take(3).count()", 2).is_some_and(|o| o.is_verified()));
+    assert!(matches!(ok("ctf", "xs.iter().take(2).take(3).count()", 3), Some(FnOutcome::Failed { .. })));
+    // skip composes additively: skip 3 of 5 -> 2.
+    assert!(ok("cs", "xs.iter().skip(1).skip(2).count()", 2).is_some_and(|o| o.is_verified()));
+    // step_by composes multiplicatively: step 6 of len 6 -> index 0 only -> 1.
+    let step = verify_src("cst", "/// requires: xs.len() == 6\n/// ensures: ret == 1\npub fn cst(xs: &[u8]) -> usize { xs.iter().step_by(2).step_by(3).count() }");
+    assert!(step.as_ref().is_some_and(|o| o.is_verified()), "step_by(2).step_by(3) of len 6 is 1 element, got {step:?}");
+}
+
+
+#[test]
+fn step_by_composes_with_skip_and_take() {
+    // `skip(n)`/`take(k)` count *yielded* elements, each `step` apart; a bare
+    // `pos + n` / `pos + k` under-counts after `step_by` (a false refutation of a true
+    // count). All of `xs.len() == 10`.
+    let ok = |name: &str, body: &str, n: u64| {
+        verify_src(name, &format!("/// requires: xs.len() == 10\n/// ensures: ret == {n}\npub fn {name}(xs: &[u8]) -> usize {{ {body} }}"))
+    };
+    assert!(ok("st", "xs.iter().step_by(3).take(2).count()", 2).is_some_and(|o| o.is_verified()));
+    assert!(ok("ss", "xs.iter().step_by(3).skip(2).count()", 2).is_some_and(|o| o.is_verified()));
+    assert!(ok("ts", "xs.iter().take(2).step_by(3).count()", 1).is_some_and(|o| o.is_verified()));
+    assert!(ok("sk", "xs.iter().skip(2).step_by(3).count()", 3).is_some_and(|o| o.is_verified()));
+    assert!(ok("rst", "xs.iter().rev().step_by(3).take(2).count()", 2).is_some_and(|o| o.is_verified()));
+    assert!(ok("rss", "xs.iter().rev().step_by(3).skip(2).count()", 2).is_some_and(|o| o.is_verified()));
+    // Teeth: before the fix (base offset) `step_by(3).take(2)` of len 10 counted 1, so
+    // `== 1` verified and `== 2` was refuted. Now the reverse: `== 1` is the refutation.
+    assert!(
+        matches!(ok("stf", "xs.iter().step_by(3).take(2).count()", 1), Some(FnOutcome::Failed { .. })),
+        "step_by(3).take(2) of len 10 is 2, so == 1 must be refuted"
+    );
+    assert!(
+        matches!(ok("ssf", "xs.iter().step_by(3).skip(2).count()", 3), Some(FnOutcome::Failed { .. })),
+        "step_by(3).skip(2) of len 10 is 2, so == 3 must be refuted"
+    );
+}
+
+
+#[test]
+fn take_cap_is_respected_by_last_and_count() {
+    let last = |name: &str, body: &str, b: bool| {
+        verify_src(name, &format!("/// requires: xs.len() == 5\n/// ensures: ret == {b}\npub fn {name}(xs: &[u8]) -> bool {{ {body} }}"))
+    };
+    let cnt = |name: &str, body: &str, n: u64| {
+        verify_src(name, &format!("/// requires: xs.len() == 5\n/// ensures: ret == {n}\npub fn {name}(xs: &[u8]) -> usize {{ {body} }}"))
+    };
+    // take(0) exhausts the cursor: last() is None, count() is 0. `last`'s tag used
+    // `pos < len` and ignored the take cap, so `is_none() == false` was a false proof.
+    assert!(last("l0", "xs.iter().take(0).last().is_none()", true).is_some_and(|o| o.is_verified()));
+    assert!(
+        matches!(last("l0f", "xs.iter().take(0).last().is_none()", false), Some(FnOutcome::Failed { .. })),
+        "take(0).last() is None, so is_none()==false must be refuted (was a false proof)"
+    );
+    assert!(last("l2", "xs.iter().take(2).last().is_some()", true).is_some_and(|o| o.is_verified()));
+    assert!(cnt("c0", "xs.iter().take(0).count()", 0).is_some_and(|o| o.is_verified()));
+    assert!(cnt("c2", "xs.iter().take(2).count()", 2).is_some_and(|o| o.is_verified()));
+}
+
+#[test]
+fn nth_advances_by_step() {
+    // `nth(k)` consumes k+1 *yielded* elements, each `step` apart, so the cursor must
+    // advance by `(k+1)*step`. A bare `+1` under-advanced after `step_by`, so a later
+    // `count()` miscounted (a false proof of the wrong count).
+    let f = |name: &str, n: u64| {
+        verify_src(name, &format!("/// requires: xs.len() == 12\n/// ensures: ret == {n}\npub fn {name}(xs: &[u8]) -> usize {{ let mut it = xs.iter().step_by(3); let _ = it.nth(1); it.count() }}"))
+    };
+    // step_by(3) over len 12 yields 0,3,6,9; nth(1) takes base 3, leaving 6,9 -> 2.
+    assert!(f("nc", 2).is_some_and(|o| o.is_verified()));
+    assert!(
+        matches!(f("ncf", 3), Some(FnOutcome::Failed { .. })),
+        "the remaining count is 2, so == 3 must be refuted"
+    );
+}
+
+#[test]
+fn rev_last_and_take_last_name_the_right_element() {
+    // `rev().last()` is the original's first element; `rev().take(k).last()` is the
+    // original's `n-k`. The rev branch named `base pos`, ignoring `step` and the take
+    // cap, so `rev().take(2).last()` returned base 0 (10) instead of base n-2 (40) --
+    // a false refutation of the true 40 and a false proof of 10.
+    let f = |name: &str, e: u64, body: &str| {
+        verify_src(name, &format!("/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n/// ensures: ret == {e}\npub fn {name}(xs: &[u8]) -> u8 {{ {body} }}"))
+    };
+    assert!(f("rl", 10, "xs.iter().rev().last().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    assert!(f("rtl", 40, "xs.iter().rev().take(2).last().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    // `rev().step_by(3).last()` = [50,40,30,20,10] stride 3 -> [50,20] -> last 20 (base 1).
+    // A stride of 2 lands on base 0, the same as no stride, so it would not exercise `step`.
+    assert!(f("rsl", 20, "xs.iter().rev().step_by(3).last().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    // Teeth: the pre-fix value of rev().take(2).last() was 10; it is 40, so == 10 is refuted.
+    assert!(
+        matches!(f("rtlf", 10, "xs.iter().rev().take(2).last().copied().unwrap_or(0)"), Some(FnOutcome::Failed { .. })),
+        "rev().take(2).last() is 40, so == 10 must be refuted"
+    );
+}
+
+#[test]
+fn extreme_folds_the_reversed_prefix() {
+    // `rev().take(2).max()` folds [50, 40] -> 50. `slice_extreme` ignored `rev` and
+    // folded the forward prefix [10, 20] -> 20, refuting the true 50 (a false proof of
+    // 20 in the other direction).
+    let f = |name: &str, e: u64, body: &str| {
+        verify_src(name, &format!("/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n/// ensures: ret == {e}\npub fn {name}(xs: &[u8]) -> u8 {{ {body} }}"))
+    };
+    assert!(f("rtm", 50, "xs.iter().rev().take(2).copied().max().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    assert!(f("rtn", 40, "xs.iter().rev().take(2).copied().min().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    assert!(f("rx", 50, "xs.iter().rev().copied().max().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    // Teeth: the pre-fix forward-prefix max was 20, so == 20 must now be refuted.
+    assert!(
+        matches!(f("rtmf", 20, "xs.iter().rev().take(2).copied().max().unwrap_or(0)"), Some(FnOutcome::Failed { .. })),
+        "rev().take(2).max() is 50, so == 20 must be refuted"
+    );
+}
+
+#[test]
+fn all_any_fold_the_reversed_prefix() {
+    // `rev().take(3).any(|x| *x == 20)` is false: the reversed prefix is [50,40,30].
+    // `all`/`any` read forward ([10,20,30], which contains 20), so the false verdict was
+    // proved and the true one refuted -- the same `rev`-mapping bug `slice_extreme` had.
+    let pre = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n";
+    let b = |name: &str, e: bool, body: &str| {
+        verify_src(name, &format!("{pre}/// ensures: ret == {e}\npub fn {name}(xs: &[u8]) -> bool {{ {body} }}"))
+    };
+    assert!(b("rta", false, "xs.iter().rev().take(3).any(|x| *x == 20)").is_some_and(|o| o.is_verified()));
+    assert!(b("rtl", true, "xs.iter().rev().take(3).all(|x| *x > 25)").is_some_and(|o| o.is_verified()));
+    // Teeth: the pre-fix (forward) `any` found 20 -> true; it is false, so == true is refuted.
+    assert!(
+        matches!(b("rtaf", true, "xs.iter().rev().take(3).any(|x| *x == 20)"), Some(FnOutcome::Failed { .. })),
+        "rev().take(3).any(==20) is false, so == true must be refuted"
+    );
+}
+
+#[test]
+fn take_rev_and_rev_take_reverse_different_prefixes() {
+    // `take(2).rev()` reverses the *taken forward prefix* [10,20] -> [20,10]; `rev().take(2)`
+    // reverses the whole slice then takes -> [50,40]. They collapse to the same cursor state
+    // (`rev, end=Some(2)`), so `base_of` must read the take/rev order (`taken_forward`).
+    let pre = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n";
+    let u8f = |name: &str, e: u64, body: &str| {
+        verify_src(name, &format!("{pre}/// ensures: ret == {e}\npub fn {name}(xs: &[u8]) -> u8 {{ {body} }}"))
+    };
+    // take(2).rev(): [20,10] -> last 10, max 20.
+    assert!(u8f("a1", 10, "xs.iter().take(2).rev().last().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    assert!(u8f("a2", 20, "xs.iter().take(2).rev().copied().max().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    // rev().take(2): [50,40] -> last 40, max 50 (the earlier fix's regression).
+    assert!(u8f("a5", 40, "xs.iter().rev().take(2).last().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    assert!(u8f("a6", 50, "xs.iter().rev().take(2).copied().max().unwrap_or(0)").is_some_and(|o| o.is_verified()));
+    // Teeth: take(2).rev().max() is 20, so == 50 (the rev().take(2) answer) must be refuted.
+    assert!(
+        matches!(u8f("a2f", 50, "xs.iter().take(2).rev().copied().max().unwrap_or(0)"), Some(FnOutcome::Failed { .. })),
+        "take(2).rev().max() is 20, so == 50 must be refuted"
+    );
+}
+
+
+
+#[test]
+fn skip_or_take_with_rev_is_refused_not_mis_windowed() {
+    // The cursor stores one `pos` (a skipped count forward, a distance-from-end under
+    // `rev`), so `skip(n).take(k).rev()` and `skip(n).rev()` cannot be represented and
+    // are refused -- before the fix `skip(1).take(2).rev().next()` read the slice edge
+    // (a false refutation of the true 30).
+    let pre = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n";
+    for (n, body) in [
+        ("sk_take_rev", "xs.iter().skip(1).take(2).rev().next().copied().unwrap_or(0)"),
+        ("sk_rev", "xs.iter().skip(1).rev().next().copied().unwrap_or(0)"),
+    ] {
+        let src = format!("{pre}/// ensures: ret == 30\npub fn {n}(xs: &[u8]) -> u8 {{ {body} }}");
+        let o = verify_src(n, &src).expect("an outcome");
+        assert!(matches!(o, FnOutcome::Incomplete { .. }), "`{n}` must be refused (Incomplete), got {o:?}");
+    }
+}
+
+#[test]
+fn a_rebound_slice_reads_the_callers_entry_length() {
+    // `mut xs: &[u8]; xs = ys` changes which slice the *body* sees, not the caller's
+    // one-element slice -- so `xs.len()` is the entry length (1), not `ys`'s (2).
+    let pre = "/// requires: xs.len() == 1 && ys.len() == 2\n";
+    let t = format!("{pre}/// ensures: xs.len() == 1\npub fn rb_true<'a>(mut xs: &'a [u8], ys: &'a [u8]) -> u8 {{ xs = ys; 0 }}");
+    assert!(verify_src("rb_true", &t).is_some_and(|o| o.is_verified()), "the caller's slice keeps length 1");
+    let f = format!("{pre}/// ensures: xs.len() == 2\npub fn rb_false<'a>(mut xs: &'a [u8], ys: &'a [u8]) -> u8 {{ xs = ys; 0 }}");
+    assert!(matches!(verify_src("rb_false", &f), Some(FnOutcome::Failed { .. })), "the caller's slice is still length 1, so == 2 must be refuted");
+}
+
+#[test]
+fn a_rebound_mut_vec_length_is_refused_but_push_is_seen() {
+    // A `&mut Vec` the body pushes to has a final length (push is seen). A `&mut Vec`
+    // that is *rebound* (`v = w`) aliases the new target, which the model does not
+    // track, so a Vec length after a rebind is *refused* (unreadable `v.len()`), never
+    // read back from the entry value -- that fallback was a false proof for
+    // `v.push(1); v = w` (the caller's Vec has length 1, the entry value 0).
+    let pre = "/// requires: v.len() == 1 && w.len() == 2\n";
+    for (n, e) in [("vr_true", 1u64), ("vr_false", 2u64)] {
+        let src = format!("{pre}/// ensures: v.len() == {e}\npub fn {n}<'a>(mut v: &'a mut Vec<u8>, w: &'a mut Vec<u8>) -> u8 {{ v = w; 0 }}");
+        assert!(matches!(verify_src(n, &src), Some(FnOutcome::Incomplete { .. })), "`{n}`: a rebound &mut Vec's length must be refused (Incomplete)");
+    }
+    // The push case is still seen (the entry length 0 becomes 1).
+    let p = "/// requires: v.len() == 0\n/// ensures: ret == 1\npub fn vp(v: &mut Vec<u8>) -> usize { v.push(1); v.len() }";
+    assert!(verify_src("vp", p).is_some_and(|o| o.is_verified()), "a push must be reflected in the final length");
+    // A push *then* rebind is refused, not proved against the entry length.
+    let pr = "/// requires: v.len() == 0 && w.len() == 1\n/// ensures: v.len() == 0\npub fn pr0<'a>(mut v: &'a mut Vec<u8>, w: &'a mut Vec<u8>) -> u8 { v.push(1); v = w; 0 }";
+    assert!(matches!(verify_src("pr0", pr), Some(FnOutcome::Incomplete { .. })), "push-then-rebind must refuse the length, not prove the entry value");
+}
+
+#[test]
+fn a_skip_on_a_reversed_prefix_cannot_be_reversed_again() {
+    // `take(k).rev().skip(1).rev()`: the `skip` advanced `pos` relative to the reversed
+    // sequence, so the second `rev` cannot map it back to a forward cursor -- it read
+    // `xs[1]` = 20 where the real next element is 10 (a false proof). Both directions are
+    // now refused (the single `take.rev.skip.next` is still correct).
+    let pre = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n";
+    for (n, e) in [("trsr10", 10u64), ("trsr20", 20u64)] {
+        let src = format!("{pre}/// ensures: ret == {e}\npub fn {n}(xs: &[u8]) -> u8 {{ xs.iter().take(3).rev().skip(1).rev().next().copied().unwrap_or(0) }}");
+        assert!(matches!(verify_src(n, &src), Some(FnOutcome::Incomplete { .. })), "`{n}` must be refused");
+    }
+}
+
+#[test]
+fn chained_map_and_filter_are_refused() {
+    // A single `map` is modelled; a second (or mixed) adapter is refused, because
+    // `map(f).map(g)` was modelled as `g` alone (a false proof: it returned 6, not 7).
+    let single = "/// requires: xs.len() == 1 && xs[0] == 5\n/// ensures: ret == 6\npub fn single_map(xs: &[u8]) -> u8 { xs.iter().copied().map(|x| x.wrapping_add(1)).sum::<u8>() }";
+    assert!(verify_src("single_map", single).is_some_and(|o| o.is_verified()), "a single map is still modelled");
+    for (n, e) in [("mm_true", 7u64), ("mm_false", 6u64)] {
+        let src = format!("/// requires: xs.len() == 1 && xs[0] == 5\n/// ensures: ret == {e}\npub fn {n}(xs: &[u8]) -> u8 {{ xs.iter().copied().map(|x| x.wrapping_add(1)).map(|x| x.wrapping_add(1)).sum::<u8>() }}");
+        let o = verify_src(n, &src).expect("an outcome");
+        assert!(matches!(o, FnOutcome::Incomplete { .. }), "`{n}` must be refused (Incomplete), got {o:?}");
+    }
+}
+
+#[test]
+fn take_rev_rev_cancels_to_the_forward_take() {
+    // `take(k).rev().rev()` is the forward `take(k)` again; a third `rev` is
+    // `take(k).rev()`. Refusing it (the old behaviour) lost a proof.
+    let pre = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n";
+    let v = |n: &str, e: u64, body: &str| verify_src(n, &format!("{pre}/// ensures: ret == {e}\npub fn {n}(xs: &[u8]) -> u8 {{ {body} }}"));
+    assert!(v("trr2", 10, "xs.iter().take(2).rev().rev().next().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()), "take(2).rev().rev() is the forward take(2), first 10");
+    assert!(v("trr3", 20, "xs.iter().take(2).rev().rev().rev().next().copied().unwrap_or(0)").is_some_and(|o| o.is_verified()), "a third rev is take(2).rev(), first 20");
+    // Teeth: == 20 on the double-rev (which is 10) must be refuted.
+    assert!(matches!(v("trr2f", 20, "xs.iter().take(2).rev().rev().next().copied().unwrap_or(0)"), Some(FnOutcome::Failed { .. })), "take(2).rev().rev() is 10, so == 20 must be refuted");
+}
+
+#[test]
+fn compound_closures_and_rev_folds_are_refused() {
+    // Pins the *stale* review findings: these shapes are already refusals, never a
+    // false proof, so the fix is the regression test, not a code change.
+    let pre = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n";
+    for (n, body) in [
+        ("cm", "xs.iter().copied().map(|x| (x + 1) * 2).sum::<u8>()"),
+        ("rs", "xs.iter().rev().copied().sum::<u8>()"),
+    ] {
+        let src = format!("{pre}/// ensures: ret == 0\npub fn {n}(xs: &[u8]) -> u8 {{ {body} }}");
+        let o = verify_src(n, &src).expect("an outcome");
+        assert!(matches!(o, FnOutcome::Incomplete { .. }), "`{n}` must be refused (Incomplete), got {o:?}");
+    }
+}
+
+#[test]
+fn vec_clear_with_drop_glue_and_box_write_are_refused() {
+    // A `Vec::clear` on an element with drop glue would run the destructor (which may
+    // panic); resetting the length alone would be a false proof. And `*b = v` on a Box
+    // hits the null-check refusal before the store, so neither can be verified.
+    let vc = "pub struct Boom;\nimpl Drop for Boom { fn drop(&mut self) { assert!(false); } }\n/// requires: v.len() == 1\n/// ensures: ret == 0\npub fn vc(v: &mut Vec<Boom>) -> usize { v.clear(); v.len() }";
+    assert!(matches!(verify_src("vc", vc), Some(FnOutcome::Incomplete { .. })), "Vec::clear on a drop-glue element must be refused");
+}
+
+#[test]
+fn map_or_all_then_a_terminal_is_refused() {
+    // `map().next()` and `all()` followed by `next()` on the same iterator are refused
+    // (the terminal consumes or discards the cursor), never mis-modelled.
+    let mn = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n/// ensures: ret == 11\npub fn mn(xs: &[u8]) -> u8 { xs.iter().copied().map(|x| x.wrapping_add(1)).next().unwrap_or(0) }";
+    assert!(matches!(verify_src("mn", mn), Some(FnOutcome::Incomplete { .. })), "map().next() must be refused");
+    let an = "/// requires: xs.len() == 5\n/// ensures: ret == 10\npub fn an(xs: &[u8]) -> u8 { let mut it = xs.iter(); let _ = it.all(|x| *x < 100); it.next().copied().unwrap_or(0) }";
+    assert!(matches!(verify_src("an", an), Some(FnOutcome::Incomplete { .. })), "all() then next() must be refused");
+}
+
+
+#[test]
+fn a_multifile_method_contract_is_verified_or_refuted_by_original_location() {
+    // A method's contract is keyed by a *snapshot* line; the MIR's `impl_loc` is rustc's
+    // original line. The line map translates between them, so a method in a module file
+    // and a root method below a `mod` declaration both pair with their own body: a true
+    // contract is `Verified`, a false one `Failed` -- never a `missing` (a lost proof) nor
+    // a wrong-body `Verified` (a false proof).
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-mf2-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lib.rs"), "pub mod m;\npub struct Root;\nimpl Root {\n    /// ensures: ret == 7\n    pub fn rok(&self) -> u8 { 7 }\n    /// ensures: ret == 7\n    pub fn rbad(&self) -> u8 { 8 }\n}\n").unwrap();
+    std::fs::write(dir.join("m.rs"), "pub struct Foo;\nimpl Foo {\n    /// ensures: ret == 1\n    pub fn ok(&self) -> u8 { 1 }\n    /// ensures: ret == 1\n    pub fn bad(&self) -> u8 { 2 }\n}\n").unwrap();
+    let report = verify::verify_file_with_opts(&rustc, &dir.join("lib.rs"), &[], &probe_opts()).expect("frontend");
+    let _ = std::fs::remove_dir_all(&dir);
+    let get = |n: &str| report.outcomes.iter().find(|(k, _)| k == n).map(|(_, o)| o);
+    assert!(matches!(get("ok"), Some(FnOutcome::Verified { .. })), "module method, true contract -> Verified, got {:?}", get("ok"));
+    assert!(matches!(get("bad"), Some(FnOutcome::Failed { .. })), "module method, false contract -> Failed, got {:?}", get("bad"));
+    assert!(matches!(get("rok"), Some(FnOutcome::Verified { .. })), "root method below `mod m;`, true contract -> Verified, got {:?}", get("rok"));
+    assert!(matches!(get("rbad"), Some(FnOutcome::Failed { .. })), "root method, false contract -> Failed, got {:?}", get("rbad"));
+    assert!(report.missing.is_empty(), "no method should be missing now: {:?}", report.missing);
+    // Item 2: the report's `(file, line)` points at the module file, not the root, so a
+    // SARIF finding lands in the file that actually holds the function.
+    match report.lines.get("ok") {
+        Some((Some(f), line)) => {
+            assert!(f.to_string_lossy().ends_with("m.rs"), "module method's report file must be m.rs, got {f:?}");
+            assert_eq!(*line, 4, "`fn ok` is at m.rs line 4");
+        }
+        other => panic!("report.lines[ok] must be (Some(m.rs), 4), got {other:?}"),
+    }
+    match report.lines.get("rok") {
+        Some((Some(f), _)) => assert!(f.to_string_lossy().ends_with("lib.rs"), "root method's report file must be lib.rs, got {f:?}"),
+        other => panic!("report.lines[rok] must be (Some(lib.rs), ..), got {other:?}"),
+    }
+}
+
+#[test]
+fn a_same_named_method_in_two_same_basename_files_is_paired_by_file() {
+    // Two module files with the same basename and the SAME method name at the SAME line
+    // and column: only the file distinguishes them, so target selection must use the path
+    // (not the bare name), or one body gets the other's contract.
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-snn-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::create_dir_all(dir.join("b")).unwrap();
+    std::fs::create_dir_all(dir.join("c")).unwrap();
+    std::fs::write(dir.join("lib.rs"), "pub mod a;\npub mod b;\npub mod c;\n").unwrap();
+    std::fs::write(dir.join("a.rs"), "pub mod m;\n").unwrap();
+    std::fs::write(dir.join("b.rs"), "pub mod m;\n").unwrap();
+    std::fs::write(dir.join("c.rs"), "pub mod m;\n").unwrap();
+    std::fs::write(dir.join("a/m.rs"), "pub struct A;\nimpl A {\n    /// ensures: ret == 1\n    pub fn f(&self) -> u8 { 1 }\n}\n").unwrap();
+    std::fs::write(dir.join("b/m.rs"), "pub struct B;\nimpl B {\n    /// ensures: ret == 2\n    pub fn f(&self) -> u8 { 2 }\n}\n").unwrap();
+    std::fs::write(dir.join("c/m.rs"), "pub struct C;\nimpl C {\n    /// ensures: ret == 9\n    pub fn f(&self) -> u8 { 1 }\n}\n").unwrap();
+    let report = verify::verify_file_with_opts(&rustc, &dir.join("lib.rs"), &[], &probe_opts()).expect("frontend");
+    let _ = std::fs::remove_dir_all(&dir);
+    // A::f (body 1, ret==1) and B::f (body 2, ret==2) both verify *only* when each gets
+    // its own contract and body; a body swap or a contract swap makes BOTH fail.
+    let a = report.outcomes.iter().find(|(k, _)| k.contains("A::")).map(|(_, o)| o);
+    let b = report.outcomes.iter().find(|(k, _)| k.contains("B::")).map(|(_, o)| o);
+    // `Verified { obligations: 0 }` means a dropped contract, which also reads as
+    // success -- so require a non-zero obligation count, not merely `Verified`.
+    assert!(matches!(a, Some(FnOutcome::Verified { obligations, .. }) if *obligations > 0), "A::f (ret==1 body 1) must verify with a real obligation; outcomes {:?}", report.outcomes);
+    assert!(matches!(b, Some(FnOutcome::Verified { obligations, .. }) if *obligations > 0), "B::f (ret==2 body 2) must verify with a real obligation; a swap breaks both; outcomes {:?}", report.outcomes);
+    // A third method with a FALSE contract (ret==9 on a body of 1) must be refuted, so
+    // the test cannot pass on two empty `Verified { obligations: 0 }` rows.
+    let c = report.outcomes.iter().find(|(k, _)| k.contains("C::")).map(|(_, o)| o);
+    assert!(matches!(c, Some(FnOutcome::Failed { .. })), "C::f (ret==9 body 1) must be refuted on its postcondition; outcomes {:?}", report.outcomes);
+}
+
+#[test]
+fn a_multifile_method_with_two_contracts_is_refused() {
+    // A module-file method that declares its own contract AND inherits a contracted
+    // trait's must be refused (Skipped), not silently checked against one. Before the
+    // line-map the method was `missing`; the line-map makes it a target, so
+    // `contract_conflict` must translate the line too or the conflict is missed and the
+    // trait's promise is dropped.
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-mfc-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lib.rs"), "pub trait Bump {\n    /// ensures: ret == 9\n    fn bump(&self) -> u8;\n}\npub mod m;\n").unwrap();
+    std::fs::write(dir.join("m.rs"), "use crate::Bump;\npub struct S;\nimpl Bump for S {\n    /// ensures: ret == 7\n    fn bump(&self) -> u8 { 7 }\n}\n").unwrap();
+    let report = verify::verify_file_with_opts(&rustc, &dir.join("lib.rs"), &[], &probe_opts()).expect("frontend");
+    let _ = std::fs::remove_dir_all(&dir);
+    let o = report.outcomes.iter().find(|(k, _)| k == "bump").map(|(_, o)| o);
+    assert!(matches!(o, Some(FnOutcome::Skipped { .. })), "a module method with its own and an inherited contract must be refused (Skipped), got {o:?}");
+}
+
+#[test]
+fn a_same_basename_module_does_not_cross_match() {
+    // Two module files with the same basename (`m.rs`) in different directories, each with
+    // an impl at the same line and column. A basename-only file comparison would pair one
+    // body with the other's contract (a false proof); the full-path match keeps them apart.
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif-sbn-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::create_dir_all(dir.join("b")).unwrap();
+    std::fs::write(dir.join("lib.rs"), "pub mod a;\npub mod b;\n").unwrap();
+    std::fs::write(dir.join("a.rs"), "pub mod m;\n").unwrap();
+    std::fs::write(dir.join("b.rs"), "pub mod m;\n").unwrap();
+    std::fs::write(dir.join("a/m.rs"), "pub struct S;\nimpl S {\n    /// ensures: ret == 1\n    pub fn af(&self) -> u8 { 1 }\n}\n").unwrap();
+    std::fs::write(dir.join("b/m.rs"), "pub struct S;\nimpl S {\n    /// ensures: ret == 2\n    pub fn bf(&self) -> u8 { 1 }\n}\n").unwrap();
+    let report = verify::verify_file_with_opts(&rustc, &dir.join("lib.rs"), &[], &probe_opts()).expect("frontend");
+    let _ = std::fs::remove_dir_all(&dir);
+    let get = |n: &str| report.outcomes.iter().find(|(k, _)| k == n).map(|(_, o)| o);
+    assert!(matches!(get("af"), Some(FnOutcome::Verified { .. })), "a::m::af (contract 1, body 1) must verify, got {:?}", get("af"));
+    assert!(matches!(get("bf"), Some(FnOutcome::Failed { .. })), "b::m::bf (contract 2, body 1) must be refuted, got {:?} (a basename cross-match would wrongly verify it)", get("bf"));
+}
+
+#[test]
+fn iterator_chain_differential_agrees_with_rustc() {
+    // Every chain the verifier decides `Verified` must match a real `rustc` compile+run of
+    // the same expression (the CONTRIBUTING differential-harness rule for a proof
+    // shortcut). A chain the verifier refuses is skipped -- a refusal is never wrong.
+    let Some(rustc) = rustc() else { return };
+    let cases: &[(&str, u8)] = &[
+        ("xs.iter().copied().sum::<u8>()", 150),
+        ("xs.iter().copied().max().unwrap_or(0)", 50),
+        ("xs.iter().copied().min().unwrap_or(0)", 10),
+        ("xs.iter().rev().next().copied().unwrap_or(0)", 50),
+        ("xs.iter().rev().take(2).last().copied().unwrap_or(0)", 40),
+        ("xs.iter().take(2).rev().next().copied().unwrap_or(0)", 20),
+        ("xs.iter().skip(2).next().copied().unwrap_or(0)", 30),
+        ("xs.iter().step_by(2).next().copied().unwrap_or(0)", 10),
+        ("xs.iter().copied().map(|x| x.wrapping_add(1)).sum::<u8>()", 155),
+        ("xs.iter().copied().filter(|x| *x > 25).count() as u8", 3),
+        ("xs.iter().copied().any(|x| x == 30) as u8", 1),
+        ("xs.iter().copied().all(|x| x < 100) as u8", 1),
+    ];
+    let pre = "/// requires: xs.len() == 5 && xs[0] == 10 && xs[1] == 20 && xs[2] == 30 && xs[3] == 40 && xs[4] == 50\n";
+    for (i, (body, expected)) in cases.iter().enumerate() {
+        let prog = format!("fn main() {{ let xs: [u8; 5] = [10, 20, 30, 40, 50]; let v: u8 = {{ {body} }}; println!(\"{{}}\", v); }}");
+        let dir = std::env::temp_dir().join(format!("verif-itdiff-{}-{i}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("main.rs");
+        std::fs::write(&f, &prog).unwrap();
+        let bin = dir.join("main");
+        let out = std::process::Command::new(&rustc).arg("--edition").arg("2024").arg("-o").arg(&bin).arg(&f).output().expect("rustc");
+        assert!(out.status.success(), "rustc failed on `{body}`: {}", String::from_utf8_lossy(&out.stderr));
+        let ran = std::process::Command::new(&bin).output().expect("run");
+        let real: u8 = String::from_utf8_lossy(&ran.stdout).trim().parse().expect("a value");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(real, *expected, "the differential case's own expected value is wrong for `{body}`");
+        let src = format!("{pre}/// ensures: ret == {expected}\npub fn f{i}(xs: &[u8]) -> u8 {{ {body} }}");
+        if let Some(o) = verify_src(&format!("f{i}"), &src) {
+            // A true postcondition must not be *refuted* (a false refutation): the
+            // verifier may prove it or refuse it, but a `Failed` on a contract that
+            // holds on every input is a bug the false-postcondition check below cannot
+            // see (it would pass if both clauses were refuted).
+            assert!(
+                !matches!(o, FnOutcome::Failed { .. }),
+                "verifier REFUTED a TRUE postcondition (`{body} == {expected}`, real computes {real})"
+            );
+            if o.is_verified() {
+                assert_eq!(real, *expected, "verifier Verified `{body} == {expected}` but rustc computes {real}");
+            }
+        }
+        // The harness's own teeth: a FALSE postcondition must never be Verified, or a
+        // verifier that proves everything would pass the true check above alone.
+        let wrong = expected.wrapping_add(1);
+        let fsrc = format!("{pre}/// ensures: ret == {wrong}\npub fn f{i}b(xs: &[u8]) -> u8 {{ {body} }}");
+        if let Some(o) = verify_src(&format!("f{i}b"), &fsrc) {
+            assert!(!o.is_verified(), "verifier Verified a FALSE postcondition (`{body} == {wrong}`, real {real})");
+        }
+    }
+}
+
+
+
+#[test]
+fn the_second_review_duplicate_and_const_len_findings_are_refused() {
+    let Some(rustc) = rustc() else { return };
+    // #3: a `const out__len` must NOT hijack a *refused* Vec length. Real `out` length
+    // is 1 (one push); the postcondition is refused (Incomplete), never the constant.
+    for (n, e) in [("sr_c3_0", 0u64), ("sr_c3_1", 1u64)] {
+        let src = format!("const out__len: usize = 0;\n/// requires: v.len() == 0 && w.len() == 1 && out.len() == 0\n/// ensures: out.len() == {e}\npub fn {n}<'a>(mut v: &'a mut Vec<u8>, w: &'a mut Vec<u8>, out: &'a mut Vec<u8>) -> u8 {{ v.push(1); v = w; out.push(1); 0 }}");
+        assert!(
+            matches!(verify_src(n, &src), Some(FnOutcome::Incomplete { .. })),
+            "`{n}`: a refused Vec length must not resolve to `const out__len`"
+        );
+    }
+    // #2: two `#[cfg]`-alternative modules sharing a name. Rust compiles one; the
+    // inliner reads both, so the contract is ambiguous -> refused (Skipped), never the
+    // inactive module's claim.
+    let dir = std::env::temp_dir().join(format!("verif-sr-cfg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a_unix.rs"), "spec! { ensures: ret == 1, }\npub fn f() -> u8 { 1 }\n").unwrap();
+    std::fs::write(dir.join("a_other.rs"), "spec! { ensures: ret == 2, }\npub fn f() -> u8 { 2 }\n").unwrap();
+    let lib = dir.join("lib.rs");
+    std::fs::write(&lib, "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n#[cfg(unix)]\n#[path = \"a_unix.rs\"]\npub mod platform;\n#[cfg(not(unix))]\n#[path = \"a_other.rs\"]\npub mod platform;\n").unwrap();
+    let rep = verify::verify_file_with_opts(&rustc, &lib, &[], &probe_opts()).expect("verify");
+    let o = rep.outcomes.iter().find(|(n, _)| n == "platform::f").map(|(_, o)| o);
+    assert!(
+        matches!(o, Some(FnOutcome::Skipped { .. })),
+        "a cfg-alternative duplicate contract must be refused (Skipped), got {o:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+#[test]
+fn a_reexported_trait_contract_across_inclusions_is_refused_not_verified() {
+    // One `shared.rs` included by two modules; it does `pub use super::T;` and
+    // `impl self::T for Shared`. `qualify_trait` cannot follow the re-export, so the two
+    // inclusions resolve `self::T` to two *unresolved* paths. The inherited contract
+    // cannot be known to agree, so the shared impl must be REFUSED (never Verified), not
+    // checked against an arbitrary trait's postcondition (here a violating ret==7 against
+    // the re-exported T::value == 9). Control: the direct impl satisfies the contract.
+    let Some(rustc) = rustc() else { return };
+    let dir = std::env::temp_dir().join(format!("verif-reexport-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lib.rs"), concat!(
+        "pub trait T {\n    /// ensures: ret == 9\n    fn value(&self) -> u8;\n}\n",
+        "pub struct Direct;\nimpl T for Direct { fn value(&self) -> u8 { 9 } }\n",
+        "#[cfg(unix)]\n#[path = \"shared.rs\"]\npub mod disabled;\n",
+        "#[cfg(not(unix))]\n#[path = \"shared.rs\"]\npub mod active;\n",
+    )).unwrap();
+    std::fs::write(dir.join("shared.rs"), concat!(
+        "pub use super::T;\n",
+        "pub struct Shared;\n",
+        "impl self::T for Shared {\n",
+        "    /// ensures: ret == 7\n",
+        "    fn value(&self) -> u8 { 7 }\n",
+        "}\n",
+    )).unwrap();
+    let rep = verify::verify_file_with_opts(&rustc, &dir.join("lib.rs"), &[], &probe_opts()).expect("verify");
+    let _ = std::fs::remove_dir_all(&dir);
+    let find = |want: &str| {
+        rep.outcomes
+            .iter()
+            .find(|(n, _)| n.contains(want) && n.ends_with("::value"))
+            .map(|(_, o)| o)
+    };
+    // Control: the direct impl satisfies T::value (ret == 9), so it must verify -- this
+    // rules out "everything is skipped" masking a broken fixture.
+    assert!(
+        matches!(find("Direct"), Some(FnOutcome::Verified { .. })),
+        "the direct impl must verify (control); outcomes {:?}",
+        rep.outcomes
+    );
+    // The shared impl must be *Skipped* for the inclusion ambiguity (not Verified, and not
+    // an unrelated Failed/Incomplete): the two inclusions resolve the re-exported trait to
+    // unresolved paths, so no contract can be applied safely.
+    assert!(
+        matches!(find("Shared"), Some(FnOutcome::Skipped { .. })),
+        "the shared impl must be Skipped for the inclusion ambiguity; outcomes {:?}",
+        rep.outcomes
+    );
 }

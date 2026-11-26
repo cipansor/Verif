@@ -2563,6 +2563,14 @@ pub fn index(v: Var) -> u32 {
     with_ctx(|c| c.node_of(v.0).a)
 }
 
+/// Whether `v` is a bare variable. A pin is indexed by a variable, so a caller that
+/// looks a pin up by `index` must first confirm the term *is* a variable -- `index` of
+/// a constant returns its value and `index` of a compound returns a term id, either of
+/// which could match an unrelated pin.
+pub fn is_var(v: Var) -> bool {
+    with_ctx(|c| c.node_of(v.0).op == Op::Var)
+}
+
 /// A word-shaped constant.
 /// A constant of the given width.
 ///

@@ -4355,9 +4355,14 @@ Three facts cost time here and are worth keeping: `swap_bytes` is a rotation by
 `div_euclid` adjusts the truncating quotient *away* from zero when the remainder is
 negative, which is the opposite of the natural reading (also caught by the test);
 and `core` has no `to_ne` *value* method, only `to_ne_bytes`, so the byte-order
-model has two variants and not three. The `next_multiple_of`/`div_*` helpers and
-the `_bytes` byte-order forms (which return an array, not an integer) remain
-reachable and unmodelled. The bit-count proofs do **not** go in `verif-arithmetic`: their oracle here is Rust's own method, checked
+model has two variants and not three. The `next_multiple_of`/`checked_next_multiple_of`
+and `div_ceil`/`div_euclid`/`rem_euclid` helpers are modelled too (they were gaps when
+this paragraph was first written -- measured now: every stable integer method
+`classify`s, and the only unmodelled call across the corpora is a deliberate `Self`
+refusal). Two boundaries are deliberate and named: `div_floor` is unstable
+(`int_roundings`) and cannot be differential-tested on the gate's toolchains, so it is
+refused; and the `_bytes` byte-order forms (which return an array, not an integer) are
+refused rather than modelled as a word. The bit-count proofs do **not** go in `verif-arithmetic`: their oracle here is Rust's own method, checked
 exhaustively over the whole operand domain, which is a stronger oracle than a
 small-domain enumeration would be. A third engine with less coverage is not a proof,
 so the split the roadmap proposed is not made.
@@ -10338,12 +10343,272 @@ teeth are a mutation: making `push` a no-op (keeping the length) turns
 `make_ok`/`two_ok` red and leaves the false twins refuted, so the test observes the
 length the `push` produces, not merely that the function decides.
 
+**Follow-up: the element model, and the length folded into `Indexed`.** The
+"length and nothing else" and "a `Vec` argument is a refusal" statements above are
+the *first* version. A `Vec` is now an `Indexed` store exactly as a slice is --
+the separate `Env::vec_len` map is gone, and `Indexed::len_mutable` (true for a
+`Vec`, false for a slice/array) is the only distinction. That buys three things
+the length-only model could not:
+
+- **`push` records the pushed value, and `v[k]`/`v.first()`/`v.get(k)`/`pop`
+  read it back.** The trait calls `v[i]` (`<Vec as Index>::index`) and
+  `v.first()` (`<Vec as Deref>::deref`, plus `as_slice`) are classified on the
+  *bare* `Vec` head with the standard trait path, and the `Index` result is a
+  reference modelled as its element with `slice_elem_ref` recorded -- the same
+  store a slice's `first`/`get` use.
+- **A `Vec` argument's length is a symbolic input, not a refusal.** The binder
+  calls `bind_indexed_len` (loose `Vec` parse, because the dump prints the type
+  bare), so `v.len()` in a contract is a fresh `usize` and `v[0]` a fresh element;
+  `v[0]` in the contract and in the body name one variable. `arg_len_refused`
+  (`len == 0`) moved from *refused* to *refuted*, which is the honest answer.
+- **`v[k]` emits `core`'s bounds panic.** The check is inside `std`, not the dump,
+  so a model that skipped it would report an out-of-bounds read panic-free. The
+  obligation is `find_obligation(path && len <= k)`, and `v[0]` under
+  `requires: v.len() == 0` is `Failed` with a *panic* witness (`len = 0`) --
+  the exact failure the model must not hide.
+
+Two limits are stated rather than papered over. `push` records an element only at
+a *constant* length (a symbolic one poisons the elements, since the store cannot
+pin the index -- a wrong element would be worse than none). And an element first
+created by a deref'd read is not the one a later `v[k]` creates, so
+`v.first() == v[0]` is a *lost* proof in that ordering (never a false one); a
+contract that names `v[0]`, or a body that reads `v[0]` first, shares the element.
+`String`, `Box` and symbolic-length slices remain open. (Iteration is now modelled
+— see the next section.)
+
 Two collision guards matter. A user type spelled `Vec` in a local module
 (`m::Vec`) is not the standard one: `classify` refuses a path that is neither
 `vec::Vec` nor a bare `Vec::` head, and the same-dump lookup answers a local body
 first regardless. And `Vec::<u8>::len` is **not** read as a slice length -- the
 slice path is matched on `core::slice::<impl [T]>`, so the two lengths (a slice's
 symbolic input, a `Vec`'s tracked model) cannot be confused.
+
+## Iterating a slice is a *cursor* at a concrete position, and a loop cut drops it
+
+`for x in xs` over a slice desugars to `<&[T] as IntoIterator>::into_iter` then
+`Iterator::next` on a `std::slice::Iter`. Modelling it is a cursor -- the base
+slice local and a **concrete `u64` position** -- that `next` reads and advances.
+The concreteness is the whole point, and three things fall out of it:
+
+- **Each iteration names the element at a constant index.** `next` at position
+  `k` reads `index_elem(base, k)`, the *same* element variable a contract's
+  `xs[k]` names. So `for x in xs { s += x }` under `requires: xs.len() == 2,
+  ensures: ret == xs[0] + xs[1]` verifies, and its false twin is refuted. A fresh
+  (unconstrained) element per iteration would *refute* the true sum; a fixed one
+  would *verify* the twin. Both are pinned.
+- **The `None` guard is the slice's own length variable.** `next` is `None`
+  exactly when `pos >= len`, so it cannot disagree with `len`/`is_empty`/`first`
+  -- they read the same variable.
+- **A loop cut havocs the cursor, and that is the honest refusal.** A `for` loop
+  with an `invariant:` havocs the loop-header state; the cursor is dropped, so
+  `next` finds none and the function is `Incomplete`. That is correct: the
+  position would be symbolic, and reading "some element" would be a wrong value.
+  A `while` loop indexing `xs[i]` with an invariant is the way to state such an
+  iteration.
+
+Four mechanical points, each a way it could have been wrong:
+
+- **`into_iter` writes the cursor on its *destination*, not its receiver.** The
+  first version keyed it on `recv.local`, so `_3 = into_iter(_1)` set `iters[_1]`
+  and the later `next(&mut _4)` (after `_4 = move _3`) found none -- `next` was
+  "not a modelled slice iterator" while `into_iter` looked modelled.
+- **The cursor travels through a move.** `_4 = move _3` copies the `Iter` by
+  value, so `copy_parts` carries `iters[s]` to `d` -- otherwise the cursor dies at
+  the move. `havoc_parts` drops it (and any cursor whose *base* is havocked);
+  `forget_parts` removes it.
+- **`for x in xs.iter()` is the identity `into_iter`.** An `Iter` is its own
+  `IntoIterator`, so `into_iter(Iter)` just carries the existing cursor.
+- **A by-value `[T; N]` loop owns an `array::IntoIter`.** Its `next` is modelled
+  the same way (accept the `array::IntoIter` head); its `drop` is a no-op exactly
+  when `T` is glue-free -- the glue check reads `T` off the name (`array::IntoIter
+  <u8, 2>` -> `u8`), so a `[String; 2]` loop is still refuted rather than assumed.
+
+`classify` accepts the two calls only for a `[T]`/`[T; N]` head (`into_iter`/`iter`)
+and a `slice::Iter`/`array::IntoIter` head (`next`), so a user iterator is refuted;
+the range `next` is matched *before* this in `classify`, so it is not shadowed.
+
+A `for` loop over a slice still needs a **bounded length** to be finite: with a
+symbolic `xs.len()` the unwinding forks at every `pos < len` and runs into the
+unwind bound, so the contract carries `requires: xs.len() == N` (or an `unwind:`).
+An array's length is its type's constant, so it needs no such precondition.
+
+## An iterator consumer folds the cursor, and `sum`'s `+` is *checked*
+
+The same cursor models the consumers `count`, `sum` and the `copied` adapter:
+
+- **`count` is `len - pos`**, on the slice's own length variable. Exact even when
+  the length is symbolic, because `pos <= len` always holds; a cursor advanced past
+  the end (a `next` that returned `None` still advances the position) is guarded so
+  the count is `0` rather than an underflow.
+- **`copied` is the identity on the cursor.** A reference is modelled as its
+  referent, so `Copied<Iter>` yields the same element `Iter` does; the adapter only
+  carries the cursor to its destination. `next`/`sum`/`count`/`into_iter` therefore
+  accept a `Copied<..>` (and the `Enumerate<..>` spelling, though its tuple payload
+  is not yet modelled) receiver, and `is_cursor_ty` requires the adapter's *payload*
+  to be a slice/array iterator, so a user `Copied<MyIter>` is refused.
+- **`sum::<T>` folds the remaining elements with a checked `+`.** `Iterator::sum`
+  is `fold(0, Add::add)`, and `Add::add` panics on overflow in a debug build, so
+  each partial sum raises a reachable-panic obligation. This is not decoration: an
+  unguarded `xs.iter().sum()` over `u8`s is *refuted as a panic* (`[200, 100]`
+  overflows), and a model that summed with a silent wrap would prove a function
+  that panics. A contract that bounds the elements discharges the additions and
+  verifies. A step whose overflow predicate cannot be built is *refused*, never
+  summed without a check.
+
+The one boundary is the **number of addends**: `sum` is modelled only when the
+length is a constant -- an array's type length, or a slice whose length the
+precondition pinned (`requires: xs.len() == N`, read from `pins` by the length
+variable's index). A symbolic length has no fixed addend count to build a term
+from, so it is refused with a message naming the missing precondition. This is the
+one place a slice's symbolic length is *not* enough, because the other consumers
+(`count`) need only the length as a term while `sum` needs to enumerate it.
+
+`classify` accepts these only for a slice/array cursor (or an adapter over one) and
+the standard library's `Iterator`/`IntoIterator` trait, so a user iterator is
+refused; the `sum` tail carries its type argument (`sum::<u8>`), which `short`
+strips.
+
+## `last`/`nth`/`max`/`min`: exact index where the length is known, a fold otherwise
+
+Three more consumers ride the same cursor:
+
+- **`last`/`nth` name an *exact* element when the length is known.** `last` is
+  `s[n-1]` and `nth(k)` is `s[pos+k]`, the same variables a contract's `xs[len-1]`/
+  `xs[pos+k]` name -- so `requires: xs.len() == 2, ensures: ret == xs[1]` verifies
+  for `xs.iter().last()`. The length is "known" when it is an array's type length
+  or a slice the precondition pinned (`requires: xs.len() == N`); a *symbolic*-length
+  slice falls back to the single fresh `LAST_INDEX` variable (the `slice::last`
+  over-approximation), which is a lost proof, never a false one. `nth(k)` needs a
+  *constant* `k` -- a symbolic offset names no single index -- and advances the
+  cursor past the returned element (`nth` consumes it).
+- **`max`/`min` are folds of comparisons**, so (like `sum`) they need a constant
+  length. The running extreme is `ite(keep, acc, elem)`; the payload is that word.
+  For a *reference* payload (`Option<&T>`, a bare `slice::Iter`) the body derefs, so
+  the element identity is built in lockstep as an `ElemId::Select` tree over the
+  same elements -- `eval_elem_id` folds it to the identical `ite`, so the payload and
+  a deref of it agree by construction rather than by a second computation.
+- **The comparison is `slt`/`ult` by the element's sign.** `i8::MIN` (`0x80`) is the
+  smallest signed value but the largest unsigned byte, so an unsigned `max` would
+  pick it as the greatest; the corpus's `iter_max_signed_array` and the
+  `smax_arr_bad` witness (`v4 = 128`) pin the signed reading.
+
+The `sum`/`max`/`min` constant-length boundary is one boundary, not three: `count`
+and `last`/`nth` need only the length as a *term*, but `sum`/`max`/`min` must
+*enumerate* it, so they refuse a symbolic length with a message naming the missing
+`requires: xs.len() == N`.
+
+### `enumerate`: a tuple payload, and the nested-downcast place it exposed
+
+`xs.iter().enumerate()` is a cursor identity (`classify` maps `enumerate` to the
+same carry as `copied`), so the cursor reaches the destination unchanged. What
+differs is `next`'s payload: `Enumerate::next` yields `Option<(usize, &T)>`, and the
+body destructures it *directly* -- `((_2 as Some).0).0` for the index, `.1` for the
+element -- so there is no intermediate tuple local to store. `next` writes the
+index (`word(pos, 64)`) and the element into the tuple store (`elems[(dest,0)]`,
+`elems[(dest,1)]`), sets the payload to `Val::Agg`, and records `slice_elem_ref`
+so `*((_2 as Some).0).1` resolves to `xs[pos]`. The `get` loop already walks a
+`[Downcast, Field(0), Field(j)]` chain correctly *if* the place parses -- the
+`Downcast` arm consumes the payload `Field(0)` and the loop's next step is the
+component `Field(j)`, which falls back to `elems`.
+
+The place did **not** parse, and that is the finding. `parse_place`'s paren-group
+arm split the group's inner text on its *last* ` as ` unconditionally. For
+`((_2 as Some).0).0` the outer group's inner is `(_2 as Some).0`, so the split gave
+base `(_2` (no matching paren) and variant `Some).0` -- `parse_place` returned
+`None`, the whole read was `Unknown`, and `enumerate` came back "the return value is
+unknown". The fix uses `find_top_level_as`, which sees only an ` as ` outside any
+nested `<...>`/`(...)`: the outer group is then a plain grouping and the inner
+`(_2 as Some).0` recurses to the real downcast. This is the recurring shape "a
+group's ` as ` can be nested inside another group's ` as `" -- the same family as
+"`const ` lives inside a cast" and "` as ` lives inside a downcast place", one level
+deeper: a *tail* after the downcast group means the outer group is not itself a
+downcast. Pinned by `mir::parse::tests::a_nested_downcast_with_a_tail_parses_whole`
+(no toolchain needed) and `a_slice_iterator_enumerate_carries_the_index_and_element`.
+
+### `String` is a length, and its drop is glue-free (unlike a `Box`'s)
+
+A `String` is a `Vec<u8>` underneath, and the dump prints neither the pointer nor
+the length, so the model tracks the **length** only -- exactly the `Vec` shape,
+reusing the `indexed` store (`len_mutable`, `elem_w = 8`). `String::new` is `0`,
+`push_str` adds the appended `&str`'s byte length, the `<String as From<&str>>::from`
+constructor is that length, and `len`/`is_empty` read it. Three facts cost the most:
+
+- **A `&str`'s byte length is symbolic for an argument and constant for a
+  literal.** `length_of` already answered a `&str` argument (the binder seeds its
+  length variable, the same one `str::len` reads); a *literal* (`const "abc"`) has
+  no such variable, so its byte length is kept in the string store (`Env::strs`,
+  recorded after `set` because a whole-place write forgets the destination) and
+  `length_of` reads `text.len()` back. That one addition is what makes `"abc".len()`
+  and `String::from("abc").len()` decide.
+- **`String::from(&str)` is a `From` call, so it is intercepted before the integer
+  conversion model.** `<String as From<&str>>::from` would otherwise be classified
+  as `Conversion` and refused ("converts a type the model does not hold"). The
+  `classify` conversion branch checks the *name* -- self type `String`, parameter a
+  `&str` -- and returns `StringMethod::From` first.
+- **A `String` drop is glue-free, a `Box`'s is not.** `String`'s destructor frees
+  its byte buffer and runs no `Drop`, exactly like `Vec<u8>`, so `drop(_s)` is a
+  no-op and a `String`-using function decides. The check is on the *qualified* path
+  (`string::String`), so a user `struct String` is not treated as the container. A
+  `Box<T>` has no modelled field set, so its drop stays refused -- and that is the
+  example `an_unmodelled_drop_is_refused_not_assumed_away` and the corpus fixture
+  `box_drop_is_refused` now use (a `String` was the example before `String` became
+  modelled).
+
+The path guard is `names_string_impl` (bare `String::m` head or a `string::String`
+segment), and `Intrinsic::StringMethod(_)` is added to `try_intrinsic`'s
+`trait_method` exception list -- `String::new` and `<String as From<&str>>::from`
+carry no `<impl`, so the guard would otherwise refuse them. The bytes are not
+modelled, so a contents-dependent method stays refused. Pinned by
+`a_string_length_model_decides_new_from_push_len` (eight verified, two refutations).
+
+## `Box<T>`: the value is stored, the pointer is a token, and the checks are discharged
+
+`Box::<T>::new(v)` + the deref `*b` are modelled (`Intrinsic::BoxMethod`). The dump
+never prints the allocation, so `box_method` stores `v` in `Env::boxed[local]` and
+writes a **large power-of-two token** to the box's field 0 -- `1 << 24`, which is
+nonzero (the compiler's null check `Ne(SIZE, 0) && Eq(ptr, 0)` is discharged) and a
+multiple of every primitive alignment (the `addr & (ALIGN-1) == 0` check is too).
+The deref `_5 = (_2.0) as *const u8; *_5` reads the stored value back: the cast
+records `box_refs[5] = 2`, and `get`'s `Deref` arm returns `boxed[2]`.
+
+Three things cost time and are worth keeping:
+
+* **A cast of an *annotated* place was swallowed as a bare place.** `parse_rvalue`
+  tried the `copy`/`move`-place check *before* the cast check, and
+  `parse_place("(_2.0: Unique<u8>) as *const u8")` reads the annotation parens,
+  returns `_2.0`, and ignores the trailing ` as ...` -- so the cast was dropped and
+  the pointer local held the box's *field value*, not a pointer. The cast check now
+  runs first, and it is safe because `find_top_level_as` is depth-aware: a downcast
+  place's ` as ` sits inside parentheses and is invisible to it.
+* **A cast's trailing kind annotation truncated the type.** `dst.split_whitespace()
+  .next()` turned `*const u8 (BoxDerefTransmute)` into `*const`, which has no width.
+  `strip_cast_kind` removes a trailing ` (Kind)` (a non-empty, uppercase-initial
+  parenthesised identifier) so `*const ()`'s empty `()` is kept.
+* **`SizedTypeProperties::{SIZE, ALIGN}` are in the constant's path.** The null and
+  alignment checks read `<T as std::mem::SizedTypeProperties>::SIZE` / `::ALIGN`;
+  both are modelled from the type in the path, so the checks fold rather than
+  leaving the assert unmodelled.
+
+A `Box<T>`'s drop glue is `T`'s: `drop_is_noop(Box<u8>)` is true, `Box<PanicOnDrop>`
+is not (`box_elem_ty` reads the element). A *bare* `Box<u8>` -- how an argument
+prints -- is accepted only when the crate declares no `struct Box`
+(`std_container_glue_free` takes the declared layouts), so a shadowing user type
+with a destructor is not read as glue-free. An explicit `std::mem::drop(b)` call is
+still refused (it lowers to a `std::mem::drop::<T>` call, not the `drop(_2)`
+terminator). Pinned by `a_box_new_deref_decides` (four verified, two refuted).
+
+A follow-up modelled the explicit drop and the iterator *method* form:
+`std::mem::drop::<T>` is `Intrinsic::MemDrop` -- a glue-free `T` is a no-op, a
+`T` with unrepresentable glue is refused (the handler has `callees.structs()`, so
+the bare-name shadow check is the same one the drop terminator uses). And
+`xs.iter()` on a `&[T; N]` now starts the cursor the `for` desugaring starts: the
+unsize coercion `xs as &[u8]` is a *reference cast*, and the cast arm carried the
+address only when the source was already `addressed`; a reference *argument* is
+modelled as its referent (not `addressed`), so the cast fell through and `iter`
+found no elements. The cast now falls back to `pointee(src)`. `xs.iter().count()`
+and `xs.iter().copied().sum()` over a constant-length array decide; `map`/
+`filter`/`fold` remain unmodelled (their bodies are in `core`, not the dump).
+
 
 ## A qualified type name must not resolve to a bare layout
 
@@ -10511,3 +10776,89 @@ both print `ok`, so a skipped test is the same "green that checked nothing" as t
 gate that did not run. Where the environment is genuinely absent, say so with
 `eprintln!` and assert on what *was* reachable; where it is present but broken,
 panic rather than return.
+
+## `cargo verif` is a thin wrapper, and the test runs the built binary
+
+U2's command-line entry point is `src/bin/cargo-verif.rs`, a `[[bin]]` with
+`required-features = ["std"]` so `cargo build --no-default-features` (the
+bare-metal gate) skips it. It is a *thin* wrapper over
+`mir::verify::verify_file_with`: it parses `--file`/`--function`/`--format`,
+prints the report (`human` or a hand-written `json`), and maps the result to a
+distinct exit code -- `0` clean, `1` a failure/incomplete/skipped/missing, `2`
+the tool could not run. The codes must stay distinct so a failed proof is never
+confused with a tool that could not start.
+
+`tests/cargo_verif.rs` is the evidence, and it runs the *built* binary through
+`env!("CARGO_BIN_EXE_cargo-verif")` (cargo sets that for an integration test of
+the same package), on a throwaway crate with a real `Cargo.toml` so the edition
+resolves. A library test on `FileReport` would not check the command a user
+actually runs or the exit code a CI step keys on. The file is `#![cfg(feature =
+"std")]` because the bin is `std`-only; the tests skip with a printed message
+when no compiler is reachable (never a silent pass).
+
+## The MSRV lowering of a `Box` deref: a field chain, not a cast, plus an alignment assert
+
+The `Box` model worked on current stable and was `incomplete` on the 1.85 floor, and
+the gate that saw it is gate 14 (the MIR suite on the MSRV) — nothing on stable did.
+The two lowerings differ in two ways, both toolchain-shaped:
+
+```text
+stable:  _3 = (_2.0: Unique<u8>) as *const u8 (BoxDerefTransmute);
+1.85:    _3 = copy (((_2.0: Unique<u8>).0: NonNull<u8>).0: *const u8);   // no cast
+```
+
+So the pointer is reached by an *all-field chain* rooted at the boxed local, not a
+cast of field 0. `box_refs` (the `dest -> box` link that makes `*dest` read the
+boxed value) was recorded only for the cast form, so on 1.85 `_3` had no link and
+the deref read `Unknown`.
+
+The second difference is the assert. For a type wider than one byte the MSRV also
+emits an **alignment** check that current stable const-folds away:
+
+```text
+_6 = AlignOf(u32); _7 = _6 - 1; _8 = _5 & _7; _9 = _8 == 0;
+assert(_9, "misaligned pointer dereference: …");
+```
+
+`AlignOf` was an unmodelled rvalue, so `_6` was `Unknown`, the assert's condition was
+`Unknown`, and the function was `incomplete` with "unmodelled assert condition" — a
+*lost* proof, not a wrong one, but the same gate failure. `parse_rvalue` now reads
+`AlignOf(T)` as the alignment constant: for every primitive Rust's alignment *is* its
+size in bytes, so it is `T`'s width rounded up to bytes (`w.div_ceil(8)` — not
+`(w+7)/8`, which clippy's `manual_div_ceil` rejects under `-D warnings`). A type whose
+width the model does not hold stays `Unknown`, which refuses the assert rather than
+guessing an alignment.
+
+Two mechanical points, both easy to get wrong again:
+
+- **Record the `box_refs` link *last* in the `Stmt::Assign` arm.** `set` and
+  `rebase_parts` both call `forget_parts`, which clears `box_refs` for the
+  destination; a link recorded before them is erased. The `Use` form also `set`s the
+  destination to the box's field-0 token so the alignment arithmetic (`token & (align-1)`)
+  folds to `0` and the assert discharges.
+- **An `Rvalue::Use` of an all-`Field` chain rooted at a boxed local is the pointer,
+  whatever its depth.** `_2.0`, `_2.0.0`, `_2.0.0.0` all name the same pointer; the
+  guard is "boxed root and only `Field` projections", not a fixed depth.
+
+The lesson is the one the `Len`/`PtrMetadata` and `RangeInclusive` sections already
+record, a third time: a predicate that keys on a *printed lowering shape* is a claim
+about a toolchain, and only running the floor toolchain's suite proves it holds there.
+
+## The proof cache keys on the engine, or it is not sound
+
+`mir::cache` (U7) reuses a decided verdict across runs. The soundness argument is the
+*key*: a verdict is a pure function of the MIR text, the source text (the contracts), the
+edition and the engine, and `file_key` folds in all four. The fourth is the one that is
+easy to forget and fatal to omit — `build.rs` hashes `src/**` + `Cargo.toml` into
+`VERIF_ENGINE_HASH`, so *any* change to a rule or a budget invalidates every entry. Without
+it, a change that turned a `verified` into a `failed` would be masked by the stale
+`verified`: a false proof, the one outcome a verifier must not produce.
+
+Two rules keep it sound, both pinned by
+`tests/mir.rs::the_proof_cache_reuses_a_decided_verdict_and_a_change_is_a_miss`. Only
+`Verified`/`Failed` are stored — an `Incomplete` carries a `MirReport` whose obligations
+are arena term ids, gone by the next run, so it cannot be cached — and a *change to the
+source is a miss*. The test tampers the cache to prove it is consulted, then changes the
+source to prove the tampered value does not survive: a cache you cannot observe being hit
+is a cache you cannot trust, and the tamper makes "the cache was used" a check rather than
+a hope.
