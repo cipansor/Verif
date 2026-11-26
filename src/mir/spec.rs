@@ -781,7 +781,9 @@ impl Specs {
             paths.push(tr);
             let known = self.declared_traits.contains(tr)
                 || tr.starts_with("std::")
-                || tr.starts_with("core::");
+                || tr.starts_with("core::")
+                || tr.starts_with("::std")
+                || tr.starts_with("::core");
             any_unresolved |= !known;
             let key = format!("{tr}::{tail}");
             keys.push(self.by_trait.contains_key(&key).then_some(key));
@@ -1677,11 +1679,14 @@ fn qualify_trait(
     scope: &[String],
     imports: &BTreeMap<String, String>,
 ) -> String {
-    // Rust's leading `::` is the external-crate root: `::core::hash::Hasher` is the same
-    // trait as `core::hash::Hasher`. Strip it *before* the relative/import/module logic, or
-    // each `#[path]` inclusion prefixes its own module and one standard-library trait looks
-    // like two different unresolved traits (wrongly refused as ambiguous).
-    let written = written.strip_prefix("::").unwrap_or(written);
+    // Rust's leading `::` is the external-crate root: `::core::hash::Hasher` is ALWAYS the
+    // external crate, even when this crate declares a local module `core`. Keep the `::` so
+    // the key stays DISTINCT from a local `core::hash::Hasher` (an external impl must never
+    // be checked against the local contract), while two `#[path]` inclusions still agree on
+    // one spelling (so one std trait is not seen as two unresolved paths).
+    if written.starts_with("::") {
+        return written.to_string();
+    }
     // A path written with a *relative* root names the same trait as the
     // module-qualified path the declaration is keyed by, so it has to be resolved
     // to that spelling or the two never meet:
