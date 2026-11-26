@@ -2237,12 +2237,15 @@ pub fn verify_file_with_opts(
         missing,
         ..Default::default()
     };
-    // The cache key covers the MIR, the source (contracts), the edition and the
-    // engine (via `VERIF_ENGINE_HASH`); a change to any of them is a miss.
-    let cache_key = opts
-        .cache
-        .as_ref()
-        .map(|_| super::cache::file_key(&mir, &specs.snapshot, &format!("{edition:?}")));
+    // The cache key covers the MIR, the source (contracts), the edition, the `--cfg`
+    // set the source was read with and the engine (via `VERIF_ENGINE_HASH`); a change
+    // to any of them is a miss. The cfg set is there because the reader *evaluates*
+    // it: turning a feature on can add an enum variant (and so widen the tag domain)
+    // without changing a byte of MIR or source, and a key without it reused the old
+    // proof across that change.
+    let cache_key = opts.cache.as_ref().map(|_| {
+        super::cache::file_key(&mir, &specs.snapshot, &format!("{edition:?}"), &opts.rustc_args)
+    });
     let cached = match (&opts.cache, &cache_key) {
         (Some(dir), Some(k)) => super::cache::load(dir, k),
         _ => super::cache::Entries::new(),

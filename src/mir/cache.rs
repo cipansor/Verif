@@ -1,11 +1,16 @@
 //! The proof cache (U7).
 //!
 //! A verdict is a *pure* function of the MIR the compiler emitted, the source text
-//! (the contracts), the edition and the engine. [`file_key`] hashes all four, so a
-//! change to any of them is a cache miss and never a stale hit — the engine is in
-//! the key via `VERIF_ENGINE_HASH`, which `build.rs` bakes from `src/**`. That is
-//! what makes reuse sound: a cached `verified` cannot survive a change to the rule
-//! that produced it.
+//! (the contracts), the edition, the `--cfg` set the source was read with and the
+//! engine. [`file_key`] hashes all five, so a change to any of them is a cache miss
+//! and never a stale hit — the engine is in the key via `VERIF_ENGINE_HASH`, which
+//! `build.rs` bakes from `src/**`. That is what makes reuse sound: a cached
+//! `verified` cannot survive a change to the rule that produced it.
+//!
+//! The cfg set is in the key because the reader now *evaluates* it: a `#[cfg]`-gated
+//! enum variant is present or absent exactly as in the compiled code, so turning a
+//! feature on can widen the tag domain without changing a byte of MIR or source. A
+//! key without it let the old proof survive that change — a false proof.
 //!
 //! Only `Verified` and `Failed` are stored. They carry no arena handles, so a
 //! cached copy is the whole answer. `Incomplete` is re-derived every run — it holds
@@ -77,14 +82,16 @@ impl Cached {
 pub type Entries = BTreeMap<String, Cached>;
 
 /// A key over everything a verdict depends on: the whole file's MIR, the source
-/// text, the edition and the engine hash.
+/// text, the edition, the `--cfg` set the source was read with and the engine hash.
 ///
 /// Coarse (the whole file) on purpose: a change to one function re-verifies the
 /// file, which is sound and simple, rather than a per-function key that could miss
 /// a dependency two functions share.
-pub fn file_key(mir: &str, source: &str, edition: &str) -> String {
+pub fn file_key(mir: &str, source: &str, edition: &str, cfgs: &[String]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for part in [mir, source, edition, engine_hash()] {
+    // The cfg list is one part, so `["a","b"]` and `["ab"]` cannot collide.
+    let cfg_part = cfgs.join("\u{1f}");
+    for part in [mir, source, edition, cfg_part.as_str(), engine_hash()] {
         for b in part.as_bytes() {
             h ^= *b as u64;
             h = h.wrapping_mul(0x100_0000_01b3);
@@ -183,14 +190,27 @@ mod tests {
 
     /// Every input that affects a verdict must be in the key, or a stale hit is
     /// possible. The engine hash is constant within a build, so it cannot be varied
-    /// here, but it is one of the four parts [`file_key`] folds in.
+    /// here, but it is one of the five parts [`file_key`] folds in.
+    ///
+    /// The cfg set is the one that *became* an input when the reader learned to
+    /// evaluate `#[cfg]`: an enum that gains a variant under a feature changes the
+    /// tag domain while the MIR and the source stay byte-identical, so a key
+    /// without it reuses a proof about a different program.
     #[test]
     fn the_key_changes_with_every_input() {
-        let base = file_key("mir", "src", "Rust2024");
-        assert_ne!(base, file_key("mir2", "src", "Rust2024"), "the MIR is in the key");
-        assert_ne!(base, file_key("mir", "src2", "Rust2024"), "the source is in the key");
-        assert_ne!(base, file_key("mir", "src", "Rust2021"), "the edition is in the key");
-        assert_eq!(base, file_key("mir", "src", "Rust2024"), "same inputs, same key");
+        let none: [String; 0] = [];
+        let extra = ["--cfg".to_string(), "feature=\"extra\"".to_string()];
+        let base = file_key("mir", "src", "Rust2024", &none);
+        assert_ne!(base, file_key("mir2", "src", "Rust2024", &none), "the MIR is in the key");
+        assert_ne!(base, file_key("mir", "src2", "Rust2024", &none), "the source is in the key");
+        assert_ne!(base, file_key("mir", "src", "Rust2021", &none), "the edition is in the key");
+        assert_ne!(base, file_key("mir", "src", "Rust2024", &extra), "the cfg set is in the key");
+        assert_ne!(
+            file_key("mir", "src", "Rust2024", &extra),
+            file_key("mir", "src", "Rust2024", &["--cfg".to_string(), "feature=extra".to_string()]),
+            "the cfg parts are separated, so two lists cannot concatenate into one"
+        );
+        assert_eq!(base, file_key("mir", "src", "Rust2024", &none), "same inputs, same key");
     }
 
     /// A tab or newline in a name/kind/detail must round-trip through the line format.

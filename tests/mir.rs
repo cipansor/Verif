@@ -15483,3 +15483,166 @@ fn a_local_method_called_through_an_impl_projection_is_inlined() {
         "the inlined body returns 1, so `ret == 9` must be refuted, got {bad}"
     );
 }
+
+/// A **replaced** slice field has no length any more.
+///
+/// A seeded field length describes the value *stored* in a field, not a permanent
+/// property of the field: `s.slice = &[]` replaces the slice, so the `usize` that
+/// `s.slice.len()` was bound to describes a value that is no longer there. Leaving
+/// it was a false proof -- the body returns the *entry* length on both paths, so
+/// `ensures: ret == 3` was proved against a function that returns 0 on the branch
+/// that replaces the slice. `forget_field_lens` drops the seed on a field write, a
+/// whole-place write and a loop havoc, and `copy_parts` carries it with the parts
+/// it moves.
+#[test]
+fn a_replaced_slice_field_has_no_stale_length() {
+    let src = "pub struct S<'a> { pub slice: &'a [u8] }\n\
+               /// requires: s.slice.len() == 3\n\
+               /// ensures: ret <= 3\n\
+               pub fn keeps_its_slice(s: &S) -> usize { s.slice.len() }\n\
+               /// requires: s.slice.len() == 3 && t.len() == 0\n\
+               /// ensures: ret == 3\n\
+               pub fn replaces_its_slice<'a>(s: &mut S<'a>, t: &'a [u8]) -> usize {\n\
+                   s.slice = t;\n\
+                   s.slice.len()\n\
+               }\n";
+    // The positive half: an un-replaced field length still decides, so the fix is
+    // not a blanket refusal.
+    let Some(ok) = verify_src("keeps_its_slice", src) else { return };
+    assert!(
+        matches!(ok, FnOutcome::Verified { .. }),
+        "an un-replaced field length must still decide, got {ok}"
+    );
+    // The false half: the body returns the *replacement's* length, 0.
+    let Some(bad) = verify_src("replaces_its_slice", src) else { return };
+    assert!(
+        !matches!(bad, FnOutcome::Verified { .. }),
+        "the replacement branch returns 0, so `ret == 3` must not be proved, got {bad}"
+    );
+}
+
+/// A `discriminant` of a **projected** place is refused, not answered with the base
+/// local's tag.
+///
+/// `match o { Outer::A(Inner::X(_)) => 0, Outer::A(Inner::Y) => 1, _ => 2 }` lowers
+/// the inner match to `discriminant((((*_1) as A).0))`: a downcast and a field on
+/// the *outer* enum's local. The tag store is keyed by local, so answering it there
+/// returned the **outer** tag -- and both inner arms share `Outer::A`'s tag, so the
+/// inner match collapsed to its first arm and a contract about the second was
+/// proved. A projected place is refused (`Val::Unknown`), which is the refusal the
+/// shape had before the parser learned to read a parenthesised place; the
+/// unprojected `discriminant((*_1))` -- the outer match, and every `match` on an
+/// enum *reference* -- still decides.
+#[test]
+fn a_nested_enum_match_is_not_the_outer_tag() {
+    let src = "pub enum Inner { X(u8), Y }\n\
+               pub enum Outer { A(Inner), B }\n\
+               /// ensures: ret <= 1\n\
+               pub fn outer_only(o: &Outer) -> u8 { match o { Outer::A(_) => 0, Outer::B => 1 } }\n\
+               /// ensures: ret == 0\n\
+               pub fn nested_pattern_tripwire(o: &Outer) -> u8 {\n\
+                   match o { Outer::A(Inner::X(_)) => 0, Outer::A(Inner::Y) => 1, Outer::B => 0 }\n\
+               }\n";
+    let Some(ok) = verify_src("outer_only", src) else { return };
+    assert!(
+        matches!(ok, FnOutcome::Verified { .. }),
+        "an unprojected discriminant must still decide, got {ok}"
+    );
+    // `Outer::A(Inner::Y)` returns 1 and every other arm returns 0, so `ret == 0` is
+    // false. Reading the *outer* tag for the inner match collapses the two `A` arms
+    // onto the first and proves it -- the tag is `Outer::A`'s, `0`, for both.
+    let Some(bad) = verify_src("nested_pattern_tripwire", src) else { return };
+    assert!(
+        !matches!(bad, FnOutcome::Verified { .. }),
+        "the inner tag is not the outer one, so `ret == 0` must not be proved, got {bad}"
+    );
+}
+
+/// A local `trait` impl does not answer an `<impl Type>::m` call.
+///
+/// rustc prints an *inherent* method call as `<impl Type>::m` and a trait method as
+/// `<T as Trait>::m`, so a projected call is inherent. The module-prefix match that
+/// lets a local method resolve must not admit a `trait` impl: a local `impl Ext for
+/// u8` inside `mod core::num` shares the prefix, the owner and the tail with
+/// `core::num::<impl u8>::wrapping_add`, so its body was inlined *for the `core`
+/// call* -- a contract the real method violates would be "proved" (here, `ret == 0`
+/// for `2 + 255`).
+#[test]
+fn a_local_trait_impl_in_a_core_module_does_not_answer_the_intrinsic() {
+    let src = "pub mod core {\n\
+                   pub mod num {\n\
+                       pub trait Ext { fn wrapping_add(self, o: u8) -> u8; }\n\
+                       impl Ext for u8 { fn wrapping_add(self, _o: u8) -> u8 { 0 } }\n\
+                   }\n\
+               }\n\
+               use crate::core::num::Ext;\n\
+               /// requires: a == 2 && b == 255\n\
+               /// ensures: ret == 1\n\
+               pub fn real_wrapping_add(a: u8, b: u8) -> u8 { a.wrapping_add(b) }\n\
+               /// requires: a == 2 && b == 255\n\
+               /// ensures: ret == 0\n\
+               pub fn local_body_tripwire(a: u8, b: u8) -> u8 { a.wrapping_add(b) }\n";
+    // The inherent `u8::wrapping_add` wraps `2 + 255` to 1. Answering from the local
+    // trait body would return 0, so this is the direction a prefix-only match breaks.
+    let Some(ok) = verify_src("real_wrapping_add", src) else { return };
+    assert!(
+        matches!(ok, FnOutcome::Verified { .. }),
+        "the inherent `wrapping_add` returns 1, got {ok}"
+    );
+    // And the local body's value must not be provable.
+    let Some(bad) = verify_src("local_body_tripwire", src) else { return };
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "the local trait body returns 0, so `ret == 0` must be refuted, got {bad}"
+    );
+}
+
+/// The cache key covers the `--cfg` set, because the cfg set shapes an enum's tag
+/// domain without touching a byte of MIR or source.
+///
+/// A `#[cfg]`-gated variant is present or absent exactly as in the compiled code, so
+/// turning a feature on can widen the tag domain while `rustc` emits *identical* MIR
+/// for a function that never inspects the enum. A key over MIR + source + edition +
+/// engine alone would then reuse a proof about a different program -- the reviewer's
+/// example is a contract `m == M::B || m == M::C`, a theorem on `{B, C}` and false
+/// once `A` exists.
+///
+/// The assertion is on the *key*, observed through the cache directory: one entry
+/// after the first run, and a **second** entry once the cfg set changes. That is the
+/// property the soundness argument rests on, and it is observable without needing the
+/// verdict to move (which today it does not for that example -- an argument enum's
+/// tag domain is not conjoined into the path, a separate completeness gap).
+#[test]
+fn the_cache_key_covers_the_cfg_set_that_shapes_an_enum() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif_cfg_cache_{}_{seq}", std::process::id()));
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let file = dir.join("f.rs");
+    let src = "pub enum M { B, C, #[cfg(feature = \"extra\")] A }\n\
+               /// ensures: ret == 0\n\
+               pub fn f(m: M) -> u8 { let _ = m; 0 }\n";
+    std::fs::write(&file, src).expect("write fixture");
+    let with = |cfgs: &[&str]| {
+        let mut opts = probe_opts_with_cfgs(cfgs);
+        opts.cache = Some(cache.clone());
+        opts
+    };
+    let entries = || std::fs::read_dir(&cache).map(|d| d.count()).unwrap_or(0);
+
+    let off = with(&[]);
+    verify::verify_file_with_opts(&rustc, &file, &[], &off).expect("verify");
+    assert_eq!(entries(), 1, "the first run writes one entry");
+    // The same options reuse that entry rather than writing a second one.
+    verify::verify_file_with_opts(&rustc, &file, &[], &off).expect("verify");
+    assert_eq!(entries(), 1, "the same cfg set is the same key");
+
+    // The domain changes with `extra`, and the MIR does not. A key without the cfg
+    // set would reuse the first entry here, which is the stale hit a wider domain
+    // makes a false proof.
+    let on = with(&["feature=\"extra\""]);
+    verify::verify_file_with_opts(&rustc, &file, &[], &on).expect("verify");
+    assert_eq!(entries(), 2, "a different cfg set is a different key");
+}

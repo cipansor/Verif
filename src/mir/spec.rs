@@ -2777,30 +2777,41 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
                 specs.enums.insert(name, def);
                 continue;
             }
-            // A `#[cfg]`-gated variant is present only when its predicate holds. An
-            // attribute line carries the verdict for the *next* line; a variant whose
-            // cfg is false is dropped, which is exactly the numbering rustc uses (an
-            // implicit discriminant counts only the variants that exist).
-            let preds = leading_cfg_preds(line);
-            if !preds.is_empty() {
-                let live = preds.iter().all(|p| cfgs.eval(p) != Some(false));
-                cfg_pending = if live { None } else { Some(false) };
-                continue;
+            // A `#[cfg]`-gated variant is present only when its predicate holds, and
+            // an attribute may share a line with the variant it decorates
+            // (`#[cfg(feature = "x")] B,`). The verdict therefore belongs to the
+            // variant *below the attributes* -- the one on this line when there is
+            // one -- and a verdict left pending by an attribute-only line above is
+            // *conjunctive* with this line's.
+            //
+            // Letting a same-line attribute set a pending verdict leaked it onto the
+            // next variant: with `A`, `#[cfg(feature = "extra")] B`, `C`, `D` and
+            // `extra` off, rustc numbers `A`, `C`, `D` as 0, 1, 2, while this reader
+            // dropped `C` as well and bound `D` to 1 -- so a precondition selecting
+            // `D` sent execution down `C`'s arm, a false proof.
+            let mut dead = cfg_pending == Some(false);
+            for p in leading_cfg_preds(line) {
+                if cfgs.eval(&p) == Some(false) {
+                    dead = true;
+                }
             }
-            if line.starts_with('#') {
-                continue;
-            }
-            let skip = cfg_pending.take() == Some(false);
             let variant_line = split_leading_attrs(line).0;
-            if variant_line.is_empty() {
+            // Attributes alone, a blank line or a comment: the verdict carries to the
+            // variant below. `line.starts_with('#')` is covered by the empty
+            // remainder, so a `#[derive]` line no longer consumes a pending verdict.
+            if variant_line.is_empty() || variant_line.starts_with("//") {
+                cfg_pending = if dead { Some(false) } else { None };
+                continue;
+            }
+            // The variant on this line consumes the verdict, whichever way it went.
+            cfg_pending = None;
+            if dead {
                 continue;
             }
             match enum_variant(variant_line) {
                 VariantLine::Variant { name: vname, payload, explicit } => {
                     if let Some((_, def)) = cur_enum.as_mut() {
-                        if !skip {
-                            push_variant(def, vname, payload, explicit);
-                        }
+                        push_variant(def, vname, payload, explicit);
                     }
                 }
                 VariantLine::NotAVariant => {}
@@ -5553,6 +5564,20 @@ fn rewrite_fields(text: &str, fields: &FieldEnv) -> Result<String, SpecError> {
                                 ),
                             });
                         }
+                    }
+                }
+                // `s.slice.len()` -- the length of a slice- or `str`-typed *field*.
+                // The key is the whole path, so it is tried before the field itself:
+                // a slice field has no *value* binding (`s.slice` is a reference the
+                // model does not hold), only a length, so looking up `s.slice` first
+                // refused every contract that named the length the executor had
+                // already seeded. The `.len()` must be spelled exactly, so a field
+                // named `len` is not mistaken for it.
+                if !field.is_empty() && chars.get(j..).is_some_and(|r| r.starts_with(&['.', 'l', 'e', 'n', '(', ')'])) {
+                    if let Some(mangled) = fields.paths.get(&format!("{ident}.{field}.len()")) {
+                        out.push_str(mangled);
+                        i = j + ".len()".len();
+                        continue;
                     }
                 }
                 let key = format!("{ident}.{field}");
@@ -9770,6 +9795,56 @@ mod tests {
         let specs = super::extract_with_cfgs(src, &off);
         let def = specs.enums.get("P").expect("P is a declared enum");
         assert_eq!(def.variants, vec![("A".to_string(), vec![], 0), ("C".to_string(), vec![], 1)]);
+    }
+
+    /// An attribute that shares a line with its variant decorates **that** variant.
+    ///
+    /// The reader kept a `#[cfg]` verdict pending for the *next* line, so a
+    /// same-line attribute decorated the variant *after* it instead: with `A`,
+    /// `#[cfg(feature = "extra")] B`, `C`, `D` and `extra` off, `C` was dropped as
+    /// well and `D` took discriminant 1 -- so a precondition selecting `D` sent
+    /// execution down `C`'s arm, a false proof. rustc numbers `A`, `C`, `D` as
+    /// 0, 1, 2.
+    #[test]
+    fn a_same_line_cfg_applies_to_its_own_variant() {
+        let src = "pub enum P {\n    A,\n    #[cfg(feature = \"extra\")] B,\n    C,\n    D,\n}\n";
+        let off = ["--cfg".to_string(), "feature=\"std\"".to_string()];
+        let def = |cfgs: &[String]| {
+            let specs = super::extract_with_cfgs(src, cfgs);
+            specs.enums.get("P").expect("P is a declared enum").variants.clone()
+        };
+        assert_eq!(
+            def(&off),
+            vec![
+                ("A".to_string(), vec![], 0),
+                ("C".to_string(), vec![], 1),
+                ("D".to_string(), vec![], 2),
+            ],
+            "the attribute decorates `B`, not the variant after it"
+        );
+        // With the feature on, the gated variant is present and nothing shifts.
+        let on = ["--cfg".to_string(), "feature=\"extra\"".to_string()];
+        assert_eq!(def(&on).len(), 4, "`extra` keeps `B`");
+    }
+
+    /// Two attributes, one per line, both decorate the variant below them.
+    ///
+    /// The verdict is *conjunctive*: `#[cfg(feature = "a")]` then
+    /// `#[cfg(feature = "b")]` then `B` drops `B` when either is off. Overwriting
+    /// the pending verdict with the second attribute's would keep a variant rustc
+    /// excluded, which widens the tag domain (a lost proof) -- and dropping the
+    /// wrong one shifts the tags (a false one).
+    #[test]
+    fn two_cfg_attributes_on_separate_lines_are_conjunctive() {
+        let src = "pub enum P {\n    A,\n    #[cfg(feature = \"a\")]\n    #[cfg(feature = \"b\")]\n    B,\n    C,\n}\n";
+        let a_on_b_off = ["--cfg".to_string(), "feature=\"a\"".to_string()];
+        let specs = super::extract_with_cfgs(src, &a_on_b_off);
+        let def = specs.enums.get("P").expect("P is a declared enum");
+        assert_eq!(
+            def.variants,
+            vec![("A".to_string(), vec![], 0), ("C".to_string(), vec![], 1)],
+            "`b` is off, so `B` is absent and `C` takes discriminant 1"
+        );
     }
 
     /// `not`/`any`/`all` compose three-valued: a decided `any`/`all` wins even when

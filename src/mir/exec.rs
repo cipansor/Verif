@@ -1530,6 +1530,17 @@ impl Env {
             .filter(|((l, _, _), _)| *l == s)
             .map(|((_, k, chain), v)| (*k, chain.clone(), *v))
             .collect();
+        // A seeded field length is a part too: `let b = a` copies the slice in
+        // `a.slice`, so `b.slice.len()` is the same number. Without this the copy
+        // would *refuse* a length it could have decided -- and, worse, a stale
+        // length the destination already held would survive the copy, which is the
+        // false-proof direction `forget_parts` closes for the other stores.
+        let lens: Vec<(Vec<u32>, Var)> = self
+            .field_lens
+            .iter()
+            .filter(|((l, _), _)| *l == s)
+            .map(|((_, chain), v)| (chain.clone(), *v))
+            .collect();
         let any = !fields.is_empty()
             || !elems.is_empty()
             || !payloads.is_empty()
@@ -1538,8 +1549,12 @@ impl Env {
             || !elem_parts.is_empty()
             || disc.is_some()
             || indexed.is_some()
-            || iter.is_some();
+            || iter.is_some()
+            || !lens.is_empty();
         self.forget_parts(dst);
+        for (chain, len) in lens {
+            self.field_lens.insert((dst, chain), len);
+        }
         for (k, chain, v) in elem_parts {
             self.elem_parts.insert((dst, k, chain), v);
         }
@@ -2065,6 +2080,21 @@ impl Env {
     /// seeded leaves under it (`o.i.v`) no longer describe the value in the store.
     /// A stale part is a wrong value, not a missing one, so it is dropped rather
     /// than read later.
+    /// Drop the seeded **lengths** of the fields a write replaces.
+    ///
+    /// A field length describes the value stored in a field, not a permanent
+    /// property of the field: `x.slice = &[]` replaces the slice, so the `usize`
+    /// that `x.slice.len()` was bound to describes a value that is no longer
+    /// there. Leaving it was a false proof -- `if x.slice.len() == 3 { x.slice =
+    /// &[]; } x.slice.len()` returned the *entry* length on both paths, so
+    /// `ensures: ret == 3` was proved against a body that returns 0. The length
+    /// is dropped (a refusal, `length_of` then answers unknown) rather than
+    /// recomputed: a replacement's length is known only when the replacement's
+    /// metadata is, and guessing is the failure this store exists to avoid.
+    fn forget_field_lens(&mut self, local: u32, prefix: &[u32]) {
+        self.field_lens.retain(|(l, chain), _| *l != local || !chain.starts_with(prefix));
+    }
+
     fn forget_nested_under(&mut self, local: u32, prefix: &[u32]) {
         self.nested
             .retain(|(l, chain), _| *l != local || !chain.starts_with(prefix));
@@ -2072,6 +2102,9 @@ impl Env {
         // longer there once the intermediate aggregate is overwritten, so they are dropped too.
         // A stale element is a wrong value, not a missing one.
         self.elems_path.retain(|(l, chain, _), _| *l != local || !chain.starts_with(prefix));
+        // The length of a slice stored *in* this prefix is a fact about the value
+        // being overwritten, so it goes with the parts above.
+        self.forget_field_lens(local, prefix);
     }
 
     /// Replace every *part* of an aggregate local with a fresh value.
@@ -2166,6 +2199,9 @@ impl Env {
         // Elements of field-path arrays under a whole-value write describe a value that is no
         // longer there; keeping them would be a stale read of the old array.
         self.elems_path.retain(|(l, _, _), _| *l != local);
+        // Every seeded field length under this local describes a value that is no
+        // longer there, exactly as the field and element stores above do.
+        self.forget_field_lens(local, &[]);
         // Fields *inside* an element of an aggregate literal describe a value that
         // is no longer there once the local is overwritten as a whole.
         self.elem_parts.retain(|(l, _, _), _| *l != local);
@@ -2179,6 +2215,11 @@ impl Env {
         self.boxed.remove(&local);
         self.box_refs.remove(&local);
         self.iters.remove(&local);
+        // A loop head is an *arbitrary* value of the local's type, so a seeded field
+        // length is no longer a fact about it: the body may have replaced the slice
+        // the length described. Dropping it is the sound direction -- a stale length
+        // is a wrong value, a missing one is a refusal.
+        self.forget_field_lens(local, &[]);
         // A `Vec` local overwritten as a whole place is no longer the value the
         // length and elements were tracking, so the whole entry is dropped rather
         // than kept: `v = other_vec` must not leave the old length readable. A
@@ -4260,6 +4301,18 @@ fn resolve_callee(prog: &MirProgram, name: &str) -> Option<usize> {
         }
         if let Some(p) = want_prefix {
             if g.name.split("<impl ").next() != Some(p) {
+                return false;
+            }
+            // An `<impl Type>::m` call is an **inherent** method call: rustc prints a
+            // trait method as `<T as Trait>::m`. So a candidate that came from a
+            // `trait` impl must not answer it. Without this a local `impl Ext for u8`
+            // declared in a module whose path also prefixes a `core` call
+            // (`core::num::<impl u8>::wrapping_add`) matched on prefix + owner + tail
+            // and its body was inlined *for the `core` call*, which would prove a
+            // contract the real method violates. A bare `Type::m` -- no projection --
+            // keeps the permissive rule below, because rustc prints an in-scope trait
+            // method exactly that way.
+            if impl_self_loc(g).and_then(|loc| prog.impl_traits.get(&loc)).is_some() {
                 return false;
             }
         }
@@ -10868,29 +10921,64 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
         // other pointer has metadata this model cannot express, and answering
         // `Unknown` there is what keeps an invented length out of a proof.
         Rvalue::PtrMetadata(p) => length_of(env, f, p),
-        Rvalue::Discriminant(p) => match env.discriminants.get(&p.local) {
-            // The tag's width is the payload's, not the dump's `isize`. The
-            // `switchInt` compares it against the small variant constants, so
-            // the width only has to be wide enough to hold them; taking it from
-            // the payload keeps `discriminant` and the payload in one width.
-            Some(Val::Sym(tag, _)) => {
-                // A seeded enum tag carries its own width; a synthesised
-                // `Option` tag takes the payload's. Reading a seeded tag at the
-                // dump's `isize` width would truncate nothing but would also
-                // widen a 2-bit tag to 64, and `eq_const` then compares a
-                // 64-bit word against the `u8`-typed place's expectations --
-                // keeping the tag's own width is what the contract's `m ==
-                // Mode::Run` was checked at.
-                let w = env.tag_width(p.local).or_else(|| env.option_width(p.local)).unwrap_or(64);
-                // A discriminant is an unsigned integer.
-                Val::Sym(smt::truncate(*tag, w), Sign::Unsigned)
+        // The tag lives on the *local*, so only a place that denotes that local
+        // whole can be answered. A nested enum's place is projected --
+        // `discriminant(((_1 as A).0))` -- and reading the outer local's tag there
+        // sent the `match` down the wrong arm: `Outer::A(Inner::X)` and
+        // `Outer::A(Inner::Y)` share the outer tag `0`, so the inner match
+        // collapsed to one arm and a contract about the other was *proved*. A
+        // projected place is refused, which is what the nested shape did before
+        // the parser learned to read a parenthesised place at all; `resolve`
+        // collapses the one transparent case (`(*_1)`, a reference argument
+        // modelled as its referent).
+        Rvalue::Discriminant(raw) => {
+            // The tag lives on the *local*, so only a place that denotes that local
+            // whole can be answered. A nested enum's place is projected --
+            // `discriminant(((_1 as A).0))` -- and reading the outer local's tag
+            // there sent the `match` down the wrong arm: `Outer::A(Inner::X)` and
+            // `Outer::A(Inner::Y)` share the outer tag `0`, so the inner match
+            // collapsed to one arm and a contract about the other was *proved*. A
+            // projected place is refused, which is what the nested shape did before
+            // the parser learned to read a parenthesised place at all; `resolve`
+            // collapses the one transparent case (`(*_1)`, a reference argument
+            // modelled as its referent).
+            let mut p = env.resolve(raw);
+            // A reference *argument* is modelled as its referent, so one leading
+            // `Deref` on such a local is transparent -- the same rule `length_of`,
+            // `get` and `set` apply. `discriminant((*_1))` is how every `match` on
+            // an enum *reference* lowers, and it must keep deciding.
+            if matches!(p.proj.first(), Some(Proj::Deref)) && env.deref_ok.contains_key(&p.local) {
+                p.proj.remove(0);
             }
-            Some(v) => *v,
-            // No modelled call wrote a tag here. An enum this frontend did not
-            // build has an unknown tag, not tag zero -- guessing `None` would
-            // send every path down the wrong arm.
-            None => Val::Unknown,
-        },
+            if !p.proj.is_empty() {
+                Val::Unknown
+            } else {
+                match env.discriminants.get(&p.local) {
+                    // The tag's width is the payload's, not the dump's `isize`. The
+                    // `switchInt` compares it against the small variant constants, so
+                    // the width only has to be wide enough to hold them; taking it from
+                    // the payload keeps `discriminant` and the payload in one width.
+                    Some(Val::Sym(tag, _)) => {
+                        // A seeded enum tag carries its own width; a synthesised
+                        // `Option` tag takes the payload's. Reading a seeded tag at the
+                        // dump's `isize` width would truncate nothing but would also
+                        // widen a 2-bit tag to 64, and `eq_const` then compares a
+                        // 64-bit word against the `u8`-typed place's expectations --
+                        // keeping the tag's own width is what the contract's `m ==
+                        // Mode::Run` was checked at.
+                        let w =
+                            env.tag_width(p.local).or_else(|| env.option_width(p.local)).unwrap_or(64);
+                        // A discriminant is an unsigned integer.
+                        Val::Sym(smt::truncate(*tag, w), Sign::Unsigned)
+                    }
+                    Some(v) => *v,
+                    // No modelled call wrote a tag here. An enum this frontend did not
+                    // build has an unknown tag, not tag zero -- guessing `None` would
+                    // send every path down the wrong arm.
+                    None => Val::Unknown,
+                }
+            }
+        }
     }
 }
 
@@ -10983,7 +11071,13 @@ fn length_of(env: &Env, f: &MirFn, p: &Place) -> Val {
     }
     let p = &p;
     // A slice- or `str`-typed *field*: `self.slice.len()`. The chain is all `Field`
-    // steps, and the length is the symbolic input bound for that path.
+    // steps, and the length is the symbolic input bound for that path -- until a
+    // write replaces that field, at which point `forget_field_lens` drops the seed
+    // and the answer is unknown. A field whose *type* is an array is the exception:
+    // its length is the type's constant, so it survives the write (`h.arr = [9, 1,
+    // 2, 3]` still has four elements). Falling through to the *base local's*
+    // stores here would answer a field read with a length that belongs to a
+    // different value.
     if !p.proj.is_empty() {
         let mut chain = Vec::with_capacity(p.proj.len());
         for pr in &p.proj {
@@ -10997,6 +11091,10 @@ fn length_of(env: &Env, f: &MirFn, p: &Place) -> Val {
                 return Val::Sym(*len, Sign::Unsigned);
             }
         }
+        return match type_of_place(f, p) {
+            Some(Ty::Array(_, n)) => Val::Sym(smt::word(n, USIZE_WIDTH), Sign::Unsigned),
+            _ => Val::Unknown,
+        };
     }
     match env.indexed.get(&p.local) {
         // A slice argument, whose length is a symbolic input.
