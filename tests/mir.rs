@@ -7062,6 +7062,75 @@ fn a_mut_vec_postcondition_reads_the_final_length() {
     );
 }
 
+/// A line inside an enum body that starts with `/*` can *close* the comment opened
+/// on an earlier line. Skipping it left the enum reader in comment mode, so it never
+/// reached the enum's `}` and every function after it lost its contract -- silently
+/// unchecked. This pins both the layout (the tags) and the following verdict.
+#[test]
+fn a_nested_comment_closer_inside_an_enum_leaves_the_next_contract_checked() {
+    let Some(t) = verify_src(
+        "pick_nested",
+        "pub enum E {\n    #[doc = \"First\"] /* outer\n    /* inner */ */ A,\n    B,\n}\n\
+         /// requires: m == E::B\n\
+         /// ensures: ret == 1\n\
+         pub fn pick_nested(m: E) -> u8 { match m { E::A => 0, E::B => 1, _ => 2 } }",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(t, FnOutcome::Verified { .. }),
+        "the function after the enum must be checked against `E::B`, got {t}"
+    );
+}
+
+/// A warm run can hit one cached verdict and recompute an **undecided** function
+/// (a `Skipped` is never stored). That must not write the cache: a write keyed on
+/// "we ran the verifier" would rewrite the file on every run.
+#[test]
+fn the_cache_is_not_written_when_only_an_undecided_function_is_recomputed() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif_mixed_cache_{}_{seq}", std::process::id()));
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let file = dir.join("f.rs");
+    let src = "/// ensures: ret == 0\npub fn decided() -> u8 { 0 }\n\
+               /// ensures: ret == NOT_A_NAME\npub fn undecided() -> u8 { 0 }\n";
+    std::fs::write(&file, src).expect("write fixture");
+    let opts = {
+        let mut o = probe_opts_with_cfgs(&[]);
+        o.cache = Some(cache.clone());
+        o
+    };
+    let entries = || std::fs::read_dir(&cache).map(|d| d.count()).unwrap_or(0);
+    let outcome = |r: &verif::mir::verify::FileReport, n: &str| {
+        r.outcomes.iter().find(|(k, _)| k == n).map(|(_, o)| o.clone())
+    };
+    let first = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    assert!(matches!(outcome(&first, "decided"), Some(FnOutcome::Verified { .. })));
+    assert!(
+        !matches!(outcome(&first, "undecided"), Some(FnOutcome::Verified { .. })),
+        "an unreadable contract is not a verdict"
+    );
+    assert_eq!(entries(), 1, "only the decided verdict is stored");
+    let path = std::fs::read_dir(&cache)
+        .expect("cache dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .next()
+        .expect("one entry");
+    let before = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    let warm = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    assert!(matches!(outcome(&warm, "decided"), Some(FnOutcome::Verified { .. })));
+    assert_eq!(entries(), 1, "the warm run adds no entry");
+    assert_eq!(
+        std::fs::metadata(&path).and_then(|m| m.modified()).ok(),
+        before,
+        "and rewrites nothing"
+    );
+}
+
 /// A block comment that spans lines inside an enum body used to hang the frontend
 /// (a pre-pass looped on it), which reports no verdict at all. The contract also
 /// pins that the comment contributes no variant: a phantom one would shift `B`.
@@ -15390,14 +15459,15 @@ fn a_cfg_gated_variant_is_not_part_of_the_tag_domain() {
         matches!(ok, FnOutcome::Verified { .. }),
         "a disabled variant must not widen the tag domain, got {ok}"
     );
-    // With nothing known about the cfgs the variant is kept as written (the
-    // conservative direction), so the match may fall through and the panic is
-    // reported -- that is the behaviour the cfg set exists to improve on, pinned so a
-    // reader that started dropping gated variants unconditionally would fail here.
-    let Some(kept) = verify_src_with("f", src, &probe_opts()) else { return };
+    // With nothing known about the cfgs the variant's tag may not be rustc's, so the
+    // layout is *refused* rather than guessed: the switch's discriminant is unmodelled
+    // and the function is `Incomplete`. The old rule kept the variant, which made the
+    // `unreachable` arm look reachable and reported a panic that cannot happen -- a
+    // false refutation. A refusal loses the proof; it never invents a failure.
+    let Some(guarded) = verify_src_with("f", src, &probe_opts()) else { return };
     assert!(
-        matches!(kept, FnOutcome::Failed { .. }),
-        "without a cfg set the variant is kept, so the `unreachable` arm is reachable, got {kept}"
+        matches!(guarded, FnOutcome::Incomplete { .. }),
+        "without a cfg set the tag is unknown, so the layout is refused, got {guarded}"
     );
 }
 
@@ -15738,4 +15808,16 @@ fn the_cache_key_covers_the_cfg_set_that_shapes_an_enum() {
     let before = stamps(&cache);
     verify::verify_file_with_opts(&rustc, &file, &[], &on).expect("verify");
     assert_eq!(stamps(&cache), before, "a pure cache hit rewrites nothing");
+
+    // A *mixed* warm run: `f` is a hit and `a_only` is recomputed (its contract is a
+    // refusal under `on` too, since `M::A` exists but the tag is not reusable), so a
+    // write keyed on "we ran the verifier" would rewrite the file. Only a cacheable
+    // verdict may write, so the directory must still be untouched.
+    let before = stamps(&cache);
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &on).expect("verify");
+    assert!(
+        matches!(outcome(&report, "f"), Some(FnOutcome::Verified { .. })),
+        "the cached verdict is reused on the mixed run"
+    );
+    assert_eq!(stamps(&cache), before, "an undecided function writes no entry");
 }

@@ -1052,34 +1052,18 @@ pub fn const_generic_params(source: &str) -> BTreeSet<String> {
 pub fn crate_level_consts(source: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let mut depth: i32 = 0;
-    let mut in_block_comment = false;
+    // An open block comment's depth, carried across lines by the mask below.
+    let mut block_comment_depth = 0u32;
     // The last non-whitespace byte of the preceding lines, so a `const NAME:`
     // that starts a line can still be told a generic parameter (the `<` or `,`
     // sits on an earlier line) from an item. See [`const_generic_params`].
     let mut prev_last: Option<u8> = None;
     for raw in source.lines() {
-        let mut line = raw;
-        // Block comments can span lines; a brace inside one is not code.
-        loop {
-            if in_block_comment {
-                match line.find("*/") {
-                    Some(i) => {
-                        in_block_comment = false;
-                        line = &line[i + 2..];
-                    }
-                    // No closer on this line: the rest of it is comment, and the
-                    // comment stays open for the next line. Setting the line to `""`
-                    // and looping spun forever on a block comment that spans lines --
-                    // a hang, which reports no verdict at all.
-                    None => break,
-                }
-            } else if let Some(i) = line.find("/*") {
-                in_block_comment = true;
-                line = &line[i + 2..];
-            } else {
-                break;
-            }
-        }
+        // A comment is not code, and masking rather than deleting keeps every
+        // column -- the `impl` location this pass records is a column. A `{` inside
+        // a comment then cannot change the depth a real declaration below is read at.
+        let masked = comment_mask(raw, &mut block_comment_depth);
+        let line = masked.trim_end();
         // A `const NAME: …` at depth zero is a crate-level item. The name is read
         // before the braces on the line are counted, so `const L: u8 = 3;` is
         // caught while a `const` inside a `fn` body (depth > 0) is not. A
@@ -1218,30 +1202,14 @@ pub(crate) fn line_scopes(source: &str) -> Vec<LineScope> {
     // argument, `impl Foo<{ 1 }>`), which would otherwise pop the frame early.
     let mut stack: Vec<ScopeFrame> = Vec::new();
     let mut depth: i32 = 0;
-    let mut in_block_comment = false;
+    // An open block comment's depth, carried across lines by the mask below.
+    let mut block_comment_depth = 0u32;
     for (idx, raw) in lines.iter().enumerate() {
-        let mut line = *raw;
-        // A brace inside a block comment is not code.
-        loop {
-            if in_block_comment {
-                match line.find("*/") {
-                    Some(i) => {
-                        in_block_comment = false;
-                        line = &line[i + 2..];
-                    }
-                    // No closer on this line: the rest of it is comment, and the
-                    // comment stays open for the next line. Setting the line to `""`
-                    // and looping spun forever on a block comment that spans lines --
-                    // a hang inside a *pre-pass*, so no verdict was ever printed.
-                    None => break,
-                }
-            } else if let Some(i) = line.find("/*") {
-                in_block_comment = true;
-                line = &line[i + 2..];
-            } else {
-                break;
-            }
-        }
+        // A comment is not code, and masking rather than deleting keeps every
+        // column -- the `impl` location this pass records is a column. A `{` inside
+        // a comment then cannot change the depth a real declaration below is read at.
+        let masked = comment_mask(raw, &mut block_comment_depth);
+        let line = masked.trim_end();
         // The scope of this line is read *before* its own items open, so a `fn`
         // that declares a contract is not inside itself.
         let impl_loc =
@@ -2450,6 +2418,102 @@ fn strip_comments(text: &str) -> String {
     strip_comments_with(text, &mut depth)
 }
 
+/// [`strip_comments`]'s *masking* sibling: comment characters become spaces, so the
+/// result has the same length and the same columns, and a brace or a header inside a
+/// comment is not code.
+///
+/// The pre-passes that track scope and crate-level items read source lines and count
+/// braces; deleting a comment would shift every column after it, and the `impl`
+/// locations those passes record are columns.
+fn comment_mask(text: &str, depth: &mut u32) -> String {
+    let b: Vec<char> = text.chars().collect();
+    let bytes: Vec<u8> = text.bytes().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if *depth > 0 {
+            if c == '/' && b.get(i + 1) == Some(&'*') {
+                *depth += 1;
+                out.push_str("  ");
+                i += 2;
+                continue;
+            }
+            if c == '*' && b.get(i + 1) == Some(&'/') {
+                *depth -= 1;
+                out.push_str("  ");
+                i += 2;
+                continue;
+            }
+            out.push(' ');
+            i += 1;
+            continue;
+        }
+        if matches!(c, 'r' | 'b' | 'c') {
+            if let Some((hashes, after)) = raw_string_start(&bytes, i) {
+                let end = skip_raw_string(&bytes, after, hashes).min(b.len());
+                if end > i {
+                    out.extend(b[i..end].iter());
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        if c == '"' {
+            out.push(c);
+            i += 1;
+            while i < b.len() {
+                if b[i] == '\\' {
+                    out.push(b[i]);
+                    if i + 1 < b.len() {
+                        out.push(b[i + 1]);
+                    }
+                    i += 2;
+                    continue;
+                }
+                out.push(b[i]);
+                i += 1;
+                if i > 0 && b[i - 1] == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '/' && b.get(i + 1) == Some(&'/') {
+            while i < b.len() {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && b.get(i + 1) == Some(&'*') {
+            *depth = 1;
+            out.push_str("  ");
+            i += 2;
+            while i + 1 < b.len() && *depth > 0 {
+                if b[i] == '/' && b[i + 1] == '*' {
+                    *depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                if b[i] == '*' && b[i + 1] == '/' {
+                    *depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// [`strip_comments`], carrying an open block comment's depth across calls.
 ///
 /// The enum reader works one source line at a time, and a block comment can open
@@ -2459,6 +2523,7 @@ fn strip_comments(text: &str) -> String {
 /// higher than rustc did, so a contract naming `B` was checked against `C`'s arm.
 fn strip_comments_with(text: &str, depth: &mut u32) -> String {
     let b: Vec<char> = text.chars().collect();
+    let bytes: Vec<u8> = text.bytes().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < b.len() {
@@ -2476,6 +2541,18 @@ fn strip_comments_with(text: &str, depth: &mut u32) -> String {
             }
             i += 1;
             continue;
+        }
+        // A raw string (`r"…"`, `r#"…"#`) is not a string with a quote in it: its
+        // contents are copied verbatim, so `r#"a "//" b"#` keeps its markers.
+        if matches!(c, 'r' | 'b' | 'c') {
+            if let Some((hashes, after)) = raw_string_start(&bytes, i) {
+                let end = skip_raw_string(&bytes, after, hashes).min(b.len());
+                if end > i {
+                    out.extend(b[i..end].iter());
+                    i = end;
+                    continue;
+                }
+            }
         }
         if c == '"' {
             out.push(c);
@@ -2967,18 +3044,10 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
             continue;
         }
         let line = raw_line.trim();
-        if in_block_comment {
-            if line.contains("*/") {
-                in_block_comment = false;
-            }
-            continue;
-        }
-        if line.starts_with("/*") {
-            if !line.contains("*/") {
-                in_block_comment = true;
-            }
-            continue;
-        }
+        // The enum cursor owns comment state for its own lines: a line that starts
+        // with `/*` can *close* the comment opened on an earlier line, so skipping it
+        // here (below) left the cursor in comment mode and every later line -- the
+        // enum's own `}` and the functions after it -- was discarded as comment text.
         // Inside an enum body: read variants until the closing brace.
         if cur_enum.is_some() {
             let masked;
@@ -2991,6 +3060,18 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
             if line.is_empty() {
                 continue;
             }
+        if in_block_comment {
+            if line.contains("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if line.starts_with("/*") {
+            if !line.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
             if line.starts_with('}') {
                 let (name, def) = cur_enum.take().unwrap();
                 // A variant whose cfg could not be decided means the tags this
@@ -3002,6 +3083,7 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
                 }
                 enum_undecidable = false;
                 enum_comment_depth = 0;
+                in_block_comment = false;
                 continue;
             }
             // A variant declaration that wrapped across lines is still open: the
@@ -3221,7 +3303,9 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
                     enum_undecidable = false;
                     variant_depth = 0;
                     cfg_pending_unknown = false;
-                    enum_comment_depth = 0;
+                    // A comment still open from before the enum body belongs to the
+                    // body's state now, so the cursor masks the rest of it too.
+                    enum_comment_depth = u32::from(in_block_comment);
                 }
                 // The body was refused *and* closed on this line. Opening a
                 // cursor here would run past the brace and consume every
@@ -9225,8 +9309,15 @@ fn enum_head(line: &str, cfgs: &CfgSet) -> Option<(String, EnumHead)> {
             // A `#[cfg]`-gated variant on a one-line body: dropped when its
             // predicate is decided false, so the numbering matches rustc's.
             let preds = leading_cfg_preds(&v);
-            if preds.iter().any(|p| cfgs.eval(p) == Some(false)) {
+            let verdicts: Vec<Option<bool>> = preds.iter().map(|p| cfgs.eval(p)).collect();
+            if verdicts.contains(&Some(false)) {
                 continue;
+            }
+            // An undecidable predicate on a *kept* variant means these tags may not be
+            // rustc's, so the layout is refused -- the rule the multi-line reader
+            // already applies. Keeping the variant would shift every later tag.
+            if verdicts.contains(&None) {
+                return Some((name.to_string(), EnumHead::Refused));
             }
             let v = split_leading_attrs(&v).0.trim();
             if v.is_empty() {
@@ -10066,10 +10157,15 @@ mod tests {
         };
         assert_eq!(names(&off), ["A", "B"], "a disabled variant is not part of the type");
         assert_eq!(names(&on), ["A", "B", "C"], "an enabled variant is");
-        // Nothing known about the crate's cfgs: keep the item as written, which is the
-        // conservative direction -- dropping a variant that exists would shift the
-        // discriminants after it.
-        assert_eq!(names(&[]), ["A", "B", "C"]);
+        // Nothing known about the crate's cfgs: `extra` cannot be decided, so these
+        // tags may not be rustc's and the layout is *refused* rather than guessed --
+        // the rule the multi-line reader applies. A contract naming a variant is then
+        // a refusal, never a check against another variant's arm.
+        let specs = super::extract_with_cfgs(src, &[]);
+        assert!(
+            !specs.enums.contains_key("P"),
+            "an undecidable predicate on a kept inline variant must refuse the layout"
+        );
     }
 
     /// A disabled variant in the *middle* of an enum must not shift the ones after
@@ -10185,6 +10281,69 @@ mod tests {
             ],
             "the quoted value keeps its markers, so `B` is present"
         );
+    }
+
+    /// A `{` inside a block comment must not count toward the brace depth: a
+    /// declaration below it would otherwise be read as nested, and a `const` named
+    /// only by a contract would drop out of the table (a lost proof).
+    #[test]
+    fn a_comment_brace_does_not_hide_a_crate_const() {
+        let src = "/*\n{\n*/\nconst LIMIT: u8 = 3;\n";
+        let consts = super::crate_level_consts(src);
+        assert!(consts.contains("LIMIT"), "the comment's brace is not depth: {consts:?}");
+    }
+
+    /// A raw doc string is not a string with a quote in it: `r#"… "//" …"#` keeps
+    /// its markers, so the variants behind it are still read.
+    #[test]
+    fn a_raw_doc_string_does_not_hide_the_variants_behind_it() {
+        let src = "pub enum Z { A, #[doc = r#\"Use \"//\" for comments\"#] B, C }\n";
+        let specs = super::extract_with_cfgs(src, &[]);
+        let got: Vec<(String, u64)> = specs
+            .enums
+            .get("Z")
+            .expect("three declarations")
+            .variants
+            .iter()
+            .map(|(n, _, d)| (n.clone(), *d))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("A".to_string(), 0),
+                ("B".to_string(), 1),
+                ("C".to_string(), 2),
+            ]
+        );
+    }
+
+    /// A comment before a *compiler-controlled* `cfg` must refuse the inline layout:
+    /// `windows` cannot be decided from a `--cfg` list, so keeping `Win` would number
+    /// `B` as 2 where rustc numbers it 1.
+    #[test]
+    fn a_comment_before_a_compiler_controlled_cfg_refuses_the_inline_layout() {
+        let src = "pub enum E { A, /* Windows-only */ #[cfg(windows)] Win, B, C }\n";
+        let std_only = ["--cfg".to_string(), "feature=\"std\"".to_string()];
+        let specs = super::extract_with_cfgs(src, &std_only);
+        assert!(!specs.enums.contains_key("E"), "an undecidable tag must refuse the layout");
+    }
+
+    /// A line that starts inside a comment and closes it is not a skipped line: the
+    /// enum cursor must see it, or it stays in comment mode and swallows the enum's
+    /// `}` and every function after it (whose contracts then go unchecked).
+    #[test]
+    fn a_nested_comment_closer_inside_an_enum_keeps_the_layout() {
+        let src = "pub enum E {\n    #[doc = \"First\"] /* outer\n    /* inner */ */ A,\n    B,\n}\n";
+        let specs = super::extract_with_cfgs(src, &[]);
+        let got: Vec<(String, u64)> = specs
+            .enums
+            .get("E")
+            .expect("E is a declared enum")
+            .variants
+            .iter()
+            .map(|(n, _, d)| (n.clone(), *d))
+            .collect();
+        assert_eq!(got, vec![("A".to_string(), 0), ("B".to_string(), 1)]);
     }
 
     /// A block comment that spans lines used to *hang* the frontend: the pre-pass
