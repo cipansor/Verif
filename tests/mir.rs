@@ -15673,4 +15673,29 @@ fn the_cache_key_covers_the_cfg_set_that_shapes_an_enum() {
         "the `on` entry must not answer an `off` run"
     );
     assert_eq!(entries(), 2, "the off run reuses its own entry");
+
+    // Reuse, not just isolation: a second `on` run must hit every entry and write
+    // nothing, so the directory is unchanged. Asserted on the configuration where
+    // every function decides -- a `skipped` function is never cached, so it would
+    // recompute (and rewrite) on every run.
+    let stamps = |dir: &std::path::Path| -> Vec<(String, std::time::SystemTime)> {
+        let mut v: Vec<_> = std::fs::read_dir(dir)
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .map(|e| {
+                        let m = e.metadata().and_then(|m| m.modified()).ok();
+                        (
+                            e.file_name().to_string_lossy().to_string(),
+                            m.unwrap_or(std::time::UNIX_EPOCH),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    };
+    let before = stamps(&cache);
+    verify::verify_file_with_opts(&rustc, &file, &[], &on).expect("verify");
+    assert_eq!(stamps(&cache), before, "a pure cache hit rewrites nothing");
 }

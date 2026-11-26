@@ -10995,7 +10995,7 @@ fn width_of(f: &MirFn, p: &Place) -> Option<u8> {
     for pr in &p.proj {
         ty = match (pr, &ty) {
             (Proj::Field(i), Ty::Tuple(ts)) => ts.get(*i as usize)?.clone(),
-            (Proj::Index(_), Ty::Array(inner, _)) => (**inner).clone(),
+            (Proj::Index(_), Ty::Array(inner, _) | Ty::Slice(inner)) => (**inner).clone(),
             // `*r` for a `&T` has type `T`. The dump prints the deref as
             // `(*_1)` with no type, so the width has to come from the referent
             // the local was declared with. This is the same transparency the
@@ -11138,7 +11138,7 @@ fn type_of_place(f: &MirFn, p: &Place) -> Option<Ty> {
             // so it types the same. Without this `type_of_place` refused
             // `a[_3]`/`other[_4]` and the whole-element rebase that needs the
             // element's type never ran.
-            (Proj::IndexVar(_), Ty::Array(inner, _)) => (**inner).clone(),
+            (Proj::IndexVar(_), Ty::Array(inner, _) | Ty::Slice(inner)) => (**inner).clone(),
             (Proj::Deref, Ty::Ref(inner)) => (**inner).clone(),
             (Proj::Downcast(_), _) => return None,
             _ => return None,

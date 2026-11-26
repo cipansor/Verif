@@ -2251,6 +2251,7 @@ pub fn verify_file_with_opts(
         _ => super::cache::Entries::new(),
     };
     let mut fresh = super::cache::Entries::new();
+    let mut recomputed = false;
     for (key, f) in select(&prog, &targets, only) {
         if let Some(c) = specs.resolve(&f.name) {
             let (file, line) = specs.original_loc(c.line);
@@ -2262,7 +2263,13 @@ pub fn verify_file_with_opts(
         // let one impl's verdict stand in for the other (a false proof).
         let outcome = match cached.get(&f.name) {
             Some(c) => c.to_outcome(),
-            None => smt::with_fresh(|| verify_function(&prog, f, &specs)),
+            None => {
+                // Only a verdict this run *computed* is worth writing back; a cache
+                // hit is already in the file, and re-storing the merged set on every
+                // run made "was the entry reused" unobservable from outside.
+                recomputed = true;
+                smt::with_fresh(|| verify_function(&prog, f, &specs))
+            }
         };
         if let Some(c) = super::cache::Cached::of(&outcome) {
             fresh.insert(f.name.clone(), c);
@@ -2270,10 +2277,7 @@ pub fn verify_file_with_opts(
         report.outcomes.push((key, outcome));
     }
     if let (Some(dir), Some(k)) = (&opts.cache, &cache_key) {
-        // Nothing recomputed means nothing to record: rewriting the file on a pure
-        // cache hit would make "was the entry reused" unobservable (a test can only
-        // see an mtime), and it writes the same bytes back for no reason.
-        if !fresh.is_empty() {
+        if recomputed {
             // Merge with the previous entries, so a `--function` run does not drop
             // the verdicts it did not recompute.
             let mut merged = cached;

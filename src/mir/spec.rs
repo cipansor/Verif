@@ -2122,10 +2122,10 @@ fn read_attr_run(lines: &[&str], start: usize, end: usize) -> Option<bool> {
 /// when one is still open. Quotes are skipped, so a `(` inside a string literal is
 /// not a bracket.
 fn bracket_depth(line: &str) -> i32 {
-    // A delimiter inside a trailing comment is not a delimiter: `Open, // '('` is a
+    // A delimiter inside a comment is not a delimiter: `Open, // '('` is a
     // complete unit variant, and counting that parenthesis made the reader treat it
     // as a wrapped declaration and drop the whole layout.
-    let line = strip_line_comment(line);
+    let line = strip_comments(line);
     let mut depth = 0;
     let mut chars = line.chars();
     let mut in_str = false;
@@ -2425,43 +2425,98 @@ fn normalise_cfg(v: &str) -> String {
     // A comment inside the attribute is not part of the predicate:
     // `feature = "extra" /* note */` names `feature="extra"`, and leaving the
     // comment in made the lookup miss and answer `false` -- so the variant was
-    // dropped although rustc keeps it, shifting every later tag.
-    let mut out = String::with_capacity(v.len());
-    let mut rest = v;
-    while let Some(open) = rest.find("/*") {
-        let line = rest.find("//");
-        // A line comment before the block comment ends the predicate.
-        if let Some(l) = line {
-            if l < open {
-                out.push_str(&rest[..l]);
-                return out.chars().filter(|c| !c.is_whitespace()).collect();
+    // dropped although rustc keeps it, shifting every later tag. The value's own
+    // text survives, including a marker inside it (`feature = "a//b"`), which is
+    // why the stripper has to know where the literals are.
+    strip_comments(v).chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// `text` with comments removed, respecting string and character literals.
+///
+/// Every scanner here -- the bracket depth, the top-level comma count, a `cfg`
+/// predicate -- must agree on what is code, and a second, simpler stripper is a
+/// second answer. `/* } */` is no brace, `"a//b"` is one value, and `'"'` is not
+/// the start of a literal.
+fn strip_comments(text: &str) -> String {
+    let b: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == '"' {
+            out.push(c);
+            i += 1;
+            while i < b.len() {
+                if b[i] == '\\' {
+                    out.push(b[i]);
+                    if i + 1 < b.len() {
+                        out.push(b[i + 1]);
+                    }
+                    i += 2;
+                    continue;
+                }
+                out.push(b[i]);
+                i += 1;
+                if b[i - 1] == '"' {
+                    break;
+                }
             }
+            continue;
         }
-        out.push_str(&rest[..open]);
-        match rest[open + 2..].find("*/") {
-            Some(e) => rest = &rest[open + 2 + e + 2..],
-            None => return out.chars().filter(|c| !c.is_whitespace()).collect(),
+        // A char literal (`'('`, `'\''`) but not a lifetime (`'a`).
+        if c == '\'' && i + 2 < b.len() && (b[i + 1] == '\\' || b[i + 2] == '\'') {
+            out.push(c);
+            i += 1;
+            while i < b.len() {
+                if b[i] == '\\' {
+                    out.push(b[i]);
+                    if i + 1 < b.len() {
+                        out.push(b[i + 1]);
+                    }
+                    i += 2;
+                    continue;
+                }
+                out.push(b[i]);
+                i += 1;
+                if b[i - 1] == '\'' {
+                    break;
+                }
+            }
+            continue;
         }
+        if c == '/' && b.get(i + 1) == Some(&'/') {
+            break;
+        }
+        if c == '/' && b.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+            out.push(' ');
+            continue;
+        }
+        out.push(c);
+        i += 1;
     }
-    match rest.find("//") {
-        Some(l) => out.push_str(&rest[..l]),
-        None => out.push_str(rest),
-    }
-    out.chars().filter(|c| !c.is_whitespace()).collect()
+    out
 }
 
 /// How many commas `text` has outside brackets, strings and a trailing one.
 ///
 /// Two variants on one line (`A, B,`) are read as one declaration by
 /// `enum_variant`, so the second is silently omitted and every later tag shifts.
-/// The reader refuses a layout when this is non-zero.
+/// The reader refuses a layout when this is non-zero. A comment is not code, so a
+/// `}` inside one must not close a brace: `Token { /* } */ pos: u8, len: u8 }` is
+/// one declaration with one field separator.
 fn top_level_commas(text: &str) -> usize {
-    let text = strip_line_comment(text).trim();
-    let text = text.strip_suffix(',').unwrap_or(text);
+    let masked = strip_comments(text);
+    let masked = masked.trim();
+    let masked = masked.strip_suffix(',').unwrap_or(masked);
     let mut depth = 0i32;
     let mut in_str = false;
     let mut count = 0;
-    let mut chars = text.chars();
+    let mut chars = masked.chars();
     while let Some(c) = chars.next() {
         if in_str {
             if c == '\\' {
@@ -10031,6 +10086,57 @@ mod tests {
         assert!(
             !specs.enums.contains_key("P"),
             "a variant whose cfg cannot be decided must not produce a layout"
+        );
+    }
+
+    /// A quoted value's own text survives comment stripping: `feature = "a//b"` is
+    /// one value, not `a`. Collapsing it to `a` would keep a variant rustc excluded.
+    #[test]
+    fn a_quoted_cfg_value_is_not_cut_at_a_comment_marker() {
+        let src = "pub enum V {\n    A,\n    #[cfg(feature = \"a//b\")]\n    B,\n    C,\n}\n";
+        let off = super::extract_with_cfgs(src, &["--cfg".to_string(), "feature=\"a\"".to_string()]);
+        let def = off.enums.get("V").expect("the predicate is decidable");
+        assert_eq!(
+            def.variants,
+            vec![("A".to_string(), vec![], 0), ("C".to_string(), vec![], 1)],
+            "`a` is not `a//b`, so `B` is absent"
+        );
+        let on = super::extract_with_cfgs(
+            src,
+            &["--cfg".to_string(), "feature=\"a//b\"".to_string()],
+        );
+        let def = on.enums.get("V").expect("the predicate is decidable");
+        assert_eq!(
+            def.variants,
+            vec![
+                ("A".to_string(), vec![], 0),
+                ("B".to_string(), vec![], 1),
+                ("C".to_string(), vec![], 2),
+            ],
+            "the quoted value keeps its markers, so `B` is present"
+        );
+    }
+
+    /// A `}` inside a block comment must not close a struct variant's brace, or the
+    /// field separator below it counts as a variant separator and the layout is
+    /// dropped although every declaration is on its own line.
+    #[test]
+    fn a_block_comment_in_a_struct_variant_does_not_split_it() {
+        let src = "pub enum W {\n    Token { /* closing delimiter is `}` */ pos: u8, len: u8 },\n    End,\n}\n";
+        let specs = super::extract_with_cfgs(src, &[]);
+        let def = specs.enums.get("W").expect("one declaration per line");
+        let got: Vec<(&str, usize, u64)> = def
+            .variants
+            .iter()
+            .map(|(n, p, d)| (n.as_str(), p.len(), *d))
+            .collect();
+        // The tags are what a `match` compares, so they are the assertion; a struct
+        // variant's *named fields* are not collected as payloads at all (a separate,
+        // pre-existing completeness gap), which is why the count is 0 for both.
+        assert_eq!(
+            got,
+            vec![("Token", 0, 0), ("End", 0, 1)],
+            "the comment's brace is not code: two declarations, tags 0 and 1"
         );
     }
 
