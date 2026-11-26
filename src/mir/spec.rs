@@ -2116,6 +2116,34 @@ fn read_attr_run(lines: &[&str], start: usize, end: usize) -> Option<bool> {
 /// delimiter -- string, raw-string and char literal contents, and comments -- is
 /// skipped by [`attr_close_offset`], so a `(` or a quote inside one does not hide
 /// the `use` behind the attribute. See [`is_cfg_use`].
+/// How many brackets `line` opens that it does not close.
+///
+/// A variant declaration can wrap (`B(`, `u8,`, `),`), so the reader needs to know
+/// when one is still open. Quotes are skipped, so a `(` inside a string literal is
+/// not a bracket.
+fn bracket_depth(line: &str) -> i32 {
+    let mut depth = 0;
+    let mut chars = line.chars();
+    let mut in_str = false;
+    while let Some(c) = chars.next() {
+        if in_str {
+            if c == '\\' {
+                chars.next();
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
 fn split_leading_attrs(line: &str) -> (&str, bool) {
     let mut rest = line.trim_start();
     let mut cfg = false;
@@ -2737,6 +2765,17 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
     // rather than a list of fields, so it needs its own cursor; a struct and an
     // enum cannot be open at once, so the two cursors never interleave.
     let mut cur_enum: Option<(String, EnumDef)> = None;
+    // Set when a variant's `#[cfg]` predicate cannot be decided from the flags this
+    // reader was given (`target_os`, a build script's own cfg). rustc decided it by
+    // its own configuration, so the tags this reader would assign can differ from
+    // the ones the compiled `match` compares against -- a wrong arm, not a weaker
+    // proof. The layout is dropped rather than guessed.
+    let mut enum_undecidable = false;
+    // Bracket depth of a variant declaration that wraps across lines. A disabled
+    // variant's payload is still *printed*, so consuming only its header leaves
+    // `u8,` and `),` to be read as variants -- and `u8,` looks exactly like a unit
+    // variant, so it became a phantom tag and shifted every later discriminant.
+    let mut variant_depth: i32 = 0;
     // A `#[cfg]`-gated variant whose predicate is false: the next variant line is
     // dropped. `None` means "no constraint" (no attribute, or an undecidable one).
     let mut cfg_pending: Option<bool> = None;
@@ -2774,7 +2813,20 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
         if cur_enum.is_some() {
             if line.starts_with('}') {
                 let (name, def) = cur_enum.take().unwrap();
-                specs.enums.insert(name, def);
+                // A variant whose cfg could not be decided means the tags this
+                // reader would assign may not be the ones rustc compiled, so the
+                // layout is dropped: a contract naming a variant is then refused
+                // instead of being checked against another variant's arm.
+                if !enum_undecidable {
+                    specs.enums.insert(name, def);
+                }
+                enum_undecidable = false;
+                continue;
+            }
+            // A variant declaration that wrapped across lines is still open: the
+            // rest of it is a payload, never a variant of its own.
+            if variant_depth > 0 {
+                variant_depth += bracket_depth(line);
                 continue;
             }
             // A `#[cfg]`-gated variant is present only when its predicate holds, and
@@ -2791,8 +2843,16 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
             // `D` sent execution down `C`'s arm, a false proof.
             let mut dead = cfg_pending == Some(false);
             for p in leading_cfg_preds(line) {
-                if cfgs.eval(&p) == Some(false) {
-                    dead = true;
+                match cfgs.eval(&p) {
+                    Some(false) => dead = true,
+                    // A predicate this reader cannot decide -- `target_os = "windows"`
+                    // is not a `feature`, and rustc excluded or kept the variant by
+                    // the *compiler's* configuration, which the reader does not have.
+                    // Guessing either way is a wrong tag: keeping a variant rustc
+                    // dropped shifts every later discriminant, so a contract naming
+                    // `C` would run `D`'s arm. The layout is refused instead.
+                    None => enum_undecidable = true,
+                    Some(true) => {}
                 }
             }
             let variant_line = split_leading_attrs(line).0;
@@ -2806,6 +2866,18 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
             // The variant on this line consumes the verdict, whichever way it went.
             cfg_pending = None;
             if dead {
+                // The declaration may continue on the following lines; its payload
+                // must be consumed with it, or `u8,` is read as a variant.
+                variant_depth = bracket_depth(variant_line);
+                continue;
+            }
+            // An *enabled* variant whose declaration wraps: this reader would have to
+            // join the payload to parse it, and a partial read is a phantom variant.
+            // The layout is refused instead -- a contract naming a variant is then a
+            // refusal, never a check against the wrong arm.
+            if bracket_depth(variant_line) > 0 {
+                enum_undecidable = true;
+                variant_depth = bracket_depth(variant_line);
                 continue;
             }
             match enum_variant(variant_line) {
@@ -2937,7 +3009,11 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
                 EnumHead::Inline(variants) => {
                     specs.enums.insert(name, EnumDef { variants });
                 }
-                EnumHead::MultiLine => cur_enum = Some((name, EnumDef::default())),
+                EnumHead::MultiLine => {
+                    cur_enum = Some((name, EnumDef::default()));
+                    enum_undecidable = false;
+                    variant_depth = 0;
+                }
                 // The body was refused *and* closed on this line. Opening a
                 // cursor here would run past the brace and consume every
                 // following line -- contracts included -- as enum contents, so
@@ -9844,6 +9920,51 @@ mod tests {
             def.variants,
             vec![("A".to_string(), vec![], 0), ("C".to_string(), vec![], 1)],
             "`b` is off, so `B` is absent and `C` takes discriminant 1"
+        );
+        // The other direction: the *first* attribute is false and the second is
+        // true. A reader that let the last attribute overwrite the pending verdict
+        // would keep `B` here and shift `C` to 2.
+        let a_off_b_on = ["--cfg".to_string(), "feature=\"b\"".to_string()];
+        let specs = super::extract_with_cfgs(src, &a_off_b_on);
+        let def = specs.enums.get("P").expect("P is a declared enum");
+        assert_eq!(
+            def.variants,
+            vec![("A".to_string(), vec![], 0), ("C".to_string(), vec![], 1)],
+            "`a` is off, so `B` is absent -- a true second attribute must not revive it"
+        );
+    }
+
+    /// A variant gated on a `cfg` this reader cannot evaluate (`target_os`) may or
+    /// may not be in the compiled enum, and the tags it would assign are then a
+    /// guess. The layout is dropped instead: a contract naming a variant becomes a
+    /// refusal, never a check against another variant's arm.
+    #[test]
+    fn an_undecidable_variant_cfg_refuses_the_layout() {
+        let src = "pub enum P {\n    A,\n    #[cfg(target_os = \"windows\")]\n    B,\n    C,\n}\n";
+        let specs = super::extract_with_cfgs(src, &[]);
+        assert!(
+            !specs.enums.contains_key("P"),
+            "a variant whose cfg cannot be decided must not produce a layout"
+        );
+    }
+
+    /// A disabled tuple variant's *payload* is printed on the following lines, and
+    /// `u8,` reads exactly like a unit variant. Consuming only the header made it a
+    /// phantom tag, which shifted every later discriminant.
+    #[test]
+    fn a_wrapped_disabled_variant_does_not_shift_later_tags() {
+        let src = "pub enum P {\n    A,\n    #[cfg(feature = \"extra\")]\n    B(\n        u8,\n    ),\n    C,\n    D,\n}\n";
+        let std_only = ["--cfg".to_string(), "feature=\"std\"".to_string()];
+        let specs = super::extract_with_cfgs(src, &std_only);
+        let def = specs.enums.get("P").expect("P is a declared enum");
+        assert_eq!(
+            def.variants,
+            vec![
+                ("A".to_string(), vec![], 0),
+                ("C".to_string(), vec![], 1),
+                ("D".to_string(), vec![], 2),
+            ],
+            "`B`'s wrapped payload must not become a variant"
         );
     }
 

@@ -15623,7 +15623,10 @@ fn the_cache_key_covers_the_cfg_set_that_shapes_an_enum() {
     let file = dir.join("f.rs");
     let src = "pub enum M { B, C, #[cfg(feature = \"extra\")] A }\n\
                /// ensures: ret == 0\n\
-               pub fn f(m: M) -> u8 { let _ = m; 0 }\n";
+               pub fn f(m: M) -> u8 { let _ = m; 0 }\n\
+               /// requires: m == M::A\n\
+               /// ensures: ret == 0\n\
+               pub fn a_only(m: M) -> u8 { let _ = m; 0 }\n";
     std::fs::write(&file, src).expect("write fixture");
     let with = |cfgs: &[&str]| {
         let mut opts = probe_opts_with_cfgs(cfgs);
@@ -15632,8 +15635,19 @@ fn the_cache_key_covers_the_cfg_set_that_shapes_an_enum() {
     };
     let entries = || std::fs::read_dir(&cache).map(|d| d.count()).unwrap_or(0);
 
-    let off = with(&[]);
-    verify::verify_file_with_opts(&rustc, &file, &[], &off).expect("verify");
+    // The `off` run *decides* `extra` (it is in a set of features that does not
+    // contain it) rather than leaving it unknown, so the two runs differ in the
+    // enum's layout as well as in the key -- a run with no `--cfg` at all leaves
+    // every feature undecidable and the layout the same.
+    let off = with(&["feature=\"std\""]);
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &off).expect("verify");
+    let outcome = |r: &verif::mir::verify::FileReport, n: &str| {
+        r.outcomes.iter().find(|(k, _)| k == n).map(|(_, o)| o.clone())
+    };
+    assert!(
+        !matches!(outcome(&report, "a_only"), Some(FnOutcome::Verified { .. })),
+        "with `extra` off, `M::A` does not exist and the contract naming it is a refusal"
+    );
     assert_eq!(entries(), 1, "the first run writes one entry");
     // The same options reuse that entry rather than writing a second one.
     verify::verify_file_with_opts(&rustc, &file, &[], &off).expect("verify");
@@ -15642,7 +15656,11 @@ fn the_cache_key_covers_the_cfg_set_that_shapes_an_enum() {
     // The domain changes with `extra`, and the MIR does not. A key without the cfg
     // set would reuse the first entry here, which is the stale hit a wider domain
     // makes a false proof.
-    let on = with(&["feature=\"extra\""]);
-    verify::verify_file_with_opts(&rustc, &file, &[], &on).expect("verify");
+    let on = with(&["feature=\"std\"", "feature=\"extra\""]);
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &on).expect("verify");
+    assert!(
+        matches!(outcome(&report, "a_only"), Some(FnOutcome::Verified { .. })),
+        "with `extra` on, `M::A` exists and the contract about it is checked"
+    );
     assert_eq!(entries(), 2, "a different cfg set is a different key");
 }
