@@ -7062,6 +7062,26 @@ fn a_mut_vec_postcondition_reads_the_final_length() {
     );
 }
 
+/// A standalone block comment between a contract and its function is not an item
+/// boundary: the contract must still reach `f`. Treating the comment as a boundary
+/// cleared the pending clause, so the function was checked against `true` -- a false
+/// postcondition silently unchecked.
+#[test]
+fn a_block_comment_between_a_contract_and_its_function_keeps_the_contract() {
+    let Some(t) = verify_src(
+        "commented",
+        "/// ensures: ret == 1\n\
+         /* This return value is part of the API. */\n\
+         pub fn commented() -> u8 { 0 }",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(&t, FnOutcome::Failed { kind, .. } if kind.contains("postcondition")),
+        "the false postcondition must be refuted, not dropped, got {t}"
+    );
+}
+
 /// A line inside an enum body that starts with `/*` can *close* the comment opened
 /// on an earlier line. Skipping it left the enum reader in comment mode, so it never
 /// reached the enum's `}` and every function after it lost its contract -- silently
@@ -7095,8 +7115,13 @@ fn the_cache_is_not_written_when_only_an_undecided_function_is_recomputed() {
     let cache = dir.join("cache");
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let file = dir.join("f.rs");
+    // `undecided` is a `Skipped` (unreadable contract); `pending` is an `Incomplete`
+    // (a call the frontend does not model). Neither is cacheable, and a warm run
+    // reaches both through the recompute path.
     let src = "/// ensures: ret == 0\npub fn decided() -> u8 { 0 }\n\
-               /// ensures: ret == NOT_A_NAME\npub fn undecided() -> u8 { 0 }\n";
+               /// ensures: ret == NOT_A_NAME\npub fn undecided() -> u8 { 0 }\n\
+               unsafe extern \"C\" { fn ext_call() -> u8; }\n\
+               /// ensures: ret <= 9\npub fn pending() -> u8 { unsafe { ext_call() } }\n";
     std::fs::write(&file, src).expect("write fixture");
     let opts = {
         let mut o = probe_opts_with_cfgs(&[]);
@@ -7112,6 +7137,10 @@ fn the_cache_is_not_written_when_only_an_undecided_function_is_recomputed() {
     assert!(
         !matches!(outcome(&first, "undecided"), Some(FnOutcome::Verified { .. })),
         "an unreadable contract is not a verdict"
+    );
+    assert!(
+        matches!(outcome(&first, "pending"), Some(FnOutcome::Incomplete { .. })),
+        "an unmodelled call is an `Incomplete`, not a verdict"
     );
     assert_eq!(entries(), 1, "only the decided verdict is stored");
     let path = std::fs::read_dir(&cache)

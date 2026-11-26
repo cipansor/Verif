@@ -1225,14 +1225,18 @@ pub(crate) fn line_scopes(source: &str) -> Vec<LineScope> {
             .map(|f| f.name.clone())
             .collect();
         out[idx] = LineScope { impl_loc, path, trait_path };
-        if let Some(col) = impl_keyword_col(raw) {
+        // Header detection reads the *masked* line: a `fn`/`impl` inside a comment is
+        // not an item, and taking its name would key every later contract to a scope
+        // that does not exist. `comment_mask` blanks rather than deletes, so `col` is
+        // the raw line's column.
+        if let Some(col) = impl_keyword_col(line) {
             stack.push(ScopeFrame {
                 kind: ItemKind::Impl,
                 name: String::new(),
                 impl_loc: Some((idx + 1, col)),
                 body_depth: None,
             });
-        } else if let Some((kind, name)) = item_head(raw) {
+        } else if let Some((kind, name)) = item_head(line) {
             stack.push(ScopeFrame {
                 kind,
                 name,
@@ -2418,6 +2422,14 @@ fn strip_comments(text: &str) -> String {
     strip_comments_with(text, &mut depth)
 }
 
+/// The byte offset of each char index, plus `len` at the end, so a raw-string
+/// helper (which works in bytes) can be spliced into a char-indexed scan.
+fn char_byte_offsets(text: &str) -> Vec<usize> {
+    let mut v: Vec<usize> = text.char_indices().map(|(k, _)| k).collect();
+    v.push(text.len());
+    v
+}
+
 /// [`strip_comments`]'s *masking* sibling: comment characters become spaces, so the
 /// result has the same length and the same columns, and a brace or a header inside a
 /// comment is not code.
@@ -2428,6 +2440,10 @@ fn strip_comments(text: &str) -> String {
 fn comment_mask(text: &str, depth: &mut u32) -> String {
     let b: Vec<char> = text.chars().collect();
     let bytes: Vec<u8> = text.bytes().collect();
+    // The raw-string helpers index *bytes*; this scan indexes chars, so every splice
+    // goes through the char's byte offset -- a non-ASCII raw string otherwise copied
+    // extra source, and a comment after it stayed unmasked.
+    let offsets = char_byte_offsets(text);
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < b.len() {
@@ -2450,14 +2466,38 @@ fn comment_mask(text: &str, depth: &mut u32) -> String {
             continue;
         }
         if matches!(c, 'r' | 'b' | 'c') {
-            if let Some((hashes, after)) = raw_string_start(&bytes, i) {
-                let end = skip_raw_string(&bytes, after, hashes).min(b.len());
-                if end > i {
-                    out.extend(b[i..end].iter());
-                    i = end;
+            if let Some((hashes, after)) = raw_string_start(&bytes, offsets[i]) {
+                let end = skip_raw_string(&bytes, after, hashes).min(bytes.len());
+                if end > offsets[i] {
+                    let copy = &text[offsets[i]..end];
+                    out.push_str(copy);
+                    i += copy.chars().count();
                     continue;
                 }
             }
+        }
+        // A character literal is not a string: `'"'` must not open one, or the
+        // comment after it stays unmasked and its braces count as code. A lifetime
+        // (`'a`) is not a char literal, so it is left alone.
+        if c == '\'' && is_char_literal_start(&b, i) {
+            out.push(c);
+            i += 1;
+            while i < b.len() {
+                if b[i] == '\\' {
+                    out.push(b[i]);
+                    if i + 1 < b.len() {
+                        out.push(b[i + 1]);
+                    }
+                    i += 2;
+                    continue;
+                }
+                out.push(b[i]);
+                i += 1;
+                if i > 0 && b[i - 1] == '\'' {
+                    break;
+                }
+            }
+            continue;
         }
         if c == '"' {
             out.push(c);
@@ -2524,6 +2564,10 @@ fn comment_mask(text: &str, depth: &mut u32) -> String {
 fn strip_comments_with(text: &str, depth: &mut u32) -> String {
     let b: Vec<char> = text.chars().collect();
     let bytes: Vec<u8> = text.bytes().collect();
+    // The raw-string helpers index *bytes*; this scan indexes chars, so every splice
+    // goes through the char's byte offset -- a non-ASCII raw string otherwise copied
+    // extra source, and a comment after it stayed unmasked.
+    let offsets = char_byte_offsets(text);
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < b.len() {
@@ -2545,14 +2589,38 @@ fn strip_comments_with(text: &str, depth: &mut u32) -> String {
         // A raw string (`r"…"`, `r#"…"#`) is not a string with a quote in it: its
         // contents are copied verbatim, so `r#"a "//" b"#` keeps its markers.
         if matches!(c, 'r' | 'b' | 'c') {
-            if let Some((hashes, after)) = raw_string_start(&bytes, i) {
-                let end = skip_raw_string(&bytes, after, hashes).min(b.len());
-                if end > i {
-                    out.extend(b[i..end].iter());
-                    i = end;
+            if let Some((hashes, after)) = raw_string_start(&bytes, offsets[i]) {
+                let end = skip_raw_string(&bytes, after, hashes).min(bytes.len());
+                if end > offsets[i] {
+                    let copy = &text[offsets[i]..end];
+                    out.push_str(copy);
+                    i += copy.chars().count();
                     continue;
                 }
             }
+        }
+        // A character literal is not a string: `'"'` must not open one, or the
+        // comment after it stays unmasked and its braces count as code. A lifetime
+        // (`'a`) is not a char literal, so it is left alone.
+        if c == '\'' && is_char_literal_start(&b, i) {
+            out.push(c);
+            i += 1;
+            while i < b.len() {
+                if b[i] == '\\' {
+                    out.push(b[i]);
+                    if i + 1 < b.len() {
+                        out.push(b[i + 1]);
+                    }
+                    i += 2;
+                    continue;
+                }
+                out.push(b[i]);
+                i += 1;
+                if i > 0 && b[i - 1] == '\'' {
+                    break;
+                }
+            }
+            continue;
         }
         if c == '"' {
             out.push(c);
@@ -3044,11 +3112,13 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
             continue;
         }
         let line = raw_line.trim();
-        // The enum cursor owns comment state for its own lines: a line that starts
-        // with `/*` can *close* the comment opened on an earlier line, so skipping it
-        // here (below) left the cursor in comment mode and every later line -- the
-        // enum's own `}` and the functions after it -- was discarded as comment text.
         // Inside an enum body: read variants until the closing brace.
+        //
+        // The cursor owns comment state for its own lines: a line that starts with
+        // `/*` can *close* the comment opened on an earlier line, so a filter above it
+        // skipped that line, left the cursor in comment mode, and every later line --
+        // the enum's own `}` and the functions after it -- was discarded as comment
+        // text. The file-level filter therefore sits *after* this branch.
         if cur_enum.is_some() {
             let masked;
             let line: &str = if enum_comment_depth > 0 || line.contains("/*") {
@@ -3060,18 +3130,6 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
             if line.is_empty() {
                 continue;
             }
-        if in_block_comment {
-            if line.contains("*/") {
-                in_block_comment = false;
-            }
-            continue;
-        }
-        if line.starts_with("/*") {
-            if !line.contains("*/") {
-                in_block_comment = true;
-            }
-            continue;
-        }
             if line.starts_with('}') {
                 let (name, def) = cur_enum.take().unwrap();
                 // A variant whose cfg could not be decided means the tags this
@@ -3184,6 +3242,21 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
                 VariantLine::UnreadableDiscriminant => {
                     cur_enum = None;
                 }
+            }
+            continue;
+        }
+        // Outside an enum body, a comment is not code. This must sit *after* the
+        // cursor above: the cursor owns its own comment state, and a filter here
+        // would skip the very line that closes a comment the cursor is carrying.
+                if in_block_comment {
+            if line.contains("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if line.starts_with("/*") {
+            if !line.contains("*/") {
+                in_block_comment = true;
             }
             continue;
         }
@@ -10280,6 +10353,57 @@ mod tests {
                 ("C".to_string(), vec![], 2),
             ],
             "the quoted value keeps its markers, so `B` is present"
+        );
+    }
+
+    /// A `char` literal spelled `'"'` is not a string opener: the comment after it
+    /// must still be masked, or its braces count and a contract-only `const` below
+    /// drops out of the table.
+    #[test]
+    fn a_quote_char_literal_does_not_expose_a_comment() {
+        let src = "const QUOTE: char = '\"'; /* closing delimiter: } */\nconst LIMIT: u8 = 3;\n";
+        let consts = super::crate_level_consts(src);
+        assert!(consts.contains("LIMIT"), "the comment's brace is not depth: {consts:?}");
+        assert!(consts.contains("QUOTE"));
+    }
+
+    /// The raw-string helpers index bytes and the stripper indexes chars, so a
+    /// non-ASCII raw doc string used to copy extra source -- leaving the comment
+    /// after it unmasked, which dropped the variant behind it and shifted the tags.
+    #[test]
+    fn a_unicode_raw_doc_string_does_not_shift_the_tags() {
+        let src = "pub enum E { #[doc = r\"日本語\"] /* note */ A, B, C }\n";
+        let specs = super::extract_with_cfgs(src, &[]);
+        let got: Vec<(String, u64)> = specs
+            .enums
+            .get("E")
+            .expect("three declarations")
+            .variants
+            .iter()
+            .map(|(n, _, d)| (n.clone(), *d))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("A".to_string(), 0),
+                ("B".to_string(), 1),
+                ("C".to_string(), 2),
+            ]
+        );
+    }
+
+    /// A `fn` header inside a comment is not an item, so it must not become the
+    /// enclosing scope of the functions after it (a contract would be keyed to a
+    /// module that does not exist).
+    #[test]
+    fn a_commented_fn_header_does_not_open_a_scope() {
+        let src = "/*\nfn nope() {\n*/\npub fn real() {}\n";
+        let scopes = super::line_scopes(src);
+        let at = src.lines().position(|l| l.contains("real")).expect("line");
+        assert!(
+            scopes[at].path.is_empty(),
+            "the commented `fn nope` is not a scope: {:?}",
+            scopes[at].path
         );
     }
 

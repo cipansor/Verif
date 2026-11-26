@@ -3052,6 +3052,14 @@ mod extern_probe_tests {
     /// would skip itself at the first spawn and report `ok` having tested nothing,
     /// which is the defect this helper exists to make impossible to write by accident.
     fn have(toolchain: &str) -> Option<(String, String)> {
+        // `rustup which --toolchain X` *installs* a missing `X`, silently and over the
+        // network: a test would block for minutes (or forever, with no network) instead
+        // of skipping. `rustup toolchain list` answers from the local state.
+        let listed = Command::new("rustup").args(["toolchain", "list"]).output().ok()?;
+        let installed = String::from_utf8(listed.stdout).ok()?;
+        if !installed.split_whitespace().any(|w| w == toolchain) {
+            return None;
+        }
         let out = Command::new("rustup")
             .args(["which", "--toolchain", toolchain, "rustc"])
             .output()
