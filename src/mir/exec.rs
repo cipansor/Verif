@@ -2074,12 +2074,6 @@ impl Env {
     /// describe a value that is no longer there. The *length* of an indexed local
     /// is kept: it is a property of the type, not of the value, so a reassigned
     /// array still has its `N`.
-    /// Drop every nested path through `prefix` for `local`.
-    ///
-    /// Called when an *intermediate* aggregate is overwritten (`o.i = ...`), so the
-    /// seeded leaves under it (`o.i.v`) no longer describe the value in the store.
-    /// A stale part is a wrong value, not a missing one, so it is dropped rather
-    /// than read later.
     /// Drop the seeded **lengths** of the fields a write replaces.
     ///
     /// A field length describes the value stored in a field, not a permanent
@@ -2095,6 +2089,12 @@ impl Env {
         self.field_lens.retain(|(l, chain), _| *l != local || !chain.starts_with(prefix));
     }
 
+    /// Drop every nested path through `prefix` for `local`.
+    ///
+    /// Called when an *intermediate* aggregate is overwritten (`o.i = ...`), so the
+    /// seeded leaves under it (`o.i.v`) no longer describe the value in the store.
+    /// A stale part is a wrong value, not a missing one, so it is dropped rather
+    /// than read later.
     fn forget_nested_under(&mut self, local: u32, prefix: &[u32]) {
         self.nested
             .retain(|(l, chain), _| *l != local || !chain.starts_with(prefix));
@@ -10921,16 +10921,6 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
         // other pointer has metadata this model cannot express, and answering
         // `Unknown` there is what keeps an invented length out of a proof.
         Rvalue::PtrMetadata(p) => length_of(env, f, p),
-        // The tag lives on the *local*, so only a place that denotes that local
-        // whole can be answered. A nested enum's place is projected --
-        // `discriminant(((_1 as A).0))` -- and reading the outer local's tag there
-        // sent the `match` down the wrong arm: `Outer::A(Inner::X)` and
-        // `Outer::A(Inner::Y)` share the outer tag `0`, so the inner match
-        // collapsed to one arm and a contract about the other was *proved*. A
-        // projected place is refused, which is what the nested shape did before
-        // the parser learned to read a parenthesised place at all; `resolve`
-        // collapses the one transparent case (`(*_1)`, a reference argument
-        // modelled as its referent).
         Rvalue::Discriminant(raw) => {
             // The tag lives on the *local*, so only a place that denotes that local
             // whole can be answered. A nested enum's place is projected --
@@ -11090,11 +11080,16 @@ fn length_of(env: &Env, f: &MirFn, p: &Place) -> Val {
             if let Some(len) = env.field_lens.get(&(p.local, chain)) {
                 return Val::Sym(*len, Sign::Unsigned);
             }
+            return match type_of_place(f, p) {
+                Some(Ty::Array(_, n)) => Val::Sym(smt::word(n, USIZE_WIDTH), Sign::Unsigned),
+                _ => Val::Unknown,
+            };
         }
-        return match type_of_place(f, p) {
-            Some(Ty::Array(_, n)) => Val::Sym(smt::word(n, USIZE_WIDTH), Sign::Unsigned),
-            _ => Val::Unknown,
-        };
+        // A projection that is not all fields (`(*_v)`, a `Downcast`) is the base
+        // local's own value seen through one step, so it falls through to the
+        // stores below rather than being answered here -- that is what makes
+        // `v.as_slice()[0]`'s bounds check read the `Vec`'s tracked length. Only a
+        // *field* path has a length of its own to look up.
     }
     match env.indexed.get(&p.local) {
         // A slice argument, whose length is a symbolic input.
