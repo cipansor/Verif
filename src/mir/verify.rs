@@ -2270,13 +2270,18 @@ pub fn verify_file_with_opts(
         report.outcomes.push((key, outcome));
     }
     if let (Some(dir), Some(k)) = (&opts.cache, &cache_key) {
-        // Merge with the previous entries, so a `--function` run does not drop the
-        // verdicts it did not recompute.
-        let mut merged = cached;
-        for (n, c) in fresh {
-            merged.insert(n, c);
+        // Nothing recomputed means nothing to record: rewriting the file on a pure
+        // cache hit would make "was the entry reused" unobservable (a test can only
+        // see an mtime), and it writes the same bytes back for no reason.
+        if !fresh.is_empty() {
+            // Merge with the previous entries, so a `--function` run does not drop
+            // the verdicts it did not recompute.
+            let mut merged = cached;
+            for (n, c) in fresh {
+                merged.insert(n, c);
+            }
+            let _ = super::cache::store(dir, k, &merged);
         }
-        let _ = super::cache::store(dir, k, &merged);
     }
     for m in &report.missing {
         if let Some(c) = specs.by_fn.get(m) {

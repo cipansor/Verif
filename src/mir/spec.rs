@@ -2422,7 +2422,64 @@ fn strip_call<'a>(p: &'a str, name: &str) -> Option<&'a str> {
 /// `feature="std"` are one spelling. Quoted values keep their quotes, which is how
 /// the `--cfg feature="std"` flag is spelled.
 fn normalise_cfg(v: &str) -> String {
-    v.chars().filter(|c| !c.is_whitespace()).collect()
+    // A comment inside the attribute is not part of the predicate:
+    // `feature = "extra" /* note */` names `feature="extra"`, and leaving the
+    // comment in made the lookup miss and answer `false` -- so the variant was
+    // dropped although rustc keeps it, shifting every later tag.
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    while let Some(open) = rest.find("/*") {
+        let line = rest.find("//");
+        // A line comment before the block comment ends the predicate.
+        if let Some(l) = line {
+            if l < open {
+                out.push_str(&rest[..l]);
+                return out.chars().filter(|c| !c.is_whitespace()).collect();
+            }
+        }
+        out.push_str(&rest[..open]);
+        match rest[open + 2..].find("*/") {
+            Some(e) => rest = &rest[open + 2 + e + 2..],
+            None => return out.chars().filter(|c| !c.is_whitespace()).collect(),
+        }
+    }
+    match rest.find("//") {
+        Some(l) => out.push_str(&rest[..l]),
+        None => out.push_str(rest),
+    }
+    out.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// How many commas `text` has outside brackets, strings and a trailing one.
+///
+/// Two variants on one line (`A, B,`) are read as one declaration by
+/// `enum_variant`, so the second is silently omitted and every later tag shifts.
+/// The reader refuses a layout when this is non-zero.
+fn top_level_commas(text: &str) -> usize {
+    let text = strip_line_comment(text).trim();
+    let text = text.strip_suffix(',').unwrap_or(text);
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut count = 0;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if in_str {
+            if c == '\\' {
+                chars.next();
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => count += 1,
+            _ => {}
+        }
+    }
+    count
 }
 
 /// The `#[cfg(…)]` predicates at the start of `line`, in order.
@@ -2892,6 +2949,12 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
             // reader's tags may not be the compiled ones.
             if unknown {
                 enum_undecidable = true;
+            }
+            // Two declarations on one line: `enum_variant` reads the first and the
+            // second is omitted, which shifts every later tag.
+            if top_level_commas(variant_line) > 0 {
+                enum_undecidable = true;
+                continue;
             }
             // An *enabled* variant whose declaration wraps: this reader would have to
             // join the payload to parse it, and a partial read is a phantom variant.
@@ -9968,6 +10031,34 @@ mod tests {
         assert!(
             !specs.enums.contains_key("P"),
             "a variant whose cfg cannot be decided must not produce a layout"
+        );
+    }
+
+    /// A comment inside a `#[cfg]` attribute is not part of the predicate: leaving
+    /// it in made `feature = "extra"` look unknown, so the variant was dropped and
+    /// every later tag shifted -- a wrong arm, not a weaker proof.
+    #[test]
+    fn a_comment_inside_a_cfg_does_not_change_the_predicate() {
+        let src = "pub enum R {\n    A,\n    #[cfg(feature = \"extra\" /* note */)]\n    B,\n    C,\n}\n";
+        let std_only = ["--cfg".to_string(), "feature=\"std\"".to_string()];
+        let specs = super::extract_with_cfgs(src, &std_only);
+        let def = specs.enums.get("R").expect("the predicate is decidable");
+        assert_eq!(
+            def.variants,
+            vec![("A".to_string(), vec![], 0), ("C".to_string(), vec![], 1)],
+            "the comment is not part of `feature = \"extra\"`"
+        );
+    }
+
+    /// Two variants on one line are read as one declaration, so the second would be
+    /// silently omitted and every later tag would shift. The layout is refused.
+    #[test]
+    fn two_variants_on_one_line_refuse_the_layout() {
+        let src = "pub enum S {\n    A, B,\n    C,\n}\n";
+        let specs = super::extract_with_cfgs(src, &[]);
+        assert!(
+            !specs.enums.contains_key("S"),
+            "a line holding two declarations must not produce a layout"
         );
     }
 
