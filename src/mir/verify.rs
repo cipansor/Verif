@@ -2264,11 +2264,13 @@ pub fn verify_file_with_opts(
         let outcome = match cached.get(&f.name) {
             Some(c) => c.to_outcome(),
             None => {
-                // Only a verdict this run *computed* is worth writing back; a cache
-                // hit is already in the file, and re-storing the merged set on every
-                // run made "was the entry reused" unobservable from outside.
-                recomputed = true;
-                smt::with_fresh(|| verify_function(&prog, f, &specs))
+                let fresh_outcome = smt::with_fresh(|| verify_function(&prog, f, &specs));
+                // Only a *cacheable* verdict this run computed is worth writing back:
+                // a hit is already in the file, and a `Skipped`/`Incomplete` is never
+                // stored, so counting it would create an empty entry on a cold run
+                // and rewrite the file on a warm one.
+                recomputed |= super::cache::Cached::of(&fresh_outcome).is_some();
+                fresh_outcome
             }
         };
         if let Some(c) = super::cache::Cached::of(&outcome) {

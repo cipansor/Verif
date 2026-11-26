@@ -2488,11 +2488,24 @@ fn strip_comments(text: &str) -> String {
             break;
         }
         if c == '/' && b.get(i + 1) == Some(&'*') {
+            // Rust nests block comments, so only the *outermost* closer ends one:
+            // `/* /* */ ) */` keeps the `)` inside the comment, and ending at the
+            // inner closer let that parenthesis close a declaration early.
+            let mut depth = 1;
             i += 2;
-            while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
+            while i + 1 < b.len() && depth > 0 {
+                if b[i] == '/' && b[i + 1] == '*' {
+                    depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if b[i] == '*' && b[i + 1] == '/' {
+                    depth -= 1;
+                    i += 2;
+                    continue;
+                }
                 i += 1;
             }
-            i = (i + 2).min(b.len());
             out.push(' ');
             continue;
         }
@@ -3020,7 +3033,12 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
                 variant_depth = bracket_depth(variant_line);
                 continue;
             }
-            match enum_variant(variant_line) {
+            // The checks above read a comment-free view of the line, so the parser
+            // must too: `A, /* note */` is variant `A`, and handing the raw text to
+            // a parser that strips only line comments dropped it, which numbered the
+            // remaining variants consecutively and shifted every later tag.
+            let decl = strip_comments(variant_line);
+            match enum_variant(&decl) {
                 VariantLine::Variant { name: vname, payload, explicit } => {
                     if let Some((_, def)) = cur_enum.as_mut() {
                         push_variant(def, vname, payload, explicit);
@@ -9149,9 +9167,11 @@ fn enum_head(line: &str, cfgs: &CfgSet) -> Option<(String, EnumHead)> {
     // multi-line reader does per line, so the two agree on numbering by
     // construction.
     if let Some(close) = after.rfind('}') {
-        let inner = &after[..close];
+        // Comments are not part of the body: `{ A, /* first */ B }` is two
+        // variants, and a comma *inside* a comment is not a separator.
+        let inner = strip_comments(&after[..close]);
         let mut def = EnumDef::default();
-        for v in split_top_level(inner, ',') {
+        for v in split_top_level(&inner, ',') {
             // A `#[cfg]`-gated variant on a one-line body: dropped when its
             // predicate is decided false, so the numbering matches rustc's.
             let preds = leading_cfg_preds(&v);
@@ -10114,6 +10134,41 @@ mod tests {
                 ("C".to_string(), vec![], 2),
             ],
             "the quoted value keeps its markers, so `B` is present"
+        );
+    }
+
+    /// A trailing block comment is not part of the declaration: `A, /* note */` is
+    /// variant `A`. The checks strip comments but the parser used to see the raw
+    /// line and drop the variant, numbering the rest consecutively.
+    #[test]
+    fn a_trailing_block_comment_keeps_its_variant() {
+        let src = "pub enum E {\n    A, /* first option */\n    B,\n    C,\n}\n";
+        let specs = super::extract_with_cfgs(src, &[]);
+        let def = specs.enums.get("E").expect("three declarations");
+        assert_eq!(
+            def.variants,
+            vec![
+                ("A".to_string(), vec![], 0),
+                ("B".to_string(), vec![], 1),
+                ("C".to_string(), vec![], 2),
+            ],
+            "`A` keeps tag 0 and `B` tag 1"
+        );
+    }
+
+    /// Rust nests block comments, so only the outermost closer ends one. Ending at
+    /// the inner closer read `) */` as code, which closed a disabled declaration
+    /// early and left its payload as a phantom variant.
+    #[test]
+    fn a_nested_block_comment_does_not_end_early() {
+        let src = "pub enum X {\n    A,\n    #[cfg(feature = \"extra\")]\n    Extra(/* ( /* nested */ ) */\n        u8,\n    ),\n    C,\n}\n";
+        let std_only = ["--cfg".to_string(), "feature=\"std\"".to_string()];
+        let specs = super::extract_with_cfgs(src, &std_only);
+        let def = specs.enums.get("X").expect("X is a declared enum");
+        assert_eq!(
+            def.variants,
+            vec![("A".to_string(), vec![], 0), ("C".to_string(), vec![], 1)],
+            "`Extra` and its payload contribute no tag"
         );
     }
 

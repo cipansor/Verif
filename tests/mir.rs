@@ -7062,6 +7062,26 @@ fn a_mut_vec_postcondition_reads_the_final_length() {
     );
 }
 
+/// A trailing block comment on a variant is not part of the declaration. With it
+/// mis-parsed, `B` took tag 0 -- `A`'s -- so a contract naming `B` was checked
+/// against the `A` arm.
+#[test]
+fn a_trailing_block_comment_keeps_a_variants_tag() {
+    let Some(t) = verify_src(
+        "pick_b",
+        "pub enum E { A, /* first option */ B, C }\n\
+         /// requires: m == E::B\n\
+         /// ensures: ret == 1\n\
+         pub fn pick_b(m: E) -> u8 { match m { E::A => 0, E::B => 1, _ => 2 } }",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(t, FnOutcome::Verified { .. }),
+        "`E::B` must select the `B` arm, got {t}"
+    );
+}
+
 /// A write through a `Box` pointer (`*b = v`) reaches the boxed store, so a later `*b`
 /// reads the *new* value: a true contract (`ret == 7`) verifies and the stale one
 /// (`ret == 0`) is refuted. The write actually runs -- it is not refused at the null
