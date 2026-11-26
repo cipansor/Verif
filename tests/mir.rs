@@ -7062,6 +7062,26 @@ fn a_mut_vec_postcondition_reads_the_final_length() {
     );
 }
 
+/// A block comment that spans lines inside an enum body used to hang the frontend
+/// (a pre-pass looped on it), which reports no verdict at all. The contract also
+/// pins that the comment contributes no variant: a phantom one would shift `B`.
+#[test]
+fn a_block_comment_spanning_lines_is_not_a_variant() {
+    let Some(t) = verify_src(
+        "pick_spanning",
+        "pub enum Y {\n    #[doc = \"First option\"] /* note\n    continues here */\n    A,\n    B,\n    C,\n}\n\
+         /// requires: m == Y::B\n\
+         /// ensures: ret == 1\n\
+         pub fn pick_spanning(m: Y) -> u8 { match m { Y::A => 0, Y::B => 1, _ => 2 } }",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(t, FnOutcome::Verified { .. }),
+        "`Y::B` must select the `B` arm, got {t}"
+    );
+}
+
 /// A trailing block comment on a variant is not part of the declaration. With it
 /// mis-parsed, `B` took tag 0 -- `A`'s -- so a contract naming `B` was checked
 /// against the `A` arm.

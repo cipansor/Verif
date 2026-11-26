@@ -1067,7 +1067,11 @@ pub fn crate_level_consts(source: &str) -> BTreeSet<String> {
                         in_block_comment = false;
                         line = &line[i + 2..];
                     }
-                    None => line = "",
+                    // No closer on this line: the rest of it is comment, and the
+                    // comment stays open for the next line. Setting the line to `""`
+                    // and looping spun forever on a block comment that spans lines --
+                    // a hang, which reports no verdict at all.
+                    None => break,
                 }
             } else if let Some(i) = line.find("/*") {
                 in_block_comment = true;
@@ -1225,7 +1229,11 @@ pub(crate) fn line_scopes(source: &str) -> Vec<LineScope> {
                         in_block_comment = false;
                         line = &line[i + 2..];
                     }
-                    None => line = "",
+                    // No closer on this line: the rest of it is comment, and the
+                    // comment stays open for the next line. Setting the line to `""`
+                    // and looping spun forever on a block comment that spans lines --
+                    // a hang inside a *pre-pass*, so no verdict was ever printed.
+                    None => break,
                 }
             } else if let Some(i) = line.find("/*") {
                 in_block_comment = true;
@@ -2438,11 +2446,37 @@ fn normalise_cfg(v: &str) -> String {
 /// second answer. `/* } */` is no brace, `"a//b"` is one value, and `'"'` is not
 /// the start of a literal.
 fn strip_comments(text: &str) -> String {
+    let mut depth = 0u32;
+    strip_comments_with(text, &mut depth)
+}
+
+/// [`strip_comments`], carrying an open block comment's depth across calls.
+///
+/// The enum reader works one source line at a time, and a block comment can open
+/// after a variant's attribute and close on a later line. A per-line stripper
+/// cannot see that, so the continuation text read as code and `enum_variant` took
+/// its first word as a phantom variant -- which numbered the real variants one
+/// higher than rustc did, so a contract naming `B` was checked against `C`'s arm.
+fn strip_comments_with(text: &str, depth: &mut u32) -> String {
     let b: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < b.len() {
         let c = b[i];
+        if *depth > 0 {
+            if c == '/' && b.get(i + 1) == Some(&'*') {
+                *depth += 1;
+                i += 2;
+                continue;
+            }
+            if c == '*' && b.get(i + 1) == Some(&'/') {
+                *depth -= 1;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
         if c == '"' {
             out.push(c);
             i += 1;
@@ -2491,16 +2525,16 @@ fn strip_comments(text: &str) -> String {
             // Rust nests block comments, so only the *outermost* closer ends one:
             // `/* /* */ ) */` keeps the `)` inside the comment, and ending at the
             // inner closer let that parenthesis close a declaration early.
-            let mut depth = 1;
+            *depth = 1;
             i += 2;
-            while i + 1 < b.len() && depth > 0 {
+            while i + 1 < b.len() && *depth > 0 {
                 if b[i] == '/' && b[i + 1] == '*' {
-                    depth += 1;
+                    *depth += 1;
                     i += 2;
                     continue;
                 }
                 if b[i] == '*' && b[i + 1] == '/' {
-                    depth -= 1;
+                    *depth -= 1;
                     i += 2;
                     continue;
                 }
@@ -2905,6 +2939,10 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
     // `u8,` and `),` to be read as variants -- and `u8,` looks exactly like a unit
     // variant, so it became a phantom tag and shifted every later discriminant.
     let mut variant_depth: i32 = 0;
+    // An open block comment inside an enum body, carried across lines: a comment can
+    // open after a variant's attribute and close on a later line, and reading the
+    // continuation as code made its first word a phantom variant.
+    let mut enum_comment_depth: u32 = 0;
     // An undecidable `#[cfg]` seen on an attribute-only line, carried to the variant
     // below it. `cfg_pending` cannot hold it: `None` there means "no constraint".
     let mut cfg_pending_unknown = false;
@@ -2943,6 +2981,16 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
         }
         // Inside an enum body: read variants until the closing brace.
         if cur_enum.is_some() {
+            let masked;
+            let line: &str = if enum_comment_depth > 0 || line.contains("/*") {
+                masked = strip_comments_with(line, &mut enum_comment_depth);
+                masked.trim()
+            } else {
+                line
+            };
+            if line.is_empty() {
+                continue;
+            }
             if line.starts_with('}') {
                 let (name, def) = cur_enum.take().unwrap();
                 // A variant whose cfg could not be decided means the tags this
@@ -2953,6 +3001,7 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
                     specs.enums.insert(name, def);
                 }
                 enum_undecidable = false;
+                enum_comment_depth = 0;
                 continue;
             }
             // A variant declaration that wrapped across lines is still open: the
@@ -3172,6 +3221,7 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
                     enum_undecidable = false;
                     variant_depth = 0;
                     cfg_pending_unknown = false;
+                    enum_comment_depth = 0;
                 }
                 // The body was refused *and* closed on this line. Opening a
                 // cursor here would run past the brace and consume every
@@ -10137,6 +10187,22 @@ mod tests {
         );
     }
 
+    /// A block comment that spans lines used to *hang* the frontend: the pre-pass
+    /// that maps each line to its scope set the line to `""` and looped when the
+    /// comment had no closer on it. A hang reports no verdict at all, which this
+    /// crate treats as worse than a refusal, so the test asserts the layout.
+    #[test]
+    fn a_block_comment_spanning_lines_terminates() {
+        let src = "pub enum Y {\n    /* note\n    cont */\n    A,\n    B,\n}\n";
+        let specs = super::extract_with_cfgs(src, &[]);
+        let def = specs.enums.get("Y").expect("Y is a declared enum");
+        assert_eq!(
+            def.variants,
+            vec![("A".to_string(), vec![], 0), ("B".to_string(), vec![], 1)],
+            "the comment contributes no variant"
+        );
+    }
+
     /// A trailing block comment is not part of the declaration: `A, /* note */` is
     /// variant `A`. The checks strip comments but the parser used to see the raw
     /// line and drop the variant, numbering the rest consecutively.
@@ -13852,4 +13918,5 @@ fn h<
             assert_eq!(got.first().map(|(_, t)| t.as_str()), Some(want), "clause of {text:?}");
         }
     }
+
 }
