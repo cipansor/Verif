@@ -544,6 +544,19 @@ pub struct MirFn {
     /// free function. The owner type is not in the dump; it is looked up from
     /// [`MirProgram::impl_owners`] by this location.
     pub impl_loc: Option<(usize, usize)>,
+    /// The same `impl` location, translated to the *snapshot* line the contract
+    /// maps are keyed by (the crate's sources concatenated, module files inlined).
+    ///
+    /// Two consumers want opposite spellings of one fact, and both are right:
+    /// `resolve_targets` pairs a contract key back to a body through
+    /// `Specs::original_loc`, so it needs the line rustc printed; the owner and
+    /// trait lookups (`method_owner_type`, `impl_self_loc`, the destructor
+    /// resolver) index `MirProgram::impl_owners`/`impl_traits`, which the scanner
+    /// built over the snapshot. Storing both is what keeps them from having to
+    /// agree on a number neither can compute alone. For a single-file crate the two
+    /// are equal; for `mod a;` they differ, and using the original line for the
+    /// owner lookup made *every* `Type::method` call unmodelled.
+    pub impl_snap: Option<(usize, usize)>,
 }
 
 impl MirFn {
@@ -1948,6 +1961,7 @@ fn fold_const_block(
         blocks: Vec::new(),
         written: std::collections::BTreeSet::new(),
         impl_loc: None,
+        impl_snap: None,
     };
     f.locals.insert(0, ret_ty.clone());
     parse_fn_body(lines, start, &mut f, enums);
@@ -3245,6 +3259,7 @@ fn parse_program_impl(
                 blocks: Vec::new(),
                 written: std::collections::BTreeSet::new(),
                 impl_loc,
+                impl_snap: None,
             };
             // Local `_0` is the return place, so it carries the return type.
             f.locals.insert(0, ret_ty);

@@ -4994,6 +4994,19 @@ pub struct FieldEnv {
     /// means the body's `((_1 as Data).0)` and a contract's `m.Data` name one
     /// variable rather than two that look alike.
     pub payload_seeds: Vec<(u32, u64, Var, u8, bool)>,
+    /// `(local, field index, tag variable, tag width, discriminants)` for each
+    /// *enum-typed field* of a struct argument.
+    ///
+    /// A field's tag is an input like any other: the caller chose which variant
+    /// the field holds. Binding it is what makes `match c.op` decidable -- without
+    /// it the field read was `Unknown`, the `switchInt` on its discriminant
+    /// reported "unmodelled switch discriminant", and every function that matched
+    /// on a struct field was undecided (`semver`: 89 of 93 functions).
+    ///
+    /// The discriminants travel with the seed so the executor can assume exactly
+    /// the tag's domain, the same rule [`tag_seeds`](Self::tag_seeds) follows for
+    /// an enum *argument*.
+    pub field_tag_seeds: Vec<(u32, u32, Var, u8, Vec<u64>)>,
     /// `Enum::Variant` → `(discriminant, tag width)`, so a contract can write
     /// `m == Mode::Idle` and have it mean the tag equals that variant's index.
     /// A name not in here is refused, which keeps a misspelled variant from being
@@ -5635,6 +5648,35 @@ impl FieldEnv {
         self.len_seeds.push((local, v, elem_w, elem_signed));
         self.known_args.insert(arg.to_string());
         Some(v)
+    }
+
+    /// Bind an *enum-typed field* of a struct argument: the field's name is the
+    /// tag, and the tag is a symbolic input whose domain is the variant
+    /// discriminants.
+    ///
+    /// The value of a unit-only enum *is* its tag, so the field also goes through
+    /// [`bind_bits`](Self::bind_bits) at the tag's width: a contract's `c.op` and
+    /// the body's `((*_1).0)` then read one variable. Only the tag is modelled --
+    /// a variant *payload* reached through a field projection is still refused,
+    /// which is the honest boundary (`get`'s downcast arm answers a payload of a
+    /// local, not of a field).
+    pub fn bind_enum_field(
+        &mut self,
+        local: u32,
+        arg: &str,
+        field: &str,
+        index: u32,
+        def: &EnumDef,
+    ) -> Option<()> {
+        if def.variants.is_empty() {
+            return None;
+        }
+        let width = def.tag_width();
+        self.bind_bits(local, arg, field, index, width, false)?;
+        let tag = *self.vars.get(&format!("{arg}__f{index}"))?;
+        let discs: Vec<u64> = def.variants.iter().map(|(_, _, d)| *d).collect();
+        self.field_tag_seeds.push((local, index, tag, width, discs));
+        Some(())
     }
 
     /// Bind the *length* of a slice- or `str`-typed field: `self.slice.len()`.
@@ -10175,6 +10217,15 @@ pub fn field_env_named(
         env.declare_arg(&arg);
         let Some(def) = struct_lookup(structs, name) else { continue };
         for (i, (fname, fty)) in def.fields.iter().enumerate() {
+            // An enum-typed field is bound as its *tag*, which is the only thing a
+            // `match` on it reads. Checked before `bind`, because `bind` returns
+            // `None` for a type with no width and the field would stay unseeded.
+            if let Ty::Other(fname_ty) = fty {
+                let def = enums.get(fname_ty).cloned().or_else(|| std_enum_def(fname_ty));
+                if let Some(def) = def {
+                    env.bind_enum_field(l, &arg, fname, i as u32, &def);
+                }
+            }
             env.bind(l, &arg, fname, i as u32, fty);
             if FieldEnv::field_has_len(fty) {
                 env.bind_field_len(l, &arg, fname, i as u32);

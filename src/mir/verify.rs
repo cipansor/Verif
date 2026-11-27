@@ -2077,6 +2077,7 @@ pub fn verify_function(prog: &MirProgram, f: &MirFn, specs: &Specs) -> FnOutcome
             path_elems: fields.path_elem_seeds.clone(),
             tags: fields.tag_seeds.clone(),
             payload_seeds: fields.payload_seeds.clone(),
+            field_tags: fields.field_tag_seeds.clone(),
             pins,
         },
         rec,
@@ -2227,8 +2228,9 @@ pub fn verify_file_with_opts(
     // missing from a numbering shifts every later implicit discriminant.
     let specs = spec::extract_crate_with_cfgs(source, &text, &opts.rustc_args);
     let (mir, edition) = emit_mir_with_opts(rustc, source, opts)?;
-    let prog =
+    let mut prog =
         parse::parse_program_scoped(&mir, &enum_layouts(&specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners, &specs.impl_traits, &specs.impl_trait_args, &specs.declared_traits);
+    fill_impl_snapshot(&mut prog, &specs);
 
     let (targets, missing) = resolve_targets(&prog, &specs);
     let mut report = FileReport {
@@ -2363,6 +2365,27 @@ fn impl_file_matches_exact(name: &str, want: Option<&Path>) -> bool {
         }
         (Some(_), None) => true,
         _ => false,
+    }
+}
+
+
+/// Fill in every method's *snapshot* `impl` line, which is the key the contract
+/// maps (`impl_owners`, `impl_traits`) are stored under.
+///
+/// The parser records the line rustc printed (`impl at FILE:L:C`), which is the
+/// file's own numbering; the scanner keys the maps by the snapshot line (the
+/// crate's sources concatenated, `mod a;` inlined). For a single file the two
+/// numbers coincide, so nothing notices; with one module file every later `impl`
+/// shifts, and the owner lookup missed for *every* method -- so a call to a local
+/// associated function was "call to unmodelled function" (`semver`'s
+/// `Identifier::empty` alone blocked 15 functions).
+///
+/// Both entry points that parse a dump call this. They did not, at first, and the
+/// one that was missed was the one `cargo verif` uses: a fix in a single site is a
+/// fix for the tests that site happens to run.
+fn fill_impl_snapshot(prog: &mut MirProgram, specs: &Specs) {
+    for f in prog.fns.iter_mut() {
+        f.impl_snap = specs.snapshot_impl_loc(&f.name);
     }
 }
 
@@ -2634,8 +2657,18 @@ pub fn verify_mir_text(
     specs: &Specs,
     only: &[String],
 ) -> Result<FileReport, String> {
-    let prog =
+    let mut prog =
         parse::parse_program_scoped(mir, &enum_layouts(specs), &specs.crate_consts, &specs.const_generics, &specs.impl_owners, &specs.impl_traits, &specs.impl_trait_args, &specs.declared_traits);
+    // `impl_owners`/`impl_traits` are keyed by the *snapshot* line (the crate's
+    // sources concatenated, module files inlined), while the parser records the line
+    // rustc printed -- the file's own. For a single-file crate the two are the same
+    // number; for a crate with `mod a;` every later `impl` shifts, so *no*
+    // `Type::method` call resolved and a local associated function was reported
+    // "unmodelled" (`semver`'s `Identifier::empty`: 15 functions). Translating once,
+    // here, keeps every consumer (`method_owner_type`, `impl_self_loc`, the
+    // destructor resolver) on one key. A name whose line has no map entry becomes
+    // `None`: an unknown owner is a refusal, not a guess.
+    fill_impl_snapshot(&mut prog, specs);
     let (targets, missing) = resolve_targets(&prog, specs);
     let mut report = FileReport { missing, ..Default::default() };
     // A request matching both a bare tail and a full path (e.g. `f` and `m::f`)
