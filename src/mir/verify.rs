@@ -3038,6 +3038,15 @@ mod extern_probe_tests {
     /// crate demo (C8): `embedded-hal` resolved to no extern and the file failed
     /// `E0433` even though the rlib was found.
     #[test]
+    fn a_listed_toolchain_matches_its_short_name() {
+        assert!(names_toolchain("stable-x86_64-unknown-linux-gnu", "stable"));
+        assert!(names_toolchain("1.85-x86_64-unknown-linux-gnu", "1.85"));
+        assert!(names_toolchain("nightly", "nightly"));
+        assert!(!names_toolchain("stable-x86_64-unknown-linux-gnu", "1.85"));
+        assert!(!names_toolchain("stableness", "stable"));
+    }
+
+    #[test]
     fn a_hyphenated_dependency_name_is_an_underscored_extern() {
         assert_eq!(extern_name("embedded-hal"), "embedded_hal");
         assert_eq!(extern_name("scratch_dep"), "scratch_dep");
@@ -3051,13 +3060,24 @@ mod extern_probe_tests {
     /// `Command::new` on it fails. A test that used the identity as the program
     /// would skip itself at the first spawn and report `ok` having tested nothing,
     /// which is the defect this helper exists to make impossible to write by accident.
+    /// `rustup toolchain list` prints `stable-x86_64-unknown-linux-gnu (default)`,
+    /// not `stable`, so a name match has to accept the `-<triple>` suffix -- otherwise
+    /// the compatibility tests skip their assertions on a machine where CI installed
+    /// exactly the toolchains they need.
+    fn names_toolchain(listed: &str, toolchain: &str) -> bool {
+        listed == toolchain
+            || listed
+                .strip_prefix(toolchain)
+                .is_some_and(|rest| rest.starts_with('-'))
+    }
+
     fn have(toolchain: &str) -> Option<(String, String)> {
         // `rustup which --toolchain X` *installs* a missing `X`, silently and over the
         // network: a test would block for minutes (or forever, with no network) instead
         // of skipping. `rustup toolchain list` answers from the local state.
         let listed = Command::new("rustup").args(["toolchain", "list"]).output().ok()?;
         let installed = String::from_utf8(listed.stdout).ok()?;
-        if !installed.split_whitespace().any(|w| w == toolchain) {
+        if !installed.split_whitespace().any(|w| names_toolchain(w, toolchain)) {
             return None;
         }
         let out = Command::new("rustup")

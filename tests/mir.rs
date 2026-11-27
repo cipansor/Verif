@@ -7062,6 +7062,60 @@ fn a_mut_vec_postcondition_reads_the_final_length() {
     );
 }
 
+/// A multi-line string is not a comment: a `/*` inside it must not swallow the
+/// contracts below, and a comment that shares a line with a declaration must not
+/// hide the declaration (which would leave its contract to the *next* function).
+#[test]
+fn a_string_or_a_leading_comment_does_not_swallow_a_later_contract() {
+    // A `/*` inside a multi-line string is not a comment: the contract below it must
+    // still reach `after_string`, so the false postcondition is *refuted*.
+    let Some(t) = verify_src(
+        "after_string",
+        "const OPEN: &str = r#\"\n/*\n\"#;\n\
+         /// ensures: ret == 1\n\
+         pub fn after_string() -> u8 { 0 }\n",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(&t, FnOutcome::Failed { kind, .. } if kind.contains("postcondition")),
+        "the `/*` inside the string is not a comment, got {t}"
+    );
+
+    // A comment that shares a line with a declaration hides nothing: `first` keeps
+    // its contract, and `second` (no contract of its own) does not inherit it.
+    let src = "/// ensures: ret == 1\n\
+               /* API note */ pub fn first() -> u8 { 1 }\n\
+               /// ensures: ret == 0\n\
+               pub fn second() -> u8 { 0 }\n";
+    let Some(first) = verify_src("first", src) else { return };
+    assert!(
+        matches!(&first, FnOutcome::Verified { .. }),
+        "the comment shares the line with `first`, so `first` keeps its contract: {first}"
+    );
+    let Some(second) = verify_src("second", src) else { return };
+    assert!(
+        matches!(&second, FnOutcome::Verified { .. }),
+        "`second` has no contract of its own: {second}"
+    );
+
+    // A comment-prefixed *non-function* item still ends the doc block, so its clause
+    // is not carried to the next function.
+    let Some(third) = verify_src(
+        "third",
+        "/// ensures: ret == 1\n\
+         /* note */ pub struct NotAFn;\n\
+         /// ensures: ret == 0\n\
+         pub fn third() -> u8 { 0 }\n",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(&third, FnOutcome::Verified { .. }),
+        "a comment-prefixed struct ends the doc block: {third}"
+    );
+}
+
 /// A standalone block comment between a contract and its function is not an item
 /// boundary: the contract must still reach `f`. Treating the comment as a boundary
 /// cleared the pending clause, so the function was checked against `true` -- a false

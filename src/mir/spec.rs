@@ -2430,6 +2430,111 @@ fn char_byte_offsets(text: &str) -> Vec<usize> {
     v
 }
 
+/// The lexical state that outlives one source line, for the clause reader: whether
+/// the line *begins* inside a string literal, and which delimiter closes it.
+///
+/// The reader walks the source line by line, and a string can span lines
+/// (`const OPEN: &str = r#"\n/*\n"#;`). Without this, the `/*` inside the literal
+/// opened a block comment that swallowed every contract below it -- and a function
+/// whose contract is never read is not refuted, it is *dropped from the check set*,
+/// which reads as a clean run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StrOpen {
+    Code,
+    Plain,
+    Raw(usize),
+}
+
+/// The string state at the end of `line`, given the state it began in.
+fn str_state(line: &str, mut st: StrOpen) -> StrOpen {
+    let b: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match st {
+            StrOpen::Plain => {
+                if c == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == '"' {
+                    st = StrOpen::Code;
+                }
+                i += 1;
+            }
+            StrOpen::Raw(hashes) => {
+                if c == '"'
+                    && b.len() >= i + 1 + hashes
+                    && b[i + 1..i + 1 + hashes].iter().all(|&h| h == '#')
+                {
+                    i += 1 + hashes;
+                    st = StrOpen::Code;
+                } else {
+                    i += 1;
+                }
+            }
+            StrOpen::Code => {
+                // A comment runs to the end of the line, so a `"` after it is text.
+                if c == '/' && matches!(b.get(i + 1), Some('/') | Some('*')) {
+                    return StrOpen::Code;
+                }
+                if c == '\'' && is_char_literal_start(&b, i) {
+                    i += 1;
+                    while i < b.len() {
+                        if b[i] == '\\' {
+                            i += 2;
+                            continue;
+                        }
+                        let done = b[i] == '\'';
+                        i += 1;
+                        if done {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                let mut j = i;
+                if matches!(c, 'b' | 'c') {
+                    j += 1;
+                }
+                if b.get(j) == Some(&'r') {
+                    let mut k = j + 1;
+                    let mut hashes = 0;
+                    while b.get(k) == Some(&'#') {
+                        hashes += 1;
+                        k += 1;
+                    }
+                    if b.get(k) == Some(&'"') {
+                        st = StrOpen::Raw(hashes);
+                        i = k + 1;
+                        continue;
+                    }
+                }
+                if c == '"' {
+                    st = StrOpen::Plain;
+                }
+                i += 1;
+            }
+        }
+    }
+    st
+}
+
+/// Strip the block comments that open *and* close at the start of `line`, so a
+/// comment sharing a line with a declaration does not hide the declaration -- which
+/// would leave its contract pending for the *next* function. A comment still open is
+/// returned as it stands, for the caller's block-comment state machine.
+fn strip_leading_closed_comments(line: &str) -> &str {
+    let mut t = line.trim_start();
+    while let Some(rest) = t.strip_prefix("/*") {
+        match rest.find("*/") {
+            Some(i) => t = rest[i + 2..].trim_start(),
+            None => return t,
+        }
+    }
+    t
+}
+
 /// [`strip_comments`]'s *masking* sibling: comment characters become spaces, so the
 /// result has the same length and the same columns, and a brace or a header inside a
 /// comment is not code.
@@ -3010,6 +3115,9 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
     let mut seen_contract_keys: BTreeSet<String> = BTreeSet::new();
     let mut pending = FnContract::default();
     let mut in_block_comment = false;
+    // The string state carried across lines: a `/*` inside a multi-line literal is
+    // not a comment, and a line that begins inside one is not code.
+    let mut str_open = StrOpen::Code;
     // Which `const` items are declared at the crate root, before any brace opens.
     // The dump cannot tell a crate-level `const` from a function-local one, so a
     // contract that names a crate-level constant the body never uses would
@@ -3111,7 +3219,16 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
         if skip_through.is_some_and(|end| lineno <= end) {
             continue;
         }
-        let line = raw_line.trim();
+        let begins_in_string = str_open != StrOpen::Code;
+        str_open = str_state(raw_line, str_open);
+        if begins_in_string {
+            // A line inside a multi-line literal is not code: it must not open an
+            // item, be read as a clause, or clear a pending contract.
+            continue;
+        }
+        // A comment that closes on this line hides nothing: `/* note */ pub fn f()`
+        // is one declaration, and `f` keeps the contract written above it.
+        let line = strip_leading_closed_comments(raw_line);
         // Inside an enum body: read variants until the closing brace.
         //
         // The cursor owns comment state for its own lines: a line that starts with

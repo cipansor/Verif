@@ -63,6 +63,11 @@ fn main() {
         }
     };
 
+    if std::env::var("VERIF_DBG").is_ok() {
+        eprintln!("DBG MIR>>>
+{mir}
+<<<DBG");
+    }
     let source = match std::fs::read_to_string(&src) {
         Ok(t) => t,
         Err(e) => {
