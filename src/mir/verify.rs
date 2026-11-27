@@ -3057,6 +3057,16 @@ mod extern_probe_tests {
         // the install the preflight just found.
         assert!(!names_toolchain("stable-aarch64-apple-darwin", "stable", host));
         assert!(!names_toolchain("stable-x86_64-unknown-linux-gnu", "stable", ""));
+        // The host comes from rustup's own configuration: the compiler on `PATH`
+        // can be a cross build, and then this preflight would reject an install
+        // that is there.
+        let show = "Default host: aarch64-apple-darwin\nrustup home:  /home/x/.rustup\n";
+        assert_eq!(
+            rustup_default_host(show).as_deref(),
+            Some("aarch64-apple-darwin")
+        );
+        assert_eq!(rustup_default_host("rustup home: /x\n"), None);
+        assert_eq!(rustup_default_host("Default host: \n"), None);
     }
 
     #[test]
@@ -3093,12 +3103,28 @@ mod extern_probe_tests {
     }
 
     /// The host triple `rustup which --toolchain <name>` would resolve.
-    fn host_triple() -> Option<String> {
-        let out = Command::new("rustc").arg("-vV").output().ok()?;
-        let text = String::from_utf8(out.stdout).ok()?;
-        text.lines()
-            .find_map(|l| l.strip_prefix("host: "))
+    /// The host `rustup which --toolchain <name>` resolves, read from **rustup's**
+    /// configuration rather than from the compiler on `PATH`.
+    ///
+    /// The two can differ -- a cross-compiler first on `PATH`, an override, a
+    /// `default-host` setting -- and when they do, a preflight that used the
+    /// compiler's host would reject a toolchain that *is* installed, quietly
+    /// skipping the cross-compiler coverage it exists to gate. `rustup show` prints
+    /// `Default host: <triple>`, which is the value the lookup itself uses.
+    fn rustup_default_host(show: &str) -> Option<String> {
+        show.lines()
+            .find_map(|l| l.trim().strip_prefix("Default host: "))
             .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+    }
+
+    fn host_triple() -> Option<String> {
+        let out = Command::new("rustup").args(["show"]).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(out.stdout).ok()?;
+        rustup_default_host(&text)
     }
 
     fn have(toolchain: &str) -> Option<(String, String)> {
