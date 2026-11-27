@@ -3039,34 +3039,43 @@ mod extern_probe_tests {
     /// `E0433` even though the rlib was found.
     #[test]
     fn a_listed_toolchain_matches_its_short_name() {
-        let host = "x86_64-unknown-linux-gnu";
-        assert!(names_toolchain("stable-x86_64-unknown-linux-gnu", "stable", host));
-        assert!(names_toolchain("1.85-x86_64-unknown-linux-gnu", "1.85", host));
-        assert!(names_toolchain("nightly", "nightly", host));
-        assert!(!names_toolchain("stable-x86_64-unknown-linux-gnu", "1.85", host));
-        assert!(!names_toolchain("stableness", "stable", host));
-        // A *dated* nightly is a different toolchain: accepting it would make
-        // `have("nightly")` look up the undated name, which rustup then installs.
-        assert!(!names_toolchain(
-            "nightly-2026-10-23-x86_64-unknown-linux-gnu",
-            "nightly",
-            host
-        ));
-        // So is the same channel installed for *another* host: `rustup which
-        // --toolchain stable` resolves the default host, so the lookup would miss
-        // the install the preflight just found.
-        assert!(!names_toolchain("stable-aarch64-apple-darwin", "stable", host));
-        assert!(!names_toolchain("stable-x86_64-unknown-linux-gnu", "stable", ""));
-        // The host comes from rustup's own configuration: the compiler on `PATH`
-        // can be a cross build, and then this preflight would reject an install
-        // that is there.
-        let show = "Default host: aarch64-apple-darwin\nrustup home:  /home/x/.rustup\n";
+        // The *installed* name is returned, because that is what `rustup which` is
+        // asked for -- and a name from the list cannot install anything, while the
+        // short name can.
         assert_eq!(
-            rustup_default_host(show).as_deref(),
-            Some("aarch64-apple-darwin")
+            resolve_listed(&["stable-x86_64-unknown-linux-gnu"], "stable"),
+            Some("stable-x86_64-unknown-linux-gnu")
         );
-        assert_eq!(rustup_default_host("rustup home: /x\n"), None);
-        assert_eq!(rustup_default_host("Default host: \n"), None);
+        assert_eq!(
+            resolve_listed(&["1.85-x86_64-unknown-linux-gnu"], "1.85"),
+            Some("1.85-x86_64-unknown-linux-gnu")
+        );
+        // The exact name wins over a suffixed one.
+        assert_eq!(
+            resolve_listed(&["stable-x86_64-unknown-linux-gnu", "stable"], "stable"),
+            Some("stable")
+        );
+        // A dated nightly and another host's install are both usable: the lookup is
+        // local, so neither costs a download.
+        assert_eq!(
+            resolve_listed(&["nightly-2026-10-23-x86_64-unknown-linux-gnu"], "nightly"),
+            Some("nightly-2026-10-23-x86_64-unknown-linux-gnu")
+        );
+        assert_eq!(
+            resolve_listed(&["stable-aarch64-apple-darwin"], "stable"),
+            Some("stable-aarch64-apple-darwin")
+        );
+        assert_eq!(
+            resolve_listed(
+                &["nightly-2026-10-23-x86_64-unknown-linux-gnu"],
+                "nightly-2026-10-23"
+            ),
+            Some("nightly-2026-10-23-x86_64-unknown-linux-gnu")
+        );
+        // A prefix that is not the same channel is not a match.
+        assert_eq!(resolve_listed(&["stableness"], "stable"), None);
+        assert_eq!(resolve_listed(&["stable-x86_64-unknown-linux-gnu"], "1.85"), None);
+        assert_eq!(resolve_listed(&[], "stable"), None);
     }
 
     #[test]
@@ -3087,44 +3096,30 @@ mod extern_probe_tests {
     /// not `stable`, so a name match has to accept the `-<triple>` suffix -- otherwise
     /// the compatibility tests skip their assertions on a machine where CI installed
     /// exactly the toolchains they need.
-    fn names_toolchain(listed: &str, toolchain: &str, host: &str) -> bool {
-        if listed == toolchain {
-            return true;
-        }
-        // A `-<triple>` suffix is the same toolchain only when the triple is *this*
-        // host's: `rustup which --toolchain stable` resolves the default host, so an
-        // install for another host is a different toolchain that the lookup would
-        // then fail on. A *dated* nightly (`nightly-2026-10-23-x86_64-…`) is a
-        // different toolchain too.
-        let Some(rest) = listed.strip_prefix(toolchain).and_then(|r| r.strip_prefix('-')) else {
-            return false;
-        };
-        !host.is_empty() && rest == host
-    }
-
-    /// The host triple `rustup which --toolchain <name>` would resolve.
-    /// The host `rustup which --toolchain <name>` resolves, read from **rustup's**
-    /// configuration rather than from the compiler on `PATH`.
+    /// The *installed* name that satisfies `toolchain`, preferring the exact one.
     ///
-    /// The two can differ -- a cross-compiler first on `PATH`, an override, a
-    /// `default-host` setting -- and when they do, a preflight that used the
-    /// compiler's host would reject a toolchain that *is* installed, quietly
-    /// skipping the cross-compiler coverage it exists to gate. `rustup show` prints
-    /// `Default host: <triple>`, which is the value the lookup itself uses.
-    fn rustup_default_host(show: &str) -> Option<String> {
-        show.lines()
-            .find_map(|l| l.trim().strip_prefix("Default host: "))
-            .map(|h| h.trim().to_string())
-            .filter(|h| !h.is_empty())
-    }
-
-    fn host_triple() -> Option<String> {
-        let out = Command::new("rustup").args(["show"]).output().ok()?;
-        if !out.status.success() {
-            return None;
+    /// `rustup toolchain list` prints `stable-x86_64-unknown-linux-gnu (default)`,
+    /// not `stable`, so the match has to accept the `-<triple>` suffix -- otherwise
+    /// the compatibility tests skip their assertions on a machine where CI installed
+    /// exactly the toolchains they need.
+    ///
+    /// The returned name is what `rustup which` is asked for, and that is the whole
+    /// safety argument: a name taken from the installed list cannot install anything,
+    /// while the *short* name can (`rustup which --toolchain nightly` downloads
+    /// nightly). It is also why a dated nightly or a triple for another host may be
+    /// accepted: the lookup is local, and a compiler that does not run on this machine
+    /// fails at the spawn instead of costing a download.
+    fn resolve_listed<'a>(installed: &[&'a str], toolchain: &str) -> Option<&'a str> {
+        if let Some(exact) = installed.iter().find(|n| **n == toolchain) {
+            return Some(exact);
         }
-        let text = String::from_utf8(out.stdout).ok()?;
-        rustup_default_host(&text)
+        installed
+            .iter()
+            .find(|n| {
+                n.strip_prefix(toolchain)
+                    .is_some_and(|rest| rest.starts_with('-'))
+            })
+            .copied()
     }
 
     fn have(toolchain: &str) -> Option<(String, String)> {
@@ -3133,15 +3128,16 @@ mod extern_probe_tests {
         // of skipping. `rustup toolchain list` answers from the local state.
         let listed = Command::new("rustup").args(["toolchain", "list"]).output().ok()?;
         let installed = String::from_utf8(listed.stdout).ok()?;
-        let host = host_triple().unwrap_or_default();
-        if !installed
+        // Only names the list carries: asking for the short name is what installs a
+        // missing toolchain, and `rustup show` (the other way to learn the host) can
+        // do the same when the default toolchain is absent.
+        let names: Vec<&str> = installed
             .split_whitespace()
-            .any(|w| names_toolchain(w, toolchain, &host))
-        {
-            return None;
-        }
+            .filter(|w| !w.starts_with('('))
+            .collect();
+        let resolved = resolve_listed(&names, toolchain)?;
         let out = Command::new("rustup")
-            .args(["which", "--toolchain", toolchain, "rustc"])
+            .args(["which", "--toolchain", resolved, "rustc"])
             .output()
             .ok()?;
         if !out.status.success() {
