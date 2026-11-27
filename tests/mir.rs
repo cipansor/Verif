@@ -7062,6 +7062,35 @@ fn a_mut_vec_postcondition_reads_the_final_length() {
     );
 }
 
+/// A nested comment before a variant, and a quote inside a comment, are both
+/// comment text. Each one used to hide what follows it: the first shifted the
+/// enum's tags (so a contract selecting `B` was checked against rustc's `A` arm),
+/// the second swallowed the contract below it (so the function was dropped from
+/// the check set instead of refuted).
+#[test]
+fn a_nested_comment_and_a_quoted_comment_do_not_hide_what_follows() {
+    let src = "pub enum E {\n    /* Default /* rationale */ option */ A,\n    B,\n    C,\n}\n\
+               /// requires: m == E::B\n\
+               /// ensures: ret == 1\n\
+               pub fn pick(m: E) -> u8 {\n    match m { E::A => 0, E::B => 1, E::C => 2 }\n}\n";
+    let Some(t) = verify_src("pick", src) else { return };
+    assert!(
+        matches!(&t, FnOutcome::Verified { .. }),
+        "`E::B` is tag 1, so `pick` returns 1: {t}"
+    );
+
+    let Some(t) = verify_src(
+        "after_quote_comment",
+        "/*\nA double quote looks like \"\n*/\n/// ensures: ret == 1\npub fn after_quote_comment() -> u8 { 0 }\n",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(&t, FnOutcome::Failed { kind, .. } if kind.contains("postcondition")),
+        "the contract after the comment is read and refuted: {t}"
+    );
+}
+
 /// A multi-line string is not a comment: a `/*` inside it must not swallow the
 /// contracts below, and a comment that shares a line with a declaration must not
 /// hide the declaration (which would leave its contract to the *next* function).

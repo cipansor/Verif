@@ -3044,6 +3044,12 @@ mod extern_probe_tests {
         assert!(names_toolchain("nightly", "nightly"));
         assert!(!names_toolchain("stable-x86_64-unknown-linux-gnu", "1.85"));
         assert!(!names_toolchain("stableness", "stable"));
+        // A *dated* nightly is a different toolchain: accepting it would make
+        // `have("nightly")` look up the undated name, which rustup then installs.
+        assert!(!names_toolchain(
+            "nightly-2026-10-23-x86_64-unknown-linux-gnu",
+            "nightly"
+        ));
     }
 
     #[test]
@@ -3065,10 +3071,19 @@ mod extern_probe_tests {
     /// the compatibility tests skip their assertions on a machine where CI installed
     /// exactly the toolchains they need.
     fn names_toolchain(listed: &str, toolchain: &str) -> bool {
-        listed == toolchain
-            || listed
-                .strip_prefix(toolchain)
-                .is_some_and(|rest| rest.starts_with('-'))
+        if listed == toolchain {
+            return true;
+        }
+        // A `-<triple>` suffix is the same toolchain. A *dated* nightly
+        // (`nightly-2026-10-23-x86_64-…`) is a different one, and treating it as
+        // `nightly` would make the lookup ask rustup for a name that is not
+        // installed -- which installs it.
+        let Some(rest) = listed.strip_prefix(toolchain).and_then(|r| r.strip_prefix('-')) else {
+            return false;
+        };
+        rest.split('-')
+            .next()
+            .is_some_and(|first| !first.starts_with(|c: char| c.is_ascii_digit()))
     }
 
     fn have(toolchain: &str) -> Option<(String, String)> {

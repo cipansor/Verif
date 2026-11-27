@@ -2520,19 +2520,63 @@ fn str_state(line: &str, mut st: StrOpen) -> StrOpen {
     st
 }
 
-/// Strip the block comments that open *and* close at the start of `line`, so a
-/// comment sharing a line with a declaration does not hide the declaration -- which
-/// would leave its contract pending for the *next* function. A comment still open is
-/// returned as it stands, for the caller's block-comment state machine.
-fn strip_leading_closed_comments(line: &str) -> &str {
-    let mut t = line.trim_start();
-    while let Some(rest) = t.strip_prefix("/*") {
-        match rest.find("*/") {
-            Some(i) => t = rest[i + 2..].trim_start(),
-            None => return t,
+/// Mask the block comments that open *and* close at the start of `line`, leaving
+/// everything else at its own offset.
+///
+/// Three things depend on this being a *mask* rather than a strip, and each was a
+/// finding:
+///
+/// * Rust nests block comments, so the run ends at the *matching* `*/`. Closing at
+///   the first one left `option */ A,` for the enum cursor, which read no variant
+///   there and shifted every later tag -- a contract naming `B` was checked against
+///   rustc's `A` arm.
+/// * The macro reader re-reads the line and looks for its first `{`; a stripped
+///   line shifts nothing but a `{` left in a comment is still there, so the comment
+///   had to be blanked for it to find the macro's own brace.
+/// * A comment still open at the end of the line is returned unchanged, for the
+///   caller's block-comment state machine.
+fn mask_leading_comments(line: &str) -> std::borrow::Cow<'_, str> {
+    let b = line.as_bytes();
+    let mut i = 0;
+    let mut end = 0usize;
+    loop {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if b.get(i) != Some(&b'/') || b.get(i + 1) != Some(&b'*') {
+            break;
+        }
+        i += 2;
+        let mut depth = 1u32;
+        while i < b.len() && depth > 0 {
+            if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                depth += 1;
+                i += 2;
+            } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                depth -= 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        if depth > 0 {
+            // Still open: the caller's state machine owns the rest of it.
+            return std::borrow::Cow::Borrowed(line);
+        }
+        end = i;
+    }
+    if end == 0 {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    for (idx, ch) in line.char_indices() {
+        if idx < end {
+            out.push(' ');
+        } else {
+            out.push(ch);
         }
     }
-    t
+    std::borrow::Cow::Owned(out)
 }
 
 /// [`strip_comments`]'s *masking* sibling: comment characters become spaces, so the
@@ -3219,16 +3263,27 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
         if skip_through.is_some_and(|end| lineno <= end) {
             continue;
         }
+        // A line inside a block comment is *comment text*: its quotes and braces
+        // mean nothing, and it must not open an item, be read as a clause, or clear
+        // a pending contract. This has to run before the string state, or a quote in
+        // a comment opened a string and the line that closes the comment was then
+        // skipped as "inside a literal" -- losing every contract below it.
+        if in_block_comment {
+            if raw_line.contains("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
         let begins_in_string = str_open != StrOpen::Code;
         str_open = str_state(raw_line, str_open);
         if begins_in_string {
-            // A line inside a multi-line literal is not code: it must not open an
-            // item, be read as a clause, or clear a pending contract.
+            // A line inside a multi-line literal is not code either.
             continue;
         }
         // A comment that closes on this line hides nothing: `/* note */ pub fn f()`
         // is one declaration, and `f` keeps the contract written above it.
-        let line = strip_leading_closed_comments(raw_line);
+        let masked_leading = mask_leading_comments(raw_line);
+        let line = masked_leading.trim();
         // Inside an enum body: read variants until the closing brace.
         //
         // The cursor owns comment state for its own lines: a line that starts with
@@ -3365,16 +3420,10 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
         // Outside an enum body, a comment is not code. This must sit *after* the
         // cursor above: the cursor owns its own comment state, and a filter here
         // would skip the very line that closes a comment the cursor is carrying.
-                if in_block_comment {
-            if line.contains("*/") {
-                in_block_comment = false;
-            }
-            continue;
-        }
-        if line.starts_with("/*") {
-            if !line.contains("*/") {
-                in_block_comment = true;
-            }
+                if line.starts_with("/*") {
+            // An opener that does not close on this line: the state above owns the
+            // rest of it. A closed one was masked away by `mask_leading_comments`.
+            in_block_comment = true;
             continue;
         }
         // Inside a struct body: read fields until the closing brace.
@@ -3805,9 +3854,17 @@ fn in_code_block(lines: &[&str], start: usize) -> (Vec<(usize, String)>, usize) 
     let mut consumed = 0usize;
     let mut closed = false;
     'lines: for (offset, raw) in lines[start..].iter().enumerate() {
+        // A `{` inside a leading comment is not the block's opener, and the macro
+        // reader looks for its *first* `{`: the comment is masked (same length, same
+        // offsets) so the opener found is the macro's own.
+        let head = if first {
+            mask_leading_comments(raw)
+        } else {
+            std::borrow::Cow::Borrowed(*raw)
+        };
         let body = if first {
             first = false;
-            match raw.split_once('{') {
+            match head.split_once('{') {
                 Some((_, rest)) => rest,
                 None => continue,
             }
@@ -4309,7 +4366,8 @@ fn fn_has_body(lines: &[&str], start: usize) -> bool {
     let mut square = 0i32;
     let mut seen_angle = false;
     for raw in &lines[start..] {
-        let mut line = *raw;
+        let head = mask_leading_comments(raw);
+        let mut line: &str = &head;
         if let Some(i) = line.find("//") {
             line = &line[..i];
         }
@@ -10625,6 +10683,78 @@ mod tests {
     /// Rust nests block comments, so only the outermost closer ends one. Ending at
     /// the inner closer read `) */` as code, which closed a disabled declaration
     /// early and left its payload as a phantom variant.
+    /// Rust nests block comments, so a leading comment closes at its *matching*
+    /// `*/`. Closing at the inner one left `option */ A,` for the enum cursor,
+    /// which read no variant there and shifted every later tag -- so a contract
+    /// naming `B` was checked against rustc's `A` arm (a false proof).
+    #[test]
+    fn a_nested_leading_comment_does_not_shift_enum_tags() {
+        let src = "pub enum E {\n    /* Default /* rationale */ option */ A,\n    B,\n    C,\n}\n";
+        let specs = super::extract_with_cfgs(src, &[]);
+        let got: Vec<(String, u64)> = specs
+            .enums
+            .get("E")
+            .expect("three variants")
+            .variants
+            .iter()
+            .map(|(n, _, d)| (n.clone(), *d))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("A".to_string(), 0),
+                ("B".to_string(), 1),
+                ("C".to_string(), 2)
+            ],
+            "the nested comment ends at its matching closer"
+        );
+    }
+
+    /// A quote inside a block comment is comment text: it must not open a string,
+    /// because the line that clears the comment is then skipped as "inside a
+    /// literal" and every contract below is lost -- the function is dropped from
+    /// the check set rather than refuted.
+    #[test]
+    fn a_quote_inside_a_comment_does_not_hide_a_later_contract() {
+        let src = "/*\nA double quote looks like \"\n*/\n/// ensures: ret == 1\npub fn f() -> u8 { 0 }\n";
+        let specs = super::extract_with_cfgs(src, &[]);
+        assert!(
+            specs.by_fn.contains_key("f"),
+            "the contract after the comment is read: {:?}",
+            specs.by_fn.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A `{` inside a leading comment is not the `spec!` opener. Taking it as one
+    /// made the macro's own closer return the depth only to one, so the block ran on
+    /// to the enclosing module's `}` and swallowed every contract inside it.
+    #[test]
+    fn a_comment_brace_does_not_swallow_a_spec_block() {
+        let src = "mod m {\n\
+             \x20   /* opening brace: { */ spec! {\n\
+             \x20       ensures: ret == 0,\n\
+             \x20   }\n\
+             \x20   pub fn first() -> u8 { 0 }\n\
+             \n\
+             \x20   /// ensures: ret == 1\n\
+             \x20   pub fn second() -> u8 { 0 }\n\
+             }\n";
+        let specs = super::extract_with_cfgs(src, &[]);
+        assert!(
+            specs.by_fn.contains_key("m::first"),
+            "the comment's brace is not the opener: {:?}",
+            specs.by_fn.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            specs
+                .by_fn
+                .get("m::second")
+                .is_some_and(|c| c.ensures == vec!["ret == 1".to_string()]),
+            "the contract after the block is its own: {:?}",
+            specs.by_fn.keys().collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn a_nested_block_comment_does_not_end_early() {
         let src = "pub enum X {\n    A,\n    #[cfg(feature = \"extra\")]\n    Extra(/* ( /* nested */ ) */\n        u8,\n    ),\n    C,\n}\n";
