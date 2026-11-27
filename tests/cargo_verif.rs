@@ -332,3 +332,131 @@ fn a_crate_with_a_dependency_is_verified() {
     assert!(out.contains("bad"), "the failing function must be named: {out}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// An *associated function* call (`S::new()`) must resolve to its own body in a
+/// crate that has module files.
+///
+/// The owner and trait maps are keyed by the *snapshot* line (the crate's sources
+/// concatenated, `mod a;` inlined), while the parser recorded the line rustc
+/// printed. For a single-file crate the two coincide; with one module file every
+/// later `impl` shifts, so *no* `Type::method` call resolved and a local
+/// associated function was reported "call to unmodelled function" -- `semver`'s
+/// `Identifier::empty` alone blocked 15 functions.
+#[test]
+fn an_associated_function_call_resolves_in_a_multi_file_crate() {
+    if !have_rustc() {
+        eprintln!("skipping an_associated_function_call_resolves_in_a_multi_file_crate: no rustc");
+        return;
+    }
+    let dir = scratch_crate(
+        "pub mod a;\n\
+         macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n\
+         pub struct S;\n\
+         impl S {\n\
+         spec! { requires: true, ensures: true, }\n\
+         pub fn new() -> S { S }\n\
+         }\n\
+         spec! { requires: true, ensures: ret == 1, }\n\
+         pub fn caller_root() -> u8 { let _ = S::new(); 1 }\n",
+    );
+    let lib = dir.join("src").join("lib.rs");
+    std::fs::write(
+        dir.join("src").join("a.rs"),
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n\
+         pub struct A;\n\
+         impl A {\n\
+         spec! { requires: true, ensures: true, }\n\
+         pub const fn cnew() -> A { A }\n\
+         }\n\
+         spec! { requires: true, ensures: ret == 1, }\n\
+         pub fn caller_mod() -> u8 { let _ = A::cnew(); 1 }\n",
+    )
+    .expect("write module");
+
+    let (code, out) = run(&[], &lib);
+    assert_eq!(code, 0, "a local associated function must be inlined: {out}");
+    for name in ["caller_root", "a::caller_mod", "new", "cnew"] {
+        assert!(out.contains(name), "the report must name `{name}`: {out}");
+    }
+    assert!(
+        !out.contains("unmodelled function"),
+        "no call may be unmodelled here: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `match c.op` on an *enum-typed field* of a struct argument decides.
+///
+/// The field's tag is an input like any other, so it is seeded with the variant
+/// discriminants as its domain; without that the field read was `Unknown`, the
+/// `switchInt` reported "unmodelled switch discriminant", and every function that
+/// matched on a struct field was undecided. The false half is asserted too: a
+/// postcondition that holds for only one variant must be *refuted*, which is what
+/// shows the tag is symbolic rather than a constant.
+#[test]
+fn a_match_on_an_enum_typed_field_decides_and_a_false_one_refutes() {
+    if !have_rustc() {
+        eprintln!("skipping a_match_on_an_enum_typed_field_decides_and_a_false_one_refutes: no rustc");
+        return;
+    }
+    let body = |ensures: &str| {
+        format!(
+            "macro_rules! spec {{ ($($c:ident : $b:expr,)*) => {{}}; }}\n\
+             pub enum Op {{ Exact, Greater, Less }}\n\
+             pub struct C {{ pub op: Op }}\n\
+             spec! {{ requires: true, ensures: {ensures}, }}\n\
+             pub fn pick(c: &C) -> u8 {{\n\
+             match c.op {{ Op::Exact => 1, Op::Greater => 2, Op::Less => 3 }}\n\
+             }}\n"
+        )
+    };
+    let dir = scratch_crate(&body("ret >= 1"));
+    let lib = dir.join("src").join("lib.rs");
+    let (code, out) = run(&[], &lib);
+    assert_eq!(code, 0, "a match on an enum field must decide: {out}");
+    assert!(out.contains("pick"), "the function must be named: {out}");
+
+    std::fs::write(&lib, body("ret == 1")).expect("rewrite");
+    let (code, out) = run(&[], &lib);
+    assert_eq!(code, 1, "a claim that holds for one variant must be refuted: {out}");
+    assert!(
+        out.contains("postcondition"),
+        "the refutation must name the postcondition: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `Drop` impl with a 128-bit local is refused, not a crash.
+///
+/// The destructor's body is *executed* by the inliner, and the root's
+/// `first_unrepresentable_type` cannot see a callee's locals, so a `u128` cast in
+/// a destructor reached `smt::truncate` and aborted the whole run. A panic is not
+/// a refusal: it reports nothing and takes the process down.
+#[test]
+fn an_inlined_destructor_with_a_128_bit_local_is_refused_not_panicked() {
+    if !have_rustc() {
+        eprintln!("skipping an_inlined_destructor_with_a_128_bit_local_is_refused_not_panicked: no rustc");
+        return;
+    }
+    let dir = scratch_crate(
+        "macro_rules! spec { ($($c:ident : $b:expr,)*) => {}; }\n\
+         pub struct W;\n\
+         impl Drop for W {\n\
+         fn drop(&mut self) { let b = 1u64 as u128 * 3; let _ = b; }\n\
+         }\n\
+         spec! { requires: true, ensures: ret == 1, }\n\
+         pub fn f() -> u8 { let _w = W; 1 }\n",
+    );
+    let lib = dir.join("src").join("lib.rs");
+    let (code, out) = run(&[], &lib);
+    assert_ne!(code, -1, "the run must not be killed: {out}");
+    assert!(
+        !out.contains("width must be 1..=64"),
+        "a 128-bit destructor local must be a refusal, not a panic: {out}"
+    );
+    assert!(
+        out.contains("64-bit engine") || out.contains("not modelled"),
+        "the refusal must name the width or the shape: {out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

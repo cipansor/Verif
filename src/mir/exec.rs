@@ -771,6 +771,16 @@ struct Env {
     elem_parts: BTreeMap<(u32, u64, Vec<u32>), Val>,
     /// Tuple fields, keyed by (local, field).
     fields: BTreeMap<(u32, u32), Val>,
+    /// `(local, field) -> (tag, tag width)` for each *enum-typed field* of a
+    /// struct argument whose tag was seeded.
+    ///
+    /// Separate from `fields` because the two answer different questions: `fields`
+    /// holds the field's *value* (which for a unit-only enum is the tag), while
+    /// this holds the tag a `discriminant` read must use. A `match` on the field
+    /// copies it into a temp first, and the temp needs the tag carried over --
+    /// `Rvalue::Discriminant` reads the tag of a *local*, so the copy is where the
+    /// link has to be made.
+    field_tags: BTreeMap<(u32, u32), (Var, u8)>,
     /// A *nested* field path, keyed by (local, the projection chain from the
     /// local to the leaf). `o.i.v` on a `&Outer` is `(1, [0, 0])`.
     ///
@@ -1019,6 +1029,7 @@ impl Env {
             field_lens: BTreeMap::new(),
             elem_parts: BTreeMap::new(),
             fields: BTreeMap::new(),
+            field_tags: BTreeMap::new(),
             nested: BTreeMap::new(),
             poisoned_elems: BTreeSet::new(),
             payloads: BTreeMap::new(),
@@ -2468,6 +2479,24 @@ impl Env {
     /// the operand width, because `checked_add` on a `u8` produces a `u8`
     /// payload: sizing it from the destination would size it from the
     /// `Option<u8>` local.
+    /// The seeded tag of an *enum-typed field* a place denotes, if any.
+    ///
+    /// The place must resolve to `(local, [Field(i)])` -- one field of one local,
+    /// after the transparent `(*_1)` of a reference argument is stripped, the same
+    /// rule `length_of` and `get` apply. A longer projection is refused rather
+    /// than answered with the outer field's tag: `((_1.0).1)` is a different enum,
+    /// and reading the outer tag there sent a nested `match` down the wrong arm.
+    fn field_tag(&self, p: &Place) -> Option<(Var, u8)> {
+        let mut p = self.resolve(p);
+        if matches!(p.proj.first(), Some(Proj::Deref)) && self.deref_ok.contains_key(&p.local) {
+            p.proj.remove(0);
+        }
+        match p.proj.as_slice() {
+            [Proj::Field(i)] => self.field_tags.get(&(p.local, *i)).copied(),
+            _ => None,
+        }
+    }
+
     fn set_payload(&mut self, local: u32, variant: u64, v: Val, width: u8) {
         self.payloads.insert((local, variant), (v, width));
     }
@@ -2936,6 +2965,11 @@ pub struct Seeds {
     /// contract names, so `m.Data` in a contract and `((_1 as Data).0)` in the
     /// body name one variable rather than two that look alike.
     pub payload_seeds: Vec<(u32, u64, Var, u8, bool)>,
+    /// `(local, field index, tag variable, tag width, discriminants)` for each
+    /// *enum-typed field* of a struct argument. Seeded so a `match` on the field
+    /// decides, with the tag's domain assumed on the initial path -- the same rule
+    /// [`tags`](Self::tags) follows for an enum argument.
+    pub field_tags: Vec<(u32, u32, Var, u8, Vec<u64>)>,
     /// `(variable index, value)` for each variable the precondition pins to a
     /// constant.
     ///
@@ -3181,6 +3215,13 @@ where
     for &(local, tag, width, _) in &seeds.tags {
         env.set_discriminant(local, Val::Sym(smt::truncate(tag, width), Sign::Unsigned));
     }
+    // An enum-typed *field*: the field's value is its tag, and the tag is also
+    // recorded so a `match` that copies the field into a temp carries it.
+    for &(local, field, tag, width, _) in &seeds.field_tags {
+        let tag = smt::truncate(tag, width);
+        env.fields.insert((local, field), Val::Sym(tag, Sign::Unsigned));
+        env.field_tags.insert((local, field), (tag, width));
+    }
     for &(local, variant, v, width, signed) in &seeds.payload_seeds {
         env.set_payload(local, variant, Val::Sym(v, Sign::of_bool(signed)), width);
     }
@@ -3205,6 +3246,33 @@ where
         // the domain cannot be assumed as written; refusing to assume is the safe
         // direction (the `otherwise` arm then looks reachable and the run reports
         // it, rather than a wrong domain being taken as fact).
+        let max = *discs.iter().max().unwrap_or(&0);
+        if width < 64 && max > (1u64 << width) - 1 {
+            continue;
+        }
+        let mut bound: Option<Pred> = None;
+        for d in discs {
+            let p = smt::eq_const(tag, *d);
+            bound = Some(match bound {
+                None => p,
+                Some(prev) => smt::or(prev, p),
+            });
+        }
+        if let Some(bound) = bound {
+            pre = Some(match pre {
+                None => bound,
+                Some(p) => smt::and(p, bound),
+            });
+        }
+    }
+    // The same domain for an enum-typed *field*: a value of the field's type always
+    // has one of its variants' tags, so assuming the disjunction is a fact about
+    // the type. Without it the `otherwise` arm of an exhaustive `match` on the
+    // field looks reachable, and rustc lowers that arm to `unreachable`.
+    for &(_, _, tag, width, ref discs) in &seeds.field_tags {
+        if discs.is_empty() {
+            continue;
+        }
         let max = *discs.iter().max().unwrap_or(&0);
         if width < 64 && max > (1u64 << width) - 1 {
             continue;
@@ -3944,7 +4012,10 @@ fn impl_self_loc(f: &MirFn) -> Option<(usize, usize)> {
     if !f.name.contains("<impl at") {
         return None;
     }
-    f.impl_loc
+    // The *snapshot* line: `impl_owners`/`impl_traits` are keyed by it, and for a
+    // crate with module files that is not the line rustc printed. See
+    // [`MirFn::impl_snap`].
+    f.impl_snap
 }
 
 /// The owner type of a method's `impl`, read from the source via the location in
@@ -8806,6 +8877,24 @@ where
                     }
                 }
                 st.env.set(dest, v);
+                // An enum-typed *field* copied into a temp: `match c.op` lowers to
+                // `_2 = ((*_1).0); _3 = discriminant(_2)`, and `discriminant` reads
+                // the tag of a *local*. The field's tag was seeded, the temp's was
+                // not, so the copy is where the two have to meet -- without it the
+                // switch reports "unmodelled switch discriminant" and the whole
+                // function is undecided. Whole-local destinations only: a
+                // `discriminant` of a projected place is refused on purpose (a
+                // nested enum's outer tag is not the inner one).
+                if dest.proj.is_empty() {
+                    if let Rvalue::Use(Operand::Copy(q) | Operand::Move(q)) = rv {
+                        if let Some((tag, w)) = st.env.field_tag(q) {
+                            st.env.set_discriminant(
+                                dest.local,
+                                Val::Sym(smt::truncate(tag, w), Sign::Unsigned),
+                            );
+                        }
+                    }
+                }
                 // A promoted `&[&str]` constant (`_4 = const f::promoted[0]`) is the
                 // format-piece array a `panic!`/`assert!` message is built from on
                 // edition 2024. Its pieces are recorded *here*, after `set`, because
@@ -9668,6 +9757,18 @@ where
                 report.unknown_paths.push("destructor has no body".into());
                 return;
             };
+            // The same width guard the call path applies: a destructor's body is
+            // *executed* here, and its 128-bit locals are invisible to the root's
+            // `first_unrepresentable_type`. Without this a `Drop` impl that casts to
+            // `u128` panics in `smt::truncate` and takes the run down, which is a
+            // crash rather than a refusal.
+            if let Some(wide) = callee_fn.first_unrepresentable_type() {
+                report.unknown_paths.push(format!(
+                    "destructor of `{}` has a local of type `{wide:?}`, which is past the 64-bit engine",
+                    ty_label(&ty)
+                ));
+                return;
+            }
             // The destructor's `self` is `&mut T`, and the place being dropped is
             // the storage it borrows, so the argument is that place itself.
             let arg = Operand::Copy(place.clone());
@@ -10241,7 +10342,8 @@ fn drop_destructor(prog: &MirProgram, ty: &Ty) -> Option<usize> {
         if f.name.rsplit("::").next() != Some("drop") {
             continue;
         }
-        let Some(loc) = f.impl_loc else { continue };
+        // The snapshot line: `impl_traits`/`impl_owners` are keyed by it.
+        let Some(loc) = f.impl_snap else { continue };
         // The *trait* has to be `Drop`. A method named `drop` on any other trait
         // (`trait NotDrop { fn drop(&mut self); }`) is not Rust's destruction hook,
         // and executing it as though it were hides the real field destruction --
@@ -10949,6 +11051,18 @@ fn eval_rvalue(f: &MirFn, env: &mut Env, dest: &Place, rv: &Rvalue) -> Val {
             // an enum *reference* lowers, and it must keep deciding.
             if matches!(p.proj.first(), Some(Proj::Deref)) && env.deref_ok.contains_key(&p.local) {
                 p.proj.remove(0);
+            }
+            // A *single field* of a local whose tag was seeded: `match c.op` lowers
+            // to `_2 = discriminant(((*_1).0: Op))` -- a direct discriminant of a
+            // projected place, with no temp copy. The field's tag is an input, so
+            // reading it is exact. A *longer* projection is still refused: the outer
+            // tag of `((_1 as A).0)` is not the inner enum's, and answering with it
+            // is the wrong-arm bug the guard below documents.
+            if let [Proj::Field(i)] = p.proj.as_slice() {
+                return match env.field_tags.get(&(p.local, *i)) {
+                    Some(&(tag, w)) => Val::Sym(smt::truncate(tag, w), Sign::Unsigned),
+                    None => Val::Unknown,
+                };
             }
             if !p.proj.is_empty() {
                 Val::Unknown
@@ -13274,6 +13388,7 @@ fn count_via_helper(_1: u8) -> u8 {
             )],
             written: [0u32].into_iter().collect(),
             impl_loc: None,
+            impl_snap: None,
         };
         // `a(x: &mut u8)`: calls `b` (so `b`'s walk sees `a` on the stack -> cycle).
         let a = MirFn {
@@ -13296,6 +13411,7 @@ fn count_via_helper(_1: u8) -> u8 {
             )],
             written: [0u32].into_iter().collect(),
             impl_loc: None,
+            impl_snap: None,
         };
         let prog = MirProgram { fns: vec![a, b], ..Default::default() };
         // The walk starts at `a`'s header (block 0) with `a` already `visiting`.

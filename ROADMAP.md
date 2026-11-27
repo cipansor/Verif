@@ -961,39 +961,66 @@ keeps growing.
 `mir_coverage` run on real published sources with a trivial contract
 (`requires: true` / `ensures: true`) injected above every `fn`, so the number is
 "how much of this crate can the frontend *model*", not "how many functions happen
-to carry contracts":
+to carry contracts". The class breakdown is quoted per crate because a total alone
+cannot say what to fix next -- the first version of this table attributed all 89
+undecided `semver` functions to one class, and the histogram says the biggest class
+is a different one.
 
-| crate | decided | notes |
-|---|---|---|
-| `itoa` 1.0.11 | **0 of 11** | 2 skipped (128-bit), 4 `incomplete` on `core` calls (`Buffer::new`, `MaybeUninit::uninit`, `<I as Sealed>::write`), 5 `unchecked` (trait declaration / ambiguous `Sealed::write`) |
-| `semver` 1.0.23 | **4 of 93** (248 s) | top reason `unmodelled switch discriminant` — `match cmp.op` where `op` is an enum-typed **field of a struct argument** |
-| `ryu` 1.0.18 | **panicked** → now `> 600 s` | `mul_shift_all_64` inlines `mul_shift_64`, whose `m as u128` panicked in `smt::truncate`; fixed here. The remaining run has no time budget and did not finish |
-| `serde_json` 1.0.128 | not measurable standalone | needs its dependency rlibs; `cargo verif` (C8) is the route |
+| crate | verified | `call to unmodelled function` | switch discriminant | call depth | no body (`unchecked`) | 128-bit skip |
+|---|---|---|---|---|---|---|
+| `itoa` 1.0.11 | **0 of 11** | 4 (`MaybeUninit::<u8>::uninit` ×3, `<I as Sealed>::write`) | 0 | 0 | 5 (trait declarations, one ambiguous `Sealed::write`) | 2 |
+| `semver` 1.0.23 | **5 of 93** (248 s) | 54 | 10 | 8 | 10 (trait declarations, `strip_prefix`) | 0 |
+| `ryu` 1.0.18 | not measurable | -- | -- | -- | -- | -- |
+| `serde_json` 1.0.128 | not measurable standalone | -- | -- | -- | -- | -- |
 
-Two findings, in priority order.
+`itoa` and `semver` are `no_std`-friendly and have no dependency of their own, so a
+loose-file run is a fair measure. `ryu` has no per-function time budget, so a
+whole-crate run still does not finish (see D2 below); `serde_json` needs its
+dependency rlibs, and `cargo verif` (C8) is the route.
 
-- **D1. A struct argument's fields are unseeded, so any `match` on one is undecided.**
-  · P0 · **open**
-  - Gap: the layout reader knows a struct's field types, but only fields a
-    *contract names* are bound (`FieldEnv.seeds`). The body's `cmp.op` therefore
-    reads `Unknown`, the `switchInt` on its discriminant reports "unmodelled switch
-    discriminant", and the function is undecided. Measured on a nine-line repro and
-    on `semver`: 89 of 93 functions are lost to this class.
-  - Closing move: seed every field of a struct-typed argument from the declared
-    layout, as a fresh symbolic input of the field's own width and sign; for an
-    enum-typed field, seed the tag with the *disjunction of its discriminants*
-    conjoined onto the initial path (the rule `tag_seeds` already applies to an
-    enum argument) and its payloads per variant. Sound because a field of an
-    argument is an input, and the tag's domain is a fact about the type.
-  - Exit: the repro decides; `semver`'s decided count rises by ≥ 40; a tripwire
-    whose postcondition is false on one variant must still be refuted.
+What moved in this round, and what the numbers say about the *next* move:
 
-- **D2. A whole-crate run has no time budget.** · P1 · **open**
-  - Gap: `ryu` no longer panics but ran past 600 s. The engine bounds *size*
-    (`CAP`, `MAX_APPLY_STEPS`, `MAX_WALK_DEPTH`) and not time, which is deliberate,
-    but a scoreboard over a real crate needs a per-function wall-clock cap that
-    reports `Incomplete` rather than stalling the whole run.
-  - Exit: `mir_coverage` over `ryu` finishes, naming the functions it capped.
+- **A local associated function call now resolves in a multi-file crate.** The
+  contract maps are keyed by the *snapshot* line (sources concatenated, `mod a;`
+  inlined) while the parser recorded the line rustc printed; with one module file
+  every later `impl` shifted, so *no* `Type::method` call resolved. `semver`'s
+  `Identifier::empty` alone blocked 15 functions, and it is now 0. This is the
+  class the histogram was hiding: `54` unmodelled calls, of which the top six are
+  `NonNull::eq` (14), `str::as_bytes` (11), `NonNull::as_ptr` (4), `Formatter::write_str`
+  (3), `ptr::read` (2), `Formatter::write_fmt` (2).
+- **`match c.op` on an enum-typed *field* decides** (10 functions in `semver`, and
+  the whole class in `everyday.rs`'s readers). The field's tag is seeded with its
+  discriminant domain, so the `switchInt` has something to compare against.
+- **A 128-bit local in an *inlined destructor* is refused, not a crash.** `ryu`'s
+  panic came from `Drop` glue the root's width guard cannot see.
+
+Remaining, in priority order:
+
+- **D1. The `core` methods the histogram now names.** · P1 · **open**
+  - Gap: `NonNull::eq`/`as_ptr` (pointer identity, which this model has no address
+    space for), `str::as_bytes` (a `&[u8]` view of a `&str` whose length is already
+    modelled), `Formatter::write_str`/`write_fmt` (a formatting sink with no
+    modelled output), `MaybeUninit::uninit` (`itoa`'s whole buffer type).
+  - Closing move, in the order the payoff justifies: `str::as_bytes` (length
+    already known, elements are the bytes), then `MaybeUninit<T>` modelled as `T`
+    (an uninitialised value is an arbitrary value -- the sound over-approximation),
+    which unblocks `itoa`'s `Buffer`. `NonNull` and `Formatter` stay refused:
+    pointer identity and formatted output are outside a bit-vector model, and a
+    wrong answer there would be a false proof rather than a weaker one.
+  - Exit: `itoa`'s `new`/`clone`/`default` decide; `semver` gains the `as_bytes`
+    family; a tripwire per modelled method.
+
+- **D2. A whole-crate run has no per-function time budget.** · P1 · **open**
+  - Gap: the engine bounds *size* (`CAP`, `MAX_APPLY_STEPS`, `MAX_WALK_DEPTH`) and
+    not time, which is deliberate -- a bound on one resource is not a bound on the
+    others -- but a scoreboard over a real crate needs a per-function wall-clock
+    cap that reports `Incomplete` rather than stalling the whole run. This is the
+    same budget C7's latency half asks for (a `u32` guard that answers after ~4 s
+    instead of being capped by the diagram), so the two are one item: implement it
+    once, in the frontend's per-function loop.
+  - Exit: `mir_coverage` over `ryu` finishes, naming the functions it capped; a
+    `u32` multiply-overflow guard reports `incomplete` promptly rather than after
+    the diagram budget runs out.
 
 
 Exit: one real `no_std` crate with a dependency verified end to end with
