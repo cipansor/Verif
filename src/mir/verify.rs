@@ -3072,6 +3072,18 @@ mod extern_probe_tests {
             ),
             Some("nightly-2026-10-23-x86_64-unknown-linux-gnu")
         );
+        // An install that is not runnable *here* is not a second compiler: the
+        // spawn failure would read as "rejected the rlib" and the compatibility
+        // test would pass having compiled nothing.
+        assert!(!compiler_runs("/nonexistent/rustc"));
+        let dir = std::env::temp_dir().join(format!("verif-norun-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        assert!(!compiler_runs(&dir.to_string_lossy()), "a directory is not a compiler");
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Some((path, _)) = active() {
+            assert!(compiler_runs(&path), "the active compiler runs: {path}");
+        }
+
         // A prefix that is not the same channel is not a match.
         assert_eq!(resolve_listed(&["stableness"], "stable"), None);
         assert_eq!(resolve_listed(&["stable-x86_64-unknown-linux-gnu"], "1.85"), None);
@@ -3144,11 +3156,26 @@ mod extern_probe_tests {
             return None;
         }
         let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
-        if path.is_empty() {
+        if path.is_empty() || !compiler_runs(&path) {
             return None;
         }
         let id = canonical_compiler(&path);
         Some((path, id))
+    }
+
+    /// Does this compiler answer `-vV` on *this* machine?
+    ///
+    /// `have` resolves an *installed* name, and an install for another host is
+    /// installed but not runnable here. Returning it would be worse than returning
+    /// nothing: `canonical_compiler` falls back to the path when the binary cannot
+    /// answer, so the identity would differ from the producer's, and the
+    /// compatibility test's "a different toolchain must not accept this rlib" would
+    /// pass on the failed *spawn* -- green, having compiled nothing.
+    fn compiler_runs(path: &str) -> bool {
+        Command::new(path)
+            .arg("-vV")
+            .output()
+            .is_ok_and(|o| o.status.success())
     }
 
     /// The path `rustc` on `PATH` actually runs, and that path's identity.
