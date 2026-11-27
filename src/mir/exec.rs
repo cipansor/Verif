@@ -9992,6 +9992,16 @@ where
                 report.unknown_paths.push(format!("callee `{name}` has no body"));
                 return;
             };
+            // The root's 128-bit guard (`first_unrepresentable_type`) cannot see an
+            // inlined callee's locals, and the callee's body is executed here: a
+            // `u128` local in it reaches a width-taking constructor and panics, which
+            // takes the whole run down instead of refusing one path. Refuse the call.
+            if let Some(ty) = callee_fn.first_unrepresentable_type() {
+                report.unknown_paths.push(format!(
+                    "callee `{name}` has a local of type `{ty:?}`, which is past the 64-bit engine"
+                ));
+                return;
+            }
             let (env, by_ref) = seed_callee_env(prog, &mut st.env, callee_fn, args);
             let caller = Frame {
                 func: st.frame.func,

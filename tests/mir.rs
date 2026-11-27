@@ -7062,6 +7062,28 @@ fn a_mut_vec_postcondition_reads_the_final_length() {
     );
 }
 
+/// A callee's 128-bit local is invisible to the *root's* width guard, and the
+/// callee's body is executed by the inliner: `ryu`'s `mul_shift_all_64` calls
+/// `mul_shift_64`, whose `m as u128` panicked the whole run in `smt::truncate`.
+/// A panic is not a refusal, so the call is refused instead.
+#[test]
+fn an_inlined_callee_with_a_128_bit_local_is_refused_not_panicked() {
+    let src = "\nfn wide(m: u64) -> u64 {\n    let b = m as u128 * 3;\n    b as u64\n}\n\
+               /// requires: true\n\
+               /// ensures: ret >= 1\n\
+               pub fn caller(m: u64) -> u64 { wide(m) + 1 }\n";
+    let Some(t) = verify_src("caller", src) else { return };
+    assert!(
+        matches!(&t, FnOutcome::Incomplete { .. }),
+        "an inlined 128-bit local is a refusal, not a crash and not a proof: {t}"
+    );
+    let detail = format!("{t}");
+    assert!(
+        detail.contains("64-bit engine") || detail.contains("wider than"),
+        "the refusal names the width: {detail}"
+    );
+}
+
 /// The line that closes a block comment can carry code, and that code can open a
 /// multi-line string. Discarding the whole line lost the opener, so the string's
 /// *closing* quote read as an opener and the contract below vanished -- the function

@@ -956,6 +956,46 @@ keeps growing.
 
 ## Phase 2 — real crates (P1)
 
+### Measured against three published crates (2026-11-26)
+
+`mir_coverage` run on real published sources with a trivial contract
+(`requires: true` / `ensures: true`) injected above every `fn`, so the number is
+"how much of this crate can the frontend *model*", not "how many functions happen
+to carry contracts":
+
+| crate | decided | notes |
+|---|---|---|
+| `itoa` 1.0.11 | **0 of 11** | 2 skipped (128-bit), 4 `incomplete` on `core` calls (`Buffer::new`, `MaybeUninit::uninit`, `<I as Sealed>::write`), 5 `unchecked` (trait declaration / ambiguous `Sealed::write`) |
+| `semver` 1.0.23 | **4 of 93** (248 s) | top reason `unmodelled switch discriminant` — `match cmp.op` where `op` is an enum-typed **field of a struct argument** |
+| `ryu` 1.0.18 | **panicked** → now `> 600 s` | `mul_shift_all_64` inlines `mul_shift_64`, whose `m as u128` panicked in `smt::truncate`; fixed here. The remaining run has no time budget and did not finish |
+| `serde_json` 1.0.128 | not measurable standalone | needs its dependency rlibs; `cargo verif` (C8) is the route |
+
+Two findings, in priority order.
+
+- **D1. A struct argument's fields are unseeded, so any `match` on one is undecided.**
+  · P0 · **open**
+  - Gap: the layout reader knows a struct's field types, but only fields a
+    *contract names* are bound (`FieldEnv.seeds`). The body's `cmp.op` therefore
+    reads `Unknown`, the `switchInt` on its discriminant reports "unmodelled switch
+    discriminant", and the function is undecided. Measured on a nine-line repro and
+    on `semver`: 89 of 93 functions are lost to this class.
+  - Closing move: seed every field of a struct-typed argument from the declared
+    layout, as a fresh symbolic input of the field's own width and sign; for an
+    enum-typed field, seed the tag with the *disjunction of its discriminants*
+    conjoined onto the initial path (the rule `tag_seeds` already applies to an
+    enum argument) and its payloads per variant. Sound because a field of an
+    argument is an input, and the tag's domain is a fact about the type.
+  - Exit: the repro decides; `semver`'s decided count rises by ≥ 40; a tripwire
+    whose postcondition is false on one variant must still be refuted.
+
+- **D2. A whole-crate run has no time budget.** · P1 · **open**
+  - Gap: `ryu` no longer panics but ran past 600 s. The engine bounds *size*
+    (`CAP`, `MAX_APPLY_STEPS`, `MAX_WALK_DEPTH`) and not time, which is deliberate,
+    but a scoreboard over a real crate needs a per-function wall-clock cap that
+    reports `Incomplete` rather than stalling the whole run.
+  - Exit: `mir_coverage` over `ryu` finishes, naming the functions it capped.
+
+
 Exit: one real `no_std` crate with a dependency verified end to end with
 `cargo verif`; Kani agrees on every function both tools decide.
 
