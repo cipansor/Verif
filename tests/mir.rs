@@ -7062,6 +7062,243 @@ fn a_mut_vec_postcondition_reads_the_final_length() {
     );
 }
 
+/// The line that closes a block comment can carry code, and that code can open a
+/// multi-line string. Discarding the whole line lost the opener, so the string's
+/// *closing* quote read as an opener and the contract below vanished -- the function
+/// was omitted instead of refuted.
+#[test]
+fn a_literal_after_a_comment_closer_does_not_hide_a_later_contract() {
+    let src = "/* Template description\n*/ const TEMPLATE: &str = \"\nhello\n\";\n\
+               /// ensures: ret == 1\n\
+               pub fn check() -> u8 { 0 }\n";
+    let Some(t) = verify_src("check", src) else { return };
+    assert!(
+        matches!(&t, FnOutcome::Failed { kind, .. } if kind.contains("postcondition")),
+        "the contract after the literal is read and refuted: {t}"
+    );
+}
+
+/// A nested comment before a variant, and a quote inside a comment, are both
+/// comment text. Each one used to hide what follows it: the first shifted the
+/// enum's tags (so a contract selecting `B` was checked against rustc's `A` arm),
+/// the second swallowed the contract below it (so the function was dropped from
+/// the check set instead of refuted).
+#[test]
+fn a_nested_comment_and_a_quoted_comment_do_not_hide_what_follows() {
+    let src = "pub enum E {\n    /* Default /* rationale */ option */ A,\n    B,\n    C,\n}\n\
+               /// requires: m == E::B\n\
+               /// ensures: ret == 1\n\
+               pub fn pick(m: E) -> u8 {\n    match m { E::A => 0, E::B => 1, E::C => 2 }\n}\n";
+    let Some(t) = verify_src("pick", src) else { return };
+    assert!(
+        matches!(&t, FnOutcome::Verified { .. }),
+        "`E::B` is tag 1, so `pick` returns 1: {t}"
+    );
+
+    let Some(t) = verify_src(
+        "after_quote_comment",
+        "/*\nA double quote looks like \"\n*/\n/// ensures: ret == 1\npub fn after_quote_comment() -> u8 { 0 }\n",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(&t, FnOutcome::Failed { kind, .. } if kind.contains("postcondition")),
+        "the contract after the comment is read and refuted: {t}"
+    );
+}
+
+/// A multi-line string is not a comment: a `/*` inside it must not swallow the
+/// contracts below, and a comment that shares a line with a declaration must not
+/// hide the declaration (which would leave its contract to the *next* function).
+#[test]
+fn a_string_or_a_leading_comment_does_not_swallow_a_later_contract() {
+    // A `/*` inside a multi-line string is not a comment: the contract below it must
+    // still reach `after_string`, so the false postcondition is *refuted*.
+    let Some(t) = verify_src(
+        "after_string",
+        "const OPEN: &str = r#\"\n/*\n\"#;\n\
+         /// ensures: ret == 1\n\
+         pub fn after_string() -> u8 { 0 }\n",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(&t, FnOutcome::Failed { kind, .. } if kind.contains("postcondition")),
+        "the `/*` inside the string is not a comment, got {t}"
+    );
+
+    // A comment that shares a line with a declaration hides nothing: `first` keeps
+    // its contract, and `second` (no contract of its own) does not inherit it.
+    let src = "/// ensures: ret == 1\n\
+               /* API note */ pub fn first() -> u8 { 1 }\n\
+               /// ensures: ret == 0\n\
+               pub fn second() -> u8 { 0 }\n";
+    let Some(first) = verify_src("first", src) else { return };
+    assert!(
+        matches!(&first, FnOutcome::Verified { .. }),
+        "the comment shares the line with `first`, so `first` keeps its contract: {first}"
+    );
+    let Some(second) = verify_src("second", src) else { return };
+    assert!(
+        matches!(&second, FnOutcome::Verified { .. }),
+        "`second` has no contract of its own: {second}"
+    );
+
+    // A comment-prefixed *non-function* item still ends the doc block, so its clause
+    // is not carried to the next function.
+    let Some(third) = verify_src(
+        "third",
+        "/// ensures: ret == 1\n\
+         /* note */ pub struct NotAFn;\n\
+         /// ensures: ret == 0\n\
+         pub fn third() -> u8 { 0 }\n",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(&third, FnOutcome::Verified { .. }),
+        "a comment-prefixed struct ends the doc block: {third}"
+    );
+}
+
+/// A standalone block comment between a contract and its function is not an item
+/// boundary: the contract must still reach `f`. Treating the comment as a boundary
+/// cleared the pending clause, so the function was checked against `true` -- a false
+/// postcondition silently unchecked.
+#[test]
+fn a_block_comment_between_a_contract_and_its_function_keeps_the_contract() {
+    let Some(t) = verify_src(
+        "commented",
+        "/// ensures: ret == 1\n\
+         /* This return value is part of the API. */\n\
+         pub fn commented() -> u8 { 0 }",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(&t, FnOutcome::Failed { kind, .. } if kind.contains("postcondition")),
+        "the false postcondition must be refuted, not dropped, got {t}"
+    );
+}
+
+/// A line inside an enum body that starts with `/*` can *close* the comment opened
+/// on an earlier line. Skipping it left the enum reader in comment mode, so it never
+/// reached the enum's `}` and every function after it lost its contract -- silently
+/// unchecked. This pins both the layout (the tags) and the following verdict.
+#[test]
+fn a_nested_comment_closer_inside_an_enum_leaves_the_next_contract_checked() {
+    let Some(t) = verify_src(
+        "pick_nested",
+        "pub enum E {\n    #[doc = \"First\"] /* outer\n    /* inner */ */ A,\n    B,\n}\n\
+         /// requires: m == E::B\n\
+         /// ensures: ret == 1\n\
+         pub fn pick_nested(m: E) -> u8 { match m { E::A => 0, E::B => 1, _ => 2 } }",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(t, FnOutcome::Verified { .. }),
+        "the function after the enum must be checked against `E::B`, got {t}"
+    );
+}
+
+/// A warm run can hit one cached verdict and recompute an **undecided** function
+/// (a `Skipped` is never stored). That must not write the cache: a write keyed on
+/// "we ran the verifier" would rewrite the file on every run.
+#[test]
+fn the_cache_is_not_written_when_only_an_undecided_function_is_recomputed() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif_mixed_cache_{}_{seq}", std::process::id()));
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let file = dir.join("f.rs");
+    // `undecided` is a `Skipped` (unreadable contract); `pending` is an `Incomplete`
+    // (a call the frontend does not model). Neither is cacheable, and a warm run
+    // reaches both through the recompute path.
+    let src = "/// ensures: ret == 0\npub fn decided() -> u8 { 0 }\n\
+               /// ensures: ret == NOT_A_NAME\npub fn undecided() -> u8 { 0 }\n\
+               unsafe extern \"C\" { fn ext_call() -> u8; }\n\
+               /// ensures: ret <= 9\npub fn pending() -> u8 { unsafe { ext_call() } }\n";
+    std::fs::write(&file, src).expect("write fixture");
+    let opts = {
+        let mut o = probe_opts_with_cfgs(&[]);
+        o.cache = Some(cache.clone());
+        o
+    };
+    let entries = || std::fs::read_dir(&cache).map(|d| d.count()).unwrap_or(0);
+    let outcome = |r: &verif::mir::verify::FileReport, n: &str| {
+        r.outcomes.iter().find(|(k, _)| k == n).map(|(_, o)| o.clone())
+    };
+    let first = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    assert!(matches!(outcome(&first, "decided"), Some(FnOutcome::Verified { .. })));
+    assert!(
+        !matches!(outcome(&first, "undecided"), Some(FnOutcome::Verified { .. })),
+        "an unreadable contract is not a verdict"
+    );
+    assert!(
+        matches!(outcome(&first, "pending"), Some(FnOutcome::Incomplete { .. })),
+        "an unmodelled call is an `Incomplete`, not a verdict"
+    );
+    assert_eq!(entries(), 1, "only the decided verdict is stored");
+    let path = std::fs::read_dir(&cache)
+        .expect("cache dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .next()
+        .expect("one entry");
+    let before = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    let warm = verify::verify_file_with_opts(&rustc, &file, &[], &opts).expect("verify");
+    assert!(matches!(outcome(&warm, "decided"), Some(FnOutcome::Verified { .. })));
+    assert_eq!(entries(), 1, "the warm run adds no entry");
+    assert_eq!(
+        std::fs::metadata(&path).and_then(|m| m.modified()).ok(),
+        before,
+        "and rewrites nothing"
+    );
+}
+
+/// A block comment that spans lines inside an enum body used to hang the frontend
+/// (a pre-pass looped on it), which reports no verdict at all. The contract also
+/// pins that the comment contributes no variant: a phantom one would shift `B`.
+#[test]
+fn a_block_comment_spanning_lines_is_not_a_variant() {
+    let Some(t) = verify_src(
+        "pick_spanning",
+        "pub enum Y {\n    #[doc = \"First option\"] /* note\n    continues here */\n    A,\n    B,\n    C,\n}\n\
+         /// requires: m == Y::B\n\
+         /// ensures: ret == 1\n\
+         pub fn pick_spanning(m: Y) -> u8 { match m { Y::A => 0, Y::B => 1, _ => 2 } }",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(t, FnOutcome::Verified { .. }),
+        "`Y::B` must select the `B` arm, got {t}"
+    );
+}
+
+/// A trailing block comment on a variant is not part of the declaration. With it
+/// mis-parsed, `B` took tag 0 -- `A`'s -- so a contract naming `B` was checked
+/// against the `A` arm.
+#[test]
+fn a_trailing_block_comment_keeps_a_variants_tag() {
+    let Some(t) = verify_src(
+        "pick_b",
+        "pub enum E { A, /* first option */ B, C }\n\
+         /// requires: m == E::B\n\
+         /// ensures: ret == 1\n\
+         pub fn pick_b(m: E) -> u8 { match m { E::A => 0, E::B => 1, _ => 2 } }",
+    ) else {
+        return;
+    };
+    assert!(
+        matches!(t, FnOutcome::Verified { .. }),
+        "`E::B` must select the `B` arm, got {t}"
+    );
+}
+
 /// A write through a `Box` pointer (`*b = v`) reaches the boxed store, so a later `*b`
 /// reads the *new* value: a true contract (`ret == 7`) verifies and the stale one
 /// (`ret == 0`) is refuted. The write actually runs -- it is not refused at the null
@@ -7280,6 +7517,43 @@ fn an_in_code_contract_can_name_verif_through_an_extern() {
 /// and exercise the manifest resolution path instead.
 fn probe_opts() -> verify::MirOptions {
     verify::MirOptions { edition: Some(verify::Edition::Rust2024), ..Default::default() }
+}
+
+/// [`probe_opts`] with a `--cfg` set, so a `#[cfg]`-gated item is read the way the
+/// compiler read it.
+fn probe_opts_with_cfgs(cfgs: &[&str]) -> verify::MirOptions {
+    let mut args = Vec::new();
+    for c in cfgs {
+        args.push("--cfg".to_string());
+        args.push((*c).to_string());
+    }
+    verify::MirOptions {
+        edition: Some(verify::Edition::Rust2024),
+        rustc_args: args,
+        ..Default::default()
+    }
+}
+
+/// [`verify_src`], with the run's options named. Used where the *options* are part of
+/// the property under test (the `cfg` set, which decides a gated enum variant).
+fn verify_src_with(name: &str, src: &str, opts: &verify::MirOptions) -> Option<FnOutcome> {
+    let rustc = rustc()?;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir()
+        .join(format!("verif-{name}-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("probe.rs");
+    std::fs::write(&file, src).expect("write probe");
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], opts).expect("frontend");
+    let o = report
+        .outcomes
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, o)| o);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_not_dropped(name, src, o.is_some(), &report.missing);
+    o
 }
 
 /// Every outcome and the `missing` list for one source, without the
@@ -15241,4 +15515,437 @@ fn a_reexported_trait_contract_across_inclusions_is_refused_not_verified() {
         "the shared impl must be Skipped for the inclusion ambiguity; outcomes {:?}",
         rep.outcomes
     );
+}
+
+/// A `match` on an enum reached **through a reference** must decide.
+///
+/// `match *e` lowers to `_2 = discriminant((*_1))`, which has *two* closing parens.
+/// The parser trimmed only one, so the place failed to parse, the discriminant was
+/// `Unknown`, and every such `match` was reported `unmodelled switch discriminant`.
+/// Measured on `serde_json`: 172 functions. Found by running the frontend over the
+/// crate; the curated corpora never matched through a reference.
+#[test]
+fn an_enum_matched_through_a_reference_decides() {
+    let src = "pub enum E { A(u8), B, C }\n\
+               /// ensures: ret <= 1\n\
+               pub fn f(e: &E) -> u8 { match *e { E::A(x) => x % 2, E::B => 1, E::C => 0 } }\n\
+               /// ensures: ret == 2\n\
+               pub fn f_tripwire(e: &E) -> u8 { match *e { E::A(x) => x % 2, E::B => 1, E::C => 0 } }\n";
+    let Some(ok) = verify_src("f", src) else { return };
+    assert!(matches!(ok, FnOutcome::Verified { .. }), "a reference match must decide, got {ok}");
+    let Some(bad) = verify_src("f_tripwire", src) else { return };
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "`ret == 2` is false on every arm, so it must be refuted, got {bad}"
+    );
+}
+
+/// A tag a *caller* built must reach the callee's `match`.
+///
+/// The caller's `E::A(x)` writes a tag into its own local; the callee matches on it.
+/// The tag has to cross the call boundary, or the callee's `switchInt` has nothing to
+/// compare against. Found on `serde_json` (`ParserNumber::visit` called from
+/// `deserialize_any`); measured before the fix as `incomplete`.
+#[test]
+fn an_enum_tag_built_by_a_caller_reaches_the_callee() {
+    let src = "pub enum E { A(u8), B, C }\n\
+               /// ensures: ret <= 1\n\
+               fn inner(e: &E) -> u8 { match *e { E::A(x) => x, E::B => 1, E::C => 0 } }\n\
+               /// requires: x == 0\n\
+               /// ensures: ret == 0\n\
+               pub fn outer(x: u8) -> u8 { let e = E::A(x); inner(&e) }\n\
+               /// requires: x == 0\n\
+               /// ensures: ret == 1\n\
+               pub fn outer_tripwire(x: u8) -> u8 { let e = E::A(x); inner(&e) }\n";
+    let Some(ok) = verify_src("outer", src) else { return };
+    assert!(matches!(ok, FnOutcome::Verified { .. }), "the caller's tag must reach the callee, got {ok}");
+    let Some(bad) = verify_src("outer_tripwire", src) else { return };
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "`ret == 1` is false when the tag reached the callee (the A arm returns 0), got {bad}"
+    );
+}
+
+/// A `#[cfg]`-disabled enum variant is not part of the type, so a `match` over the
+/// enabled ones is exhaustive and its `otherwise` arm is unreachable.
+///
+/// The reader counted every variant the *source* writes. With one extra, the tag
+/// domain is too wide, rustc's `unreachable` arm looks reachable, and the function is
+/// reported as a panic -- `serde_json`'s `ParserNumber` has a
+/// `#[cfg(feature = "arbitrary_precision")]` variant and three functions were `failed`
+/// for a panic that cannot happen.
+#[test]
+fn a_cfg_gated_variant_is_not_part_of_the_tag_domain() {
+    let src = "pub enum P { A(u8), B, #[cfg(feature = \"extra\")] C(String) }\n\
+               /// ensures: ret <= 1\n\
+               pub fn f(p: P) -> u8 { match p { P::A(x) => x % 2, P::B => 1 } }\n";
+    // The feature is off, which is how the crate is compiled: the match is exhaustive.
+    let Some(ok) = verify_src_with("f", src, &probe_opts_with_cfgs(&["feature=\"std\""])) else {
+        return;
+    };
+    assert!(
+        matches!(ok, FnOutcome::Verified { .. }),
+        "a disabled variant must not widen the tag domain, got {ok}"
+    );
+    // With nothing known about the cfgs the variant's tag may not be rustc's, so the
+    // layout is *refused* rather than guessed: the switch's discriminant is unmodelled
+    // and the function is `Incomplete`. The old rule kept the variant, which made the
+    // `unreachable` arm look reachable and reported a panic that cannot happen -- a
+    // false refutation. A refusal loses the proof; it never invents a failure.
+    let Some(guarded) = verify_src_with("f", src, &probe_opts()) else { return };
+    assert!(
+        matches!(guarded, FnOutcome::Incomplete { .. }),
+        "without a cfg set the tag is unknown, so the layout is refused, got {guarded}"
+    );
+}
+
+/// A slice- or `str`-typed **field**'s length is an input, and a reference to it
+/// addresses the field.
+///
+/// Three separate gaps had to be closed for `if self.index < self.slice.len()` to
+/// decide, and each is a way to be wrong rather than slow:
+///
+/// 1. `Ty::parse("&'a [u8]")` read the lifetime as part of the referent, so the field
+///    was `Other("'a [u8]")` -- no width, not a slice, no length. Every struct field
+///    written with an explicit lifetime was unseeded.
+/// 2. A reference *field* is read as `((*_1).0)`, whose head is a deref followed by a
+///    field step. Only a projection of exactly `[Deref]` carried an address, so
+///    `PtrMetadata` of the copied reference was `Unknown`.
+/// 3. Nothing bound a *field*'s length: a top-level slice argument's length is
+///    `indexed`, but `self.slice` is a field, so it is now a fresh `usize` input keyed
+///    by the field path.
+///
+/// Measured on `serde_json`: this is its reader (`SliceRead`), and the shape accounted
+/// for 86 "unmodelled switch discriminant" refusals.
+#[test]
+fn a_slice_typed_field_has_a_length_input() {
+    // The body *branches* on the comparison, so a length the frontend cannot read
+    // leaves the `switchInt` unknown and the function `incomplete` -- which is what
+    // every one of those 86 functions was. A contract on the branch values is
+    // therefore only provable once the comparison is modelled.
+    let src = "pub struct S<'a> { pub slice: &'a [u8], pub index: usize }\n\
+               /// ensures: ret <= 1\n\
+               pub fn before_end(x: &S) -> u8 { if x.index < x.slice.len() { 1 } else { 0 } }\n\
+               /// ensures: ret <= 1\n\
+               pub fn before_end_through_a_temp(x: &S) -> u8 { let s = x.slice; if x.index < s.len() { 1 } else { 0 } }\n\
+               /// ensures: ret == 1\n\
+               pub fn before_end_tripwire(x: &S) -> u8 { if x.index < x.slice.len() { 1 } else { 0 } }\n";
+    for name in ["before_end", "before_end_through_a_temp"] {
+        let Some(f) = verify_src(name, src) else { return };
+        assert!(matches!(f, FnOutcome::Verified { .. }), "{name} must decide, got {f}");
+    }
+    // The tripwire is the evidence the length is a *symbolic input* and not a value
+    // that makes the comparison always true: `index >= len` is reachable, so
+    // `ret == 1` must be refuted.
+    let Some(bad) = verify_src("before_end_tripwire", src) else { return };
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "an index past the end is reachable, so `ret == 1` must be refuted, got {bad}"
+    );
+}
+
+/// A **turbofish** call to a local method resolves, so its body is inlined.
+///
+/// `call_type` read the receiver from the text before the *last* `::`, which for
+/// `V::scaled::<u8>` is `V::scaled` -- whose last segment is the method, not the
+/// receiver. Every explicit-generic-argument call to a local method therefore found
+/// no candidate and was reported "call to unmodelled function", which on `serde_json`
+/// was the single largest refusal (38 functions on one call to
+/// `value::de::<impl Value>::invalid_type::<error::Error>`).
+///
+/// The trailing group is now stripped before the receiver is read. Both halves are
+/// asserted: the true contract verifies *because* the body was inlined (a refused
+/// call would be `incomplete`), and the false one is refuted with a witness.
+#[test]
+fn a_turbofish_call_to_a_local_method_is_inlined() {
+    let src = "pub struct V;\n\
+               impl V {\n\
+                   fn scaled<T>(&self, k: u8) -> u8 { k + 1 }\n\
+               }\n\
+               /// ensures: ret <= 1\n\
+               pub fn use_it(v: &V) -> u8 { v.scaled::<u8>(0) }\n\
+               /// ensures: ret == 2\n\
+               pub fn use_it_tripwire(v: &V) -> u8 { v.scaled::<u8>(0) }\n";
+    let Some(f) = verify_src("use_it", src) else { return };
+    assert!(
+        matches!(f, FnOutcome::Verified { .. }),
+        "a turbofish method call must be inlined, got {f}"
+    );
+    let Some(bad) = verify_src("use_it_tripwire", src) else { return };
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "the inlined body returns 1, so `ret == 2` must be refuted, got {bad}"
+    );
+}
+
+/// A local method whose *type* lives in another module is called through an
+/// `<impl V>` projection, and that is not a `core` callee.
+///
+/// rustc prints a call to a method whose `impl` block is in the calling module but
+/// whose *type* is imported as `de::<impl V>::h`. The resolver used to refuse **any**
+/// name containing `<impl`, on the reasoning that only `core`/`std` print that
+/// projection -- which is false, and on `serde_json` cost 38 functions
+/// (`value::de::<impl Value>::invalid_type::<error::Error>`, a *local* function).
+/// What separates the two is the module prefix, which a local definition prints
+/// identically: a `core` call (`core::num::<impl u8>::wrapping_add`) then finds no
+/// candidate whose prefix matches, and is refused exactly as before.
+///
+/// The generic-argument form (`h::<u8>`) needs the turbofish strip as well, so the
+/// two halves are asserted separately.
+#[test]
+fn a_local_method_called_through_an_impl_projection_is_inlined() {
+    let src = "pub mod val { pub enum V { X } }\n\
+               pub mod de {\n\
+                   use crate::val::V;\n\
+                   impl V {\n\
+                       pub fn scaled(&self, k: u8) -> u8 { k + 1 }\n\
+                       pub fn twice<T>(&self, k: u8) -> u8 { k + k }\n\
+                   }\n\
+                   /// ensures: ret <= 1\n\
+                   pub fn use_scaled(v: &V) -> u8 { v.scaled(0) }\n\
+                   /// ensures: ret <= 2\n\
+                   pub fn use_twice(v: &V) -> u8 { v.twice::<u8>(1) }\n\
+                   /// ensures: ret == 9\n\
+                   pub fn use_scaled_tripwire(v: &V) -> u8 { v.scaled(0) }\n\
+               }\n";
+    for name in ["de::use_scaled", "de::use_twice"] {
+        let Some(f) = verify_src(name, src) else { return };
+        assert!(
+            matches!(f, FnOutcome::Verified { .. }),
+            "a local method behind `<impl V>` must be inlined, got {f}"
+        );
+    }
+    let Some(bad) = verify_src("de::use_scaled_tripwire", src) else { return };
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "the inlined body returns 1, so `ret == 9` must be refuted, got {bad}"
+    );
+}
+
+/// A **replaced** slice field has no length any more.
+///
+/// A seeded field length describes the value *stored* in a field, not a permanent
+/// property of the field: `s.slice = &[]` replaces the slice, so the `usize` that
+/// `s.slice.len()` was bound to describes a value that is no longer there. Leaving
+/// it was a false proof -- the body returns the *entry* length on both paths, so
+/// `ensures: ret == 3` was proved against a function that returns 0 on the branch
+/// that replaces the slice. `forget_field_lens` drops the seed on a field write, a
+/// whole-place write and a loop havoc, and `copy_parts` carries it with the parts
+/// it moves.
+#[test]
+fn a_replaced_slice_field_has_no_stale_length() {
+    let src = "pub struct S<'a> { pub slice: &'a [u8] }\n\
+               /// requires: s.slice.len() == 3\n\
+               /// ensures: ret <= 3\n\
+               pub fn keeps_its_slice(s: &S) -> usize { s.slice.len() }\n\
+               /// requires: s.slice.len() == 3 && t.len() == 0\n\
+               /// ensures: ret == 3\n\
+               pub fn replaces_its_slice<'a>(s: &mut S<'a>, t: &'a [u8]) -> usize {\n\
+                   s.slice = t;\n\
+                   s.slice.len()\n\
+               }\n";
+    // The positive half: an un-replaced field length still decides, so the fix is
+    // not a blanket refusal.
+    let Some(ok) = verify_src("keeps_its_slice", src) else { return };
+    assert!(
+        matches!(ok, FnOutcome::Verified { .. }),
+        "an un-replaced field length must still decide, got {ok}"
+    );
+    // The false half: the body returns the *replacement's* length, 0.
+    let Some(bad) = verify_src("replaces_its_slice", src) else { return };
+    assert!(
+        !matches!(bad, FnOutcome::Verified { .. }),
+        "the replacement branch returns 0, so `ret == 3` must not be proved, got {bad}"
+    );
+}
+
+/// A `discriminant` of a **projected** place is refused, not answered with the base
+/// local's tag.
+///
+/// `match o { Outer::A(Inner::X(_)) => 0, Outer::A(Inner::Y) => 1, _ => 2 }` lowers
+/// the inner match to `discriminant((((*_1) as A).0))`: a downcast and a field on
+/// the *outer* enum's local. The tag store is keyed by local, so answering it there
+/// returned the **outer** tag -- and both inner arms share `Outer::A`'s tag, so the
+/// inner match collapsed to its first arm and a contract about the second was
+/// proved. A projected place is refused (`Val::Unknown`), which is the refusal the
+/// shape had before the parser learned to read a parenthesised place; the
+/// unprojected `discriminant((*_1))` -- the outer match, and every `match` on an
+/// enum *reference* -- still decides.
+#[test]
+fn a_nested_enum_match_is_not_the_outer_tag() {
+    let src = "pub enum Inner { X(u8), Y }\n\
+               pub enum Outer { A(Inner), B }\n\
+               /// ensures: ret <= 1\n\
+               pub fn outer_only(o: &Outer) -> u8 { match o { Outer::A(_) => 0, Outer::B => 1 } }\n\
+               /// ensures: ret == 0\n\
+               pub fn nested_pattern_tripwire(o: &Outer) -> u8 {\n\
+                   match o { Outer::A(Inner::X(_)) => 0, Outer::A(Inner::Y) => 1, Outer::B => 0 }\n\
+               }\n";
+    let Some(ok) = verify_src("outer_only", src) else { return };
+    assert!(
+        matches!(ok, FnOutcome::Verified { .. }),
+        "an unprojected discriminant must still decide, got {ok}"
+    );
+    // `Outer::A(Inner::Y)` returns 1 and every other arm returns 0, so `ret == 0` is
+    // false. Reading the *outer* tag for the inner match collapses the two `A` arms
+    // onto the first and proves it -- the tag is `Outer::A`'s, `0`, for both.
+    let Some(bad) = verify_src("nested_pattern_tripwire", src) else { return };
+    assert!(
+        !matches!(bad, FnOutcome::Verified { .. }),
+        "the inner tag is not the outer one, so `ret == 0` must not be proved, got {bad}"
+    );
+}
+
+/// A local `trait` impl does not answer an `<impl Type>::m` call.
+///
+/// rustc prints an *inherent* method call as `<impl Type>::m` and a trait method as
+/// `<T as Trait>::m`, so a projected call is inherent. The module-prefix match that
+/// lets a local method resolve must not admit a `trait` impl: a local `impl Ext for
+/// u8` inside `mod core::num` shares the prefix, the owner and the tail with
+/// `core::num::<impl u8>::wrapping_add`, so its body was inlined *for the `core`
+/// call* -- a contract the real method violates would be "proved" (here, `ret == 0`
+/// for `2 + 255`).
+#[test]
+fn a_local_trait_impl_in_a_core_module_does_not_answer_the_intrinsic() {
+    let src = "pub mod core {\n\
+                   pub mod num {\n\
+                       pub trait Ext { fn wrapping_add(self, o: u8) -> u8; }\n\
+                       impl Ext for u8 { fn wrapping_add(self, _o: u8) -> u8 { 0 } }\n\
+                   }\n\
+               }\n\
+               use crate::core::num::Ext;\n\
+               /// requires: a == 2 && b == 255\n\
+               /// ensures: ret == 1\n\
+               pub fn real_wrapping_add(a: u8, b: u8) -> u8 { a.wrapping_add(b) }\n\
+               /// requires: a == 2 && b == 255\n\
+               /// ensures: ret == 0\n\
+               pub fn local_body_tripwire(a: u8, b: u8) -> u8 { a.wrapping_add(b) }\n";
+    // The inherent `u8::wrapping_add` wraps `2 + 255` to 1. Answering from the local
+    // trait body would return 0, so this is the direction a prefix-only match breaks.
+    let Some(ok) = verify_src("real_wrapping_add", src) else { return };
+    assert!(
+        matches!(ok, FnOutcome::Verified { .. }),
+        "the inherent `wrapping_add` returns 1, got {ok}"
+    );
+    // And the local body's value must not be provable.
+    let Some(bad) = verify_src("local_body_tripwire", src) else { return };
+    assert!(
+        matches!(bad, FnOutcome::Failed { .. }),
+        "the local trait body returns 0, so `ret == 0` must be refuted, got {bad}"
+    );
+}
+
+/// The cache key covers the `--cfg` set, because the cfg set shapes an enum's tag
+/// domain without touching a byte of MIR or source.
+///
+/// A `#[cfg]`-gated variant is present or absent exactly as in the compiled code, so
+/// turning a feature on can widen the tag domain while `rustc` emits *identical* MIR
+/// for a function that never inspects the enum. A key over MIR + source + edition +
+/// engine alone would then reuse a proof about a different program -- the reviewer's
+/// example is a contract `m == M::B || m == M::C`, a theorem on `{B, C}` and false
+/// once `A` exists.
+///
+/// The assertion is on the *key*, observed through the cache directory: one entry
+/// after the first run, and a **second** entry once the cfg set changes. That is the
+/// property the soundness argument rests on, and it is observable without needing the
+/// verdict to move (which today it does not for that example -- an argument enum's
+/// tag domain is not conjoined into the path, a separate completeness gap).
+#[test]
+fn the_cache_key_covers_the_cfg_set_that_shapes_an_enum() {
+    let Some(rustc) = rustc() else { return };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verif_cfg_cache_{}_{seq}", std::process::id()));
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let file = dir.join("f.rs");
+    let src = "pub enum M { B, C, #[cfg(feature = \"extra\")] A }\n\
+               /// ensures: ret == 0\n\
+               pub fn f(m: M) -> u8 { let _ = m; 0 }\n\
+               /// requires: m == M::A\n\
+               /// ensures: ret == 0\n\
+               pub fn a_only(m: M) -> u8 { let _ = m; 0 }\n";
+    std::fs::write(&file, src).expect("write fixture");
+    let with = |cfgs: &[&str]| {
+        let mut opts = probe_opts_with_cfgs(cfgs);
+        opts.cache = Some(cache.clone());
+        opts
+    };
+    let entries = || std::fs::read_dir(&cache).map(|d| d.count()).unwrap_or(0);
+
+    // The `off` run *decides* `extra` (it is in a set of features that does not
+    // contain it) rather than leaving it unknown, so the two runs differ in the
+    // enum's layout as well as in the key -- a run with no `--cfg` at all leaves
+    // every feature undecidable and the layout the same.
+    let off = with(&["feature=\"std\""]);
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &off).expect("verify");
+    let outcome = |r: &verif::mir::verify::FileReport, n: &str| {
+        r.outcomes.iter().find(|(k, _)| k == n).map(|(_, o)| o.clone())
+    };
+    assert!(
+        !matches!(outcome(&report, "a_only"), Some(FnOutcome::Verified { .. })),
+        "with `extra` off, `M::A` does not exist and the contract naming it is a refusal"
+    );
+    assert_eq!(entries(), 1, "the first run writes one entry");
+    // The same options reuse that entry rather than writing a second one.
+    verify::verify_file_with_opts(&rustc, &file, &[], &off).expect("verify");
+    assert_eq!(entries(), 1, "the same cfg set is the same key");
+
+    // The domain changes with `extra`, and the MIR does not. A key without the cfg
+    // set would reuse the first entry here, which is the stale hit a wider domain
+    // makes a false proof.
+    let on = with(&["feature=\"std\"", "feature=\"extra\""]);
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &on).expect("verify");
+    assert!(
+        matches!(outcome(&report, "a_only"), Some(FnOutcome::Verified { .. })),
+        "with `extra` on, `M::A` exists and the contract about it is checked"
+    );
+    assert_eq!(entries(), 2, "a different cfg set is a different key");
+
+    // Running `off` again must *not* replay the `on` verdict: both entries exist, so
+    // the only thing that can keep them apart is the key. This is the on-to-off
+    // direction, which is the one a stale hit would prove a false claim in.
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &off).expect("verify");
+    assert!(
+        !matches!(outcome(&report, "a_only"), Some(FnOutcome::Verified { .. })),
+        "the `on` entry must not answer an `off` run"
+    );
+    assert_eq!(entries(), 2, "the off run reuses its own entry");
+
+    // Reuse, not just isolation: a second `on` run must hit every entry and write
+    // nothing, so the directory is unchanged. Asserted on the configuration where
+    // every function decides -- a `skipped` function is never cached, so it would
+    // recompute (and rewrite) on every run.
+    let stamps = |dir: &std::path::Path| -> Vec<(String, std::time::SystemTime)> {
+        let mut v: Vec<_> = std::fs::read_dir(dir)
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .map(|e| {
+                        let m = e.metadata().and_then(|m| m.modified()).ok();
+                        (
+                            e.file_name().to_string_lossy().to_string(),
+                            m.unwrap_or(std::time::UNIX_EPOCH),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    };
+    let before = stamps(&cache);
+    verify::verify_file_with_opts(&rustc, &file, &[], &on).expect("verify");
+    assert_eq!(stamps(&cache), before, "a pure cache hit rewrites nothing");
+
+    // A *mixed* warm run: `f` is a hit and `a_only` is recomputed (its contract is a
+    // refusal under `on` too, since `M::A` exists but the tag is not reusable), so a
+    // write keyed on "we ran the verifier" would rewrite the file. Only a cacheable
+    // verdict may write, so the directory must still be untouched.
+    let before = stamps(&cache);
+    let report = verify::verify_file_with_opts(&rustc, &file, &[], &on).expect("verify");
+    assert!(
+        matches!(outcome(&report, "f"), Some(FnOutcome::Verified { .. })),
+        "the cached verdict is reused on the mixed run"
+    );
+    assert_eq!(stamps(&cache), before, "an undecided function writes no entry");
 }

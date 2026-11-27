@@ -136,6 +136,16 @@ impl Ty {
     /// what this tool's own host target uses.
     pub fn parse(s: &str) -> Ty {
         let s = s.trim();
+        // A leading *lifetime* is not part of a type's shape: `&'a [u8]` and `&[u8]`
+        // are the same reference. Leaving it in front of the referent made the type
+        // `Other("'a [u8]")` -- no width, not a slice, no length -- so a struct field
+        // written with an explicit lifetime was unseeded and every read of it was
+        // `Unknown`. `serde_json`'s `SliceRead { slice: &'a [u8], index: usize }` is
+        // exactly this shape, and it is the crate's reader: `if self.index <
+        // self.slice.len()` reported "unmodelled switch discriminant" in 86 functions.
+        if let Some(rest) = strip_lifetime(s) {
+            return Ty::parse(rest);
+        }
         match s {
             "bool" => return Ty::Bool,
             "char" => return Ty::Char,
@@ -181,6 +191,25 @@ impl Ty {
         }
         Ty::Other(s.to_string())
     }
+}
+
+/// The rest of `s` when it begins with a lifetime (`'a`, `'static`, `'_`).
+///
+/// A lifetime is a name and nothing else, so the rest is what follows it once the
+/// name and the whitespace after it are gone. `'_` and `'static` are lifetimes too,
+/// and `'a mut T` keeps its `mut`, which [`Ty::parse`] reads.
+fn strip_lifetime(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix('\'')?;
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    // `'a[0]` is not a lifetime in a type position; require a separator so a
+    // future shape is left alone rather than mis-split.
+    let after = &rest[end..];
+    if !after.is_empty() && !after.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(after.trim_start())
 }
 
 /// A projection out of a place: `_3.1` is `Field(1)`, `_2[0]` is `Index(0)`.
@@ -2588,7 +2617,14 @@ fn parse_rvalue(s: &str, enums: &BTreeMap<String, EnumLayout>) -> Rvalue {
         }
     }
     if let Some(rest) = t.strip_prefix("discriminant(") {
-        if let Some(p) = parse_place(rest.trim_end_matches(')'), enums) {
+        // `close_paren`, not `trim_end_matches(')')`: the operand may itself end in
+        // a parenthesised place, and `discriminant((*_1))` has two closing parens.
+        // Trimming *all* of them left `(*_1`, which no place parser reads, so the
+        // tag came back `Unknown` and every `match` on an enum *reference* reported
+        // "unmodelled switch discriminant" -- 172 of serde_json's 1078 functions,
+        // the frontend's largest single refusal on a real crate. This is the same
+        // defect the `Len((*_1))` arm already fixed one shape over.
+        if let Some(p) = parse_place(close_paren(rest), enums) {
             return Rvalue::Discriminant(p);
         }
     }
