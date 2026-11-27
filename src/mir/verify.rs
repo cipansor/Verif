@@ -3039,55 +3039,85 @@ mod extern_probe_tests {
     /// `E0433` even though the rlib was found.
     #[test]
     fn a_listed_toolchain_matches_its_short_name() {
+        // The selection rule, with the runnability filter injected: that is the rule
+        // `have` applies, so a test of `compiler_runs` alone would keep passing if
+        // `have` stopped consulting it.
+        let all = |_: &str| true;
         // The *installed* name is returned, because that is what `rustup which` is
         // asked for -- and a name from the list cannot install anything, while the
         // short name can.
         assert_eq!(
-            resolve_listed(&["stable-x86_64-unknown-linux-gnu"], "stable"),
+            select_listed(&["stable-x86_64-unknown-linux-gnu"], "stable", all),
             Some("stable-x86_64-unknown-linux-gnu")
         );
         assert_eq!(
-            resolve_listed(&["1.85-x86_64-unknown-linux-gnu"], "1.85"),
+            select_listed(&["1.85-x86_64-unknown-linux-gnu"], "1.85", all),
             Some("1.85-x86_64-unknown-linux-gnu")
         );
         // The exact name wins over a suffixed one.
         assert_eq!(
-            resolve_listed(&["stable-x86_64-unknown-linux-gnu", "stable"], "stable"),
+            select_listed(&["stable-x86_64-unknown-linux-gnu", "stable"], "stable", all),
             Some("stable")
         );
-        // A dated nightly and another host's install are both usable: the lookup is
-        // local, so neither costs a download.
+        // A dated nightly and a pinned date both resolve to the install that carries
+        // them, and the lookup stays local so neither costs a download.
         assert_eq!(
-            resolve_listed(&["nightly-2026-10-23-x86_64-unknown-linux-gnu"], "nightly"),
-            Some("nightly-2026-10-23-x86_64-unknown-linux-gnu")
-        );
-        assert_eq!(
-            resolve_listed(&["stable-aarch64-apple-darwin"], "stable"),
-            Some("stable-aarch64-apple-darwin")
-        );
-        assert_eq!(
-            resolve_listed(
+            select_listed(
                 &["nightly-2026-10-23-x86_64-unknown-linux-gnu"],
-                "nightly-2026-10-23"
+                "nightly",
+                all
             ),
             Some("nightly-2026-10-23-x86_64-unknown-linux-gnu")
         );
-        // An install that is not runnable *here* is not a second compiler: the
-        // spawn failure would read as "rejected the rlib" and the compatibility
-        // test would pass having compiled nothing.
+        assert_eq!(
+            select_listed(
+                &["nightly-2026-10-23-x86_64-unknown-linux-gnu"],
+                "nightly-2026-10-23",
+                all
+            ),
+            Some("nightly-2026-10-23-x86_64-unknown-linux-gnu")
+        );
+        // The selection is over *runnable* installs: a foreign one is skipped, and a
+        // later runnable install of the same channel is used instead of skipping the
+        // whole probe. Returning the foreign one would make the compatibility test
+        // pass on a failed spawn -- green, having compiled nothing.
+        assert_eq!(
+            select_listed(
+                &[
+                    "stable-aarch64-apple-darwin",
+                    "stable-x86_64-unknown-linux-gnu"
+                ],
+                "stable",
+                |n| n.contains("x86_64")
+            ),
+            Some("stable-x86_64-unknown-linux-gnu")
+        );
+        assert_eq!(
+            select_listed(&["stable-aarch64-apple-darwin"], "stable", |_| false),
+            None,
+            "nothing runnable is a skip, never a selection"
+        );
+        // A prefix that is not the same channel is not a match.
+        assert_eq!(select_listed(&["stableness"], "stable", all), None);
+        assert_eq!(
+            select_listed(&["stable-x86_64-unknown-linux-gnu"], "1.85", all),
+            None
+        );
+        assert_eq!(select_listed(&[], "stable", all), None);
+
+        // The runner itself: a missing path and a directory are not compilers, and
+        // the active one is.
         assert!(!compiler_runs("/nonexistent/rustc"));
         let dir = std::env::temp_dir().join(format!("verif-norun-{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
-        assert!(!compiler_runs(&dir.to_string_lossy()), "a directory is not a compiler");
+        assert!(
+            !compiler_runs(&dir.to_string_lossy()),
+            "a directory is not a compiler"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         if let Some((path, _)) = active() {
             assert!(compiler_runs(&path), "the active compiler runs: {path}");
         }
-
-        // A prefix that is not the same channel is not a match.
-        assert_eq!(resolve_listed(&["stableness"], "stable"), None);
-        assert_eq!(resolve_listed(&["stable-x86_64-unknown-linux-gnu"], "1.85"), None);
-        assert_eq!(resolve_listed(&[], "stable"), None);
     }
 
     #[test]
@@ -3104,34 +3134,49 @@ mod extern_probe_tests {
     /// `Command::new` on it fails. A test that used the identity as the program
     /// would skip itself at the first spawn and report `ok` having tested nothing,
     /// which is the defect this helper exists to make impossible to write by accident.
-    /// `rustup toolchain list` prints `stable-x86_64-unknown-linux-gnu (default)`,
-    /// not `stable`, so a name match has to accept the `-<triple>` suffix -- otherwise
-    /// the compatibility tests skip their assertions on a machine where CI installed
-    /// exactly the toolchains they need.
-    /// The *installed* name that satisfies `toolchain`, preferring the exact one.
+    ///
+    /// The installed name to ask `rustup which` for: the first matching one that
+    /// actually *runs*.
     ///
     /// `rustup toolchain list` prints `stable-x86_64-unknown-linux-gnu (default)`,
     /// not `stable`, so the match has to accept the `-<triple>` suffix -- otherwise
     /// the compatibility tests skip their assertions on a machine where CI installed
     /// exactly the toolchains they need.
     ///
-    /// The returned name is what `rustup which` is asked for, and that is the whole
-    /// safety argument: a name taken from the installed list cannot install anything,
-    /// while the *short* name can (`rustup which --toolchain nightly` downloads
-    /// nightly). It is also why a dated nightly or a triple for another host may be
-    /// accepted: the lookup is local, and a compiler that does not run on this machine
-    /// fails at the spawn instead of costing a download.
-    fn resolve_listed<'a>(installed: &[&'a str], toolchain: &str) -> Option<&'a str> {
-        if let Some(exact) = installed.iter().find(|n| **n == toolchain) {
-            return Some(exact);
-        }
+    /// The *runnable* filter is what makes a second install of one channel usable:
+    /// the list can carry one for another host, which matches by name and cannot run
+    /// here. Returning it would be worse than returning nothing -- `canonical_compiler`
+    /// falls back to the path when the binary cannot answer `-vV`, so the identity
+    /// would differ from the producer's and the compatibility test's "a different
+    /// toolchain must not accept this rlib" would pass on the failed *spawn*: green,
+    /// having compiled nothing.
+    ///
+    /// The returned name is also what keeps the lookup local: a name taken from the
+    /// installed list cannot install anything, while the *short* name can (`rustup
+    /// which --toolchain nightly` downloads nightly).
+    fn select_listed<'a>(
+        installed: &[&'a str],
+        toolchain: &str,
+        runs: impl Fn(&str) -> bool,
+    ) -> Option<&'a str> {
+        let matching = |n: &str| {
+            n == toolchain
+                || n.strip_prefix(toolchain)
+                    .is_some_and(|rest| rest.starts_with('-'))
+        };
+        // The exact name wins, then any suffixed one -- each only if it runs.
         installed
             .iter()
-            .find(|n| {
-                n.strip_prefix(toolchain)
-                    .is_some_and(|rest| rest.starts_with('-'))
-            })
             .copied()
+            .filter(|n| matching(n))
+            .find(|n| *n == toolchain && runs(n))
+            .or_else(|| {
+                installed
+                    .iter()
+                    .copied()
+                    .filter(|n| matching(n))
+                    .find(|n| runs(n))
+            })
     }
 
     fn have(toolchain: &str) -> Option<(String, String)> {
@@ -3147,7 +3192,7 @@ mod extern_probe_tests {
             .split_whitespace()
             .filter(|w| !w.starts_with('('))
             .collect();
-        let resolved = resolve_listed(&names, toolchain)?;
+        let resolved = select_listed(&names, toolchain, compiler_runs)?;
         let out = Command::new("rustup")
             .args(["which", "--toolchain", resolved, "rustc"])
             .output()
