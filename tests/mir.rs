@@ -7062,6 +7062,22 @@ fn a_mut_vec_postcondition_reads_the_final_length() {
     );
 }
 
+/// The line that closes a block comment can carry code, and that code can open a
+/// multi-line string. Discarding the whole line lost the opener, so the string's
+/// *closing* quote read as an opener and the contract below vanished -- the function
+/// was omitted instead of refuted.
+#[test]
+fn a_literal_after_a_comment_closer_does_not_hide_a_later_contract() {
+    let src = "/* Template description\n*/ const TEMPLATE: &str = \"\nhello\n\";\n\
+               /// ensures: ret == 1\n\
+               pub fn check() -> u8 { 0 }\n";
+    let Some(t) = verify_src("check", src) else { return };
+    assert!(
+        matches!(&t, FnOutcome::Failed { kind, .. } if kind.contains("postcondition")),
+        "the contract after the literal is read and refuted: {t}"
+    );
+}
+
 /// A nested comment before a variant, and a quote inside a comment, are both
 /// comment text. Each one used to hide what follows it: the first shifted the
 /// enum's tags (so a contract selecting `B` was checked against rustc's `A` arm),

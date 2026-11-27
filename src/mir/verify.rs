@@ -3039,17 +3039,24 @@ mod extern_probe_tests {
     /// `E0433` even though the rlib was found.
     #[test]
     fn a_listed_toolchain_matches_its_short_name() {
-        assert!(names_toolchain("stable-x86_64-unknown-linux-gnu", "stable"));
-        assert!(names_toolchain("1.85-x86_64-unknown-linux-gnu", "1.85"));
-        assert!(names_toolchain("nightly", "nightly"));
-        assert!(!names_toolchain("stable-x86_64-unknown-linux-gnu", "1.85"));
-        assert!(!names_toolchain("stableness", "stable"));
+        let host = "x86_64-unknown-linux-gnu";
+        assert!(names_toolchain("stable-x86_64-unknown-linux-gnu", "stable", host));
+        assert!(names_toolchain("1.85-x86_64-unknown-linux-gnu", "1.85", host));
+        assert!(names_toolchain("nightly", "nightly", host));
+        assert!(!names_toolchain("stable-x86_64-unknown-linux-gnu", "1.85", host));
+        assert!(!names_toolchain("stableness", "stable", host));
         // A *dated* nightly is a different toolchain: accepting it would make
         // `have("nightly")` look up the undated name, which rustup then installs.
         assert!(!names_toolchain(
             "nightly-2026-10-23-x86_64-unknown-linux-gnu",
-            "nightly"
+            "nightly",
+            host
         ));
+        // So is the same channel installed for *another* host: `rustup which
+        // --toolchain stable` resolves the default host, so the lookup would miss
+        // the install the preflight just found.
+        assert!(!names_toolchain("stable-aarch64-apple-darwin", "stable", host));
+        assert!(!names_toolchain("stable-x86_64-unknown-linux-gnu", "stable", ""));
     }
 
     #[test]
@@ -3070,20 +3077,28 @@ mod extern_probe_tests {
     /// not `stable`, so a name match has to accept the `-<triple>` suffix -- otherwise
     /// the compatibility tests skip their assertions on a machine where CI installed
     /// exactly the toolchains they need.
-    fn names_toolchain(listed: &str, toolchain: &str) -> bool {
+    fn names_toolchain(listed: &str, toolchain: &str, host: &str) -> bool {
         if listed == toolchain {
             return true;
         }
-        // A `-<triple>` suffix is the same toolchain. A *dated* nightly
-        // (`nightly-2026-10-23-x86_64-…`) is a different one, and treating it as
-        // `nightly` would make the lookup ask rustup for a name that is not
-        // installed -- which installs it.
+        // A `-<triple>` suffix is the same toolchain only when the triple is *this*
+        // host's: `rustup which --toolchain stable` resolves the default host, so an
+        // install for another host is a different toolchain that the lookup would
+        // then fail on. A *dated* nightly (`nightly-2026-10-23-x86_64-…`) is a
+        // different toolchain too.
         let Some(rest) = listed.strip_prefix(toolchain).and_then(|r| r.strip_prefix('-')) else {
             return false;
         };
-        rest.split('-')
-            .next()
-            .is_some_and(|first| !first.starts_with(|c: char| c.is_ascii_digit()))
+        !host.is_empty() && rest == host
+    }
+
+    /// The host triple `rustup which --toolchain <name>` would resolve.
+    fn host_triple() -> Option<String> {
+        let out = Command::new("rustc").arg("-vV").output().ok()?;
+        let text = String::from_utf8(out.stdout).ok()?;
+        text.lines()
+            .find_map(|l| l.strip_prefix("host: "))
+            .map(|h| h.trim().to_string())
     }
 
     fn have(toolchain: &str) -> Option<(String, String)> {
@@ -3092,7 +3107,11 @@ mod extern_probe_tests {
         // of skipping. `rustup toolchain list` answers from the local state.
         let listed = Command::new("rustup").args(["toolchain", "list"]).output().ok()?;
         let installed = String::from_utf8(listed.stdout).ok()?;
-        if !installed.split_whitespace().any(|w| names_toolchain(w, toolchain)) {
+        let host = host_triple().unwrap_or_default();
+        if !installed
+            .split_whitespace()
+            .any(|w| names_toolchain(w, toolchain, &host))
+        {
             return None;
         }
         let out = Command::new("rustup")

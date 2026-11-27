@@ -2568,6 +2568,11 @@ fn mask_leading_comments(line: &str) -> std::borrow::Cow<'_, str> {
     if end == 0 {
         return std::borrow::Cow::Borrowed(line);
     }
+    std::borrow::Cow::Owned(mask_prefix(line, end))
+}
+
+/// Blank `line[..end]`, one space per char, so the result keeps its offsets.
+fn mask_prefix(line: &str, end: usize) -> String {
     let mut out = String::with_capacity(line.len());
     for (idx, ch) in line.char_indices() {
         if idx < end {
@@ -2576,7 +2581,36 @@ fn mask_leading_comments(line: &str) -> std::borrow::Cow<'_, str> {
             out.push(ch);
         }
     }
-    std::borrow::Cow::Owned(out)
+    out
+}
+
+/// Mask a block comment that is already open at the start of `line`, through its
+/// *matching* `*/`. `None` means the comment runs past the end of the line.
+///
+/// The closing line carries code as well as the closer (`*/ const TEMPLATE: &str =
+/// "`), and that code can open a multi-line string. Discarding the whole line lost
+/// the opener, so the string's *closing* quote read as an opener and every later
+/// contract vanished -- a dropped contract is a function that silently leaves the
+/// check set, not a refusal.
+fn mask_open_comment(line: &str) -> Option<String> {
+    let b = line.as_bytes();
+    let mut i = 0;
+    let mut depth = 1u32;
+    while i < b.len() {
+        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+            depth += 1;
+            i += 2;
+        } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return Some(mask_prefix(line, i));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 /// [`strip_comments`]'s *masking* sibling: comment characters become spaces, so the
@@ -3264,25 +3298,37 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
             continue;
         }
         // A line inside a block comment is *comment text*: its quotes and braces
-        // mean nothing, and it must not open an item, be read as a clause, or clear
-        // a pending contract. This has to run before the string state, or a quote in
-        // a comment opened a string and the line that closes the comment was then
-        // skipped as "inside a literal" -- losing every contract below it.
+        // mean nothing, and it must not open an item or be read as a clause. The
+        // comment is masked rather than dropped, because the line that *closes* it
+        // can carry code -- and that code can open a multi-line string, whose opener
+        // would otherwise be lost and whose closing quote would read as an opener.
+        let mut view = std::borrow::Cow::Borrowed(raw_line);
         if in_block_comment {
-            if raw_line.contains("*/") {
-                in_block_comment = false;
+            match mask_open_comment(raw_line) {
+                Some(masked) => {
+                    in_block_comment = false;
+                    view = std::borrow::Cow::Owned(masked);
+                }
+                None => continue,
             }
-            continue;
         }
-        let begins_in_string = str_open != StrOpen::Code;
-        str_open = str_state(raw_line, str_open);
-        if begins_in_string {
-            // A line inside a multi-line literal is not code either.
+        if str_open != StrOpen::Code {
+            // A line inside a multi-line literal is not code.
+            str_open = str_state(&view, str_open);
             continue;
         }
         // A comment that closes on this line hides nothing: `/* note */ pub fn f()`
         // is one declaration, and `f` keeps the contract written above it.
-        let masked_leading = mask_leading_comments(raw_line);
+        let masked_leading = mask_leading_comments(&view);
+        if masked_leading.trim_start().starts_with("/*") {
+            // An opener that does not close on this line: the state above owns the
+            // rest of it, and the rest of *this* line is comment text.
+            in_block_comment = true;
+            continue;
+        }
+        // The literal state is read from the *masked* text, so a quote inside a
+        // comment cannot open a string.
+        str_open = str_state(&masked_leading, str_open);
         let line = masked_leading.trim();
         // Inside an enum body: read variants until the closing brace.
         //
@@ -3420,13 +3466,7 @@ pub fn extract_with_cfgs(source: &str, cfgs: &[String]) -> Specs {
         // Outside an enum body, a comment is not code. This must sit *after* the
         // cursor above: the cursor owns its own comment state, and a filter here
         // would skip the very line that closes a comment the cursor is carrying.
-                if line.starts_with("/*") {
-            // An opener that does not close on this line: the state above owns the
-            // rest of it. A closed one was masked away by `mask_leading_comments`.
-            in_block_comment = true;
-            continue;
-        }
-        // Inside a struct body: read fields until the closing brace.
+                // Inside a struct body: read fields until the closing brace.
         if cur_struct.is_some() {
             if line.starts_with('}') {
                 let (name, def) = cur_struct.take().unwrap();
@@ -10683,6 +10723,21 @@ mod tests {
     /// Rust nests block comments, so only the outermost closer ends one. Ending at
     /// the inner closer read `) */` as code, which closed a disabled declaration
     /// early and left its payload as a phantom variant.
+    /// The line that closes a block comment can carry code, and that code can open
+    /// a multi-line string. Discarding the whole line lost the opener, so the string's
+    /// *closing* quote read as an opener and every later contract vanished -- the
+    /// function was dropped from the check set rather than refuted.
+    #[test]
+    fn a_multiline_string_after_a_comment_closer_does_not_hide_a_later_contract() {
+        let src = "/* Template description\n*/ const TEMPLATE: &str = \"\nhello\n\";\n/// ensures: ret == 1\npub fn check() -> u8 { 0 }\n";
+        let specs = super::extract_with_cfgs(src, &[]);
+        assert!(
+            specs.by_fn.contains_key("check"),
+            "the contract after the literal is read: {:?}",
+            specs.by_fn.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// Rust nests block comments, so a leading comment closes at its *matching*
     /// `*/`. Closing at the inner one left `option */ A,` for the enum cursor,
     /// which read no variant there and shifted every later tag -- so a contract
